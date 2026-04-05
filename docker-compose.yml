@@ -1,0 +1,417 @@
+services:
+  # Cloudflare Tunnel to securely expose services without opening ports on the host machine
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    restart: unless-stopped
+  
+  # Proxy to expose Docker API securely to other containers without giving them direct access to the Docker socket
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: portracker-docker-proxy
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - INFO=1
+      - NETWORKS=1
+      - POST=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "2375:2375"
+
+  # Application for monitoring and tracking Docker containers
+  portracker:
+    image: mostafawahied/portracker:latest
+    container_name: portracker
+    restart: unless-stopped
+    pid: "host"
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ./portracker-data:/data
+    ports:
+      - "4999:4999"
+    environment:
+      - DOCKER_HOST=tcp://docker-proxy:2375
+    depends_on:
+      - docker-proxy
+
+  # Network-wide ad-blocker
+  pihole:
+    container_name: pihole
+    image: pihole/pihole:latest
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "8180:80/tcp"
+    environment:
+      PIHOLE_UID: 1000
+      PIHOLE_GID: 1000
+      TZ: ${TZ}
+      FTLCONF_webserver_api_password: ${WEBPASSWORD}
+      FTLCONF_dns_listeningMode: 'ALL'
+      FTLCONF_dns_upstreams: '172.18.0.31#5053'
+    volumes:
+      - './etc-pihole:/etc/pihole'
+    restart: unless-stopped
+    cap_add:
+      - SYS_NICE
+    depends_on:
+      - unbound
+  
+  # Recursive DNS resolver for Pi-hole to use for upstream DNS queries, improving privacy and performance
+  unbound:
+    container_name: unbound
+    image: mvance/unbound:latest
+    restart: unless-stopped
+    ports:
+      - "5053:5053/tcp"
+      - "5053:5053/udp"
+    volumes:
+      - './unbound:/opt/unbound/etc/unbound'
+
+  # Reverse proxy to manage and route traffic to different services
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    ports:
+      - 80:80
+      - 81:81
+      - 443:443
+    volumes:
+      - ./nginx-proxy-manager/data:/data
+      - ./nginx-proxy-manager/letsencrypt:/etc/letsencrypt
+    restart: unless-stopped
+
+  # Unified Dashboard to monitor and manage all services, integrated with LM Studio for AI-powered insights and recommendations on system performance and optimization
+  homarr:
+    container_name: homarr
+    image: ghcr.io/homarr-labs/homarr:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./homarr/appdata:/appdata
+    environment:
+      - SECRET_ENCRYPTION_KEY=${HOMARR_SECRET_KEY}
+    ports:
+      - '7575:7575'
+
+  # Download Clients - qBittorrent for torrenting, integrated with Sonarr/Radarr for automated media management
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+    ports:
+    - 8080:8080 
+    - 6881:6881  
+    - 6881:6881/udp  
+    volumes:
+      - ./qbittorrent:/config
+      - D:/downloads:/downloads
+    restart: unless-stopped
+
+  # Indexer Manager to manage and aggregate torrent indexers for Sonarr/Radarr
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ./prowlarr:/config
+    ports:
+      - 9696:9696
+    restart: unless-stopped
+
+  # TV Shows 
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ./sonarr:/config
+      - D:/tv show:/tv
+      - D:/mine/tv:/mine/tv
+    ports:
+      - 8989:8989
+    restart: unless-stopped
+
+  # Movies 
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ./radarr:/config
+      - D:/film:/media
+      - D:/mine/movies:/mine/movies
+    ports:
+      - 7878:7878
+    restart: unless-stopped
+
+  # Subtitles 
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ./bazarr:/config
+      - D:/film:/movies
+      - D:/tv show:/tv
+      - D:/mine/tv:/mine/tv
+      - D:/mine/movies:/mine/movies
+    ports:
+      - 6767:6767
+    restart: unless-stopped
+
+  # Request Management + Recommendations 
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    volumes:
+      - ./jellyseerr:/app/config
+    ports:
+      - 5055:5055
+    restart: unless-stopped
+
+  # Transcoding and Media Management
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: tdarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265
+      - internalNode=true
+      - nodeName=MainNode
+      - NVIDIA_VISIBLE_DEVICES=all   
+      - NVIDIA_DRIVER_CAPABILITIES=all  
+    volumes:
+      - ./tdarr/server:/app/server
+      - ./tdarr/configs:/app/configs
+      - ./tdarr/logs:/app/logs
+      - /d/film:/movies
+      - /d/tv show:/tv
+      - /d/mine:/mine
+      - /d/transcode_cache:/temp
+    ports:
+      - 8265:8265
+      - 8266:8266
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Developer Tools Collection - A collection of web-based tools for developers, including code editors, API testing, and more
+  it-tools:
+    image: corentinth/it-tools:latest
+    container_name: it-tools
+    ports:
+      - 8888:80
+    restart: unless-stopped
+
+  # open webui - Self-hosted web interface for managing and running language models, integrated with LM Studio for local model hosting and inference
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:cuda
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3001:8080"
+    volumes:
+      - ./open-webui:/app/backend/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OPENAI_API_BASE_URL=http://host.docker.internal:1234/v1
+      - OPENAI_API_KEY=lmstudio
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Nextcloud - Self-hosted cloud storage and collaboration platform
+  nextcloud:
+    image: nextcloud:latest
+    container_name: nextcloud-app
+    restart: unless-stopped
+    ports:
+      - 8084:80
+    volumes:
+      - ./nextcloud/nextcloud_html:/var/www/html
+    environment:
+      - MYSQL_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
+      - MYSQL_DATABASE=${NEXTCLOUD_DB_NAME}
+      - MYSQL_USER=${NEXTCLOUD_DB_USER}
+      - MYSQL_HOST=nextcloud-db
+    depends_on:
+      - nextcloud-db
+
+  # MariaDB instance for Nextcloud to store data, ensuring reliable and scalable database management for the Nextcloud application, with secure credentials and persistent storage
+  nextcloud-db:
+    image: mariadb:latest
+    container_name: nextcloud-db
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${NEXTCLOUD_DB_ROOT_PASSWORD}
+      - MYSQL_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
+      - MYSQL_DATABASE=${NEXTCLOUD_DB_NAME}
+      - MYSQL_USER=${NEXTCLOUD_DB_USER}
+    volumes:
+      - ./nextcloud/db_data:/var/lib/mysql
+  
+  # SearxNG - Metasearch Engine
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_SETTINGS_URL=https://raw.githubusercontent.com/searxng/searxng/master/utils/brand/searxng.yml
+      - INSTANCE_NAME=local-ai-search
+    restart: unless-stopped
+
+  # Automation Platform - n8n for workflow automation, integrated with various services for seamless automation of tasks and processes across the homelab environment
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_PROTOCOL=http
+      - N8N_HOST=192.168.0.163
+      - WEBHOOK_URL=http://192.168.0.163:5678/
+      - NODE_ENV=production
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_SECURE_COOKIE=false
+    volumes:
+      - ./n8n/n8n_data:/home/node/.n8n
+
+  # Diagrams - Tools for creating and managing diagrams, including Draw.io and Excalidraw
+  drawio:
+    image: jgraph/drawio:latest
+    container_name: drawio
+    ports:
+      - 8081:8080
+    restart: unless-stopped
+
+  # Excalidraw (self-hosted version)
+  excalidraw:
+    build: ./excalidraw
+    container_name: excalidraw
+    ports:
+      - 8082:80
+    restart: unless-stopped
+
+  # Excalidraw Room - Collaborative version of Excalidraw for real-time diagramming with multiple users, integrated with the Excalidraw Storage Service for saving and retrieving drawings
+  excalidraw-room:
+    build: ./excalidraw-room
+    container_name: excalidraw-room
+    ports:
+      - 8083:80
+    restart: unless-stopped
+
+  # MongoDB instance for Excalidraw Storage Service to store drawings and related data, ensuring persistence and scalability for the Excalidraw Room collaborative diagramming tool
+  excalidraw-mongo:
+    image: mongo:7
+    container_name: excalidraw-mongo
+    volumes:
+      - ./excalidraw-mongo-data:/data/db
+    restart: unless-stopped
+
+  # Excalidraw Storage Service to handle saving and retrieving drawings, integrated with MongoDB for storage
+  excalidraw-storage:
+    build: ./excalidraw-storage
+    container_name: excalidraw-storage
+    ports:
+      - "7802:7802"
+    environment:
+      - MONGO_URL=mongodb://excalidraw-mongo:27017
+      - MONGO_DB=excalidraw
+    depends_on:
+      - excalidraw-mongo
+    restart: unless-stopped
+
+  # Text-to-Diagram AI (uses LM Studio)
+  text-to-diagram:
+    build: ./text-to-diagram
+    container_name: text-to-diagram
+    ports:
+      - "7801:7801"
+    environment:
+      - LM_STUDIO_URL=http://host.docker.internal:1234/v1
+      - LM_STUDIO_MODEL=openai/gpt-oss-20b
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # RustDesk Self-Hosted Remote Desktop Server, providing secure remote access to devices on the local network, integrated with the RustDesk Client for seamless remote desktop experience across different platforms
+  hbbs:
+    container_name: hbbs
+    image: rustdesk/rustdesk-server:latest
+    environment:
+      - ALWAYS_USE_RELAY=Y
+    command: hbbs -r hbbr:21117
+    ports:
+      - 21115:21115
+      - 21116:21116
+      - 21116:21116/udp
+      - 21118:21118
+    volumes:
+      - ./rustdesk/data:/root
+    depends_on:
+      - hbbr
+    restart: unless-stopped
+
+  # RustDesk Relay Server (HBBR) to facilitate remote connections when direct peer-to-peer communication is not possible, ensuring reliable remote desktop access even in complex network environments
+  hbbr:
+    container_name: hbbr
+    image: rustdesk/rustdesk-server:latest
+    command: hbbr
+    ports:
+      - 21117:21117
+      - 21119:21119
+    volumes:
+      - ./rustdesk/data:/root
+    restart: unless-stopped
+
