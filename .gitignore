@@ -1,5 +1,4 @@
 .env
-.env.*
 portracker-data
 homarr
 nginx-proxy-manager
