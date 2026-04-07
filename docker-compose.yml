@@ -150,6 +150,7 @@ services:
       - ./sonarr:/config
       - D:/tv show:/tv
       - D:/mine/tv:/mine/tv
+      - D:/downloads:/downloads
     ports:
       - 8989:8989
     restart: unless-stopped
@@ -166,6 +167,7 @@ services:
       - ./radarr:/config
       - D:/film:/media
       - D:/mine/movies:/mine/movies
+      - D:/downloads:/downloads
     ports:
       - 7878:7878
     restart: unless-stopped
