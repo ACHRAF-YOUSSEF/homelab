@@ -417,3 +417,62 @@ services:
       - ./rustdesk/data:/root
     restart: unless-stopped
 
+  # TubeArchivist - Self-hosted YouTube archiving and management tool, integrated with Elasticsearch for indexing and searching archived content, and Redis for caching and performance optimization
+  tubearchivist:
+    container_name: tubearchivist
+    restart: unless-stopped
+    image: bbilly1/tubearchivist
+    ports:
+      - 8000:8000
+    volumes:
+      - D:/YT/youtube:/youtube
+      - D:/YT/cache:/cache
+    environment:
+      - ES_URL=http://archivist-es:9200    
+      - REDIS_CON=redis://archivist-redis:6379
+      - HOST_UID=1000
+      - HOST_GID=1000
+      - TA_HOST=http://192.168.0.163:8000
+      - TA_USERNAME=${YT_TA_USERNAME}           
+      - TA_PASSWORD=${YT_TA_PASSWORD}             
+      - ELASTIC_PASSWORD=${YT_ELASTIC_PASSWORD}       
+      - TZ=${TZ}               
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      - archivist-es
+      - archivist-redis
+  # Redis instance for TubeArchivist to use for caching and performance optimization, ensuring fast access to frequently used data and improving overall responsiveness of the application
+  archivist-redis:
+    image: redis
+    container_name: archivist-redis
+    restart: unless-stopped
+    expose:
+      - "6379"
+    volumes:
+      - ./archivist/redis:/data
+    depends_on:
+      - archivist-es
+  # Elasticsearch instance for TubeArchivist to use for indexing and searching archived content, providing powerful search capabilities and efficient data storage for the application
+  archivist-es:
+    image: bbilly1/tubearchivist-es       
+    container_name: archivist-es
+    restart: unless-stopped
+    environment:
+      - "ELASTIC_PASSWORD=${YT_ELASTIC_PASSWORD}"      
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - "xpack.security.enabled=true"
+      - "discovery.type=single-node"
+      - "path.repo=/usr/share/elasticsearch/data/snapshot"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ./archivist/es:/usr/share/elasticsearch/data   
+    expose:
+      - "9200"
