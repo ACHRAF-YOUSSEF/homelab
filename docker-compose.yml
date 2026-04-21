@@ -482,7 +482,7 @@ services:
     image: stirlingtools/stirling-pdf:latest
     container_name: stirling-pdf
     ports:
-      - '8080:8080'
+      - '48537:8080'
     volumes:
       - ./stirling/tessdata:/usr/share/tessdata  
       - ./stirling/configs:/configs              
