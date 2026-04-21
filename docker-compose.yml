@@ -476,3 +476,19 @@ services:
       - ./archivist/es:/usr/share/elasticsearch/data   
     expose:
       - "9200"
+  
+  # Stirling PDF - Self-hosted PDF management and automation tool, integrated with OCR capabilities for extracting text from scanned documents, and a powerful pipeline system for automating PDF processing tasks such as renaming, organizing, and converting files based on customizable rules and triggers
+  stirling-pdf:
+    image: stirlingtools/stirling-pdf:latest
+    container_name: stirling-pdf
+    ports:
+      - '8080:8080'
+    volumes:
+      - ./stirling/tessdata:/usr/share/tessdata  
+      - ./stirling/configs:/configs              
+      - ./stirling/logs:/logs                     
+      - ./stirling/pipeline:/pipeline             
+    environment:
+      - SECURITY_ENABLELOGIN=false    
+      - LANGS=en_GB                  
+    restart: unless-stopped
