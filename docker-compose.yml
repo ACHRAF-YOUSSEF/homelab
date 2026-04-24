@@ -416,6 +416,22 @@ services:
     volumes:
       - ./rustdesk/data:/root
     restart: unless-stopped
+  
+  # MeTube - Self-hosted YouTube downloader and media management tool, integrated with local storage for saving downloaded content and customizable download settings
+  metube:
+    image: ghcr.io/alexta69/metube:latest
+    container_name: metube
+    environment:
+      - DOWNLOAD_DIR=/downloads
+      - UID=1000
+      - GID=1000
+      - YTDL_OPTIONS={"writeinfojson":true,"writethumbnail":true,"postprocessors":[{"key":"FFmpegMetadata"}]}
+      - OUTPUT_TEMPLATE=%(title)s [%(id)s].%(ext)s
+    volumes:
+      - D:/yt-dlp:/downloads
+    ports:
+      - "8085:8081"
+    restart: unless-stopped
 
   # TubeArchivist - Self-hosted YouTube archiving and management tool, integrated with Elasticsearch for indexing and searching archived content, and Redis for caching and performance optimization
   tubearchivist:
