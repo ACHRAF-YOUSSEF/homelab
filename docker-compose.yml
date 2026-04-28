@@ -508,3 +508,27 @@ services:
       - SECURITY_ENABLELOGIN=false    
       - LANGS=en_GB                  
     restart: unless-stopped
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:latest
+    container_name: uptime-kuma
+    volumes:
+      - ./uptime-kuma:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "47028:3001"
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - UMASK=0022
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:47028"]
+      interval: 30s
+      retries: 3
+      start_period: 10s
+      timeout: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
