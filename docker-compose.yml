@@ -409,11 +409,40 @@ services:
     image: ghcr.io/alexta69/metube:latest
     container_name: metube
     environment:
-      - DOWNLOAD_DIR=/downloads
-      - UID=1000
-      - GID=1000
-      - YTDL_OPTIONS={"writeinfojson":true,"writethumbnail":true,"postprocessors":[{"key":"FFmpegMetadata"}]}
-      - OUTPUT_TEMPLATE=%(title)s [%(id)s].%(ext)s
+      DOWNLOAD_DIR: /downloads
+      UID: 1000
+      GID: 1000
+      DEFAULT_MERGE_FORMAT: mkv
+      YTDL_OPTIONS: >-
+        {
+          "writeinfojson": true,
+          "writethumbnail": true,
+
+          "writesubtitles": true,
+          "writeautomaticsub": true,
+          "subtitleslangs": ["en","-live_chat"],
+          "convertsubtitles": "srt",
+
+          "embedsubtitles": true,
+          "embedthumbnail": true,
+          "ignoreerrors": "only_download",
+
+          "postprocessors": [
+            {
+              "key": "FFmpegEmbedSubtitle",
+              "already_have_subtitle": false
+            },
+            {
+              "key": "FFmpegMetadata",
+              "add_metadata": true,
+              "add_chapters": true
+            },
+            {
+              "key": "EmbedThumbnail"
+            }
+          ]
+        }
+      OUTPUT_TEMPLATE: "%(title)s [%(id)s].%(ext)s"
     volumes:
       - D:/yt-dlp:/downloads
     ports:
