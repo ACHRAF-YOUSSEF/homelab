@@ -190,19 +190,6 @@ services:
       - 6767:6767
     restart: unless-stopped
 
-  # Request Management + Recommendations 
-  jellyseerr:
-    image: fallenbagel/jellyseerr:latest
-    container_name: jellyseerr
-    environment:
-      - LOG_LEVEL=info
-      - TZ=${TZ}
-    volumes:
-      - ./jellyseerr:/app/config
-    ports:
-      - 5055:5055
-    restart: unless-stopped
-
   # Transcoding and Media Management
   tdarr:
     image: ghcr.io/haveagitgat/tdarr:latest
@@ -510,7 +497,7 @@ services:
     restart: unless-stopped
 
   uptime-kuma:
-    image: louislam/uptime-kuma:latest
+    image: louislam/uptime-kuma:2
     container_name: uptime-kuma
     volumes:
       - ./uptime-kuma:/app/data
