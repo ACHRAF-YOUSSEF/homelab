@@ -417,6 +417,7 @@ services:
         {
           "writeinfojson": true,
           "writethumbnail": true,
+          "keepvideo": false,
 
           "writesubtitles": true,
           "writeautomaticsub": true,
@@ -424,7 +425,7 @@ services:
           "convertsubtitles": "srt",
 
           "embedsubtitles": true,
-          "embedthumbnail": true,
+          "embedthumbnail": false,
           "ignoreerrors": "only_download",
 
           "postprocessors": [
@@ -436,9 +437,6 @@ services:
               "key": "FFmpegMetadata",
               "add_metadata": true,
               "add_chapters": true
-            },
-            {
-              "key": "EmbedThumbnail"
             }
           ]
         }
