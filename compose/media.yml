@@ -1,0 +1,245 @@
+services:
+  # Download Clients - qBittorrent for torrenting, integrated with Sonarr/Radarr for automated media management
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+      - TORRENTING_PORT=6881
+    ports:
+      - 8080:8080
+      - 6881:6881
+      - 6881:6881/udp
+    volumes:
+      - ../qbittorrent:/config
+      - D:/downloads:/downloads
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # Indexer Manager to manage and aggregate torrent indexers for Sonarr/Radarr
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ../prowlarr:/config
+    ports:
+      - 9696:9696
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # TV Shows
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ../sonarr:/config
+      - D:/tv show:/tv
+      - D:/mine/tv:/mine/tv
+      - D:/downloads:/downloads
+    ports:
+      - 8989:8989
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # Movies
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ../radarr:/config
+      - D:/film:/media
+      - D:/mine/movies:/mine/movies
+      - D:/downloads:/downloads
+    ports:
+      - 7878:7878
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # Subtitles
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - ../bazarr:/config
+      - D:/film:/movies
+      - D:/tv show:/tv
+      - D:/mine/tv:/mine/tv
+      - D:/mine/movies:/mine/movies
+    ports:
+      - 6767:6767
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # Transcoding and Media Management
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: tdarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265
+      - internalNode=true
+      - nodeName=MainNode
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - ../tdarr/server:/app/server
+      - ../tdarr/configs:/app/configs
+      - ../tdarr/logs:/app/logs
+      - /d/film:/movies
+      - /d/tv show:/tv
+      - /d/mine:/mine
+      - /d/transcode_cache:/temp
+    ports:
+      - 8265:8265
+      - 8266:8266
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - homelab
+
+  # MeTube - Self-hosted YouTube downloader and media management tool
+  metube:
+    image: ghcr.io/alexta69/metube:latest
+    container_name: metube
+    environment:
+      DOWNLOAD_DIR: /downloads
+      UID: 1000
+      GID: 1000
+      DEFAULT_MERGE_FORMAT: mkv
+      YTDL_OPTIONS: >-
+        {
+          "writeinfojson": true,
+          "writethumbnail": true,
+          "keepvideo": false,
+
+          "writesubtitles": true,
+          "writeautomaticsub": true,
+          "subtitleslangs": ["en","-live_chat"],
+          "convertsubtitles": "srt",
+
+          "embedsubtitles": true,
+          "embedthumbnail": false,
+          "ignoreerrors": "only_download",
+
+          "postprocessors": [
+            {
+              "key": "FFmpegEmbedSubtitle",
+              "already_have_subtitle": false
+            },
+            {
+              "key": "FFmpegMetadata",
+              "add_metadata": true,
+              "add_chapters": true
+            }
+          ]
+        }
+      OUTPUT_TEMPLATE: "%(title)s [%(id)s].%(ext)s"
+    volumes:
+      - D:/yt-dlp:/downloads
+    ports:
+      - "8085:8081"
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # TubeArchivist - Self-hosted YouTube archiving and management tool
+  tubearchivist:
+    container_name: tubearchivist
+    restart: unless-stopped
+    image: bbilly1/tubearchivist
+    ports:
+      - 8000:8000
+    volumes:
+      - D:/YT/youtube:/youtube
+      - D:/YT/cache:/cache
+    environment:
+      - ES_URL=http://archivist-es:9200
+      - REDIS_CON=redis://archivist-redis:6379
+      - HOST_UID=1000
+      - HOST_GID=1000
+      - TA_HOST=http://192.168.0.163:8000
+      - TA_USERNAME=${YT_TA_USERNAME}
+      - TA_PASSWORD=${YT_TA_PASSWORD}
+      - ELASTIC_PASSWORD=${YT_ELASTIC_PASSWORD}
+      - TZ=${TZ}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      - archivist-es
+      - archivist-redis
+    networks:
+      - homelab
+
+  # Redis instance for TubeArchivist to use for caching and performance optimization
+  archivist-redis:
+    image: redis
+    container_name: archivist-redis
+    restart: unless-stopped
+    expose:
+      - "6379"
+    volumes:
+      - ../archivist/redis:/data
+    depends_on:
+      - archivist-es
+    networks:
+      - homelab
+
+  # Elasticsearch instance for TubeArchivist to use for indexing and searching archived content
+  archivist-es:
+    image: bbilly1/tubearchivist-es
+    container_name: archivist-es
+    restart: unless-stopped
+    environment:
+      - "ELASTIC_PASSWORD=${YT_ELASTIC_PASSWORD}"
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - "xpack.security.enabled=true"
+      - "discovery.type=single-node"
+      - "path.repo=/usr/share/elasticsearch/data/snapshot"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ../archivist/es:/usr/share/elasticsearch/data
+    expose:
+      - "9200"
+    networks:
+      - homelab

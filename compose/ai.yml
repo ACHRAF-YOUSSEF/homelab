@@ -1,0 +1,40 @@
+services:
+  # Open WebUI - Self-hosted web interface for local language models
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:cuda
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3001:8080"
+    volumes:
+      - ../open-webui:/app/backend/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OPENAI_API_BASE_URL=http://host.docker.internal:1234/v1
+      - OPENAI_API_KEY=lmstudio
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - homelab
+
+  # SearxNG - Metasearch Engine
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+    ports:
+      - "8088:8080"
+    volumes:
+      - ../searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_SETTINGS_URL=https://raw.githubusercontent.com/searxng/searxng/master/utils/brand/searxng.yml
+      - INSTANCE_NAME=local-ai-search
+    restart: unless-stopped
+    networks:
+      - homelab

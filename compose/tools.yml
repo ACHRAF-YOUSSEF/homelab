@@ -1,0 +1,28 @@
+services:
+  # Developer Tools Collection
+  it-tools:
+    image: corentinth/it-tools:latest
+    container_name: it-tools
+    ports:
+      - 8888:80
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # Stirling PDF - Self-hosted PDF management and automation tool
+  stirling-pdf:
+    image: stirlingtools/stirling-pdf:latest
+    container_name: stirling-pdf
+    ports:
+      - "48537:8080"
+    volumes:
+      - ../stirling/tessdata:/usr/share/tessdata
+      - ../stirling/configs:/configs
+      - ../stirling/logs:/logs
+      - ../stirling/pipeline:/pipeline
+    environment:
+      - SECURITY_ENABLELOGIN=false
+      - LANGS=en_GB
+    restart: unless-stopped
+    networks:
+      - homelab

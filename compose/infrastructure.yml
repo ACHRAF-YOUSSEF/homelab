@@ -1,0 +1,109 @@
+services:
+  # Cloudflare Tunnel to securely expose services without opening ports on the host machine
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # Proxy to expose Docker API securely to other containers without giving them direct access to the Docker socket
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: portracker-docker-proxy
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - INFO=1
+      - NETWORKS=1
+      - POST=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "2375:2375"
+    networks:
+      - homelab
+
+  # Application for monitoring and tracking Docker containers
+  portracker:
+    image: mostafawahied/portracker:latest
+    container_name: portracker
+    restart: unless-stopped
+    pid: "host"
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ../portracker-data:/data
+    ports:
+      - "4999:4999"
+    environment:
+      - DOCKER_HOST=tcp://docker-proxy:2375
+    depends_on:
+      - docker-proxy
+    networks:
+      - homelab
+
+  # Reverse proxy to manage and route traffic to different services
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    ports:
+      - 80:80
+      - 81:81
+      - 443:443
+    volumes:
+      - ../nginx-proxy-manager/data:/data
+      - ../nginx-proxy-manager/letsencrypt:/etc/letsencrypt
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # Unified Dashboard to monitor and manage all services
+  homarr:
+    container_name: homarr
+    image: ghcr.io/homarr-labs/homarr:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../homarr/appdata:/appdata
+    environment:
+      - SECRET_ENCRYPTION_KEY=${HOMARR_SECRET_KEY}
+    ports:
+      - "7575:7575"
+    networks:
+      - homelab
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    container_name: uptime-kuma
+    volumes:
+      - ../uptime-kuma:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "47028:3001"
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - UMASK=0022
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001"]
+      interval: 30s
+      retries: 3
+      start_period: 10s
+      timeout: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - homelab

@@ -1,0 +1,34 @@
+services:
+  # RustDesk Self-Hosted Remote Desktop Server
+  hbbs:
+    container_name: hbbs
+    image: rustdesk/rustdesk-server:latest
+    environment:
+      - ALWAYS_USE_RELAY=Y
+    command: hbbs -r hbbr:21117
+    ports:
+      - 21115:21115
+      - 21116:21116
+      - 21116:21116/udp
+      - 21118:21118
+    volumes:
+      - ../rustdesk/data:/root
+    depends_on:
+      - hbbr
+    restart: unless-stopped
+    networks:
+      - homelab
+
+  # RustDesk Relay Server (HBBR)
+  hbbr:
+    container_name: hbbr
+    image: rustdesk/rustdesk-server:latest
+    command: hbbr
+    ports:
+      - 21117:21117
+      - 21119:21119
+    volumes:
+      - ../rustdesk/data:/root
+    restart: unless-stopped
+    networks:
+      - homelab

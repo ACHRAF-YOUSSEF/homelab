@@ -1,0 +1,39 @@
+services:
+  # Recursive DNS resolver for local DNS blockers to use as upstream
+  unbound:
+    container_name: unbound
+    image: mvance/unbound:latest
+    restart: unless-stopped
+    ports:
+      - "5053:5053/tcp"
+      - "5053:5053/udp"
+    volumes:
+      - ../unbound:/opt/unbound/etc/unbound
+    networks:
+      - homelab
+
+  # AdGuard Home, the primary network-wide DNS blocker for the homelab
+  adguardhome:
+    image: adguard/adguardhome:latest
+    container_name: adguardhome
+    restart: unless-stopped
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "3000:3000/tcp"
+      - "8180:80/tcp"
+      - "8443:443/tcp"
+      - "8443:443/udp"
+      - "853:853/tcp"
+      - "853:853/udp"
+      - "784:784/udp"
+      - "8853:8853/udp"
+      - "5443:5443/tcp"
+      - "5443:5443/udp"
+    volumes:
+      - ../adguard/work:/opt/adguardhome/work
+      - ../adguard/conf:/opt/adguardhome/conf
+    depends_on:
+      - unbound
+    networks:
+      - homelab
