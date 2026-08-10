@@ -4,6 +4,7 @@ include:
   - compose/media.yml
   - compose/ai.yml
   - compose/cloud-automation.yml
+  - compose/nextcloud-aio.yml
   - compose/diagrams.yml
   - compose/tools.yml
   - compose/remote.yml

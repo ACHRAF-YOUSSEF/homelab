@@ -1,38 +1,4 @@
 services:
-  # Nextcloud - Self-hosted cloud storage and collaboration platform
-  nextcloud:
-    image: nextcloud:latest
-    container_name: nextcloud-app
-    restart: unless-stopped
-    ports:
-      - 8084:80
-    volumes:
-      - ../nextcloud/nextcloud_html:/var/www/html
-    environment:
-      - MYSQL_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
-      - MYSQL_DATABASE=${NEXTCLOUD_DB_NAME}
-      - MYSQL_USER=${NEXTCLOUD_DB_USER}
-      - MYSQL_HOST=nextcloud-db
-    depends_on:
-      - nextcloud-db
-    networks:
-      - homelab
-
-  # MariaDB instance for Nextcloud to store data
-  nextcloud-db:
-    image: mariadb:latest
-    container_name: nextcloud-db
-    restart: unless-stopped
-    environment:
-      - MYSQL_ROOT_PASSWORD=${NEXTCLOUD_DB_ROOT_PASSWORD}
-      - MYSQL_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
-      - MYSQL_DATABASE=${NEXTCLOUD_DB_NAME}
-      - MYSQL_USER=${NEXTCLOUD_DB_USER}
-    volumes:
-      - ../nextcloud/db_data:/var/lib/mysql
-    networks:
-      - homelab
-
   # Automation Platform - n8n for workflow automation
   n8n:
     image: n8nio/n8n:latest
