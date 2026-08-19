@@ -7,6 +7,26 @@ services:
     restart: unless-stopped
     networks:
       - homelab
+  
+  # Cloudflare DDNS to automatically update DNS records for dynamic IP addresses
+  cloudflare-ddns:
+    image: favonia/cloudflare-ddns:latest
+    container_name: cloudflare-ddns
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [all]
+    security_opt: [no-new-privileges:true]
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - DOMAINS=jellyfin.achrafyoussef.tech
+      - IP6_PROVIDER=none
+      - PROXIED=false
+      - UPDATE_CRON=@every 5m
+    networks:
+      - homelab
 
   # Proxy to expose Docker API securely to other containers without giving them direct access to the Docker socket
   docker-proxy:
