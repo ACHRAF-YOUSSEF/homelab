@@ -64,7 +64,6 @@ services:
     volumes:
       - ../sonarr:/config
       - D:/tv show:/tv
-      - D:/mine/tv:/mine/tv
       - D:/downloads:/downloads
     ports:
       - 8989:8989
@@ -83,7 +82,6 @@ services:
     volumes:
       - ../radarr:/config
       - D:/film:/media
-      - D:/mine/movies:/mine/movies
       - D:/downloads:/downloads
     ports:
       - 7878:7878
@@ -125,8 +123,6 @@ services:
       - ../bazarr:/config
       - D:/film:/movies
       - D:/tv show:/tv
-      - D:/mine/tv:/mine/tv
-      - D:/mine/movies:/mine/movies
     ports:
       - 6767:6767
     restart: unless-stopped
@@ -154,7 +150,6 @@ services:
       - ../tdarr/logs:/app/logs
       - /d/film:/movies
       - /d/tv show:/tv
-      - /d/mine:/mine
       - /d/transcode_cache:/temp
     ports:
       - 8265:8265
