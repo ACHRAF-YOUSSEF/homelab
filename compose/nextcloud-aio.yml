@@ -2,6 +2,7 @@ services:
   nextcloud-aio-mastercontainer:
     image: ghcr.io/nextcloud-releases/all-in-one:latest
     container_name: nextcloud-aio-mastercontainer
+    mem_limit: 512m
     init: true
     restart: unless-stopped
     ports:

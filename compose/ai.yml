@@ -3,6 +3,7 @@ services:
   open-webui:
     image: ghcr.io/open-webui/open-webui:cuda
     container_name: open-webui
+    mem_limit: 2g
     restart: unless-stopped
     ports:
       - "3001:8080"
@@ -28,6 +29,7 @@ services:
   searxng:
     container_name: searxng
     image: searxng/searxng:latest
+    mem_limit: 512m
     ports:
       - "8088:8080"
     volumes:

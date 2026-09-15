@@ -3,6 +3,7 @@ services:
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
+    mem_limit: 128m
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     restart: unless-stopped
     networks:
@@ -12,6 +13,7 @@ services:
   cloudflare-ddns:
     image: favonia/cloudflare-ddns:latest
     container_name: cloudflare-ddns
+    mem_limit: 64m
     restart: unless-stopped
     read_only: true
     cap_drop: [all]
@@ -21,7 +23,7 @@ services:
       - PGID=1000
       - TZ=${TZ}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-      - DOMAINS=jellyfin.achrafyoussef.tech
+      - DOMAINS=jellyfin.achrafyoussef.tech, ai.achrafyoussef.tech
       - IP6_PROVIDER=none
       - PROXIED=false
       - UPDATE_CRON=@every 5m
@@ -32,6 +34,7 @@ services:
   docker-proxy:
     image: tecnativa/docker-socket-proxy:latest
     container_name: portracker-docker-proxy
+    mem_limit: 128m
     restart: unless-stopped
     environment:
       - CONTAINERS=1
@@ -50,6 +53,7 @@ services:
   portracker:
     image: mostafawahied/portracker:latest
     container_name: portracker
+    mem_limit: 256m
     restart: unless-stopped
     pid: "host"
     cap_add:
@@ -72,6 +76,7 @@ services:
   nginx-proxy-manager:
     image: jc21/nginx-proxy-manager:latest
     container_name: nginx-proxy-manager
+    mem_limit: 512m
     environment:
       - PUID=1000
       - PGID=1000
@@ -91,6 +96,7 @@ services:
   homarr:
     container_name: homarr
     image: ghcr.io/homarr-labs/homarr:latest
+    mem_limit: 768m
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -105,6 +111,7 @@ services:
   uptime-kuma:
     image: louislam/uptime-kuma:2
     container_name: uptime-kuma
+    mem_limit: 512m
     volumes:
       - ../uptime-kuma:/app/data
       - /var/run/docker.sock:/var/run/docker.sock:ro

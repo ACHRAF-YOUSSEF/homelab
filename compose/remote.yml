@@ -3,6 +3,7 @@ services:
   hbbs:
     container_name: hbbs
     image: rustdesk/rustdesk-server:latest
+    mem_limit: 128m
     environment:
       - ALWAYS_USE_RELAY=Y
     command: hbbs -r hbbr:21117
@@ -23,6 +24,7 @@ services:
   hbbr:
     container_name: hbbr
     image: rustdesk/rustdesk-server:latest
+    mem_limit: 128m
     command: hbbr
     ports:
       - 21117:21117

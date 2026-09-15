@@ -3,6 +3,7 @@ services:
   qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:latest
     container_name: qbittorrent
+    mem_limit: 768m
     environment:
       - PUID=1000
       - PGID=1000
@@ -24,6 +25,7 @@ services:
     image: ghcr.io/dispatcharr/dispatcharr:latest
     restart: unless-stopped
     container_name: dispatcharr
+    mem_limit: 2g
     ports:
       - 9191:9191
     volumes:
@@ -41,6 +43,7 @@ services:
   prowlarr:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
+    mem_limit: 512m
     environment:
       - PUID=1000
       - PGID=1000
@@ -57,6 +60,7 @@ services:
   sonarr:
     image: lscr.io/linuxserver/sonarr:latest
     container_name: sonarr
+    mem_limit: 512m
     environment:
       - PUID=1000
       - PGID=1000
@@ -75,6 +79,7 @@ services:
   radarr:
     image: lscr.io/linuxserver/radarr:latest
     container_name: radarr
+    mem_limit: 512m
     environment:
       - PUID=1000
       - PGID=1000
@@ -94,6 +99,7 @@ services:
     image: ghcr.io/seerr-team/seerr:latest
     init: true
     container_name: seerr
+    mem_limit: 768m
     environment:
       - LOG_LEVEL=debug
       - TZ=${TZ}
@@ -115,6 +121,7 @@ services:
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
     container_name: bazarr
+    mem_limit: 512m
     environment:
       - PUID=1000
       - PGID=1000
@@ -133,6 +140,7 @@ services:
   tdarr:
     image: ghcr.io/haveagitgat/tdarr:latest
     container_name: tdarr
+    mem_limit: 2g
     environment:
       - PUID=1000
       - PGID=1000
@@ -169,6 +177,7 @@ services:
   metube:
     image: ghcr.io/alexta69/metube:latest
     container_name: metube
+    mem_limit: 1g
     environment:
       DOWNLOAD_DIR: /downloads
       UID: 1000
@@ -215,6 +224,7 @@ services:
     container_name: tubearchivist
     restart: unless-stopped
     image: bbilly1/tubearchivist
+    mem_limit: 2g
     ports:
       - 8000:8000
     volumes:
@@ -246,6 +256,7 @@ services:
   archivist-redis:
     image: redis
     container_name: archivist-redis
+    mem_limit: 256m
     restart: unless-stopped
     expose:
       - "6379"
@@ -260,6 +271,7 @@ services:
   archivist-es:
     image: bbilly1/tubearchivist-es
     container_name: archivist-es
+    mem_limit: 3g
     restart: unless-stopped
     environment:
       - "ELASTIC_PASSWORD=${YT_ELASTIC_PASSWORD}"
