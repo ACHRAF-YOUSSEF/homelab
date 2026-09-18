@@ -14,7 +14,7 @@ services:
   stirling-pdf:
     image: stirlingtools/stirling-pdf:latest
     container_name: stirling-pdf
-    mem_limit: 3g
+    mem_limit: 2g
     ports:
       - "48537:8080"
     volumes:
@@ -25,6 +25,7 @@ services:
     environment:
       - SECURITY_ENABLELOGIN=false
       - LANGS=en_GB
+      - JAVA_CUSTOM_OPTS=-XX:InitialRAMPercentage=5 -XX:MaxRAMPercentage=45 -XX:MaxMetaspaceSize=192m
     restart: unless-stopped
     networks:
       - homelab

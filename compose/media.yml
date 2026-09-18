@@ -25,7 +25,7 @@ services:
     image: ghcr.io/dispatcharr/dispatcharr:latest
     restart: unless-stopped
     container_name: dispatcharr
-    mem_limit: 2g
+    mem_limit: 1536m
     ports:
       - 9191:9191
     volumes:
@@ -38,6 +38,9 @@ services:
       - REDIS_HOST=localhost
       - CELERY_BROKER_URL=redis://localhost:6379/0
       - DISPATCHARR_LOG_LEVEL=info
+      - UWSGI_WORKERS=2
+      - CELERY_MAX_WORKERS=2
+      - CELERY_MIN_WORKERS=1
 
   # Indexer Manager to manage and aggregate torrent indexers for Sonarr/Radarr
   prowlarr:
@@ -271,11 +274,11 @@ services:
   archivist-es:
     image: bbilly1/tubearchivist-es
     container_name: archivist-es
-    mem_limit: 3g
+    mem_limit: 2g
     restart: unless-stopped
     environment:
       - "ELASTIC_PASSWORD=${YT_ELASTIC_PASSWORD}"
-      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
       - "xpack.security.enabled=true"
       - "discovery.type=single-node"
       - "path.repo=/usr/share/elasticsearch/data/snapshot"
