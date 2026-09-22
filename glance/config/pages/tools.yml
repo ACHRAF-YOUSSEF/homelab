@@ -62,16 +62,6 @@
                   description: Developer utilities
                   url: https://tools.achrafyoussef.tech/
                   icon: sh:it-tools
-            - title: Diagrams
-              color: 38 90 58
-              links:
-                - title: Excalidraw
-                  url: https://excalidraw.achrafyoussef.tech/
-                  icon: sh:excalidraw
-                - title: Draw.io
-                  url: https://drawio.achrafyoussef.tech/
-                  icon: sh:draw-io
-  
         # Keyless widget from glanceapp/community-widgets.
         - type: custom-api
           title: Latest Glance community widgets

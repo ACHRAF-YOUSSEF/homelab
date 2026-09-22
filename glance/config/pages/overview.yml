@@ -42,6 +42,23 @@
           containers:
             homarr:
               hide: true
+            unbound:
+              icon: sh:unbound
+            archivist-es:
+              name: Archivist Elasticsearch
+              icon: sh:elasticsearch
+            archivist-redis:
+              name: Archivist Redis
+              icon: sh:redis
+            bazarr:
+              icon: sh:bazarr
+            cloudflare-ddns:
+              name: Cloudflare DDNS
+              icon: si:cloudflare
+            cloudflared:
+              icon: si:cloudflare
+            dispatcharr:
+              icon: sh:dispatcharr
             glance:
               name: Glance
               description: Homelab dashboard
@@ -57,6 +74,50 @@
               description: Reverse proxy and TLS
               url: ${HOMELAB_URL}:81
               icon: sh:nginx-proxy-manager
+            hbbr:
+              name: RustDesk Relay
+              icon: sh:rustdesk
+            hbbs:
+              name: RustDesk Server
+              icon: sh:rustdesk
+            it-tools:
+              name: IT-Tools
+              icon: sh:it-tools
+            metube:
+              name: MeTube
+              icon: sh:metube
+            n8n:
+              icon: sh:n8n
+            nextcloud-aio-apache:
+              name: Nextcloud AIO Apache
+              icon: sh:nextcloud
+            nextcloud-aio-database:
+              name: Nextcloud AIO Database
+              icon: sh:postgresql
+            nextcloud-aio-eurooffice:
+              name: Nextcloud AIO EuroOffice
+              icon: sh:nextcloud
+            nextcloud-aio-imaginary:
+              name: Nextcloud AIO Imaginary
+              icon: sh:nextcloud
+            nextcloud-aio-mastercontainer:
+              name: Nextcloud AIO Mastercontainer
+              icon: sh:nextcloud
+            nextcloud-aio-nextcloud:
+              name: Nextcloud AIO Nextcloud
+              icon: sh:nextcloud
+            nextcloud-aio-notify-push:
+              name: Nextcloud AIO Notify Push
+              icon: sh:nextcloud
+            nextcloud-aio-redis:
+              name: Nextcloud AIO Redis
+              icon: sh:redis
+            nextcloud-aio-talk:
+              name: Nextcloud AIO Talk
+              icon: sh:nextcloud
+            nextcloud-aio-whiteboard:
+              name: Nextcloud AIO Whiteboard
+              icon: sh:nextcloud
             uptime-kuma:
               name: Uptime Kuma
               description: Service monitoring
@@ -87,6 +148,25 @@
               description: Indexer management
               url: ${HOMELAB_URL}:9696
               icon: sh:prowlarr
+            portracker:
+              icon: sh:portracker
+            portracker-docker-proxy:
+              name: Portracker Docker Proxy
+              icon: si:docker
+            searxng:
+              name: SearXNG
+              icon: sh:searxng
+            seerr:
+              icon: sh:seerr
+            stirling-pdf:
+              name: Stirling PDF
+              icon: sh:stirling-pdf
+            tdarr:
+              name: Tdarr
+              icon: sh:tdarr.png
+            tubearchivist:
+              name: TubeArchivist
+              icon: sh:tube-archivist.png
   
     - size: small
       widgets:

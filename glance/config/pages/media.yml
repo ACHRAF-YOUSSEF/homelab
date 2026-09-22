@@ -26,7 +26,7 @@
             - title: TubeArchivist
               url: ${HOMELAB_URL}:8000
               check-url: http://tubearchivist:8000
-              icon: sh:tubearchivist
+              icon: sh:tube-archivist.png
   
         - type: bookmarks
           title: Watch
@@ -41,7 +41,7 @@
                 - title: TubeArchivist
                   description: Archived YouTube library
                   url: ${HOMELAB_URL}:8000
-                  icon: sh:tubearchivist
+                  icon: sh:tube-archivist.png
   
     - size: full
       widgets:
@@ -68,7 +68,7 @@
             - title: Tdarr
               url: ${HOMELAB_URL}:8265
               check-url: http://tdarr:8265
-              icon: sh:tdarr
+              icon: sh:tdarr.png
   
         - type: releases
           title: Media stack releases

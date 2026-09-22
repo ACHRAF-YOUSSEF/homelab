@@ -25,7 +25,7 @@
             - title: TubeArchivist
               url: ${HOMELAB_URL}:8000
               check-url: http://tubearchivist:8000
-              icon: sh:tubearchivist
+              icon: sh:tube-archivist.png
   
     - size: full
       widgets:
@@ -53,14 +53,14 @@
                 - title: TubeArchivist
                   description: Manage archived channels
                   url: ${HOMELAB_URL}:8000
-                  icon: sh:tubearchivist
+                  icon: sh:tube-archivist.png
             - title: Processing
               color: 181 80 46
               links:
                 - title: Tdarr
                   description: Transcode and normalize media
                   url: ${HOMELAB_URL}:8265
-                  icon: sh:tdarr
+                  icon: sh:tdarr.png
   
         - type: releases
           title: Download stack releases
@@ -81,7 +81,7 @@
             - title: Tdarr
               url: ${HOMELAB_URL}:8265
               check-url: http://tdarr:8265
-              icon: sh:tdarr
+              icon: sh:tdarr.png
             - title: Sonarr
               url: ${HOMELAB_URL}:8989
               check-url: http://sonarr:8989
