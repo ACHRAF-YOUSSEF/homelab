@@ -29,6 +29,8 @@
   
     - size: full
       widgets:
+        - $include: ../widgets/qbittorrent-stats.yml
+
         - type: bookmarks
           title: Download center
           groups:

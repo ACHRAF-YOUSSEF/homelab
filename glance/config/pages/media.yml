@@ -45,6 +45,8 @@
   
     - size: full
       widgets:
+        - $include: ../widgets/jellyfin-stats.yml
+
         - type: monitor
           title: Automation
           cache: 1m

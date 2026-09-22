@@ -103,6 +103,7 @@ services:
     environment:
       - TZ=${TZ}
       - HOMELAB_URL=${HOMELAB_URL}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
     ports:
       - "7575:8080"
     extra_hosts:
