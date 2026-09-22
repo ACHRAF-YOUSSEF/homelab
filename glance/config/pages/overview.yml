@@ -52,6 +52,7 @@
               icon: sh:redis
             bazarr:
               icon: sh:bazarr
+              url: ${HOMELAB_URL}:6767
             cloudflare-ddns:
               name: Cloudflare DDNS
               icon: si:cloudflare
@@ -59,10 +60,11 @@
               icon: si:cloudflare
             dispatcharr:
               icon: sh:dispatcharr
+              url: ${HOMELAB_URL}:9191
             glance:
               name: Glance
               description: Homelab dashboard
-              url: https://home.achrafyoussef.tech/
+              url: ${HOMELAB_URL}:7575
               icon: sh:glance
             adguardhome:
               name: AdGuard Home
@@ -83,14 +85,18 @@
             it-tools:
               name: IT-Tools
               icon: sh:it-tools
+              url: ${HOMELAB_URL}:8888
             metube:
               name: MeTube
               icon: sh:metube
+              url: ${HOMELAB_URL}:8085
             n8n:
               icon: sh:n8n
+              url: ${HOMELAB_URL}:5678
             nextcloud-aio-apache:
               name: Nextcloud AIO Apache
               icon: sh:nextcloud
+              url: ${HOMELAB_URL}:11000
             nextcloud-aio-database:
               name: Nextcloud AIO Database
               icon: sh:postgresql
@@ -106,6 +112,7 @@
             nextcloud-aio-nextcloud:
               name: Nextcloud AIO Nextcloud
               icon: sh:nextcloud
+              url: ${HOMELAB_URL}:11000
             nextcloud-aio-notify-push:
               name: Nextcloud AIO Notify Push
               icon: sh:nextcloud
@@ -126,7 +133,7 @@
             open-webui:
               name: Open WebUI
               description: Local AI interface
-              url: https://ai.achrafyoussef.tech/
+              url: ${HOMELAB_URL}:3001
               icon: sh:open-webui
             qbittorrent:
               name: qBittorrent
@@ -150,23 +157,29 @@
               icon: sh:prowlarr
             portracker:
               icon: sh:portracker
+              url: ${HOMELAB_URL}:4999
             portracker-docker-proxy:
               name: Portracker Docker Proxy
               icon: si:docker
             searxng:
               name: SearXNG
               icon: sh:searxng
+              url: ${HOMELAB_URL}:8088
             seerr:
               icon: sh:seerr
+              url: ${HOMELAB_URL}:5055
             stirling-pdf:
               name: Stirling PDF
               icon: sh:stirling-pdf
+              url: ${HOMELAB_URL}:48537
             tdarr:
               name: Tdarr
               icon: sh:tdarr.png
+              url: ${HOMELAB_URL}:8265
             tubearchivist:
               name: TubeArchivist
               icon: sh:tube-archivist.png
+              url: ${HOMELAB_URL}:8000
   
     - size: small
       widgets:
