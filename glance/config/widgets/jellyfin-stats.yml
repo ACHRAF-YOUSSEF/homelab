@@ -2,10 +2,14 @@
   title: Jellyfin Stats
   title-url: ${HOMELAB_URL}:8096
   cache: 5s
-  url: http://host.docker.internal:8096/Sessions?api_key=${JELLYFIN_API_KEY}
+  url: http://host.docker.internal:8096/Sessions
+  headers:
+    Authorization: MediaBrowser Client="Glance", Device="Glance", DeviceId="glance-dashboard", Version="1.0", Token="${JELLYFIN_API_KEY}"
   subrequests:
     counts:
-      url: http://host.docker.internal:8096/Items/Counts?api_key=${JELLYFIN_API_KEY}
+      url: http://host.docker.internal:8096/Items/Counts
+      headers:
+        Authorization: MediaBrowser Client="Glance", Device="Glance", DeviceId="glance-dashboard", Version="1.0", Token="${JELLYFIN_API_KEY}"
   template: |
     {{- $activeStreams := 0 -}}
     {{- range .JSON.Array "" -}}
