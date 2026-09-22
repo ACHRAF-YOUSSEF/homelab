@@ -1,0 +1,114 @@
+- name: Media
+  slug: media
+  width: wide
+  show-mobile-header: true
+  
+  columns:
+    - size: small
+      widgets:
+        - type: monitor
+          title: Media services
+          cache: 1m
+          sites:
+            - title: Jellyfin
+              url: https://jellyfin.achrafyoussef.tech/
+              check-url: http://host.docker.internal:8096
+              icon: sh:jellyfin
+            - title: Seerr
+              url: ${HOMELAB_URL}:5055
+              check-url: http://seerr:5055
+              icon: sh:seerr
+            - title: Dispatcharr
+              url: ${HOMELAB_URL}:9191
+              check-url: http://dispatcharr:9191
+              icon: sh:dispatcharr
+              timeout: 10s
+            - title: TubeArchivist
+              url: ${HOMELAB_URL}:8000
+              check-url: http://tubearchivist:8000
+              icon: sh:tubearchivist
+  
+        - type: bookmarks
+          title: Watch
+          groups:
+            - title: Libraries
+              color: 267 72 62
+              links:
+                - title: Jellyfin
+                  description: Movies, shows and IPTV
+                  url: https://jellyfin.achrafyoussef.tech/
+                  icon: sh:jellyfin
+                - title: TubeArchivist
+                  description: Archived YouTube library
+                  url: ${HOMELAB_URL}:8000
+                  icon: sh:tubearchivist
+  
+    - size: full
+      widgets:
+        - type: monitor
+          title: Automation
+          cache: 1m
+          sites:
+            - title: Sonarr
+              url: ${HOMELAB_URL}:8989
+              check-url: http://sonarr:8989
+              icon: sh:sonarr
+            - title: Radarr
+              url: ${HOMELAB_URL}:7878
+              check-url: http://radarr:7878
+              icon: sh:radarr
+            - title: Bazarr
+              url: ${HOMELAB_URL}:6767
+              check-url: http://bazarr:6767
+              icon: sh:bazarr
+            - title: Prowlarr
+              url: ${HOMELAB_URL}:9696
+              check-url: http://prowlarr:9696
+              icon: sh:prowlarr
+            - title: Tdarr
+              url: ${HOMELAB_URL}:8265
+              check-url: http://tdarr:8265
+              icon: sh:tdarr
+  
+        - type: releases
+          title: Media stack releases
+          cache: 12h
+          show-source-icon: true
+          collapse-after: 6
+          repositories:
+            - jellyfin/jellyfin
+            - Sonarr/Sonarr
+            - Radarr/Radarr
+            - Prowlarr/Prowlarr
+            - seerr-team/seerr
+            - bbilly1/tubearchivist
+  
+    - size: small
+      widgets:
+        - type: bookmarks
+          title: Manage
+          groups:
+            - title: Requests
+              color: 173 70 45
+              links:
+                - title: Seerr
+                  url: ${HOMELAB_URL}:5055
+                  icon: sh:seerr
+                - title: Dispatcharr
+                  url: ${HOMELAB_URL}:9191
+                  icon: sh:dispatcharr
+            - title: Automation
+              color: 38 90 58
+              links:
+                - title: Sonarr
+                  url: ${HOMELAB_URL}:8989
+                  icon: sh:sonarr
+                - title: Radarr
+                  url: ${HOMELAB_URL}:7878
+                  icon: sh:radarr
+                - title: Bazarr
+                  url: ${HOMELAB_URL}:6767
+                  icon: sh:bazarr
+                - title: Prowlarr
+                  url: ${HOMELAB_URL}:9696
+                  icon: sh:prowlarr

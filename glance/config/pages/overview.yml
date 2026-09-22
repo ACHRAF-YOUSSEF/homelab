@@ -1,0 +1,132 @@
+- name: Overview
+  slug: overview
+  width: wide
+  show-mobile-header: true
+  
+  head-widgets:
+    - type: search
+      search-engine: ${HOMELAB_URL}:8088/search?q={QUERY}
+      new-tab: true
+      placeholder: Search with SearXNG…
+      bangs:
+        - title: YouTube
+          shortcut: "!yt"
+          url: https://www.youtube.com/results?search_query={QUERY}
+        - title: GitHub
+          shortcut: "!gh"
+          url: https://github.com/search?q={QUERY}
+        - title: Reddit
+          shortcut: "!r"
+          url: https://www.reddit.com/search/?q={QUERY}
+  
+  columns:
+    - size: small
+      widgets:
+        - type: clock
+          hour-format: 24h
+  
+        - type: weather
+          location: Tunis, Tunisia
+          units: metric
+          hour-format: 24h
+  
+        - type: calendar
+          first-day-of-week: monday
+  
+    - size: full
+      widgets:
+        - type: docker-containers
+          title: Docker containers
+          sock-path: tcp://docker-proxy:2375
+          format-container-names: true
+          containers:
+            homarr:
+              hide: true
+            glance:
+              name: Glance
+              description: Homelab dashboard
+              url: https://home.achrafyoussef.tech/
+              icon: sh:glance
+            adguardhome:
+              name: AdGuard Home
+              description: DNS filtering
+              url: ${HOMELAB_URL}:8180
+              icon: sh:adguard-home
+            nginx-proxy-manager:
+              name: Nginx Proxy Manager
+              description: Reverse proxy and TLS
+              url: ${HOMELAB_URL}:81
+              icon: sh:nginx-proxy-manager
+            uptime-kuma:
+              name: Uptime Kuma
+              description: Service monitoring
+              url: ${HOMELAB_URL}:47028
+              icon: sh:uptime-kuma
+            open-webui:
+              name: Open WebUI
+              description: Local AI interface
+              url: https://ai.achrafyoussef.tech/
+              icon: sh:open-webui
+            qbittorrent:
+              name: qBittorrent
+              description: Download client
+              url: ${HOMELAB_URL}:8080
+              icon: sh:qbittorrent
+            sonarr:
+              name: Sonarr
+              description: TV automation
+              url: ${HOMELAB_URL}:8989
+              icon: sh:sonarr
+            radarr:
+              name: Radarr
+              description: Movie automation
+              url: ${HOMELAB_URL}:7878
+              icon: sh:radarr
+            prowlarr:
+              name: Prowlarr
+              description: Indexer management
+              url: ${HOMELAB_URL}:9696
+              icon: sh:prowlarr
+  
+    - size: small
+      widgets:
+        - type: monitor
+          title: Core services
+          cache: 1m
+          sites:
+            - title: Jellyfin
+              url: https://jellyfin.achrafyoussef.tech/
+              check-url: http://host.docker.internal:8096
+              icon: sh:jellyfin
+            - title: Nextcloud
+              url: https://cloud.achrafyoussef.tech/
+              icon: sh:nextcloud
+              alt-status-codes: [301, 302, 307, 308]
+            - title: Open WebUI
+              url: https://ai.achrafyoussef.tech/
+              check-url: http://open-webui:8080
+              icon: sh:open-webui
+            - title: AdGuard Home
+              url: ${HOMELAB_URL}:8180
+              check-url: http://adguardhome:80
+              icon: sh:adguard-home
+            - title: Uptime Kuma
+              url: ${HOMELAB_URL}:47028
+              check-url: http://uptime-kuma:3001
+              icon: sh:uptime-kuma
+  
+        - type: bookmarks
+          title: Quick access
+          groups:
+            - title: Public
+              color: 4 88 64
+              links:
+                - title: Nextcloud
+                  url: https://cloud.achrafyoussef.tech/
+                  icon: sh:nextcloud
+                - title: Open WebUI
+                  url: https://ai.achrafyoussef.tech/
+                  icon: sh:open-webui
+                - title: IT-Tools
+                  url: https://tools.achrafyoussef.tech/
+                  icon: sh:it-tools

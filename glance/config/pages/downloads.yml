@@ -1,0 +1,92 @@
+- name: Downloads
+  slug: downloads
+  width: wide
+  show-mobile-header: true
+  
+  columns:
+    - size: small
+      widgets:
+        - type: monitor
+          title: Download services
+          cache: 1m
+          sites:
+            - title: qBittorrent
+              url: ${HOMELAB_URL}:8080
+              check-url: http://qbittorrent:8080
+              icon: sh:qbittorrent
+            - title: Prowlarr
+              url: ${HOMELAB_URL}:9696
+              check-url: http://prowlarr:9696
+              icon: sh:prowlarr
+            - title: MeTube
+              url: ${HOMELAB_URL}:8085
+              check-url: http://metube:8081
+              icon: sh:metube
+            - title: TubeArchivist
+              url: ${HOMELAB_URL}:8000
+              check-url: http://tubearchivist:8000
+              icon: sh:tubearchivist
+  
+    - size: full
+      widgets:
+        - type: bookmarks
+          title: Download center
+          groups:
+            - title: Torrents
+              color: 205 78 58
+              links:
+                - title: qBittorrent
+                  description: Torrents and transfer queue
+                  url: ${HOMELAB_URL}:8080
+                  icon: sh:qbittorrent
+                - title: Prowlarr
+                  description: Indexers and search
+                  url: ${HOMELAB_URL}:9696
+                  icon: sh:prowlarr
+            - title: Video
+              color: 4 88 64
+              links:
+                - title: MeTube
+                  description: Download individual videos
+                  url: ${HOMELAB_URL}:8085
+                  icon: sh:metube
+                - title: TubeArchivist
+                  description: Manage archived channels
+                  url: ${HOMELAB_URL}:8000
+                  icon: sh:tubearchivist
+            - title: Processing
+              color: 181 80 46
+              links:
+                - title: Tdarr
+                  description: Transcode and normalize media
+                  url: ${HOMELAB_URL}:8265
+                  icon: sh:tdarr
+  
+        - type: releases
+          title: Download stack releases
+          cache: 12h
+          show-source-icon: true
+          repositories:
+            - qbittorrent/qBittorrent
+            - Prowlarr/Prowlarr
+            - alexta69/metube
+            - bbilly1/tubearchivist
+  
+    - size: small
+      widgets:
+        - type: monitor
+          title: Processing
+          cache: 1m
+          sites:
+            - title: Tdarr
+              url: ${HOMELAB_URL}:8265
+              check-url: http://tdarr:8265
+              icon: sh:tdarr
+            - title: Sonarr
+              url: ${HOMELAB_URL}:8989
+              check-url: http://sonarr:8989
+              icon: sh:sonarr
+            - title: Radarr
+              url: ${HOMELAB_URL}:7878
+              check-url: http://radarr:7878
+              icon: sh:radarr

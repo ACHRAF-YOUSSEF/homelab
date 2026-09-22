@@ -1,0 +1,123 @@
+- name: Tools
+  slug: tools
+  width: wide
+  show-mobile-header: true
+  
+  columns:
+    - size: small
+      widgets:
+        - type: monitor
+          title: Self-hosted tools
+          cache: 1m
+          sites:
+            - title: IT-Tools
+              url: https://tools.achrafyoussef.tech/
+              check-url: http://it-tools:80
+              icon: sh:it-tools
+            - title: Stirling PDF
+              url: ${HOMELAB_URL}:48537
+              check-url: http://stirling-pdf:8080
+              icon: sh:stirling-pdf
+            - title: n8n
+              url: https://n8n.achrafyoussef.tech/
+              check-url: http://n8n:5678
+              icon: sh:n8n
+            - title: SearXNG
+              url: ${HOMELAB_URL}:8088
+              check-url: http://searxng:8080
+              icon: sh:searxng
+  
+    - size: full
+      widgets:
+        - type: bookmarks
+          title: Applications
+          groups:
+            - title: AI & automation
+              color: 288 65 64
+              links:
+                - title: Open WebUI
+                  description: Local AI chat
+                  url: https://ai.achrafyoussef.tech/
+                  icon: sh:open-webui
+                - title: n8n
+                  description: Workflow automation
+                  url: https://n8n.achrafyoussef.tech/
+                  icon: sh:n8n
+                - title: SearXNG
+                  description: Private metasearch
+                  url: ${HOMELAB_URL}:8088
+                  icon: sh:searxng
+            - title: Documents & cloud
+              color: 205 78 58
+              links:
+                - title: Nextcloud
+                  description: Files and collaboration
+                  url: https://cloud.achrafyoussef.tech/
+                  icon: sh:nextcloud
+                - title: Stirling PDF
+                  description: PDF toolbox
+                  url: ${HOMELAB_URL}:48537
+                  icon: sh:stirling-pdf
+                - title: IT-Tools
+                  description: Developer utilities
+                  url: https://tools.achrafyoussef.tech/
+                  icon: sh:it-tools
+            - title: Diagrams
+              color: 38 90 58
+              links:
+                - title: Excalidraw
+                  url: https://excalidraw.achrafyoussef.tech/
+                  icon: sh:excalidraw
+                - title: Draw.io
+                  url: https://drawio.achrafyoussef.tech/
+                  icon: sh:draw-io
+  
+        # Keyless widget from glanceapp/community-widgets.
+        - type: custom-api
+          title: Latest Glance community widgets
+          cache: 1d
+          url: https://raw.githubusercontent.com/glanceapp/community-widgets/refs/heads/main/registry/widgets.json
+          template: |
+            <ul class="list list-gap-14 collapsible-container" data-collapse-after="5">
+              {{ $widgets := .JSON.Array "" | sortByTime "time_added" "rfc3339" "desc" }}
+              {{ if gt (len $widgets) 10 }}
+                {{ $widgets = slice $widgets 0 10 }}
+              {{ end }}
+              {{ range $widgets }}
+              <li>
+                <a class="size-h4 block text-truncate color-primary-if-not-visited" href="https://github.com/glanceapp/community-widgets/blob/main/widgets/{{ .String "directory" }}/README.md" target="_blank" rel="noreferrer">{{ .String "title" }}</a>
+                <p class="text-truncate-2-lines margin-top-3">{{ .String "description" }}</p>
+                <ul class="list-horizontal-text margin-top-3">
+                  <li {{ .String "time_added" | parseRelativeTime "rfc3339" }}></li>
+                  <li>{{ .String "author" }}</li>
+                </ul>
+              </li>
+              {{ end }}
+            </ul>
+  
+    - size: small
+      widgets:
+        - type: bookmarks
+          title: Developer links
+          groups:
+            - title: Code
+              color: 215 80 65
+              links:
+                - title: GitHub
+                  url: https://github.com/
+                  icon: si:github
+                - title: Docker Hub
+                  url: https://hub.docker.com/
+                  icon: si:docker
+                - title: Stack Overflow
+                  url: https://stackoverflow.com/
+                  icon: si:stackoverflow
+            - title: AI
+              color: 288 65 64
+              links:
+                - title: ChatGPT
+                  url: https://chatgpt.com/
+                  icon: si:openai
+                - title: Hugging Face
+                  url: https://huggingface.co/
+                  icon: si:huggingface

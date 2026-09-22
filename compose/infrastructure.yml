@@ -92,19 +92,23 @@ services:
     networks:
       - homelab
 
-  # Unified Dashboard to monitor and manage all services
-  homarr:
-    container_name: homarr
-    image: ghcr.io/homarr-labs/homarr:latest
-    mem_limit: 768m
+  # Responsive, feed-oriented dashboard with page tabs
+  glance:
+    container_name: glance
+    image: glanceapp/glance:latest
+    mem_limit: 256m
     restart: unless-stopped
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ../homarr/appdata:/appdata
+      - ../glance/config:/app/config:ro
     environment:
-      - SECRET_ENCRYPTION_KEY=${HOMARR_SECRET_KEY}
+      - TZ=${TZ}
+      - HOMELAB_URL=${HOMELAB_URL}
     ports:
-      - "7575:7575"
+      - "7575:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - docker-proxy
     networks:
       - homelab
 

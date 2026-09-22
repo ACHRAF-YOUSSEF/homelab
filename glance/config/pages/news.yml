@@ -1,0 +1,92 @@
+- name: News
+  slug: news
+  width: wide
+  show-mobile-header: true
+  
+  columns:
+    - size: small
+      widgets:
+        - type: rss
+          title: Security
+          limit: 24
+          collapse-after: 10
+          cache: 1h
+          feeds:
+            - url: https://www.bleepingcomputer.com/feed/
+              title: BleepingComputer
+            - url: https://krebsonsecurity.com/feed/
+              title: Krebs on Security
+            - url: https://www.schneier.com/feed/atom/
+              title: Schneier on Security
+  
+    - size: full
+      widgets:
+        - type: group
+          widgets:
+            - type: hacker-news
+              title: Hacker News
+              limit: 20
+              collapse-after: 10
+            - type: lobsters
+              title: Lobsters
+              limit: 20
+              collapse-after: 10
+            - type: reddit
+              title: Technology
+              subreddit: technology
+              show-thumbnails: true
+              collapse-after: 10
+            - type: reddit
+              title: Self-hosted
+              subreddit: selfhosted
+              show-thumbnails: true
+              collapse-after: 10
+            - type: reddit
+              title: AI
+              subreddit: LocalLLaMA
+              show-thumbnails: true
+              collapse-after: 10
+  
+        - type: rss
+          title: Software, infrastructure & AI
+          style: horizontal-cards
+          limit: 18
+          collapse-after: 12
+          cache: 1h
+          feeds:
+            - url: https://feeds.arstechnica.com/arstechnica/index
+              title: Ars Technica
+            - url: https://www.theregister.com/headlines.atom
+              title: The Register
+            - url: https://selfh.st/rss/
+              title: selfh.st
+            - url: https://www.phoronix.com/rss.php
+              title: Phoronix
+            - url: https://huggingface.co/blog/feed.xml
+              title: Hugging Face
+  
+        - type: videos
+          title: Tech videos
+          style: grid-cards
+          collapse-after-rows: 2
+          channels:
+            - UCXuqSBlHAE6Xw-yeJA0Tunw # Linus Tech Tips
+            - UCR-DXc1voovS8nhAvccRZhg # Jeff Geerling
+            - UCsBjURrPoezykLs9EqgamOA # Fireship
+            - UCHnyfMqiRRG1u-2MsSQLbXA # Veritasium
+  
+    - size: small
+      widgets:
+        - type: releases
+          title: Project releases
+          cache: 12h
+          show-source-icon: true
+          collapse-after: 10
+          repositories:
+            - glanceapp/glance
+            - open-webui/open-webui
+            - n8n-io/n8n
+            - jellyfin/jellyfin
+            - Nextcloud/server
+            - AdguardTeam/AdGuardHome
+            - louislam/uptime-kuma

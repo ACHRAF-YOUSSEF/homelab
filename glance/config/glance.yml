@@ -1,0 +1,26 @@
+server:
+  port: 8080
+  proxied: true
+
+branding:
+  app-name: Achraf's Homelab
+  logo-text: AY
+  hide-footer: true
+  app-background-color: "#181a1f"
+
+theme:
+  background-color: 220 12 10
+  primary-color: 4 88 64
+  positive-color: 142 70 45
+  negative-color: 0 78 58
+  contrast-multiplier: 1.12
+  text-saturation-multiplier: 0.9
+
+pages:
+  - $include: pages/overview.yml
+  - $include: pages/media.yml
+  - $include: pages/downloads.yml
+  - $include: pages/network.yml
+  - $include: pages/tools.yml
+  - $include: pages/gaming.yml
+  - $include: pages/news.yml

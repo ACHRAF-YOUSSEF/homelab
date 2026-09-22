@@ -1,0 +1,75 @@
+- name: Gaming
+  slug: gaming
+  width: wide
+  show-mobile-header: true
+  
+  columns:
+    - size: small
+      widgets:
+        - type: twitch-top-games
+          limit: 20
+          collapse-after: 12
+          exclude:
+            - just-chatting
+            - pools-hot-tubs-and-beaches
+            - music
+            - art
+            - asmr
+  
+        - type: bookmarks
+          title: Game stores
+          groups:
+            - title: Stores & libraries
+              color: 215 80 65
+              links:
+                - title: Steam
+                  url: https://store.steampowered.com/
+                  icon: si:steam
+                - title: Epic Games
+                  url: https://store.epicgames.com/
+                  icon: si:epicgames
+                - title: GOG
+                  url: https://www.gog.com/
+                  icon: si:gogdotcom
+                - title: ProtonDB
+                  url: https://www.protondb.com/
+                  icon: si:protondb
+  
+    - size: full
+      widgets:
+        - type: group
+          widgets:
+            - type: reddit
+              title: PC Gaming
+              subreddit: pcgaming
+              show-thumbnails: true
+              collapse-after: 8
+            - type: reddit
+              title: Games
+              subreddit: games
+              show-thumbnails: true
+              collapse-after: 8
+            - type: reddit
+              title: Gaming News
+              subreddit: gamingnews
+              show-thumbnails: true
+              collapse-after: 8
+  
+        - type: videos
+          title: Gaming videos
+          style: grid-cards
+          collapse-after-rows: 3
+          channels:
+            - UCNvzD7Z-g64bPXxGzaQaa4g # gameranx
+            - UCZ7AeeVbyslLM_8-nVy2B8Q # Skill Up
+            - UCHDxYLv8iovIbhrfl16CNyg # GameLinked
+            - UC9PBzalIcEQCsiIkq36PyUA # Digital Foundry
+  
+    - size: small
+      widgets:
+        - type: reddit
+          title: Game deals
+          subreddit: GameDeals
+          limit: 12
+          collapse-after: 8
+          style: vertical-cards
