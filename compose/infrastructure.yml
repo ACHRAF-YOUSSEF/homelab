@@ -93,6 +93,21 @@ services:
       - homelab
 
   # Responsive, feed-oriented dashboard with page tabs
+  jellyfin-counts-cache:
+    image: python:3.12-alpine
+    container_name: jellyfin-counts-cache
+    mem_limit: 64m
+    restart: unless-stopped
+    command: python /app/jellyfin-counts-cache.py
+    environment:
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
+    volumes:
+      - ../glance/jellyfin-counts-cache.py:/app/jellyfin-counts-cache.py:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - homelab
+
   glance:
     container_name: glance
     image: glanceapp/glance:latest
@@ -113,6 +128,7 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - docker-proxy
+      - jellyfin-counts-cache
     networks:
       - homelab
 

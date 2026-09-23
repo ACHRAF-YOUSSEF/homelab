@@ -1,16 +1,11 @@
 - type: custom-api
-  title: Jellyfin Stats
+  title: Jellyfin sessions
   title-url: ${HOMELAB_URL}:8096
   css-class: media-live-jellyfin
-  cache: 5s
+  cache: 15s
   url: http://host.docker.internal:8096/Sessions
   headers:
     Authorization: MediaBrowser Client="Glance", Device="Glance", DeviceId="glance-dashboard", Version="1.0", Token="${JELLYFIN_API_KEY}"
-  subrequests:
-    counts:
-      url: http://host.docker.internal:8096/Items/Counts
-      headers:
-        Authorization: MediaBrowser Client="Glance", Device="Glance", DeviceId="glance-dashboard", Version="1.0", Token="${JELLYFIN_API_KEY}"
   template: |
     {{- $activeStreams := 0 -}}
     {{- range .JSON.Array "" -}}
@@ -18,18 +13,10 @@
         {{- $activeStreams = add $activeStreams 1 -}}
       {{- end -}}
     {{- end -}}
-    <div class="flex justify-between text-center">
+    <div class="text-center">
       <div>
         <div class="{{ if gt $activeStreams 0 }}color-positive{{ else }}color-highlight{{ end }} size-h3">{{ $activeStreams }}</div>
         <div class="size-h6{{ if gt $activeStreams 0 }} color-positive{{ end }}">SESSIONS</div>
-      </div>
-      <div>
-        <div class="color-highlight size-h3">{{ (.Subrequest "counts").JSON.Int "MovieCount" }}</div>
-        <div class="size-h6">MOVIES</div>
-      </div>
-      <div>
-        <div class="color-highlight size-h3">{{ (.Subrequest "counts").JSON.Int "SeriesCount" }}</div>
-        <div class="size-h6">SERIES</div>
       </div>
     </div>
     <style>

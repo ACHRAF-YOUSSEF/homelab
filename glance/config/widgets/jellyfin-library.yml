@@ -1,0 +1,41 @@
+- type: custom-api
+  title: Jellyfin library
+  title-url: ${HOMELAB_URL}:8096
+  css-class: media-live-jellyfin-library
+  cache: 15s
+  url: http://jellyfin-counts-cache:8765/counts
+  template: |
+    {{ if eq .Response.StatusCode 200 }}
+      <style>
+        .jellyfin-library-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 15px; text-align: center; }
+        @media (max-width: 650px) { .jellyfin-library-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+      </style>
+      <div class="jellyfin-library-grid">
+        <div>
+          <div class="color-highlight size-h3">{{ .JSON.Int "MovieCount" }}</div>
+          <div class="size-h6">MOVIES</div>
+        </div>
+        <div>
+          <div class="color-highlight size-h3">{{ .JSON.Int "SeriesCount" }}</div>
+          <div class="size-h6">SERIES</div>
+        </div>
+        <div>
+          <div class="color-highlight size-h3">{{ .JSON.Int "EpisodeCount" }}</div>
+          <div class="size-h6">EPISODES</div>
+        </div>
+        <div>
+          <div class="color-highlight size-h3">{{ .JSON.Int "AlbumCount" }}</div>
+          <div class="size-h6">ALBUMS</div>
+        </div>
+        <div>
+          <div class="color-highlight size-h3">{{ .JSON.Int "SongCount" }}</div>
+          <div class="size-h6">SONGS</div>
+        </div>
+        <div>
+          <div class="color-highlight size-h3">{{ .JSON.Int "BoxSetCount" }}</div>
+          <div class="size-h6">COLLECTIONS</div>
+        </div>
+      </div>
+    {{ else }}
+      <p class="color-subdue">Waiting for Jellyfin library counts.</p>
+    {{ end }}

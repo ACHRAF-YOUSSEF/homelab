@@ -37,8 +37,15 @@ internal Docker network; the keys are not placed in browser-side JavaScript.
 While the Media page is open, its Jellyfin stats, Seerr requests, Sonarr/Radarr
 calendar, and service status widgets refresh every 15 seconds. The browser fetches
 rendered content from Glance rather than calling the services directly. Glance
-caches Jellyfin for 5 seconds, Seerr for 15 seconds, and the calendar and status
-widgets for 30 seconds. Refreshing pauses when the tab is hidden and resumes when
-it becomes visible. The script is served from `config/assets/media-live.js`.
+refreshes Jellyfin sessions and cached library counts every 15 seconds, Seerr
+every 15 seconds, and the calendar and status widgets every 30 seconds.
+Refreshing pauses when the tab is hidden and resumes when it becomes visible.
+The script is served from `config/assets/media-live.js`.
+
+Jellyfin library counts (movies, series, episodes, albums, songs, and collections)
+are served by the internal `jellyfin-counts-cache` container.
+It requests `/Items/Counts` with a 30-second timeout every five minutes and keeps
+the last successful result if Jellyfin responds slowly. This avoids Glance's
+five-second custom API request timeout. No port or API key is exposed to browsers.
 
 The previous `homarr/` data directory is intentionally retained for rollback.

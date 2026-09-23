@@ -46,7 +46,10 @@
   
     - size: full
       widgets:
-        - $include: ../widgets/jellyfin-stats.yml
+        - type: split-column
+          widgets:
+            - $include: ../widgets/jellyfin-stats.yml
+            - $include: ../widgets/jellyfin-library.yml
 
         - $include: ../widgets/media-calendar.yml
 
