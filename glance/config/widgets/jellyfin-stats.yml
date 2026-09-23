@@ -13,6 +13,8 @@
         {{- $activeStreams = add $activeStreams 1 -}}
       {{- end -}}
     {{- end -}}
+
+    
     <div class="text-center">
       <div>
         <div class="{{ if gt $activeStreams 0 }}color-positive{{ else }}color-highlight{{ end }} size-h3">{{ $activeStreams }}</div>
