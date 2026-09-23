@@ -31,3 +31,66 @@
         <div class="size-h6">SERIES</div>
       </div>
     </div>
+    <style>
+      .jellyfin-streams {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+        margin-top: 1.5rem;
+      }
+      @media (max-width: 768px) {
+        .jellyfin-streams { grid-template-columns: 1fr; }
+      }
+      .jellyfin-progress {
+        height: .4rem;
+        overflow: hidden;
+        border-radius: var(--border-radius);
+        background: var(--color-background);
+      }
+      .jellyfin-progress > div {
+        height: 100%;
+        background: var(--color-primary);
+      }
+    </style>
+    {{ if eq $activeStreams 0 }}
+      <p class="color-subdue margin-top-20">Nothing is playing right now.</p>
+    {{ else }}
+      <div class="jellyfin-streams">
+        {{ range .JSON.Array "" }}
+          {{ if .Exists "NowPlayingItem" }}
+            {{ $mediaType := .String "NowPlayingItem.Type" }}
+            {{ $title := .String "NowPlayingItem.Name" }}
+            {{ $series := .String "NowPlayingItem.SeriesName" }}
+            {{ $duration := .Float "NowPlayingItem.RunTimeTicks" }}
+            {{ $position := .Float "PlayState.PositionTicks" }}
+            {{ $progress := 0 }}
+            {{ if gt $duration 0.0 }}
+              {{ $progress = mul 100 (div $position $duration) | toInt }}
+            {{ end }}
+            <div class="card gap-5">
+              <div class="flex justify-between items-center gap-10">
+                <strong class="color-primary text-truncate">{{ .String "UserName" }}</strong>
+                <span class="color-subdue">
+                  {{ if .Bool "PlayState.IsPaused" }}Paused{{ else }}Playing{{ end }}
+                </span>
+              </div>
+              {{ if eq $mediaType "Episode" }}
+                <div class="text-truncate">{{ $series }}</div>
+                <div class="text-truncate color-subdue">
+                  S{{ printf "%02d" (.Int "NowPlayingItem.ParentIndexNumber") }}E{{ printf "%02d" (.Int "NowPlayingItem.IndexNumber") }} · {{ $title }}
+                </div>
+              {{ else }}
+                <div class="text-truncate">{{ $title }}</div>
+              {{ end }}
+              <div class="flex justify-between gap-10 color-subdue size-h6">
+                <span class="text-truncate">{{ .String "Client" }} · {{ .String "DeviceName" }}</span>
+                <span>{{ .String "PlayState.PlayMethod" }}</span>
+              </div>
+              {{ if gt $duration 0.0 }}
+                <div class="jellyfin-progress"><div style="width: {{ $progress }}%"></div></div>
+              {{ end }}
+            </div>
+          {{ end }}
+        {{ end }}
+      </div>
+    {{ end }}
