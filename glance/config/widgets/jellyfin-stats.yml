@@ -1,6 +1,7 @@
 - type: custom-api
   title: Jellyfin Stats
   title-url: ${HOMELAB_URL}:8096
+  css-class: media-live-jellyfin
   cache: 5s
   url: http://host.docker.internal:8096/Sessions
   headers:

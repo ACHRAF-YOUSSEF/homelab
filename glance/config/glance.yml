@@ -1,6 +1,11 @@
 server:
   port: 8080
   proxied: true
+  assets-path: /app/config/assets
+
+document:
+  head: |
+    <script defer src="/assets/media-live.js"></script>
 
 branding:
   app-name: Achraf's Homelab

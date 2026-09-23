@@ -8,7 +8,8 @@
       widgets:
         - type: monitor
           title: Media services
-          cache: 1m
+          css-class: media-live-services
+          cache: 30s
           sites:
             - title: Jellyfin
               url: https://jellyfin.achrafyoussef.tech/
@@ -47,9 +48,12 @@
       widgets:
         - $include: ../widgets/jellyfin-stats.yml
 
+        - $include: ../widgets/media-calendar.yml
+
         - type: monitor
           title: Automation
-          cache: 1m
+          css-class: media-live-automation
+          cache: 30s
           sites:
             - title: Sonarr
               url: ${HOMELAB_URL}:8989
@@ -87,6 +91,8 @@
   
     - size: small
       widgets:
+        - $include: ../widgets/seerr-requests.yml
+
         - type: bookmarks
           title: Manage
           groups:

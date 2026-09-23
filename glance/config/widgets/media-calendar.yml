@@ -1,0 +1,64 @@
+- type: custom-api
+  title: Upcoming episodes & movies
+  css-class: media-live-calendar
+  cache: 30s
+  template: |
+    {{ $start := now | formatTime "2006-01-02" }}
+    {{ $end := offsetNow "+336h" | formatTime "2006-01-02" }}
+    {{ $episodes := newRequest "http://sonarr:8989/api/v3/calendar"
+      | withParameter "start" $start
+      | withParameter "end" $end
+      | withParameter "includeSeries" "true"
+      | withHeader "X-Api-Key" "${SONARR_API_KEY}"
+      | getResponse }}
+    {{ $movies := newRequest "http://radarr:7878/api/v3/calendar"
+      | withParameter "start" $start
+      | withParameter "end" $end
+      | withHeader "X-Api-Key" "${RADARR_API_KEY}"
+      | getResponse }}
+    {{ if and (eq $episodes.Response.StatusCode 200) (eq $movies.Response.StatusCode 200) }}
+      <style>
+        .media-calendar { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; }
+        .media-calendar-day { min-height: 92px; padding: 9px; border: 1px solid var(--color-separator); border-radius: var(--border-radius); min-width: 0; }
+        .media-calendar-today { border-color: var(--color-primary); }
+        .media-calendar-event { display: block; margin-top: 7px; line-height: 1.35; overflow-wrap: anywhere; }
+        @media (max-width: 1100px) { .media-calendar { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+        @media (max-width: 650px) { .media-calendar { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+      </style>
+      <p class="color-subdue margin-bottom-10">Next 14 days · {{ len ($episodes.JSON.Array "") }} episodes · {{ len ($movies.JSON.Array "") }} movies</p>
+      <div class="media-calendar">
+        {{ range $index := 14 }}
+          {{ $hours := $index | mul 24 }}
+          {{ $day := offsetNow (printf "+%dh" $hours) }}
+          {{ $date := $day | formatTime "2006-01-02" }}
+          {{ $hasItems := false }}
+          <div class="media-calendar-day{{ if eq $hours 0 }} media-calendar-today{{ end }}">
+            <div class="size-h6 color-subdue">{{ $day | formatTime "Mon 2 Jan" }}</div>
+            {{ range $episodes.JSON.Array "" | sortByTime "airDateUtc" "rfc3339" "asc" }}
+              {{ $airTime := .String "airDateUtc" | parseTime "rfc3339" }}
+              {{ $airDate := $airTime.In now.Location | formatTime "2006-01-02" }}
+              {{ if eq $airDate $date }}
+                {{ $hasItems = true }}
+                <a class="media-calendar-event color-primary" href="${HOMELAB_URL}:8989/series/{{ .String "series.titleSlug" }}" title="{{ .String "title" }}">
+                  <span class="size-h6">TV</span> {{ .String "series.title" }} <span class="color-subdue">S{{ printf "%02d" (.Int "seasonNumber") }}E{{ printf "%02d" (.Int "episodeNumber") }}</span>
+                </a>
+              {{ end }}
+            {{ end }}
+            {{ range $movies.JSON.Array "" | sortByTime "releaseDate" "rfc3339" "asc" }}
+              {{ $releaseDate := .String "releaseDate" }}
+              {{ if ne $releaseDate "" }}
+                {{ if eq ($releaseDate | parseTime "rfc3339" | formatTime "2006-01-02") $date }}
+                  {{ $hasItems = true }}
+                  <a class="media-calendar-event color-highlight" href="${HOMELAB_URL}:7878/movie/{{ .String "titleSlug" }}">
+                    <span class="size-h6">MOVIE</span> {{ .String "title" }}
+                  </a>
+                {{ end }}
+              {{ end }}
+            {{ end }}
+            {{ if not $hasItems }}<div class="color-subdue margin-top-10">—</div>{{ end }}
+          </div>
+        {{ end }}
+      </div>
+    {{ else }}
+      <p class="color-negative">Could not load the Sonarr or Radarr calendar. Check their API keys and service status.</p>
+    {{ end }}

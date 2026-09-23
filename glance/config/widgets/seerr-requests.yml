@@ -1,0 +1,24 @@
+- type: custom-api
+  title: Seerr requests
+  title-url: ${HOMELAB_URL}:5055/requests
+  css-class: media-live-seerr
+  cache: 15s
+  url: http://seerr:5055/api/v1/request/count
+  headers:
+    X-Api-Key: ${SEERR_API_KEY}
+  template: |
+    {{ if eq .Response.StatusCode 200 }}
+      <div class="flex justify-between text-center">
+        <div><div class="color-highlight size-h3">{{ .JSON.Int "total" }}</div><div class="size-h6">TOTAL</div></div>
+        <div><div class="color-highlight size-h3">{{ .JSON.Int "movie" }}</div><div class="size-h6">MOVIES</div></div>
+        <div><div class="color-highlight size-h3">{{ .JSON.Int "tv" }}</div><div class="size-h6">SHOWS</div></div>
+      </div>
+      <div class="flex justify-between text-center margin-top-15">
+        <div><div class="{{ if gt (.JSON.Int "pending") 0 }}color-negative{{ else }}color-positive{{ end }} size-h4">{{ .JSON.Int "pending" }}</div><div class="size-h6">PENDING</div></div>
+        <div><div class="color-primary size-h4">{{ .JSON.Int "processing" }}</div><div class="size-h6">PROCESSING</div></div>
+        <div><div class="color-positive size-h4">{{ .JSON.Int "available" }}</div><div class="size-h6">AVAILABLE</div></div>
+      </div>
+      <a class="block margin-top-15 color-primary" href="${HOMELAB_URL}:5055/requests">Manage requests ↗</a>
+    {{ else }}
+      <p class="color-negative">Could not load Seerr requests. Check the API key and service status.</p>
+    {{ end }}
