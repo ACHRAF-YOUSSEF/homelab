@@ -1,4 +1,4 @@
-const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [] };
+const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all' };
 const $ = id => document.getElementById(id);
 
 const ui = {
@@ -179,6 +179,7 @@ async function submitJob() {
         model,
       }),
     });
+    state.jobFilter = 'all';
     await loadJobs();
   } catch (error) {
     displayError(error.message);
@@ -196,47 +197,66 @@ function badgeClasses(status) {
   return `${ui.badge} ${colors[status] || 'bg-[#36404b] text-[#cad7de]'}`;
 }
 
+function filterClasses(selected) {
+  return `shrink-0 cursor-pointer rounded-md border px-[9px] py-[6px] text-[11px] font-bold focus-visible:outline-2 focus-visible:outline-mint ${selected
+    ? 'border-[#54c995] bg-[#1b4435] text-[#a4f2c9]'
+    : 'border-[#344453] bg-[#18242e] text-[#b8c7d0] hover:border-[#5a927c]'}`;
+}
+
+function renderJobs() {
+  for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
+    const selected = button.dataset.jobFilter === state.jobFilter;
+    button.className = filterClasses(selected);
+    button.setAttribute('aria-pressed', String(selected));
+  }
+  const list = $('jobs-list');
+  list.replaceChildren();
+  const visibleJobs = state.jobFilter === 'all'
+    ? state.jobs
+    : state.jobs.filter(job => job.status === state.jobFilter);
+  if (!visibleJobs.length) {
+    const message = state.jobFilter === 'all' ? 'No jobs yet.' : `No ${state.jobFilter} jobs.`;
+    list.append(element('div', ui.empty, message));
+    return;
+  }
+  for (const job of visibleJobs) {
+    const card = element('div', ui.job);
+    const top = element('div', 'flex items-center justify-between gap-[10px]');
+    top.append(
+      element('div', 'min-w-0 truncate text-xs font-bold', job.filename),
+      element('span', badgeClasses(job.status), job.status),
+    );
+    card.append(top);
+    let stage = job.stage;
+    if (job.status === 'running' && job.stage === 'Transcribing' && job.duration) {
+      stage += ` · ${seconds(job.position)} / ${seconds(job.duration)}`;
+    }
+    card.append(element('div', ui.stage, `${stage} · ${job.progress}%`));
+    const progress = element('div', 'h-[5px] overflow-hidden rounded-[10px] bg-[#30404b]');
+    const fill = element('div', 'h-full bg-mint');
+    fill.style.width = `${job.progress}%`;
+    progress.append(fill);
+    card.append(progress);
+    if (job.reused?.length) card.append(element('div', ui.stage, `Reused: ${job.reused.join(', ')}`));
+    if (job.error) card.append(element('div', 'mt-[9px] text-[11px] leading-[1.4] text-[#ffafaa]', job.error));
+    const codes = Object.keys(job.outputs || {});
+    if (codes.length) {
+      const links = element('div', 'mt-3 flex flex-wrap gap-[6px]');
+      for (const code of codes) {
+        const link = element('a', 'rounded-md border border-[#3a8064] px-2 py-[6px] text-[11px] font-bold text-[#91ecc0] no-underline hover:bg-[#23503c] focus-visible:outline-2 focus-visible:outline-mint', `${code.toUpperCase()} .srt ↓`);
+        link.href = job.outputs[code].url;
+        links.append(link);
+      }
+      card.append(links);
+    }
+    list.append(card);
+  }
+}
+
 async function loadJobs() {
   try {
     state.jobs = await api('/api/jobs');
-    const list = $('jobs-list');
-    list.replaceChildren();
-    if (!state.jobs.length) {
-      list.append(element('div', ui.empty, 'No jobs yet.'));
-      return;
-    }
-    for (const job of state.jobs) {
-      const card = element('div', ui.job);
-      const top = element('div', 'flex items-center justify-between gap-[10px]');
-      top.append(
-        element('div', 'min-w-0 truncate text-xs font-bold', job.filename),
-        element('span', badgeClasses(job.status), job.status),
-      );
-      card.append(top);
-      let stage = job.stage;
-      if (job.status === 'running' && job.stage === 'Transcribing' && job.duration) {
-        stage += ` · ${seconds(job.position)} / ${seconds(job.duration)}`;
-      }
-      card.append(element('div', ui.stage, `${stage} · ${job.progress}%`));
-      const progress = element('div', 'h-[5px] overflow-hidden rounded-[10px] bg-[#30404b]');
-      const fill = element('div', 'h-full bg-mint');
-      fill.style.width = `${job.progress}%`;
-      progress.append(fill);
-      card.append(progress);
-      if (job.reused?.length) card.append(element('div', ui.stage, `Reused: ${job.reused.join(', ')}`));
-      if (job.error) card.append(element('div', 'mt-[9px] text-[11px] leading-[1.4] text-[#ffafaa]', job.error));
-      const codes = Object.keys(job.outputs || {});
-      if (codes.length) {
-        const links = element('div', 'mt-3 flex flex-wrap gap-[6px]');
-        for (const code of codes) {
-          const link = element('a', 'rounded-md border border-[#3a8064] px-2 py-[6px] text-[11px] font-bold text-[#91ecc0] no-underline hover:bg-[#23503c] focus-visible:outline-2 focus-visible:outline-mint', `${code.toUpperCase()} .srt ↓`);
-          link.href = job.outputs[code].url;
-          links.append(link);
-        }
-        card.append(links);
-      }
-      list.append(card);
-    }
+    renderJobs();
   } catch (error) {
     $('jobs-list').replaceChildren(element('div', ui.empty, error.message));
   }
@@ -245,5 +265,12 @@ async function loadJobs() {
 $('refresh-library').onclick = () => loadFolder(state.folder);
 $('refresh-jobs').onclick = loadJobs;
 $('submit-job').onclick = submitJob;
+for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
+  button.onclick = () => {
+    state.jobFilter = button.dataset.jobFilter;
+    renderJobs();
+  };
+}
+renderJobs();
 Promise.all([loadConfig(), loadFolder(''), loadJobs()]).catch(error => displayError(error.message));
 setInterval(loadJobs, 2500);

@@ -106,6 +106,13 @@
           </div>
           <button id="refresh-jobs" type="button" aria-label="Refresh jobs" title="Refresh jobs" class="h-[34px] w-[34px] cursor-pointer rounded-lg border border-[#33414d] bg-[#1b2632] text-2xl leading-5 text-[#aec6d4] hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">↻</button>
         </div>
+        <div id="job-filters" role="group" aria-label="Filter jobs by status" class="flex gap-[6px] overflow-x-auto border-b border-[#28333e] px-[11px] py-[10px]">
+          <button type="button" data-job-filter="all" aria-pressed="true">All</button>
+          <button type="button" data-job-filter="completed" aria-pressed="false">Completed</button>
+          <button type="button" data-job-filter="failed" aria-pressed="false">Failed</button>
+          <button type="button" data-job-filter="running" aria-pressed="false">Running</button>
+          <button type="button" data-job-filter="queued" aria-pressed="false">Queued</button>
+        </div>
         <div id="jobs-list" class="p-[11px]">
           <div class="px-6 py-10 text-center text-[13px] text-[#7f92a2]">No jobs yet.</div>
         </div>
