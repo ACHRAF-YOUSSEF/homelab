@@ -1,6 +1,7 @@
 """Local MKV subtitle studio. No cloud or n8n dependency."""
 
 import json
+import gc
 import hashlib
 import logging
 import os
@@ -25,7 +26,9 @@ WEB_ROOT = Path(__file__).parent / "web"
 LLM_BASE = os.getenv("SUBTITLE_LLM_BASE_URL", "http://host.docker.internal:1234/v1").rstrip("/")
 LLM_DEFAULT = os.getenv("SUBTITLE_LLM_MODEL", "").strip()
 LLM_TIMEOUT = int(os.getenv("SUBTITLE_LLM_TIMEOUT", "600"))
-WHISPER_NAME = os.getenv("WHISPER_MODEL", "medium")
+WHISPER_NAME = os.getenv("WHISPER_MODEL", "medium").strip() or "medium"
+WHISPER_CACHE_DIR = os.getenv("HF_HUB_CACHE", "/models/hub")
+WHISPER_LOCAL_ONLY = os.getenv("WHISPER_LOCAL_FILES_ONLY", "false").lower() == "true"
 LANGUAGES = {
     "en": "English", "fr": "French", "ar": "Arabic", "es": "Spanish",
     "de": "German", "it": "Italian", "pt": "Portuguese", "ja": "Japanese",
@@ -40,6 +43,7 @@ jobs = {}
 jobs_lock = threading.RLock()
 job_queue = queue.Queue()
 speech_model = None
+speech_model_name = None
 speech_lock = threading.Lock()
 
 
@@ -71,7 +75,7 @@ def transcript_cache_key(job, media):
         "audio_stream_index": job["audio_stream_index"],
         "audio_offset": job["audio_offset"],
         "source_language": job["source_language"],
-        "whisper_model": WHISPER_NAME,
+        "whisper_model": job.get("whisper_model", WHISPER_NAME),
         "whisper_options": {"beam_size": 5, "vad_filter": True, "word_timestamps": True, "condition_on_previous_text": False},
     })
 
@@ -237,6 +241,24 @@ def load_jobs():
         logging.exception("Could not read previous jobs")
 
 
+def supported_whisper_models():
+    from faster_whisper.utils import available_models
+    return list(dict.fromkeys([WHISPER_NAME, *available_models()]))
+
+
+def whisper_downloaded(name):
+    from faster_whisper.utils import download_model
+    try:
+        location = download_model(name, cache_dir=WHISPER_CACHE_DIR, local_files_only=True)
+        return (Path(location) / "model.bin").is_file()
+    except Exception:
+        return False
+
+
+def whisper_model_options():
+    return [{"id": name, "downloaded": whisper_downloaded(name)} for name in supported_whisper_models()]
+
+
 def create_job(payload):
     relative = payload.get("path")
     media = resolve_media(relative, file_required=True)
@@ -253,6 +275,10 @@ def create_job(payload):
     model = payload.get("model", "")
     if not isinstance(model, str) or len(model) > 300:
         raise ValueError("Invalid LM Studio model")
+    whisper_model = payload.get("whisper_model", WHISPER_NAME)
+    if (not isinstance(whisper_model, str) or len(whisper_model) > 100
+            or not whisper_model or (whisper_model != WHISPER_NAME and whisper_model not in supported_whisper_models())):
+        raise ValueError("Unsupported Whisper model")
     metadata = probe_media(media)
     index = payload.get("audio_stream_index")
     if type(index) is not int or index not in [track["index"] for track in metadata["tracks"]]:
@@ -262,6 +288,7 @@ def create_job(payload):
     job = {
         "id": job_id, "path": relative, "filename": media.name, "audio_stream_index": index,
         "source_language": source, "transcript": transcript, "targets": targets,
+        "whisper_model": whisper_model,
         "model": model.strip(), "status": "queued", "stage": "Waiting", "progress": 0,
         "duration": metadata["duration"], "position": 0, "audio_offset": selected_track.get("offset", 0), "detected_language": None,
         "media_fingerprint": media_fingerprint(media, relative), "reused": [],
@@ -274,17 +301,23 @@ def create_job(payload):
     return job
 
 
-def get_speech_model():
-    global speech_model
+def get_speech_model(name):
+    global speech_model, speech_model_name
     with speech_lock:
-        if speech_model is None:
+        if speech_model is None or speech_model_name != name:
+            if WHISPER_LOCAL_ONLY and not whisper_downloaded(name):
+                raise RuntimeError(f"Whisper {name} is not downloaded. Run: docker compose run --rm subtitle-worker python download_model.py {name}")
+            speech_model = None
+            speech_model_name = None
+            gc.collect()
             from faster_whisper import WhisperModel
             speech_model = WhisperModel(
-                WHISPER_NAME, device=os.getenv("WHISPER_DEVICE", "cpu"),
+                name, device=os.getenv("WHISPER_DEVICE", "cpu"),
                 compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
-                download_root=os.getenv("HF_HUB_CACHE", "/models/hub"),
-                local_files_only=os.getenv("WHISPER_LOCAL_FILES_ONLY", "false").lower() == "true",
+                download_root=WHISPER_CACHE_DIR,
+                local_files_only=WHISPER_LOCAL_ONLY,
             )
+            speech_model_name = name
     return speech_model
 
 
@@ -467,6 +500,7 @@ def run_job(job_id):
     with jobs_lock:
         job = jobs[job_id].copy()
     media = resolve_media(job["path"], file_required=True)
+    whisper_model = job.get("whisper_model", WHISPER_NAME)
     set_job(job_id, status="running", stage="Checking cached results", progress=1)
     if job.get("media_fingerprint") != media_fingerprint(media, job["path"]):
         raise RuntimeError("The media file changed after this job was queued. Submit it again.")
@@ -484,8 +518,8 @@ def run_job(job_id):
             audio = Path(directory) / "audio.wav"
             set_job(job_id, stage="Extracting audio", progress=2)
             extract_audio(media, job["audio_stream_index"], audio)
-            set_job(job_id, stage=f"Loading Whisper {WHISPER_NAME}", progress=8)
-            model = get_speech_model()
+            set_job(job_id, stage=f"Loading Whisper {whisper_model}", progress=8)
+            model = get_speech_model(whisper_model)
             segments, info = model.transcribe(
                 str(audio), language=None if job["source_language"] == "auto" else job["source_language"],
                 task="transcribe", beam_size=5, vad_filter=True, word_timestamps=True,
@@ -588,7 +622,9 @@ class Handler(BaseHTTPRequestHandler):
                 models, model_error = [], str(exc)
             if LLM_DEFAULT and LLM_DEFAULT not in models:
                 models.insert(0, LLM_DEFAULT)
-            return self.send_json({"languages": LANGUAGES, "whisper_model": WHISPER_NAME, "models": models, "default_model": LLM_DEFAULT or (models[0] if models else ""), "model_error": model_error})
+            return self.send_json({"languages": LANGUAGES, "whisper_model": WHISPER_NAME,
+                                   "whisper_models": whisper_model_options(), "whisper_local_only": WHISPER_LOCAL_ONLY,
+                                   "models": models, "default_model": LLM_DEFAULT or (models[0] if models else ""), "model_error": model_error})
         if path == "/api/library":
             return self.send_json(browse(query.get("path", [""])[0]))
         if path == "/api/media":

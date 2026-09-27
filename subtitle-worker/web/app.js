@@ -1,4 +1,4 @@
-const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all' };
+const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false };
 const $ = id => document.getElementById(id);
 
 const ui = {
@@ -51,10 +51,30 @@ function libraryClasses(selected) {
     : 'border-transparent bg-transparent'}`;
 }
 
+function updateWhisperSelection() {
+  const selected = $('whisper-select').value;
+  $('whisper-model').textContent = `Whisper ${selected}`;
+  const downloaded = state.whisperModels.get(selected);
+  const availability = state.whisperLocalOnly && !downloaded
+    ? `Not downloaded locally. Run: docker compose run --rm subtitle-worker python download_model.py ${selected}`
+    : downloaded
+      ? 'Downloaded locally. A different model needs a new transcription unless its result is cached.'
+      : 'This model will be downloaded when first used.';
+  $('whisper-note').textContent = `${availability}${selected.endsWith('.en') ? ' This model only supports English audio.' : ''}`;
+}
+
 async function loadConfig() {
   const data = await api('/api/config');
   state.languages = data.languages;
-  $('whisper-model').textContent = `Whisper ${data.whisper_model}`;
+  state.whisperLocalOnly = data.whisper_local_only;
+  const whisperSelect = $('whisper-select');
+  for (const item of data.whisper_models) {
+    state.whisperModels.set(item.id, item.downloaded);
+    whisperSelect.append(new Option(`${item.id}${item.downloaded ? ' · downloaded' : ' · download needed'}`, item.id));
+  }
+  whisperSelect.value = data.whisper_model;
+  whisperSelect.onchange = updateWhisperSelection;
+  updateWhisperSelection();
 
   const source = $('source-language');
   source.append(new Option('Auto detect', 'auto'));
@@ -174,6 +194,7 @@ async function submitJob() {
         path: state.media.path,
         audio_stream_index: Number($('audio-track').value),
         source_language: $('source-language').value,
+        whisper_model: $('whisper-select').value,
         transcript: $('transcript').checked,
         targets: [...state.targets],
         model,
@@ -227,6 +248,7 @@ function renderJobs() {
       element('span', badgeClasses(job.status), job.status),
     );
     card.append(top);
+    if (job.whisper_model) card.append(element('div', 'mt-[5px] text-[11px] text-[#91a3af]', `Whisper ${job.whisper_model}`));
     let stage = job.stage;
     if (job.status === 'running' && job.stage === 'Transcribing' && job.duration) {
       stage += ` · ${seconds(job.position)} / ${seconds(job.duration)}`;

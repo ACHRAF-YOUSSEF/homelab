@@ -34,7 +34,7 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     ports:
-      - "${SUBTITLE_BIND_ADDRESS:-127.0.0.1}:8099:8099"
+      - "8099:8099"
     environment:
       - SUBTITLE_LIBRARY_ROOT=/library
       - SUBTITLE_OUTPUT_ROOT=/media/output

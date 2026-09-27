@@ -35,7 +35,7 @@ docker compose exec subtitle-worker python -c "from faster_whisper import Whispe
 
 The first model load needs free GPU memory. Already cached transcripts will be reused, so choose a video without a cached transcript to measure transcription speed.
 
-Open <http://localhost:8099>. The media library is a read-only mount of `SUBTITLE_LIBRARY_DIR`. Choose a video, an audio track, the source language (or auto), whether to save its transcript, and any target languages. Select a model loaded in LM Studio, then create the job. The Jobs panel displays progress and download links. Completed SRT files are also saved under `SUBTITLE_MEDIA_DIR/output`, mirroring the source media folder structure. The UI only binds to localhost by default. For access from another device on your LAN, set `SUBTITLE_BIND_ADDRESS` to your computer's LAN IP address and restart this service.
+Open <http://localhost:8099>. The media library is a read-only mount of `SUBTITLE_LIBRARY_DIR`. Choose a video, an audio track, the source language (or auto), a Whisper transcription model, whether to save its transcript, and any target languages. Select a model loaded in LM Studio, then create the job. The Jobs panel displays progress, the Whisper model used, and download links. Completed SRT files are also saved under `SUBTITLE_MEDIA_DIR/output`, mirroring the source media folder structure. The UI only binds to localhost by default. For access from another device on your LAN, set `SUBTITLE_BIND_ADDRESS` to your computer's LAN IP address and restart this service.
 
 The UI uses Tailwind CSS v4 utilities through the Play CDN. Your browser needs to reach jsDelivr to load the styling; subtitle processing and media files remain local. The Play CDN is intended for development, so a future offline deployment should compile Tailwind into a local CSS file.
 
@@ -43,13 +43,13 @@ LM Studio's local server must be running with an instruction model available for
 
 TranslateGemma 12B is supported through a separate adapter: it uses Google's language-specific template through LM Studio's raw `/v1/completions` endpoint and translates one timed cue per request. This preserves SRT boundaries but may take longer than the eight-cue batches used for general models. On a 12 GB GPU, try Q5_K_M with a 2,048-token context for quality; use Q4_K_M if GPU memory is tight. Q8_0 exceeds 12 GB. The adapter has unit coverage, but it needs a live test once you download and load TranslateGemma in LM Studio.
 
-The first Whisper run downloads model files into the persistent `subtitle_models` volume unless `WHISPER_LOCAL_FILES_ONLY=true`. To download them in advance:
+The Whisper selector lists Faster Whisper models and marks the ones already downloaded in the persistent `subtitle_models` volume. `WHISPER_MODEL` sets the default selection. Only one Whisper model remains loaded in GPU memory at a time; switching models loads the selected one for the next uncached transcription. The first use downloads model files unless `WHISPER_LOCAL_FILES_ONLY=true`. To download a specific model in advance:
 
 ```powershell
-docker compose run --rm subtitle-worker python download_model.py
+docker compose run --rm subtitle-worker python download_model.py large-v3
 ```
 
-Then set `WHISPER_LOCAL_FILES_ONLY=true` to prevent model downloads during jobs. Audio, transcript text, and subtitles remain on your machine. Model downloads, if enabled, connect to Hugging Face.
+With `WHISPER_LOCAL_FILES_ONLY=true`, download each model you intend to use before selecting it for a new transcription. Reload the page to refresh the downloaded labels. Audio, transcript text, and subtitles remain on your machine. Model downloads, if enabled, connect to Hugging Face. Models ending in `.en` support English audio only; choose a multilingual model for Japanese and other languages.
 
 ## Reusing completed work
 
