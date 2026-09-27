@@ -5,7 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3 
 
 WORKDIR /app
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+    && python3 -m pip install --no-cache-dir -r requirements.txt
 COPY worker.py download_model.py validate_srt.py ./
 COPY web ./web
 
