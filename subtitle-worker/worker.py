@@ -259,7 +259,52 @@ def render_srt(cues):
     ) + ("\n" if cues else "")
 
 
+def is_translategemma(model):
+    return "translategemma" in model.lower()
+
+
+def translategemma_prompt(source_code, target_code, text):
+    """Render Google's strict text translation template for the raw completions API."""
+    if source_code not in LANGUAGES or target_code not in LANGUAGES:
+        raise ValueError("TranslateGemma needs supported two-letter source and target languages")
+    source = LANGUAGES[source_code]
+    target = LANGUAGES[target_code]
+    return (
+        f"<bos><start_of_turn>user\nYou are a professional {source} ({source_code}) to {target} ({target_code}) translator. "
+        f"Your goal is to accurately convey the meaning and nuances of the original {source} text while adhering to "
+        f"{target} grammar, vocabulary, and cultural sensitivities.\n"
+        f"Produce only the {target} translation, without any additional explanations or commentary. "
+        f"Please translate the following {source} text into {target}:\n\n\n"
+        f"{text.strip()}<end_of_turn>\n<start_of_turn>model\n"
+    )
+
+
+def request_translategemma(model, source_code, target_code, cue):
+    payload = {
+        "model": model, "prompt": translategemma_prompt(source_code, target_code, cue["text"]),
+        "temperature": 0, "max_tokens": 256, "stop": ["<end_of_turn>"], "stream": False,
+    }
+    request = Request(LLM_BASE + "/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=LLM_TIMEOUT) as response:
+                reply = json.load(response)["choices"][0]["text"]
+            reply = normalize_text(reply.split("<end_of_turn>", 1)[0])
+            if not reply:
+                raise ValueError("TranslateGemma returned empty text")
+            return reply
+        except (TimeoutError, URLError, HTTPError, ValueError, KeyError, TypeError) as exc:
+            last_error = exc
+            logging.warning("TranslateGemma cue attempt %d failed: %s", attempt + 1, exc)
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"TranslateGemma translation failed after 3 attempts: {last_error}")
+
+
 def request_translation(model, source_code, target_code, batch):
+    if is_translategemma(model):
+        return [request_translategemma(model, source_code, target_code, cue) for cue in batch]
     numbered = [{"id": i, "text": cue["text"]} for i, cue in enumerate(batch, 1)]
     prompt = (
         f"Translate these subtitle cues from {LANGUAGES.get(source_code, source_code)} to {LANGUAGES[target_code]}. "
@@ -353,17 +398,23 @@ def run_job(job_id):
         if targets:
             model_id = model_for_job(job["model"])
             set_job(job_id, model=model_id)
-            total_batches = sum((len(cues) + 7) // 8 for _ in targets)
+            batch_size = 1 if is_translategemma(model_id) else 8
+            total_batches = sum((len(cues) + batch_size - 1) // batch_size for _ in targets)
             finished_batches = 0
             for language in targets:
                 translated = []
-                for start in range(0, len(cues), 8):
-                    batch = cues[start:start + 8]
-                    set_job(job_id, stage=f"Translating to {LANGUAGES[language]} ({start + 1}/{len(cues)} cues)")
+                last_percent = -1
+                for start in range(0, len(cues), batch_size):
+                    batch = cues[start:start + batch_size]
+                    if start % max(1, len(cues) // 100) == 0:
+                        set_job(job_id, stage=f"Translating to {LANGUAGES[language]} ({start + 1}/{len(cues)} cues)")
                     texts = request_translation(model_id, source_code, language, batch)
                     translated.extend({"start": cue["start"], "end": cue["end"], "text": text} for cue, text in zip(batch, texts))
                     finished_batches += 1
-                    set_job(job_id, progress=64 + int(34 * finished_batches / total_batches))
+                    percent = 64 + int(34 * finished_batches / total_batches)
+                    if percent != last_percent:
+                        set_job(job_id, progress=percent)
+                        last_percent = percent
                 write_output(job_id, language, translated)
     set_job(job_id, status="completed", stage="Complete", progress=100, position=job["duration"])
 

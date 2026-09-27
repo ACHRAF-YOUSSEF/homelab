@@ -49,6 +49,27 @@ class SubtitleStudioTests(unittest.TestCase):
         with patch.object(worker, "urlopen", return_value=Reply()):
             self.assertEqual(worker.request_translation("local", "en", "fr", cues), ["Un", "Deux"])
 
+    def test_translategemma_uses_raw_completions_and_language_template(self):
+        class Reply:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                return json.dumps({"choices": [{"text": "Hello, world!<end_of_turn>"}]}).encode()
+        calls = []
+        def fake_open(request, timeout):
+            calls.append(request)
+            return Reply()
+        with patch.object(worker, "urlopen", side_effect=fake_open):
+            result = worker.request_translation("mradermacher/translategemma-12b-it-GGUF", "ja", "en", [{"text": "こんにちは、世界！"}])
+        self.assertEqual(result, ["Hello, world!"])
+        self.assertTrue(calls[0].full_url.endswith("/completions"))
+        body = json.loads(calls[0].data)
+        self.assertIn("Japanese (ja) to English (en)", body["prompt"])
+        self.assertIn("こんにちは、世界！", body["prompt"])
+        self.assertNotIn("messages", body)
+
     def test_job_validates_actual_audio_stream(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
