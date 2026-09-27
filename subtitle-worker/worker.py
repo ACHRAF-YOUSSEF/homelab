@@ -1,6 +1,7 @@
 """Local MKV subtitle studio. No cloud or n8n dependency."""
 
 import json
+import hashlib
 import logging
 import os
 import queue
@@ -34,6 +35,7 @@ LANGUAGES = {
 }
 VIDEO_SUFFIXES = {".mkv", ".mp4", ".m4v", ".webm"}
 JOBS_FILE = DATA_ROOT / "jobs.json"
+CACHE_VERSION = 1
 jobs = {}
 jobs_lock = threading.RLock()
 job_queue = queue.Queue()
@@ -43,6 +45,91 @@ speech_lock = threading.Lock()
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def cache_digest(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def media_fingerprint(media, relative):
+    """A cheap identity check that also catches same-size replacements."""
+    stat = media.stat()
+    digest = hashlib.sha256()
+    with media.open("rb") as source:
+        digest.update(source.read(65536))
+        if stat.st_size > 65536:
+            source.seek(max(0, stat.st_size - 65536))
+            digest.update(source.read(65536))
+    return {"path": relative, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sample": digest.hexdigest()}
+
+
+def transcript_cache_key(job, media):
+    return cache_digest({
+        "kind": "transcript", "version": CACHE_VERSION,
+        "media": media_fingerprint(media, job["path"]),
+        "audio_stream_index": job["audio_stream_index"],
+        "audio_offset": job["audio_offset"],
+        "source_language": job["source_language"],
+        "whisper_model": WHISPER_NAME,
+        "whisper_options": {"beam_size": 5, "vad_filter": True, "word_timestamps": True, "condition_on_previous_text": False},
+    })
+
+
+def translation_cache_key(transcript_key, source_code, cues, target_code, model):
+    return cache_digest({
+        "kind": "translation", "version": CACHE_VERSION,
+        "transcript_key": transcript_key, "source_language": source_code,
+        "source_cues": cues, "target_language": target_code, "model": model,
+        "adapter": "translategemma-raw-v1" if is_translategemma(model) else "chat-json-v1",
+    })
+
+
+def cache_path(kind, key):
+    return DATA_ROOT / "cache" / kind / f"{key}.json"
+
+
+def read_cache(kind, key):
+    try:
+        payload = json.loads(cache_path(kind, key).read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) and payload.get("key") == key else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_cache(kind, key, payload):
+    destination = cache_path(kind, key)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + f".{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps({"key": key, **payload}, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def valid_cues(cues):
+    return (isinstance(cues, list) and bool(cues) and all(
+        isinstance(cue, dict) and type(cue.get("start")) in (int, float)
+        and type(cue.get("end")) in (int, float) and cue["end"] > cue["start"]
+        and isinstance(cue.get("text"), str) and bool(cue["text"].strip())
+        for cue in cues
+    ))
+
+
+def load_transcript_cache(key):
+    payload = read_cache("transcripts", key)
+    if payload and isinstance(payload.get("language"), str) and payload["language"] not in ("", "auto") and valid_cues(payload.get("cues")):
+        return payload["language"], payload["cues"]
+    return None
+
+
+def load_translation_cache(key, expected_count):
+    payload = read_cache("translations", key)
+    texts = payload.get("texts") if payload else None
+    if isinstance(texts, list) and len(texts) <= expected_count and all(isinstance(text, str) and text.strip() for text in texts):
+        return texts
+    return []
 
 
 def within(path, root):
@@ -166,6 +253,7 @@ def create_job(payload):
         "source_language": source, "transcript": transcript, "targets": targets,
         "model": model.strip(), "status": "queued", "stage": "Waiting", "progress": 0,
         "duration": metadata["duration"], "position": 0, "audio_offset": selected_track.get("offset", 0), "detected_language": None,
+        "media_fingerprint": media_fingerprint(media, relative), "reused": [],
         "outputs": {}, "error": None, "created_at": now(), "updated_at": now(),
     }
     with jobs_lock:
@@ -347,11 +435,19 @@ def write_output(job_id, language, cues):
     with jobs_lock:
         job = jobs[job_id].copy()
     destination = output_path(job, language)
-    temporary = destination.with_suffix(".srt.tmp")
-    temporary.write_text(render_srt(cues), encoding="utf-8")
-    temporary.replace(destination)
+    content = render_srt(cues)
+    if not destination.exists() or destination.read_text(encoding="utf-8") != content:
+        temporary = destination.with_suffix(".srt.tmp")
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(destination)
+    snapshot_dir = DATA_ROOT / "job_outputs" / job_id
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshot_dir / destination.name
+    snapshot_tmp = snapshot.with_suffix(".srt.tmp")
+    snapshot_tmp.write_text(content, encoding="utf-8")
+    snapshot_tmp.replace(snapshot)
     with jobs_lock:
-        jobs[job_id]["outputs"][language] = {"path": str(destination), "name": destination.name, "url": f"/api/jobs/{job_id}/files/{language}"}
+        jobs[job_id]["outputs"][language] = {"path": str(snapshot), "export_path": str(destination), "name": destination.name, "url": f"/api/jobs/{job_id}/files/{language}"}
         jobs[job_id]["updated_at"] = now()
         persist_locked()
 
@@ -360,62 +456,85 @@ def run_job(job_id):
     with jobs_lock:
         job = jobs[job_id].copy()
     media = resolve_media(job["path"], file_required=True)
-    set_job(job_id, status="running", stage="Extracting audio", progress=2)
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="subtitle-") as directory:
-        audio = Path(directory) / "audio.wav"
-        extract_audio(media, job["audio_stream_index"], audio)
-        set_job(job_id, stage=f"Loading Whisper {WHISPER_NAME}", progress=8)
-        model = get_speech_model()
-        segments, info = model.transcribe(
-            str(audio), language=None if job["source_language"] == "auto" else job["source_language"],
-            task="transcribe", beam_size=5, vad_filter=True, word_timestamps=True,
-            condition_on_previous_text=False,
-        )
-        source_code = info.language or job["source_language"]
-        set_job(job_id, detected_language=source_code, stage="Transcribing", progress=10)
-        collected = []
-        last_percent = 10
-        duration = max(job["duration"], 1)
-        for segment in segments:
-            collected.append(segment)
-            percent = min(62, 10 + int(52 * segment.end / duration))
-            if percent >= last_percent + 2:
-                set_job(job_id, progress=percent, position=round(segment.end, 1))
-                last_percent = percent
-        cues = make_cues(collected)
-        for cue in cues:
-            cue["start"] += job["audio_offset"]
-            cue["end"] += job["audio_offset"]
-        if not cues:
-            raise RuntimeError("No speech was detected in the selected audio track")
-        set_job(job_id, stage="Preparing subtitles", progress=64)
-        if job["transcript"]:
-            write_output(job_id, source_code, cues)
-        targets = [language for language in job["targets"] if language != source_code]
-        if source_code in job["targets"] and not job["transcript"]:
-            write_output(job_id, source_code, cues)
-        if targets:
-            model_id = model_for_job(job["model"])
-            set_job(job_id, model=model_id)
-            batch_size = 1 if is_translategemma(model_id) else 8
-            total_batches = sum((len(cues) + batch_size - 1) // batch_size for _ in targets)
-            finished_batches = 0
-            for language in targets:
-                translated = []
-                last_percent = -1
-                for start in range(0, len(cues), batch_size):
-                    batch = cues[start:start + batch_size]
-                    if start % max(1, len(cues) // 100) == 0:
-                        set_job(job_id, stage=f"Translating to {LANGUAGES[language]} ({start + 1}/{len(cues)} cues)")
-                    texts = request_translation(model_id, source_code, language, batch)
-                    translated.extend({"start": cue["start"], "end": cue["end"], "text": text} for cue, text in zip(batch, texts))
-                    finished_batches += 1
-                    percent = 64 + int(34 * finished_batches / total_batches)
-                    if percent != last_percent:
-                        set_job(job_id, progress=percent)
-                        last_percent = percent
-                write_output(job_id, language, translated)
+    set_job(job_id, status="running", stage="Checking cached results", progress=1)
+    if job.get("media_fingerprint") != media_fingerprint(media, job["path"]):
+        raise RuntimeError("The media file changed after this job was queued. Submit it again.")
+    transcript_key = transcript_cache_key(job, media)
+    cached = load_transcript_cache(transcript_key)
+    reused = []
+    if cached:
+        source_code, cues = cached
+        reused.append("transcription")
+        set_job(job_id, stage="Reusing cached transcription", progress=64,
+                detected_language=source_code, position=job["duration"], reused=reused[:])
+    else:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="subtitle-") as directory:
+            audio = Path(directory) / "audio.wav"
+            set_job(job_id, stage="Extracting audio", progress=2)
+            extract_audio(media, job["audio_stream_index"], audio)
+            set_job(job_id, stage=f"Loading Whisper {WHISPER_NAME}", progress=8)
+            model = get_speech_model()
+            segments, info = model.transcribe(
+                str(audio), language=None if job["source_language"] == "auto" else job["source_language"],
+                task="transcribe", beam_size=5, vad_filter=True, word_timestamps=True,
+                condition_on_previous_text=False,
+            )
+            source_code = info.language or job["source_language"]
+            if source_code == "auto":
+                raise RuntimeError("Whisper could not detect the audio language. Select it explicitly and retry.")
+            set_job(job_id, detected_language=source_code, stage="Transcribing", progress=10)
+            collected = []
+            last_percent = 10
+            duration = max(job["duration"], 1)
+            for segment in segments:
+                collected.append(segment)
+                percent = min(62, 10 + int(52 * segment.end / duration))
+                if percent >= last_percent + 2:
+                    set_job(job_id, progress=percent, position=round(segment.end, 1))
+                    last_percent = percent
+            cues = make_cues(collected)
+            for cue in cues:
+                cue["start"] += job["audio_offset"]
+                cue["end"] += job["audio_offset"]
+            if not cues:
+                raise RuntimeError("No speech was detected in the selected audio track")
+            write_cache("transcripts", transcript_key, {"language": source_code, "cues": cues})
+    set_job(job_id, stage="Preparing subtitles", progress=64)
+    if job["transcript"] or source_code in job["targets"]:
+        write_output(job_id, source_code, cues)
+    targets = [language for language in job["targets"] if language != source_code]
+    if targets:
+        model_id = model_for_job(job["model"])
+        set_job(job_id, model=model_id)
+        batch_size = 1 if is_translategemma(model_id) else 8
+        total_batches = sum((len(cues) + batch_size - 1) // batch_size for _ in targets)
+        finished_batches = 0
+        for language in targets:
+            translation_key = translation_cache_key(transcript_key, source_code, cues, language, model_id)
+            texts = load_translation_cache(translation_key, len(cues))
+            finished_batches += (len(texts) + batch_size - 1) // batch_size
+            if texts:
+                reused.append(language if len(texts) == len(cues) else f"{language} ({len(texts)} cues)")
+                set_job(job_id, stage=f"Reusing cached {LANGUAGES[language]} cues", reused=reused[:],
+                        progress=64 + int(34 * finished_batches / total_batches))
+            for start in range(len(texts), len(cues), batch_size):
+                batch = cues[start:start + batch_size]
+                if start % max(1, len(cues) // 100) == 0:
+                    set_job(job_id, stage=f"Translating to {LANGUAGES[language]} ({start + 1}/{len(cues)} cues)")
+                translated = request_translation(model_id, source_code, language, batch)
+                texts.extend(translated)
+                write_cache("translations", translation_key, {"texts": texts})
+                finished_batches += 1
+                percent = 64 + int(34 * finished_batches / total_batches)
+                with jobs_lock:
+                    prior_percent = jobs[job_id]["progress"]
+                if percent != prior_percent:
+                    set_job(job_id, progress=percent)
+            write_output(job_id, language, [
+                {"start": cue["start"], "end": cue["end"], "text": text}
+                for cue, text in zip(cues, texts)
+            ])
     set_job(job_id, status="completed", stage="Complete", progress=100, position=job["duration"])
 
 
@@ -456,6 +575,8 @@ class Handler(BaseHTTPRequestHandler):
                 models, model_error = list_models(), None
             except Exception as exc:
                 models, model_error = [], str(exc)
+            if LLM_DEFAULT and LLM_DEFAULT not in models:
+                models.insert(0, LLM_DEFAULT)
             return self.send_json({"languages": LANGUAGES, "whisper_model": WHISPER_NAME, "models": models, "default_model": LLM_DEFAULT or (models[0] if models else ""), "model_error": model_error})
         if path == "/api/library":
             return self.send_json(browse(query.get("path", [""])[0]))
@@ -479,7 +600,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not output:
                     return self.send_json({"error": "Subtitle not found"}, 404)
                 path_on_disk = Path(output["path"]).resolve()
-                if not within(path_on_disk, OUTPUT_ROOT) or not path_on_disk.is_file():
+                if not (within(path_on_disk, OUTPUT_ROOT) or within(path_on_disk, DATA_ROOT / "job_outputs")) or not path_on_disk.is_file():
                     return self.send_json({"error": "Subtitle file missing"}, 404)
                 return self.send_bytes(path_on_disk.read_bytes(), "application/x-subrip; charset=utf-8", download=output["name"])
             return self.send_json(job)

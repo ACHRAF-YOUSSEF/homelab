@@ -35,6 +35,14 @@ docker compose run --rm subtitle-worker python download_model.py
 
 Then set `WHISPER_LOCAL_FILES_ONLY=true` to prevent model downloads during jobs. Audio, transcript text, and subtitles remain on your machine. Model downloads, if enabled, connect to Hugging Face.
 
+## Reusing completed work
+
+Every job saves the timed source transcript to the persistent `subtitle_data` volume, even when **Save original transcript** is unchecked. Translation text is saved after each successful batch (one cue at a time for TranslateGemma). The extracted WAV is temporary and is skipped entirely whenever a matching transcript is cached.
+
+For example, make English subtitles first, then submit the same media and audio track with French selected. The second job reuses the source transcript, leaves the English translation alone, and translates only the French cues. Repeating an already completed language uses cached text and does not call LM Studio. The Jobs panel shows which stages were reused. A failed translation can resume at its first missing batch on a new job. Each job's download is stored as a small immutable SRT snapshot, so a later export for another audio track or model cannot change an earlier download. The conventional SRT under `SUBTITLE_MEDIA_DIR/output` reflects the latest job for that media and language.
+
+Cache entries are specific to the media file, its size and modification time, the selected audio track and source-language setting, the Whisper model and transcription settings, the output language, and the LM Studio model. Changing any of these starts the affected stage again. The worker also samples the beginning and end of the media file to avoid reusing a cache for a same-size replacement. Jobs made before this cache feature have no stored source transcript; they need one new transcription before later languages can be added without Whisper. Cache files live in the `subtitle_data` Docker volume under `/data/cache`.
+
 ## Status and troubleshooting
 
 The UI polls job status every 2.5 seconds. Transcription progress is based on the last completed audio segment; translation progress is based on completed batches. A stalled LM Studio response can take up to `SUBTITLE_LLM_TIMEOUT` seconds per attempt. The worker retries a failed translation batch twice before marking the job failed; SRT files already produced remain downloadable. Jobs survive service restarts in `subtitle_data`, although an in-progress job is marked interrupted and must be submitted again. Only one job runs at a time.
