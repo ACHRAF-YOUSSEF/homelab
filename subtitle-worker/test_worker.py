@@ -1,94 +1,58 @@
-import os
+import json
 import tempfile
-import time
 import unittest
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import worker
 
 
-class SubtitleWorkerTests(unittest.TestCase):
-    def test_srt_timestamps_and_nonoverlap(self):
-        cues = worker.normalize_cues([
-            {"start": 0.0, "end": 2.1, "text": "  Hello  there. "},
-            {"start": 2.0, "end": 3.25, "text": "How are you?"},
-        ])
-        self.assertEqual(cues[0]["end"], 2.0)
-        self.assertEqual(
-            worker.render_srt(cues),
-            "1\n00:00:00,000 --> 00:00:02,000\nHello there.\n\n"
-            "2\n00:00:02,000 --> 00:00:03,250\nHow are you?\n",
-        )
+class SubtitleStudioTests(unittest.TestCase):
+    def test_library_path_stays_inside_mount(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            film = root / "film.mkv"
+            film.write_bytes(b"fixture")
+            with patch.object(worker, "LIBRARY_ROOT", root):
+                self.assertEqual(worker.resolve_media("film.mkv", True), film)
+                for invalid in ("../outside.mkv", "/outside.mkv", r"..\outside.mkv"):
+                    with self.assertRaises(ValueError):
+                        worker.resolve_media(invalid, True)
 
-    def test_long_segment_uses_word_timestamps(self):
-        words = [
-            SimpleNamespace(start=i * 0.5, end=(i + 1) * 0.5, word=" example")
-            for i in range(16)
-        ]
-        segment = SimpleNamespace(start=0, end=8, text=" ".join("example" for _ in words), words=words)
-        cues = worker.split_segment(segment)
+    def test_word_timing_and_srt(self):
+        words = [SimpleNamespace(start=i * .5, end=(i + 1) * .5, word=" example") for i in range(16)]
+        segment = SimpleNamespace(start=0, end=8, text="", words=words)
+        cues = worker.make_cues([segment])
         self.assertGreater(len(cues), 1)
         self.assertEqual(cues[0]["start"], 0)
         self.assertEqual(cues[-1]["end"], 8)
-        self.assertTrue(all(cues[i]["end"] <= cues[i + 1]["start"] for i in range(len(cues) - 1)))
+        self.assertTrue(all(cues[i]["end"] <= cues[i + 1]["start"] for i in range(len(cues)-1)))
+        self.assertIn("00:00:00,000 -->", worker.render_srt(cues))
 
-    def test_scan_waits_for_stable_file_and_queues_once(self):
-        with tempfile.TemporaryDirectory() as directory:
-            input_dir = Path(directory) / "input"
-            output_dir = Path(directory) / "output"
-            input_dir.mkdir()
-            output_dir.mkdir()
-            source = input_dir / "film.mkv"
-            source.write_bytes(b"mkv fixture")
-            old_time = time.time() - 120
-            os.utime(source, (old_time, old_time))
-            with patch.object(worker, "INPUT_DIR", input_dir), patch.object(worker, "OUTPUT_DIR", output_dir), patch.object(worker, "MIN_AGE_SECONDS", 90):
-                worker.seen.clear()
-                worker.jobs.clear()
-                self.assertEqual(worker.scan(), [])
-                queued = worker.scan()
-                self.assertEqual(len(queued), 1)
-                self.assertEqual(worker.scan(), [])
-                self.assertEqual(queued[0]["filename"], "film.mkv")
+    def test_translation_preserves_cue_count_and_order(self):
+        class Reply:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": '[{"id":2,"text":"Deux"},{"id":1,"text":"Un"}]'}}]}).encode()
+        cues = [{"text": "One"}, {"text": "Two"}]
+        with patch.object(worker, "urlopen", return_value=Reply()):
+            self.assertEqual(worker.request_translation("local", "en", "fr", cues), ["Un", "Deux"])
 
-    def test_proofreading_preserves_timing(self):
-        cues = [{"start": 1.25, "end": 2.75, "text": "He go home."}]
-
-        def fake_request(url, payload=None, headers=None):
-            if url.endswith("/models"):
-                return {"data": [{"id": "local-model"}]}
-            return {"choices": [{"message": {"content": '[{"id": 0, "text": "He went home."}]'}}]}
-
-        with patch.object(worker, "request_json", side_effect=fake_request):
-            worker.polish(cues)
-        self.assertEqual(cues, [{"start": 1.25, "end": 2.75, "text": "He went home."}])
-
-    def test_windows_path_maps_only_inside_mounted_source(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "Movie.mkv"
-            source.write_bytes(b"fixture")
-            with patch.object(worker, "SOURCE_DIR", Path(directory)), patch.object(worker, "SOURCE_HOST_DIR", PureWindowsPath("D:/subtitles/input")):
-                self.assertEqual(worker.resolve_source(r"D:\subtitles\input\Movie.mkv"), source)
-                with self.assertRaises(ValueError):
-                    worker.resolve_source(r"D:\film\Movie.mkv")
-                with self.assertRaises(ValueError):
-                    worker.resolve_source(r"D:\subtitles\input\..\..\secret.mkv")
-
-    def test_progress_and_duplicate_job(self):
+    def test_job_validates_actual_audio_stream(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "Movie.mkv"
-            source.write_bytes(b"fixture")
-            with patch.object(worker, "OUTPUT_DIR", root):
+            (root / "film.mkv").write_bytes(b"fixture")
+            with patch.object(worker, "LIBRARY_ROOT", root), patch.object(worker, "DATA_ROOT", root), patch.object(worker, "JOBS_FILE", root / "jobs.json"), patch.object(worker, "probe_media", return_value={"tracks": [{"index": 2}], "duration": 30}):
+                with self.assertRaises(ValueError):
+                    worker.create_job({"path": "film.mkv", "audio_stream_index": 0, "transcript": True})
+                job = worker.create_job({"path": "film.mkv", "audio_stream_index": 2, "transcript": True, "targets": ["fr"]})
+                self.assertEqual(job["status"], "queued")
+                self.assertEqual(json.loads((root / "jobs.json").read_text())[0]["id"], job["id"])
                 worker.jobs.clear()
-                first = worker.enqueue_source(source)
-                second = worker.enqueue_source(source)
-                self.assertEqual(first["id"], second["id"])
-                worker.update_job(first["id"], "transcribing", 55, media_position_seconds=33)
-                self.assertEqual(worker.jobs[first["id"]]["progress_percent"], 55)
-                self.assertEqual(worker.jobs[first["id"]]["media_position_seconds"], 33)
 
 
 if __name__ == "__main__":

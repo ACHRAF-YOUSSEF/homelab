@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Subtitle Studio</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar"><div class="brand"><span class="brand-mark">S</span><span>Subtitle <b>Studio</b></span></div><span class="local-pill"><i></i> LOCAL WORKSPACE</span></header>
+  <main class="shell">
+    <div class="heading"><div><p class="eyebrow">MEDIA TRANSLATION</p><h1>Create subtitles</h1><p class="intro">Choose a video, pick its audio track, and export timed subtitles in the languages you need.</p></div><div class="engine"><span>TRANSCRIPTION ENGINE</span><strong id="whisper-model">Whisper</strong></div></div>
+    <div class="layout">
+      <section class="panel library-panel"><div class="panel-header"><div><p class="step">01 / SOURCE</p><h2>Media library</h2></div><button id="refresh-library" class="icon-button" title="Refresh folder">↻</button></div><div class="breadcrumb" id="breadcrumb"></div><div class="library-list" id="library-list"><div class="empty">Loading library…</div></div></section>
+      <section class="panel setup-panel"><div class="panel-header"><div><p class="step">02 / SETUP</p><h2>Subtitle options</h2></div></div><div id="media-empty" class="select-prompt"><div class="prompt-icon">▣</div><h3>Select a video</h3><p>Browse your library and select an MKV or another supported video file.</p></div><div id="media-options" hidden><div class="selected-media"><div class="file-icon">▶</div><div><span>SELECTED MEDIA</span><strong id="media-name"></strong><small id="media-duration"></small></div></div><label for="audio-track">Audio track</label><select id="audio-track"></select><label for="source-language">Source language</label><select id="source-language"></select><div class="check-row"><input id="transcript" type="checkbox" checked><label for="transcript"><strong>Save original transcript</strong><small>Export speech in the detected source language as SRT</small></label></div><div class="section-label">TRANSLATE TO <small>Choose one or more</small></div><div id="language-grid" class="language-grid"></div><label for="model-select">LM Studio translation model</label><select id="model-select"></select><p class="field-note" id="model-note"></p><button id="submit-job" class="primary-button">Create subtitles <span>→</span></button><p class="error" id="form-error" hidden></p></div></section>
+      <section class="panel jobs-panel"><div class="panel-header"><div><p class="step">03 / ACTIVITY</p><h2>Jobs & downloads</h2></div><button id="refresh-jobs" class="icon-button" title="Refresh jobs">↻</button></div><div id="jobs-list" class="jobs-list"><div class="empty">No jobs yet.</div></div></section>
+    </div>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
