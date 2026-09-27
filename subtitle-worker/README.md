@@ -47,6 +47,16 @@ Cache entries are specific to the media file, its size and modification time, th
 
 The UI polls job status every 2.5 seconds. Transcription progress is based on the last completed audio segment; translation progress is based on completed batches. A stalled LM Studio response can take up to `SUBTITLE_LLM_TIMEOUT` seconds per attempt. The worker retries a failed translation batch twice before marking the job failed; SRT files already produced remain downloadable. Jobs survive service restarts in `subtitle_data`, although an in-progress job is marked interrupted and must be submitted again. Only one job runs at a time.
 
+## Check subtitle quality
+
+After rebuilding the container, run the built-in validator from the repository root with a job ID from `/api/jobs`:
+
+```powershell
+docker compose exec subtitle-worker python validate_srt.py --job-id 2ced752ce1c9 --target-language en
+```
+
+It checks SRT structure, chronological timestamps, video duration, source/translation cue alignment, and flags subtitles that may be too brief, too long, or too dense to read. It cannot prove the speech was recognized correctly or that a translation preserves the meaning. Play the video with each SRT and review samples near the start, middle, and end. Listen for missed or invented words in the source transcript; then compare the source and translated cues for names, negation, pronouns, omissions, and sentences split across cues. For a reliable accuracy score, compare against a trusted human transcript or translation. The current Compose configuration runs Whisper on CPU with `int8`; LM Studio controls GPU use for translation separately.
+
 For logs:
 
 ```powershell

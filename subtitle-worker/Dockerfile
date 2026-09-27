@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY worker.py download_model.py ./
+COPY worker.py download_model.py validate_srt.py ./
 COPY web ./web
 
 ENV PYTHONUNBUFFERED=1 \

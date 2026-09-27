@@ -1,4 +1,5 @@
 import json
+import os
 import queue
 import tempfile
 import unittest
@@ -7,9 +8,20 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import worker
+import validate_srt
 
 
 class SubtitleStudioTests(unittest.TestCase):
+    def test_quality_tool_resolves_job_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = [{"id": "test123", "path": "film.mkv", "detected_language": "ja",
+                     "outputs": {"ja": {"path": str(root / "ja.srt")}, "en": {"path": str(root / "en.srt")}}}]
+            (root / "jobs.json").write_text(json.dumps(jobs), encoding="utf-8")
+            with patch.dict(os.environ, {"SUBTITLE_DATA_ROOT": str(root), "SUBTITLE_LIBRARY_ROOT": str(root)}):
+                target, source, video = validate_srt.paths_for_job("test123", "en")
+            self.assertEqual((target, source, video), (root / "en.srt", root / "ja.srt", root / "film.mkv"))
+
     def test_library_path_stays_inside_mount(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
