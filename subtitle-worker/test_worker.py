@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -105,8 +106,12 @@ class SubtitleStudioTests(unittest.TestCase):
             with patch.object(worker, "LIBRARY_ROOT", root), patch.object(worker, "DATA_ROOT", root), patch.object(worker, "JOBS_FILE", root / "jobs.json"), patch.object(worker, "probe_media", return_value={"tracks": [{"index": 2}], "duration": 30}):
                 with self.assertRaises(ValueError):
                     worker.create_job({"path": "film.mkv", "audio_stream_index": 0, "transcript": True})
+                with patch.object(worker, "supported_whisper_models", return_value=["medium", "small"]):
+                    with self.assertRaises(ValueError):
+                        worker.create_job({"path": "film.mkv", "audio_stream_index": 2, "transcript": True, "whisper_model": "invalid"})
                 job = worker.create_job({"path": "film.mkv", "audio_stream_index": 2, "transcript": True, "targets": ["fr"]})
                 self.assertEqual(job["status"], "queued")
+                self.assertEqual(job["whisper_model"], worker.WHISPER_NAME)
                 self.assertEqual(json.loads((root / "jobs.json").read_text())[0]["id"], job["id"])
                 worker.jobs.clear()
 
@@ -132,10 +137,11 @@ class SubtitleStudioTests(unittest.TestCase):
                   patch.object(worker, "get_speech_model", return_value=model) as load_model,
                   patch.object(worker, "request_translation", side_effect=translate)):
                 try:
-                    def submit(target):
+                    def submit(target, whisper_model="medium"):
                         job = worker.create_job({"path": "film.mkv", "audio_stream_index": 1,
                                                  "source_language": "auto", "transcript": False,
-                                                 "targets": [target], "model": "local-model"})
+                                                 "targets": [target], "model": "local-model",
+                                                 "whisper_model": whisper_model})
                         worker.run_job(job["id"])
                         return worker.jobs[job["id"]]
                     first = submit("en")
@@ -144,14 +150,20 @@ class SubtitleStudioTests(unittest.TestCase):
                     (root / "output" / "film.en.srt").write_text("changed export", encoding="utf-8")
                     second = submit("fr")
                     third = submit("en")
+                    with patch.object(worker, "supported_whisper_models", return_value=["medium", "small"]):
+                        fourth = submit("fr", "small")
                     self.assertEqual(first["status"], "completed")
                     self.assertEqual(second["status"], "completed")
                     self.assertEqual(third["status"], "completed")
-                    self.assertEqual(extract.call_count, 1)
-                    self.assertEqual(load_model.call_count, 1)
-                    self.assertEqual(translated_languages, ["en", "fr"])
+                    self.assertEqual(fourth["status"], "completed")
+                    self.assertEqual(extract.call_count, 2)
+                    self.assertEqual(load_model.call_count, 2)
+                    self.assertEqual(load_model.call_args_list[0].args, ("medium",))
+                    self.assertEqual(load_model.call_args_list[1].args, ("small",))
+                    self.assertEqual(translated_languages, ["en", "fr", "fr"])
                     self.assertIn("transcription", second["reused"])
                     self.assertIn("en", third["reused"])
+                    self.assertNotIn("transcription", fourth["reused"])
                     self.assertEqual(first_download.read_text(encoding="utf-8"), saved_english)
                     self.assertIn("fr:", (root / "output" / "film.fr.srt").read_text(encoding="utf-8"))
                 finally:
@@ -201,8 +213,9 @@ class SubtitleStudioTests(unittest.TestCase):
             root = Path(directory)
             media = root / "film.mkv"
             media.write_bytes(b"first")
-            job = {"path": "film.mkv", "audio_stream_index": 1, "audio_offset": 0, "source_language": "auto"}
+            job = {"path": "film.mkv", "audio_stream_index": 1, "audio_offset": 0, "source_language": "auto", "whisper_model": "medium"}
             first = worker.transcript_cache_key(job, media)
+            self.assertNotEqual(first, worker.transcript_cache_key({**job, "whisper_model": "small"}, media))
             media.write_bytes(b"second")
             self.assertNotEqual(first, worker.transcript_cache_key(job, media))
             cues = [{"start": 0, "end": 1, "text": "こんにちは"}]
@@ -210,6 +223,22 @@ class SubtitleStudioTests(unittest.TestCase):
                 worker.translation_cache_key(first, "ja", cues, "en", "model-a"),
                 worker.translation_cache_key(first, "ja", cues, "en", "model-b"),
             )
+
+    def test_whisper_model_switch_loads_selected_model_once(self):
+        loaded = []
+        def fake_model(name, **kwargs):
+            loaded.append(name)
+            return SimpleNamespace(name=name)
+        previous_model, previous_name = worker.speech_model, worker.speech_model_name
+        try:
+            worker.speech_model = worker.speech_model_name = None
+            with patch.dict(sys.modules, {"faster_whisper": SimpleNamespace(WhisperModel=fake_model)}), patch.object(worker, "WHISPER_LOCAL_ONLY", False):
+                self.assertEqual(worker.get_speech_model("medium").name, "medium")
+                self.assertEqual(worker.get_speech_model("small").name, "small")
+                self.assertEqual(worker.get_speech_model("small").name, "small")
+            self.assertEqual(loaded, ["medium", "small"])
+        finally:
+            worker.speech_model, worker.speech_model_name = previous_model, previous_name
 
 
 if __name__ == "__main__":
