@@ -157,13 +157,24 @@ def browse(relative):
     if not directory.is_dir():
         raise ValueError("Select a folder")
     entries = []
-    for child in directory.iterdir():
-        if child.name.startswith(".") or not (child.is_dir() or child.suffix.lower() in VIDEO_SUFFIXES):
-            continue
-        target = child.resolve()
-        if not within(target, LIBRARY_ROOT):
-            continue
-        entries.append({"name": child.name, "path": target.relative_to(LIBRARY_ROOT).as_posix(), "type": "folder" if child.is_dir() else "media"})
+    try:
+        children = directory.iterdir()
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            try:
+                is_folder = child.is_dir()
+                if not is_folder and (child.suffix.lower() not in VIDEO_SUFFIXES or not child.is_file()):
+                    continue
+                target = child.resolve()
+            except OSError:
+                # Drive roots include protected files such as pagefile.sys.
+                continue
+            if not within(target, LIBRARY_ROOT):
+                continue
+            entries.append({"name": child.name, "path": target.relative_to(LIBRARY_ROOT).as_posix(), "type": "folder" if is_folder else "media"})
+    except PermissionError as exc:
+        raise ValueError("This folder cannot be read by Subtitle Studio") from exc
     entries.sort(key=lambda x: (x["type"] != "folder", x["name"].casefold()))
     return {"path": relative, "entries": entries}
 

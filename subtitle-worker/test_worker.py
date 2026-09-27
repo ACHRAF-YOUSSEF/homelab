@@ -21,6 +21,21 @@ class SubtitleStudioTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         worker.resolve_media(invalid, True)
 
+    def test_library_skips_unreadable_system_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pagefile.sys").write_bytes(b"protected")
+            (root / "movie.mkv").write_bytes(b"media")
+            (root / "Movies").mkdir()
+            original_is_dir = Path.is_dir
+            def protected_is_dir(path):
+                if path.name == "pagefile.sys":
+                    raise PermissionError("protected system file")
+                return original_is_dir(path)
+            with patch.object(worker, "LIBRARY_ROOT", root), patch.object(Path, "is_dir", protected_is_dir):
+                names = [entry["name"] for entry in worker.browse("")["entries"]]
+            self.assertEqual(names, ["Movies", "movie.mkv"])
+
     def test_word_timing_and_srt(self):
         words = [SimpleNamespace(start=i * .5, end=(i + 1) * .5, word=" example") for i in range(16)]
         segment = SimpleNamespace(start=0, end=8, text="", words=words)
