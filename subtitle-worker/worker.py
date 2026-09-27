@@ -28,6 +28,8 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None
+WHISPER_LOCAL_FILES_ONLY = os.getenv("WHISPER_LOCAL_FILES_ONLY", "false").lower() in {"1", "true", "yes", "on"}
+WHISPER_CACHE_DIR = os.getenv("HF_HUB_CACHE", "/models/hub")
 AUDIO_TRACK = int(os.getenv("SUBTITLE_AUDIO_TRACK", "0"))
 LLM_PROVIDER = os.getenv("SUBTITLE_LLM_PROVIDER", "lmstudio").lower()
 LLM_BASE_URL = os.getenv("SUBTITLE_LLM_BASE_URL", "http://host.docker.internal:1234/v1").rstrip("/")
@@ -251,7 +253,10 @@ def transcribe(audio: Path, on_progress=None) -> list[dict]:
 
     global whisper_model
     if whisper_model is None:
-        whisper_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
+        whisper_model = WhisperModel(
+            WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE,
+            download_root=WHISPER_CACHE_DIR, local_files_only=WHISPER_LOCAL_FILES_ONLY,
+        )
     segments, _ = whisper_model.transcribe(
         str(audio), task="translate", language=WHISPER_LANGUAGE,
         beam_size=5, vad_filter=True, word_timestamps=True,

@@ -6,9 +6,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY worker.py .
+COPY worker.py download_model.py ./
 
 ENV PYTHONUNBUFFERED=1 \
-    HF_HOME=/models
+    HF_HOME=/models \
+    HF_HUB_CACHE=/models/hub
 EXPOSE 8099
 CMD ["python", "worker.py"]

@@ -1,22 +1,33 @@
 {
-  "name": "MKV path to English SRT (local AI)",
+  "name": "MKV path to English SRT (private manual run)",
   "nodes": [
     {
+      "parameters": {},
+      "id": "0a1be61e-4457-4275-94cb-1504a1639651",
+      "name": "When clicking Execute workflow",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
       "parameters": {
-        "authentication": "n8nUserAuth",
-        "requireExecuteAccess": true,
-        "formTitle": "Translate MKV audio to English subtitles",
-        "formDescription": "Enter an MKV path inside the configured subtitle source folder. The file stays on the host.",
-        "formFields": { "values": [{ "fieldLabel": "MKV file path", "placeholder": "D:\\subtitles\\input\\Movie.mkv", "requiredField": true }] },
-        "responseMode": "lastNode",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "77e68ec4-83b1-446d-a981-a661854e3580",
+              "name": "file_path",
+              "value": "D:\\subtitles\\input\\Movie.mkv",
+              "type": "string"
+            }
+          ]
+        },
         "options": {}
       },
-      "id": "0a1be61e-4457-4275-94cb-1504a1639651",
-      "name": "Enter MKV path",
-      "type": "n8n-nodes-base.formTrigger",
-      "typeVersion": 2.6,
-      "position": [240, 300],
-      "webhookId": "7671cdf9-c28d-45c1-951e-49565dc02253"
+      "id": "6433696b-709e-42d2-9dde-5b105cd46841",
+      "name": "Enter MKV file path",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [500, 300]
     },
     {
       "parameters": {
@@ -24,34 +35,19 @@
         "url": "http://subtitle-worker:8099/jobs",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ file_path: $json['MKV file path'] }) }}",
+        "jsonBody": "={{ JSON.stringify({ file_path: $json.file_path }) }}",
         "options": { "timeout": 30000 }
       },
       "id": "775b0139-f02e-40d9-a343-6345628da4e3",
       "name": "Start translation job",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [500, 300]
-    },
-    {
-      "parameters": {
-        "operation": "completion",
-        "respondWith": "text",
-        "completionTitle": "Translation queued",
-        "completionMessage": "={{ 'Job ID: ' + $json.id + '\\nStatus: ' + $json.status + '\\nUse the progress form to check this job. Output: ' + $json.expected_output }}",
-        "options": {}
-      },
-      "id": "c3a770df-76c8-423f-980a-9327c93082b6",
-      "name": "Show job ID",
-      "type": "n8n-nodes-base.form",
-      "typeVersion": 2.5,
-      "position": [760, 300],
-      "webhookId": "c402079a-310a-4929-a68b-040a438d71e3"
+      "position": [760, 300]
     }
   ],
   "connections": {
-    "Enter MKV path": { "main": [[{ "node": "Start translation job", "type": "main", "index": 0 }]] },
-    "Start translation job": { "main": [[{ "node": "Show job ID", "type": "main", "index": 0 }]] }
+    "When clicking Execute workflow": { "main": [[{ "node": "Enter MKV file path", "type": "main", "index": 0 }]] },
+    "Enter MKV file path": { "main": [[{ "node": "Start translation job", "type": "main", "index": 0 }]] }
   },
   "pinData": {},
   "settings": { "executionOrder": "v1" },

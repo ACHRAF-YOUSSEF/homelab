@@ -1,10 +1,11 @@
 # MKV audio to English SRT
 
-The path-input n8n workflow starts a job for an MKV file in a mounted source
+The private manual n8n workflow starts a job for an MKV file in a mounted source
 folder. A private worker extracts the first audio track with FFmpeg, translates
 speech to English with local Faster Whisper, edits the English with LM Studio,
-and writes a timed `.srt` file. A second workflow shows job progress. The video
-is never uploaded to n8n or a cloud API.
+and writes a timed `.srt` file. A second manual workflow checks job progress.
+Neither workflow needs publishing or a public form URL. The video is never
+uploaded to n8n or a cloud API.
 
 ## Setup
 
@@ -26,20 +27,44 @@ is never uploaded to n8n or a cloud API.
    recognition quality. `WHISPER_MODEL=large-v3` is better but needs more memory
    and is much slower on CPU.
 4. In n8n, import [`n8n-workflow.json`](n8n-workflow.json) and
-   [`n8n-progress-workflow.json`](n8n-progress-workflow.json). Publish both.
-   Their forms require a logged-in n8n user with execute permission.
-5. Open the first workflow's production form URL and enter an MKV file path,
-   for example `D:\subtitles\input\Movie.mkv` or `/source/Movie.mkv`. The file
-   must be inside `SUBTITLE_SOURCE_DIR`. The form returns a job ID. Open the
-   progress workflow's form URL, enter that ID, and submit it again whenever you
-   want an updated status. The output appears at
+   [`n8n-progress-workflow.json`](n8n-progress-workflow.json). Leave both
+   unpublished. Open **Enter MKV file path** in the first workflow and change
+   `file_path` to a path inside `SUBTITLE_SOURCE_DIR`, for example
+   `D:\subtitles\input\Movie.mkv` or `/source/Movie.mkv`. Click **Execute
+   workflow**. The **Start translation job** node returns a job ID.
+5. In the progress workflow, edit **Enter job ID**, paste that ID into `job_id`,
+   and click **Execute workflow**. The **Get job progress** output shows the
+   stage, estimated percentage, audio position, result, or error. Run it again
+   for a fresh status. The output SRT appears at
    `D:\subtitles\output\<name>.en.srt` by default.
 
-The original automatic folder scanner is still available as
-[`n8n-folder-scan.json`](n8n-folder-scan.json). It checks `input/` every minute
-and queues files only after their size stays unchanged across scans and their
-last modification is at least 90 seconds old. Its first scan may therefore
-show `submitted: []`. Use the path form to submit a completed file immediately.
+The older automatic scanner is still available as
+[`n8n-folder-scan.json`](n8n-folder-scan.json). Its schedule needs publishing
+to run automatically. Leave it unpublished if you want only manual runs.
+
+## Download Whisper models locally
+
+The worker's first use of a model downloads its Faster Whisper weights from
+Hugging Face into the persistent `subtitle_models` Docker volume. The volume
+is local to your Docker host and survives container rebuilds. If the currently
+running job finishes loading `medium`, that model is already cached.
+
+To download a model ahead of time, run this from the repository root **after
+any active job finishes**:
+
+```powershell
+docker compose build subtitle-worker
+docker compose run --rm --no-deps subtitle-worker python download_model.py medium
+```
+
+Replace `medium` with `small` or `large-v3` if desired. Set `WHISPER_MODEL` in
+the root `.env` to the model you downloaded. To require the worker to use only
+cached model files, set `WHISPER_LOCAL_FILES_ONLY=true` there, then recreate the
+worker with `docker compose up -d --build subtitle-worker`. If the selected
+model is absent, the job fails with a clear error instead of downloading it.
+Speech recognition and English proofreading then run locally; LM Studio must
+also have a local model loaded. For Japanese or other non-English audio, choose
+a multilingual model such as `medium` or `large-v3`, not an `.en` model.
 
 The output is UTF-8 SRT. FFmpeg preserves initial audio silence so timestamps
 remain relative to the video start. Whisper supplies segment and word timestamps;
@@ -53,6 +78,8 @@ and tunable values are listed in [`.env.example`](../.env.example).
 
 - `WHISPER_LANGUAGE=ja` gives Whisper a Japanese language hint. Leave it blank
   for automatic detection.
+- `WHISPER_MODEL=medium` selects the Faster Whisper model.
+- `WHISPER_LOCAL_FILES_ONLY=true` disables model downloads at job time.
 - `SUBTITLE_AUDIO_TRACK=0` selects the first audio track. Use `1` for the second,
   and so on. This is an index among audio tracks, not the global MKV stream ID.
 - `SUBTITLE_MIN_AGE_SECONDS=90` controls the minimum time since the file changed.
@@ -77,9 +104,10 @@ If a job fails, the worker writes
 file, and resubmit the path or let the next stable-file scan retry. Existing
 `.en.srt` files are not overwritten; remove an output file to reprocess its MKV.
 
-Rebuilding or recreating the worker interrupts any active job and clears its
-in-memory job IDs. Let an active translation finish before running Compose
-again, then import the updated forms. Completed SRT files remain on disk.
+Rebuilding the image is safe while a job runs, but recreating the worker
+interrupts the job and clears its in-memory job IDs. Let an active translation
+finish before running `docker compose up` again. Completed SRT files remain on
+disk.
 
 Speech recognition and machine translation can mishear names, music, overlapping
 speakers, or difficult accents. Review the result against the video before
