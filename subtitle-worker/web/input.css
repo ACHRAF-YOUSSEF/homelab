@@ -1,0 +1,14 @@
+@import "tailwindcss" source(none);
+
+@source "./index.html";
+@source "./app.js";
+
+@theme {
+  --color-canvas: #0c1017;
+  --color-surface: #121a24;
+  --color-stroke: #27333e;
+  --color-mint: #60dba7;
+  --color-copy: #ecf1f7;
+}
+
+[hidden] { display: none !important; }

@@ -611,9 +611,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
     def route_get(self, path, query):
-        if path in ("/", "/app.js"):
+        if path in ("/", "/app.js", "/app.css"):
             filename = "index.html" if path == "/" else path[1:]
-            content_type = "text/html; charset=utf-8" if filename.endswith("html") else "application/javascript; charset=utf-8"
+            content_type = {
+                "index.html": "text/html; charset=utf-8",
+                "app.js": "application/javascript; charset=utf-8",
+                "app.css": "text/css; charset=utf-8",
+            }[filename]
             return self.send_bytes((WEB_ROOT / filename).read_bytes(), content_type)
         if path == "/api/config":
             try:

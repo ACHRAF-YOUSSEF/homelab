@@ -1,0 +1,12 @@
+{
+  "name": "subtitle-studio-web",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -i ./web/input.css -o ./web/app.css --minify",
+    "watch:css": "tailwindcss -i ./web/input.css -o ./web/app.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.0.0",
+    "tailwindcss": "^4.0.0"
+  }
+}
