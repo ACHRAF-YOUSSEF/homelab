@@ -1,54 +1,59 @@
 {
-  "name": "MKV audio to English SRT (local AI)",
+  "name": "MKV path to English SRT (local AI)",
   "nodes": [
     {
       "parameters": {
-        "rule": {
-          "interval": [
-            {
-              "field": "minutes",
-              "minutesInterval": 1
-            }
-          ]
-        }
+        "authentication": "n8nUserAuth",
+        "requireExecuteAccess": true,
+        "formTitle": "Translate MKV audio to English subtitles",
+        "formDescription": "Enter an MKV path inside the configured subtitle source folder. The file stays on the host.",
+        "formFields": { "values": [{ "fieldLabel": "MKV file path", "placeholder": "D:\\subtitles\\input\\Movie.mkv", "requiredField": true }] },
+        "responseMode": "lastNode",
+        "options": {}
       },
-      "id": "7567fd46-373e-44d0-864c-90fa41c4ca61",
-      "name": "Every minute",
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
-      "position": [240, 300]
+      "id": "0a1be61e-4457-4275-94cb-1504a1639651",
+      "name": "Enter MKV path",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [240, 300],
+      "webhookId": "7671cdf9-c28d-45c1-951e-49565dc02253"
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "http://subtitle-worker:8099/scan",
-        "options": {
-          "timeout": 30000
-        }
+        "url": "http://subtitle-worker:8099/jobs",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ file_path: $json['MKV file path'] }) }}",
+        "options": { "timeout": 30000 }
       },
-      "id": "fb51a864-2b9b-489b-b6d7-55d0f4eeb608",
-      "name": "Queue stable MKV files",
+      "id": "775b0139-f02e-40d9-a343-6345628da4e3",
+      "name": "Start translation job",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "text",
+        "completionTitle": "Translation queued",
+        "completionMessage": "={{ 'Job ID: ' + $json.id + '\\nStatus: ' + $json.status + '\\nUse the progress form to check this job. Output: ' + $json.expected_output }}",
+        "options": {}
+      },
+      "id": "c3a770df-76c8-423f-980a-9327c93082b6",
+      "name": "Show job ID",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [760, 300],
+      "webhookId": "c402079a-310a-4929-a68b-040a438d71e3"
     }
   ],
   "connections": {
-    "Every minute": {
-      "main": [
-        [
-          {
-            "node": "Queue stable MKV files",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    }
+    "Enter MKV path": { "main": [[{ "node": "Start translation job", "type": "main", "index": 0 }]] },
+    "Start translation job": { "main": [[{ "node": "Show job ID", "type": "main", "index": 0 }]] }
   },
   "pinData": {},
-  "settings": {
-    "executionOrder": "v1"
-  },
+  "settings": { "executionOrder": "v1" },
   "active": false
 }

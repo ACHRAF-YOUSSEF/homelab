@@ -28,6 +28,8 @@ services:
     restart: unless-stopped
     environment:
       - SUBTITLE_MEDIA_ROOT=/media
+      - SUBTITLE_SOURCE_ROOT=/source
+      - SUBTITLE_SOURCE_HOST_DIR=${SUBTITLE_SOURCE_DIR:-D:/subtitles/input}
       - SUBTITLE_MIN_AGE_SECONDS=${SUBTITLE_MIN_AGE_SECONDS:-90}
       - SUBTITLE_AUDIO_TRACK=${SUBTITLE_AUDIO_TRACK:-0}
       - WHISPER_MODEL=${WHISPER_MODEL:-medium}
@@ -41,6 +43,7 @@ services:
       - host.docker.internal:host-gateway
     volumes:
       - ${SUBTITLE_MEDIA_DIR:-D:/subtitles}:/media
+      - ${SUBTITLE_SOURCE_DIR:-D:/subtitles/input}:/source:ro
       - subtitle_models:/models
     networks:
       - homelab

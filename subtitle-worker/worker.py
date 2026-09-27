@@ -13,13 +13,16 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 MEDIA_ROOT = Path(os.getenv("SUBTITLE_MEDIA_ROOT", "/media")).resolve()
 INPUT_DIR = MEDIA_ROOT / "input"
 OUTPUT_DIR = MEDIA_ROOT / "output"
+SOURCE_DIR = Path(os.getenv("SUBTITLE_SOURCE_ROOT", "/source")).resolve()
+SOURCE_HOST_DIR = PureWindowsPath(os.getenv("SUBTITLE_SOURCE_HOST_DIR", "D:/subtitles/input"))
 MIN_AGE_SECONDS = int(os.getenv("SUBTITLE_MIN_AGE_SECONDS", "90"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
@@ -36,6 +39,41 @@ seen: dict[str, tuple[int, int]] = {}
 pending: queue.Queue[tuple[str, Path]] = queue.Queue()
 lock = threading.Lock()
 whisper_model = None
+
+
+def update_job(job_id: str, stage: str, percent: int, **details) -> None:
+    percent = max(0, min(100, int(percent)))
+    with lock:
+        job = jobs[job_id]
+        previous_stage = job.get("stage")
+        previous_percent = job.get("progress_percent", 0)
+        job.update(stage=stage, progress_percent=max(previous_percent, percent), **details)
+    if stage != previous_stage or percent >= previous_percent + 5:
+        print(f"{job['filename']}: {stage} {percent}%", flush=True)
+
+
+def resolve_source(raw_path: str) -> Path:
+    """Accept a Windows host path under the configured source root or /source."""
+    if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+        raise ValueError("file_path is required")
+    raw_path = raw_path.strip()
+    if re.match(r"^[A-Za-z]:[\\/]", raw_path):
+        try:
+            relative = PureWindowsPath(raw_path).relative_to(SOURCE_HOST_DIR)
+        except ValueError as error:
+            raise ValueError(f"Path must be inside {SOURCE_HOST_DIR}") from error
+        source = SOURCE_DIR.joinpath(*relative.parts)
+    else:
+        source = Path(raw_path)
+        if not source.is_absolute():
+            source = SOURCE_DIR / source
+    root = SOURCE_DIR.resolve()
+    source = source.resolve()
+    if not source.is_relative_to(root) or source == root:
+        raise ValueError(f"Path must be inside {SOURCE_HOST_DIR} (container: {root})")
+    if source.suffix.lower() != ".mkv" or not source.is_file():
+        raise ValueError("Path must name an existing MKV file")
+    return source
 
 
 def stamp(seconds: float) -> str:
@@ -163,7 +201,7 @@ def model_name() -> str:
     return models[0]["id"]
 
 
-def polish(cues: list[dict]) -> None:
+def polish(cues: list[dict], on_progress=None) -> None:
     if LLM_PROVIDER not in {"lmstudio", "openai"}:
         raise RuntimeError("SUBTITLE_LLM_PROVIDER must be lmstudio or openai")
     if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
@@ -204,9 +242,11 @@ def polish(cues: list[dict]) -> None:
                     raise RuntimeError(f"Language model returned invalid subtitle JSON: {error}") from error
         for cue, item in zip(batch, edited):
             cue["text"] = clean_text(item["text"])
+        if on_progress:
+            on_progress(min(len(cues), offset + len(batch)), len(cues))
 
 
-def transcribe(audio: Path) -> list[dict]:
+def transcribe(audio: Path, on_progress=None) -> list[dict]:
     from faster_whisper import WhisperModel
 
     global whisper_model
@@ -217,7 +257,12 @@ def transcribe(audio: Path) -> list[dict]:
         beam_size=5, vad_filter=True, word_timestamps=True,
         condition_on_previous_text=False,
     )
-    cues = normalize_cues([cue for segment in segments for cue in split_segment(segment)])
+    cues = []
+    for segment in segments:
+        cues.extend(split_segment(segment))
+        if on_progress:
+            on_progress(float(segment.end), len(cues))
+    cues = normalize_cues(cues)
     if not cues:
         raise RuntimeError("No speech was detected in the selected audio track")
     return cues
@@ -228,23 +273,37 @@ def process_job(job_id: str, source: Path) -> None:
     error_file = OUTPUT_DIR / f"{source.stem}.en.error.txt"
     with tempfile.TemporaryDirectory(prefix="subtitle-") as directory:
         audio = Path(directory) / "audio.wav"
+        update_job(job_id, "extracting_audio", 2)
         extract_audio(source, audio)
-        cues = transcribe(audio)
-        polish(cues)
+        with wave.open(str(audio), "rb") as wave_file:
+            duration = wave_file.getnframes() / wave_file.getframerate()
+        update_job(job_id, "loading_speech_model", 10, duration_seconds=round(duration, 2))
+
+        def transcription_progress(position: float, count: int) -> None:
+            fraction = min(1.0, max(0.0, position / duration)) if duration else 0.0
+            update_job(
+                job_id, "transcribing", 10 + int(70 * fraction),
+                media_position_seconds=round(position, 2), cue_count=count,
+            )
+
+        cues = transcribe(audio, transcription_progress)
+        update_job(job_id, "proofreading", 80, cue_count=len(cues))
+        polish(cues, lambda finished, total: update_job(job_id, "proofreading", 80 + int(18 * finished / total), edited_cues=finished))
+        update_job(job_id, "writing_srt", 99)
         text = render_srt(cues)
         temporary_output = output.with_suffix(".srt.tmp")
         temporary_output.write_text(text, encoding="utf-8")
         temporary_output.replace(output)
     error_file.unlink(missing_ok=True)
     with lock:
-        jobs[job_id].update(status="completed", output=str(output), cue_count=len(cues), finished_at=time.time())
+        jobs[job_id].update(status="completed", stage="completed", progress_percent=100, output=str(output), cue_count=len(cues), finished_at=time.time())
 
 
 def run_jobs() -> None:
     while True:
         job_id, source = pending.get()
         with lock:
-            jobs[job_id]["status"] = "running"
+            jobs[job_id].update(status="running", started_at=time.time())
         try:
             print(f"Processing {source.name}", flush=True)
             process_job(job_id, source)
@@ -257,9 +316,36 @@ def run_jobs() -> None:
                 pass
             print(f"Failed {source.name}: {error}", flush=True)
             with lock:
-                jobs[job_id].update(status="failed", error=str(error), finished_at=time.time())
+                jobs[job_id].update(status="failed", stage="failed", error=str(error), finished_at=time.time())
         finally:
             pending.task_done()
+
+
+def enqueue_source(source: Path) -> dict:
+    stat = source.stat()
+    signature = (stat.st_size, stat.st_mtime_ns)
+    with lock:
+        existing = next((job for job in jobs.values() if job["filename"] == source.name and job["signature"] == signature and job["status"] in {"queued", "running"}), None)
+        if existing:
+            return existing.copy()
+        output = OUTPUT_DIR / f"{source.stem}.en.srt"
+        if output.exists():
+            raise FileExistsError(f"Output already exists: {output}. Remove it to reprocess.")
+        job_id = uuid.uuid4().hex
+        job = {
+            "id": job_id,
+            "filename": source.name,
+            "input": str(source),
+            "signature": signature,
+            "status": "queued",
+            "stage": "queued",
+            "progress_percent": 0,
+            "expected_output": str(output),
+            "created_at": time.time(),
+        }
+        jobs[job_id] = job
+    pending.put((job_id, source))
+    return job.copy()
 
 
 def scan() -> list[dict]:
@@ -278,11 +364,11 @@ def scan() -> list[dict]:
             existing = next((job for job in jobs.values() if job["filename"] == key and job["signature"] == signature and job["status"] in {"queued", "running"}), None)
             if previous != signature or time.time() - stat.st_mtime < MIN_AGE_SECONDS or output.exists() or error_file.exists() or existing:
                 continue
-            job_id = uuid.uuid4().hex
-            job = {"id": job_id, "filename": key, "signature": signature, "status": "queued", "created_at": time.time()}
-            jobs[job_id] = job
-        pending.put((job_id, source))
-        submitted.append({"id": job_id, "filename": key})
+        try:
+            job = enqueue_source(source)
+            submitted.append({"id": job["id"], "filename": key})
+        except FileExistsError:
+            continue
     return submitted
 
 
@@ -300,22 +386,38 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, {"status": "ok"})
         if self.path == "/jobs":
             with lock:
-                return self.reply(200, {"jobs": list(jobs.values())[-100:]})
+                recent = [job.copy() for job in list(jobs.values())[-100:]]
+            return self.reply(200, {"jobs": recent})
         if self.path.startswith("/jobs/"):
             with lock:
                 job = jobs.get(self.path[len("/jobs/"):])
-                return self.reply(200 if job else 404, job or {"error": "Job not found"})
+                result = job.copy() if job else None
+            return self.reply(200 if result else 404, result or {"error": "Job not found"})
         self.reply(404, {"error": "Not found"})
 
     def do_POST(self) -> None:
-        if self.path != "/scan":
+        if self.path == "/scan":
+            return self.reply(200, {"submitted": scan()})
+        if self.path != "/jobs":
             return self.reply(404, {"error": "Not found"})
-        self.reply(200, {"submitted": scan()})
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if size <= 0 or size > 8192:
+                raise ValueError("Expected a small JSON body with file_path")
+            body = json.loads(self.rfile.read(size))
+            source = resolve_source(body.get("file_path"))
+            job = enqueue_source(source)
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            return self.reply(400, {"error": str(error)})
+        except FileExistsError as error:
+            return self.reply(409, {"error": str(error)})
+        self.reply(202, job)
 
 
 def main() -> None:
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=run_jobs, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8099), Handler).serve_forever()
 

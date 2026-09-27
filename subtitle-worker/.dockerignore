@@ -3,3 +3,5 @@ __pycache__/
 test_worker.py
 README.md
 n8n-workflow.json
+n8n-progress-workflow.json
+n8n-folder-scan.json

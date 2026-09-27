@@ -2,7 +2,7 @@ import os
 import tempfile
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -64,6 +64,31 @@ class SubtitleWorkerTests(unittest.TestCase):
         with patch.object(worker, "request_json", side_effect=fake_request):
             worker.polish(cues)
         self.assertEqual(cues, [{"start": 1.25, "end": 2.75, "text": "He went home."}])
+
+    def test_windows_path_maps_only_inside_mounted_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "Movie.mkv"
+            source.write_bytes(b"fixture")
+            with patch.object(worker, "SOURCE_DIR", Path(directory)), patch.object(worker, "SOURCE_HOST_DIR", PureWindowsPath("D:/subtitles/input")):
+                self.assertEqual(worker.resolve_source(r"D:\subtitles\input\Movie.mkv"), source)
+                with self.assertRaises(ValueError):
+                    worker.resolve_source(r"D:\film\Movie.mkv")
+                with self.assertRaises(ValueError):
+                    worker.resolve_source(r"D:\subtitles\input\..\..\secret.mkv")
+
+    def test_progress_and_duplicate_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "Movie.mkv"
+            source.write_bytes(b"fixture")
+            with patch.object(worker, "OUTPUT_DIR", root):
+                worker.jobs.clear()
+                first = worker.enqueue_source(source)
+                second = worker.enqueue_source(source)
+                self.assertEqual(first["id"], second["id"])
+                worker.update_job(first["id"], "transcribing", 55, media_position_seconds=33)
+                self.assertEqual(worker.jobs[first["id"]]["progress_percent"], 55)
+                self.assertEqual(worker.jobs[first["id"]]["media_position_seconds"], 33)
 
 
 if __name__ == "__main__":

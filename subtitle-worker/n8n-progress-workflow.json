@@ -1,0 +1,55 @@
+{
+  "name": "MKV subtitle translation progress",
+  "nodes": [
+    {
+      "parameters": {
+        "authentication": "n8nUserAuth",
+        "requireExecuteAccess": true,
+        "formTitle": "Check subtitle translation progress",
+        "formDescription": "Enter the Job ID returned by the MKV translation form.",
+        "formFields": { "values": [{ "fieldLabel": "Job ID", "requiredField": true }] },
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "3169189e-4b54-43cc-9704-2cb41907511d",
+      "name": "Enter job ID",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [240, 300],
+      "webhookId": "7656f78b-8641-446c-a0cd-35c7016d3913"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'http://subtitle-worker:8099/jobs/' + encodeURIComponent($json['Job ID']) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "99558672-93ef-4f6e-b007-c0888c64f1b2",
+      "name": "Get job progress",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "text",
+        "completionTitle": "Translation progress",
+        "completionMessage": "={{ 'File: ' + $json.filename + '\\nStatus: ' + $json.status + '\\nStage: ' + ($json.stage || $json.status) + '\\nProgress: ' + ($json.progress_percent === undefined ? 'unavailable on the previous worker' : $json.progress_percent + '%') + ($json.duration_seconds ? '\\nAudio position: ' + ($json.media_position_seconds || 0) + ' / ' + $json.duration_seconds + ' seconds' : '') + ($json.output ? '\\nSRT: ' + $json.output : '') + ($json.error ? '\\nError: ' + $json.error : '') }}",
+        "options": {}
+      },
+      "id": "4b21287a-c693-4717-a694-3d3bab1a8356",
+      "name": "Show progress",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [760, 300],
+      "webhookId": "1bcc2e45-c080-4f71-a88f-6210a39c82cc"
+    }
+  ],
+  "connections": {
+    "Enter job ID": { "main": [[{ "node": "Get job progress", "type": "main", "index": 0 }]] },
+    "Get job progress": { "main": [[{ "node": "Show progress", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "settings": { "executionOrder": "v1" },
+  "active": false
+}
