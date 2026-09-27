@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+test_worker.py
+README.md
+n8n-workflow.json

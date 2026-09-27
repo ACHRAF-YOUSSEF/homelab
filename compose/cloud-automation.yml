@@ -18,3 +18,32 @@ services:
       - ../n8n/n8n_data:/home/node/.n8n
     networks:
       - homelab
+
+  # Local MKV audio translation worker; called by the imported n8n workflow.
+  subtitle-worker:
+    build:
+      context: ../subtitle-worker
+    container_name: subtitle-worker
+    mem_limit: 6g
+    restart: unless-stopped
+    environment:
+      - SUBTITLE_MEDIA_ROOT=/media
+      - SUBTITLE_MIN_AGE_SECONDS=${SUBTITLE_MIN_AGE_SECONDS:-90}
+      - SUBTITLE_AUDIO_TRACK=${SUBTITLE_AUDIO_TRACK:-0}
+      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-}
+      - SUBTITLE_LLM_PROVIDER=lmstudio
+      - SUBTITLE_LLM_BASE_URL=${SUBTITLE_LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+      - SUBTITLE_LLM_MODEL=${SUBTITLE_LLM_MODEL:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ${SUBTITLE_MEDIA_DIR:-D:/subtitles}:/media
+      - subtitle_models:/models
+    networks:
+      - homelab
+
+volumes:
+  subtitle_models:
