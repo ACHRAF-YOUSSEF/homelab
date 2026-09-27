@@ -157,7 +157,7 @@ def create_job(payload):
         raise ValueError("Invalid LM Studio model")
     metadata = probe_media(media)
     index = payload.get("audio_stream_index")
-    if not isinstance(index, int) or index not in [track["index"] for track in metadata["tracks"]]:
+    if type(index) is not int or index not in [track["index"] for track in metadata["tracks"]]:
         raise ValueError("Select an audio track from this file")
     job_id = uuid.uuid4().hex[:12]
     selected_track = next(track for track in metadata["tracks"] if track["index"] == index)
@@ -238,7 +238,7 @@ def make_cues(segments):
 def wrap_subtitle(text, width=42):
     words = normalize_text(text).split(" ")
     if len(words) == 1:
-        return words[0]
+        return "\n".join(words[0][i:i + width] for i in range(0, len(words[0]), width))
     lines = []
     line = ""
     for word in words:

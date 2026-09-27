@@ -29,6 +29,13 @@ class SubtitleStudioTests(unittest.TestCase):
         self.assertEqual(cues[-1]["end"], 8)
         self.assertTrue(all(cues[i]["end"] <= cues[i + 1]["start"] for i in range(len(cues)-1)))
         self.assertIn("00:00:00,000 -->", worker.render_srt(cues))
+        self.assertIn("\n", worker.wrap_subtitle("語" * 80))
+
+    def test_probe_preserves_audio_start_offset(self):
+        fixture = {"format": {"duration": "10", "start_time": "0"}, "streams": [{"index": 2, "codec_type": "audio", "start_time": "1.5", "codec_name": "aac", "tags": {"language": "jpn"}}]}
+        with patch.object(worker.subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(fixture))):
+            result = worker.probe_media(Path("film.mkv"))
+        self.assertEqual(result["tracks"][0]["offset"], 1.5)
 
     def test_translation_preserves_cue_count_and_order(self):
         class Reply:
