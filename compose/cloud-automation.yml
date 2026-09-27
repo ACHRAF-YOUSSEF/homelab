@@ -25,6 +25,13 @@ services:
       context: ../subtitle-worker
     container_name: subtitle-worker
     mem_limit: 6g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     ports:
       - "${SUBTITLE_BIND_ADDRESS:-127.0.0.1}:8099:8099"
@@ -34,8 +41,8 @@ services:
       - SUBTITLE_DATA_ROOT=/data
       - WHISPER_MODEL=${WHISPER_MODEL:-medium}
       - WHISPER_LOCAL_FILES_ONLY=${WHISPER_LOCAL_FILES_ONLY:-false}
-      - WHISPER_DEVICE=cpu
-      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=int8_float16
       - SUBTITLE_LLM_BASE_URL=${SUBTITLE_LLM_BASE_URL:-http://host.docker.internal:1234/v1}
       - SUBTITLE_LLM_MODEL=${SUBTITLE_LLM_MODEL:-}
       - SUBTITLE_LLM_TIMEOUT=${SUBTITLE_LLM_TIMEOUT:-600}

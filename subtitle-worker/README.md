@@ -21,9 +21,23 @@ Run from the repository root:
 docker compose up -d --build subtitle-worker
 ```
 
+Docker Desktop on Windows needs the WSL 2 backend with NVIDIA GPU support. Verify the container can see the GPU after it starts:
+
+```powershell
+docker compose exec subtitle-worker python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"
+```
+
+The command should print `1` for the configured single GPU. To confirm that Whisper itself loads on CUDA, run:
+
+```powershell
+docker compose exec subtitle-worker python -c "from faster_whisper import WhisperModel; WhisperModel('medium', device='cuda', compute_type='int8_float16', download_root='/models', local_files_only=True); print('Whisper loaded on CUDA')"
+```
+
+The first model load needs free GPU memory. Already cached transcripts will be reused, so choose a video without a cached transcript to measure transcription speed.
+
 Open <http://localhost:8099>. The media library is a read-only mount of `SUBTITLE_LIBRARY_DIR`. Choose a video, an audio track, the source language (or auto), whether to save its transcript, and any target languages. Select a model loaded in LM Studio, then create the job. The Jobs panel displays progress and download links. Completed SRT files are also saved under `SUBTITLE_MEDIA_DIR/output`, mirroring the source media folder structure. The UI only binds to localhost by default. For access from another device on your LAN, set `SUBTITLE_BIND_ADDRESS` to your computer's LAN IP address and restart this service.
 
-LM Studio's local server must be running with an instruction model available for translation. The selector displays IDs returned by its `/v1/models` endpoint; with just-in-time loading enabled, that endpoint can list downloaded models that are not yet in memory. If `SUBTITLE_LLM_MODEL` is set, that model is selected by default; otherwise the first available model is selected. Whisper uses CPU by default, while LM Studio may use your GPU. For a 12 GB GPU, Gemma 4 12B Instruct Q4_K_M is a practical general model. Larger models that spill into system RAM can be substantially slower.
+LM Studio's local server must be running with an instruction model available for translation. The selector displays IDs returned by its `/v1/models` endpoint; with just-in-time loading enabled, that endpoint can list downloaded models that are not yet in memory. If `SUBTITLE_LLM_MODEL` is set, that model is selected by default; otherwise the first available model is selected. Whisper runs on the NVIDIA GPU with `int8_float16`; LM Studio also uses the GPU for translation. On a 12 GB GPU, unload large LM Studio models before starting a new transcription if VRAM is tight. For translation, a 12B Q4_K_M model is a practical general choice; larger models that spill into system RAM can be substantially slower.
 
 TranslateGemma 12B is supported through a separate adapter: it uses Google's language-specific template through LM Studio's raw `/v1/completions` endpoint and translates one timed cue per request. This preserves SRT boundaries but may take longer than the eight-cue batches used for general models. On a 12 GB GPU, try Q5_K_M with a 2,048-token context for quality; use Q4_K_M if GPU memory is tight. Q8_0 exceeds 12 GB. The adapter has unit coverage, but it needs a live test once you download and load TranslateGemma in LM Studio.
 
@@ -55,7 +69,7 @@ After rebuilding the container, run the built-in validator from the repository r
 docker compose exec subtitle-worker python validate_srt.py --job-id 2ced752ce1c9 --target-language en
 ```
 
-It checks SRT structure, chronological timestamps, video duration, source/translation cue alignment, and flags subtitles that may be too brief, too long, or too dense to read. It cannot prove the speech was recognized correctly or that a translation preserves the meaning. Play the video with each SRT and review samples near the start, middle, and end. Listen for missed or invented words in the source transcript; then compare the source and translated cues for names, negation, pronouns, omissions, and sentences split across cues. For a reliable accuracy score, compare against a trusted human transcript or translation. The current Compose configuration runs Whisper on CPU with `int8`; LM Studio controls GPU use for translation separately.
+It checks SRT structure, chronological timestamps, video duration, source/translation cue alignment, and flags subtitles that may be too brief, too long, or too dense to read. It cannot prove the speech was recognized correctly or that a translation preserves the meaning. Play the video with each SRT and review samples near the start, middle, and end. Listen for missed or invented words in the source transcript; then compare the source and translated cues for names, negation, pronouns, omissions, and sentences split across cues. For a reliable accuracy score, compare against a trusted human transcript or translation. The current Compose configuration runs Whisper on the NVIDIA GPU with `int8_float16`; LM Studio controls GPU use for translation separately.
 
 For logs:
 
