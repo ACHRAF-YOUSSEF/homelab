@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/app.css">
 </head>
 <body class="min-h-screen bg-canvas bg-[radial-gradient(circle_at_78%_-10%,#18283b_0%,transparent_38%)] font-sans text-copy [color-scheme:dark]">
-  <header class="flex h-[72px] items-center justify-between border-b border-[#26313d] bg-[#0e141cdb] px-[max(3vw,24px)] max-[720px]:px-[15px]">
+  <header class="sticky top-0 z-50 flex h-[72px] items-center justify-between border-b border-[#26313d] bg-[#0e141cdb] px-[max(3vw,24px)] backdrop-blur-md max-[720px]:px-[15px]">
     <div class="flex items-center gap-3 text-lg tracking-[-0.04em]">
       <span class="grid h-[34px] w-[34px] place-items-center rounded-[9px] bg-[#48cfa2] text-[21px] font-black text-[#0c221a]">S</span>
       <span>Subtitle <b class="text-[#7ce3bf]">Studio</b></span>
@@ -24,10 +24,6 @@
         <p class="mb-[11px] text-[11px] font-extrabold tracking-[0.16em] text-[#70d6b0]">MEDIA TRANSLATION</p>
         <h1 class="mb-3 text-[40px] leading-[1.1] font-bold tracking-[-0.05em] max-[720px]:text-[32px]">Create subtitles</h1>
         <p class="max-w-[620px] leading-normal text-[#9baab9]">Choose a video, pick its audio track, and export timed subtitles in the languages you need.</p>
-      </div>
-      <div class="flex min-w-[170px] flex-col gap-1 rounded-xl border border-[#263642] bg-[#131c27] px-[17px] py-3">
-        <span class="text-[10px] font-bold tracking-[0.12em] text-[#8291a0]">TRANSCRIPTION ENGINE</span>
-        <strong id="whisper-model" class="text-sm">Whisper</strong>
       </div>
     </div>
 

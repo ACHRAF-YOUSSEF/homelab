@@ -53,7 +53,6 @@ function libraryClasses(selected) {
 
 function updateWhisperSelection() {
   const selected = $('whisper-select').value;
-  $('whisper-model').textContent = `Whisper ${selected}`;
   const downloaded = state.whisperModels.get(selected);
   const availability = state.whisperLocalOnly && !downloaded
     ? `Not downloaded locally. Run: docker compose run --rm subtitle-worker python download_model.py ${selected}`
