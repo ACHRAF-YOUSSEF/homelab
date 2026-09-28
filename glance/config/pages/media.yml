@@ -70,6 +70,10 @@
               url: ${HOMELAB_URL}:6767
               check-url: http://bazarr:6767
               icon: sh:bazarr
+            - title: Subtitle Studio
+              url: ${HOMELAB_URL}:8099
+              check-url: http://subtitle-worker:8099
+              icon: /assets/subtitle-studio.svg
             - title: Prowlarr
               url: ${HOMELAB_URL}:9696
               check-url: http://prowlarr:9696
@@ -120,6 +124,10 @@
                 - title: Bazarr
                   url: ${HOMELAB_URL}:6767
                   icon: sh:bazarr
+                - title: Subtitle Studio
+                  description: Transcribe and translate subtitles
+                  url: ${HOMELAB_URL}:8099
+                  icon: /assets/subtitle-studio.svg
                 - title: Prowlarr
                   url: ${HOMELAB_URL}:9696
                   icon: sh:prowlarr

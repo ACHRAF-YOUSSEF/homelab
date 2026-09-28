@@ -172,6 +172,11 @@
               name: Stirling PDF
               icon: sh:stirling-pdf
               url: ${HOMELAB_URL}:48537
+            subtitle-worker:
+              name: Subtitle Studio
+              description: Local subtitle transcription and translation
+              icon: /assets/subtitle-studio.svg
+              url: ${HOMELAB_URL}:8099
             tdarr:
               name: Tdarr
               icon: sh:tdarr.png
