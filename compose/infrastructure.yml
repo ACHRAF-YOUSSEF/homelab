@@ -71,6 +71,28 @@ services:
       - docker-proxy
     networks:
       - homelab
+  
+  # Multiplexer listening on public port 443
+  sslh:
+    image: oorabona/sslh:latest
+    container_name: sslh
+    mem_limit: 128m
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "443:443"
+    command:
+      - "--foreground"
+      - "--listen=0.0.0.0:443"
+      # Forward web/HTTPS traffic to NPM container on internal port 443
+      - "--tls=nginx-proxy-manager:443"
+      # Forward OpenVPN traffic to your TP-Link router's gateway IP (adjust IP if needed)
+      - "--openvpn=192.168.0.1:8443"
+    restart: unless-stopped
+    depends_on:
+      - nginx-proxy-manager
+    networks:
+      - homelab
 
   # Reverse proxy to manage and route traffic to different services
   nginx-proxy-manager:
@@ -84,7 +106,7 @@ services:
     ports:
       - 80:80
       - 81:81
-      - 443:443
+      - 4443:443
     volumes:
       - ../nginx-proxy-manager/data:/data
       - ../nginx-proxy-manager/letsencrypt:/etc/letsencrypt
