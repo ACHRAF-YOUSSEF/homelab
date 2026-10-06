@@ -1,4 +1,4 @@
-const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', jobPage: 1, jobPageSize: 5, jobTotal: 0, jobTotalAll: 0, jobPageCount: 1, jobsLoading: true, workspaceTab: 'library', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', modelThinking: {}, thinkingError: '', openReviews: new Set(), openSteps: new Set(), pendingReviews: new Set(), pendingStepActions: new Set(), jobActionFeedback: new Map(), reviewingMissing: false };
+const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', jobPage: 1, jobPageSize: 5, jobTotal: 0, jobTotalAll: 0, jobPageCount: 1, jobsLoading: true, workspaceTab: 'library', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', modelThinking: {}, thinkingError: '', openJobs: new Set(), openReviews: new Set(), openSteps: new Set(), pendingReviews: new Set(), pendingStepActions: new Set(), jobActionFeedback: new Map(), reviewingMissing: false };
 const $ = id => document.getElementById(id);
 
 const ui = {
@@ -7,7 +7,7 @@ const ui = {
   divider: 'text-[#526474]',
   library: 'flex w-full cursor-pointer items-center gap-3 rounded-[9px] border p-3 text-left text-[13px] text-[#dbe6ec] hover:bg-[#1c2a36] focus-visible:outline-2 focus-visible:outline-mint',
   language: 'cursor-pointer rounded-lg border px-[5px] py-[10px] text-xs font-bold hover:border-[#5a927c] focus-visible:outline-2 focus-visible:outline-mint',
-  job: 'mb-[10px] rounded-[11px] border border-[#2b3a45] bg-[#16212b] px-[14px] py-[15px]',
+  job: 'mb-[10px] rounded-[11px] border border-[#2b3a45] bg-[#16212b]',
   stage: 'mt-[10px] mb-2 text-[11px] text-[#91a3af]',
   badge: 'whitespace-nowrap rounded-[5px] px-[7px] py-[5px] text-[10px] uppercase tracking-[0.08em]',
 };
@@ -779,8 +779,26 @@ function renderQuality(card, job) {
   card.append(section);
 }
 
+function rememberJobDisclosure(card) {
+  // Native toggle events are queued; an old detached card cannot change new state.
+  if (!card.isConnected) return;
+  if (card.open) state.openJobs.add(card.dataset.jobId);
+  else state.openJobs.delete(card.dataset.jobId);
+}
+
+function jobSummaryActivity(job) {
+  const active = ['queued', 'running', 'cancelling'];
+  if (active.includes(job.step_task?.status)) return { ...job.step_task, label: 'Step retry' };
+  if (active.includes(job.review_task?.status)) return { ...job.review_task, label: job.review_task.force ? 'Re-review' : 'Translation review' };
+  return job;
+}
+
 function renderJobs() {
   const scrollTop = $('jobs-content').scrollTop;
+  const activeElement = document.activeElement;
+  const focusedJobId = activeElement?.classList?.contains('job-summary')
+    ? activeElement.parentElement?.dataset.jobId : null;
+  let focusedSummary = null;
   for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
     const selected = button.dataset.jobFilter === state.jobFilter;
     button.className = filterClasses(selected);
@@ -788,6 +806,8 @@ function renderJobs() {
   }
   renderJobsPagination();
   const list = $('jobs-list');
+  // Capture native state before replacing cards, even if their toggle is pending.
+  for (const card of list.querySelectorAll(':scope > details.job-card')) rememberJobDisclosure(card);
   list.replaceChildren();
   // Status filtering happens before pagination on the server, across all history.
   const visibleJobs = state.jobs;
@@ -807,23 +827,39 @@ function renderJobs() {
     return;
   }
   for (const job of visibleJobs) {
-    const card = element('div', `${ui.job}${previousVisible.has(job.id) ? '' : ' ui-enter'}`);
+    const card = element('details', `${ui.job} job-card${previousVisible.has(job.id) ? '' : ' ui-enter'}`);
+    card.dataset.jobId = job.id;
+    card.open = state.openJobs.has(job.id);
+    card.addEventListener('toggle', event => {
+      if (event.target === card) rememberJobDisclosure(card);
+    });
+    const summary = element('summary', 'job-summary');
+    if (job.id === focusedJobId) focusedSummary = summary;
+    const activity = jobSummaryActivity(job);
     const top = element('div', 'flex items-center justify-between gap-[10px]');
+    const name = element('div', 'min-w-0 flex-1 truncate text-xs font-bold', job.filename);
+    name.title = job.filename;
+    const chevron = element('span', 'job-chevron');
+    chevron.setAttribute('aria-hidden', 'true');
     top.append(
-      element('div', 'min-w-0 truncate text-xs font-bold', job.filename),
-      element('span', badgeClasses(job.status), job.status),
+      name,
+      element('span', badgeClasses(activity.status), activity.status),
+      chevron,
     );
-    card.append(top);
-    if (job.whisper_model) card.append(element('div', 'mt-[5px] text-[11px] text-[#91a3af]', `Whisper ${job.whisper_model}`));
-    if (typeof job.translation_thinking === 'boolean') card.append(element('div', 'mt-[5px] text-[11px] text-[#91a3af]', `Translation thinking ${job.translation_thinking ? 'on' : 'off'}`));
-    let stage = job.stage;
-    if (job.status === 'running' && job.stage === 'Transcribing' && job.duration) {
+    summary.append(top);
+    let stage = activity.stage;
+    if (activity.label) stage = `${activity.label} · ${stage}`;
+    if (activity === job && job.status === 'running' && job.stage === 'Transcribing' && job.duration) {
       stage += ` · ${seconds(job.position)} / ${seconds(job.duration)}`;
     }
-    card.append(element('div', ui.stage, `${stage} · ${job.progress}%`));
-    card.append(renderProgress(`${job.id}:job`, job.progress, job.status, `${job.filename} job progress`));
-    if (job.reused?.length) card.append(element('div', ui.stage, `Reused: ${job.reused.join(', ')}`));
-    if (job.error) card.append(element('div', 'mt-[9px] text-[11px] leading-[1.4] text-[#ffafaa]', job.error));
+    summary.append(element('div', ui.stage, `${stage} · ${activity.progress}%`));
+    summary.append(renderProgress(`${job.id}:job`, activity.progress, activity.status, `${job.filename} job progress`));
+    card.append(summary);
+    const body = element('div', 'job-body');
+    if (job.whisper_model) body.append(element('div', 'text-[11px] text-[#91a3af]', `Whisper ${job.whisper_model}`));
+    if (typeof job.translation_thinking === 'boolean') body.append(element('div', 'mt-[5px] text-[11px] text-[#91a3af]', `Translation thinking ${job.translation_thinking ? 'on' : 'off'}`));
+    if (job.reused?.length) body.append(element('div', ui.stage, `Reused: ${job.reused.join(', ')}`));
+    if (job.error) body.append(element('div', 'mt-[9px] text-[11px] leading-[1.4] text-[#ffafaa]', job.error));
     const codes = Object.keys(job.outputs || {});
     if (codes.length) {
       const links = element('div', 'mt-3 flex flex-wrap gap-[6px]');
@@ -832,16 +868,18 @@ function renderJobs() {
         link.href = job.outputs[code].url;
         links.append(link);
       }
-      card.append(links);
+      body.append(links);
     }
-    renderReviewActivity(card, job);
-    renderStepActivity(card, job);
-    renderJobControls(card, job);
-    renderSteps(card, job);
-    renderReviewActions(card, job);
-    renderQuality(card, job);
+    renderReviewActivity(body, job);
+    renderStepActivity(body, job);
+    renderJobControls(body, job);
+    renderSteps(body, job);
+    renderReviewActions(body, job);
+    renderQuality(body, job);
+    card.append(body);
     list.append(card);
   }
+  focusedSummary?.focus({ preventScroll: true });
   $('jobs-content').scrollTop = scrollTop;
 }
 

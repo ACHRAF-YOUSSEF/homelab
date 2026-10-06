@@ -48,6 +48,27 @@ html { height: 100%; overflow: hidden; }
   @apply inline-flex h-10 cursor-pointer items-center justify-center rounded-lg border border-[#465564] bg-[#1b2632] px-3 text-xs font-bold text-[#bdccd5] hover:bg-[#294052] disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-mint;
 }
 
+.job-summary {
+  @apply cursor-pointer rounded-[10px] px-[14px] py-[15px] hover:bg-[#1c2a36] focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-mint;
+  display: block;
+  list-style: none;
+  transition: background-color 160ms ease;
+}
+
+.job-summary::-webkit-details-marker { display: none; }
+
+.job-chevron {
+  @apply block h-2 w-2 shrink-0 border-r-2 border-b-2 border-[#91a3af];
+  transform: rotate(-45deg);
+  transition: transform 160ms ease;
+}
+
+.job-card[open] > .job-summary .job-chevron { transform: rotate(45deg); }
+
+.job-body {
+  @apply border-t border-[#2b3a45] px-[14px] pt-3 pb-[15px];
+}
+
 @media (max-width: 1024px) {
   .app-header { @apply h-14 px-4; }
   .workspace-main { @apply gap-3 px-4 py-3; }
@@ -164,7 +185,8 @@ main { animation: ui-enter 300ms ease-out; }
 @keyframes progress-stripes { to { background-position: 40px 0; } }
 
 @media (prefers-reduced-motion: reduce) {
-  button, a, select, .thinking-switch, .thinking-switch::before { transition: none; }
+  button, a, select, .thinking-switch, .thinking-switch::before,
+  .job-summary, .job-chevron { transition: none; }
   button:active:not(:disabled) { transform: none; }
   main, .ui-enter, #media-options:not([hidden]), .is-refreshing svg,
   .progress-fill[data-active="true"]::after { animation: none; }

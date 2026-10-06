@@ -67,6 +67,8 @@ Transcription progress is based on the last completed audio segment; translation
 
 The Jobs panel paginates the full saved history, with 5 jobs per page by default and options for 10 or 25. Status filters apply before pagination. Live updates preserve the current page and filter; changing the filter or page size returns to page 1. Previous and Next buttons and the job count remain visible at the bottom of the panel.
 
+Each job starts collapsed, showing its name, status, current stage, and progress. Click its summary or use Enter/Space to expand downloads, processing steps, and reviews. Expansion is remembered during live updates and page/filter changes in the current browser session; refreshing the page collapses jobs again.
+
 On screens wider than 1,024 pixels, the workspace fills the viewport with three panels. The library, subtitle options, and jobs scroll within their panels while the header remains visible. Narrower screens use **Library**, **Setup**, and **Jobs** tabs. Selecting a media file opens Setup, and submitting a job opens Jobs. Switching tabs preserves the selected media and settings.
 
 The SSE endpoint emits named `jobs` events. The web app requests `/api/jobs/events?page=1&page_size=5&status=all`; each event contains `jobs`, `page`, `page_size`, `total`, `total_all`, and `page_count`, matching the paginated `GET /api/jobs` response. Pages cover all saved jobs, with sizes from 1 to 50 and status values `all`, `completed`, `failed`, `running`, `queued`, or `cancelled`. Out-of-range pages are clamped to the last available page. Calls without pagination parameters retain the previous array response of the latest 100 jobs for existing API clients.
