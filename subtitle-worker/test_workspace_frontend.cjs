@@ -33,7 +33,7 @@ function fixture({ mobile = true } = {}) {
   for (const [id, value] of [['model-select', 'test-model'], ['source-language', 'ja'], ['whisper-select', 'medium'], ['audio-track', '1']]) get(id).value = value;
   get('transcript').checked = true;
   const context = vm.createContext({
-    state, $: get,
+    state, $: get, folderRequestSequence: 0, mediaRequestSequence: 0,
     matchMedia(query) { assert.equal(query, '(max-width: 1024px)'); return media; },
     Option: class { constructor(text, value) { this.text = text; this.value = value; } },
     seconds: () => '0:24:00',

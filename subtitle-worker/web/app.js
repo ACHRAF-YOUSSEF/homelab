@@ -137,8 +137,16 @@ async function api(url, options) {
   const response = await fetch(url, options);
   let data;
   try { data = await response.json(); }
-  catch { throw Error(`Request failed (${response.status})`); }
-  if (!response.ok) throw Error(data.error || `Request failed (${response.status})`);
+  catch {
+    const error = Error(`Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = Error(data.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -318,12 +326,37 @@ function showBreadcrumb(path) {
   });
 }
 
-async function loadFolder(path) {
+const libraryFolderStorageKey = 'subtitle-studio:library-folder';
+const selectedMediaStorageKey = 'subtitle-studio:selected-media';
+let folderRequestSequence = 0;
+let mediaRequestSequence = 0;
+
+async function restoreLibrarySelection() {
+  const request = mediaRequestSequence;
+  let path = '';
+  try { path = localStorage.getItem(selectedMediaStorageKey) || ''; }
+  catch { /* Selection still works when browser storage is unavailable. */ }
+  await restoreLibraryFolder();
+  if (path && request === mediaRequestSequence) await selectMedia(path, { restore: true });
+}
+
+async function restoreLibraryFolder() {
+  try { state.folder = localStorage.getItem(libraryFolderStorageKey) || ''; }
+  catch { /* Browsing still works when browser storage is unavailable. */ }
+  showBreadcrumb(state.folder);
+  await loadFolder(state.folder, { restore: true });
+}
+
+async function loadFolder(path, { restore = false } = {}) {
+  const request = ++folderRequestSequence;
   const list = $('library-list');
   list.replaceChildren(element('div', ui.empty, 'Loading folder…'));
   try {
     const data = await api(`/api/library?path=${encodeURIComponent(path)}`);
+    if (request !== folderRequestSequence) return;
     state.folder = data.path;
+    try { localStorage.setItem(libraryFolderStorageKey, data.path); }
+    catch { /* Keep the current folder usable without browser storage. */ }
     showBreadcrumb(data.path);
     list.replaceChildren();
     if (!data.entries.length) list.append(element('div', ui.empty, 'No media files in this folder.'));
@@ -340,16 +373,30 @@ async function loadFolder(path) {
       list.append(button);
     }
   } catch (error) {
+    if (request !== folderRequestSequence) return;
+    if (restore && path && [400, 404].includes(error.status)) {
+      await loadFolder('');
+      return;
+    }
     list.replaceChildren(element('div', ui.empty, error.message));
   }
 }
 
-async function selectMedia(path) {
+async function selectMedia(path, { restore = false } = {}) {
+  const request = ++mediaRequestSequence;
+  const folderRequest = folderRequestSequence;
   displayError('');
   try {
     const media = await api(`/api/media?path=${encodeURIComponent(path)}`);
-    if (!media.tracks.length) throw Error('This file has no audio tracks');
+    if (request !== mediaRequestSequence) return;
+    if (!media.tracks.length) {
+      const error = Error('This file has no audio tracks');
+      error.invalidMedia = true;
+      throw error;
+    }
     state.media = media;
+    try { localStorage.setItem(selectedMediaStorageKey, media.path); }
+    catch { /* Keep the selected video usable without browser storage. */ }
     $('media-empty').hidden = true;
     $('media-options').hidden = false;
     $('media-name').textContent = path.split('/').at(-1);
@@ -362,9 +409,17 @@ async function selectMedia(path) {
       if (track.channels) label += ` · ${track.channels} ch`;
       tracks.append(new Option(label, String(track.index)));
     }
-    loadFolder(state.folder);
-    if (workspaceMobile?.matches) setWorkspaceTab('setup');
+    if (folderRequest === folderRequestSequence) loadFolder(state.folder);
+    if (workspaceMobile?.matches && !restore) setWorkspaceTab('setup');
   } catch (error) {
+    if (request !== mediaRequestSequence) return;
+    if (restore && ([400, 404].includes(error.status) || error.invalidMedia)) {
+      try {
+        if (localStorage.getItem(selectedMediaStorageKey) === path) localStorage.removeItem(selectedMediaStorageKey);
+      }
+      catch { /* A stale selection can be ignored without browser storage. */ }
+      return;
+    }
     displayError(error.message);
   }
 }
@@ -1105,7 +1160,7 @@ $('jobs-page-size').onchange = () => {
 initializeWorkspaceTabs();
 renderJobs();
 startJobsUpdates();
-Promise.all([loadConfig(), loadFolder(''), loadJobs()]).catch(error => displayError(error.message));
+Promise.all([loadConfig(), restoreLibrarySelection(), loadJobs()]).catch(error => displayError(error.message));
 window.addEventListener('pagehide', stopJobsUpdates);
 window.addEventListener('pageshow', event => {
   if (event.persisted) startJobsUpdates();
