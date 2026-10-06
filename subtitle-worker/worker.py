@@ -45,6 +45,11 @@ REVIEW_METHOD = "llm-fidelity-v1"
 REVIEW_BATCH_SIZE = 8
 jobs = {}
 jobs_lock = threading.RLock()
+jobs_changed = threading.Condition(jobs_lock)
+jobs_revision = 0
+jobs_stream_epoch = uuid.uuid4().hex[:12]
+SSE_HEARTBEAT_SECONDS = 15
+SSE_WRITE_TIMEOUT_SECONDS = 20
 job_queue = queue.Queue()
 speech_model = None
 speech_model_name = None
@@ -302,10 +307,15 @@ def review_model_for_job(preferred, translation_model):
 
 
 def persist_locked():
+    global jobs_revision
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     temporary = JOBS_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(list(jobs.values()), ensure_ascii=False), encoding="utf-8")
     temporary.replace(JOBS_FILE)
+    # Publish only successfully persisted changes. Condition shares jobs_lock;
+    # clients wait for a revision, never accumulate per-client event queues.
+    jobs_revision += 1
+    jobs_changed.notify_all()
 
 
 def set_job(job_id, **changes):
@@ -1164,6 +1174,17 @@ def public_job(job):
     return result
 
 
+def jobs_snapshot_locked():
+    items = sorted(jobs.values(), key=lambda job: job["created_at"], reverse=True)
+    return json.loads(json.dumps(items[:100]))
+
+
+def jobs_snapshot():
+    with jobs_lock:
+        snapshots = jobs_snapshot_locked()
+    return [public_job(job) for job in snapshots]
+
+
 def validate_review_action(payload):
     thinking_setting(payload, "review_thinking")
     model = payload.get("review_model", "")
@@ -1686,6 +1707,49 @@ def worker_loop():
 
 
 class Handler(BaseHTTPRequestHandler):
+    def stream_jobs(self):
+        """Send fresh state on connect/reconnect, then wake on persisted changes."""
+        # Each client has its own HTTP thread. Slow/disconnected clients cannot
+        # block job processing: enrichment and network writes occur outside the
+        # job lock, and writes have a timeout.
+        self.connection.settimeout(SSE_WRITE_TIMEOUT_SECONDS)
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(b"retry: 3000\n\n")
+            self.wfile.flush()
+            last_revision = -1
+            while True:
+                with jobs_changed:
+                    changed = jobs_changed.wait_for(lambda: jobs_revision != last_revision,
+                                                    timeout=SSE_HEARTBEAT_SECONDS)
+                    if changed:
+                        revision = jobs_revision
+                        snapshots = jobs_snapshot_locked()
+                if changed:
+                    data = json.dumps([public_job(job) for job in snapshots], ensure_ascii=False,
+                                      separators=(",", ":"))
+                    packet = f"id: {jobs_stream_epoch}:{revision}\nevent: jobs\ndata: {data}\n\n".encode("utf-8")
+                    last_revision = revision
+                else:
+                    packet = b": heartbeat\n\n"
+                self.wfile.write(packet)
+                self.wfile.flush()
+        except (ConnectionError, OSError):
+            # A closed browser or a timed-out socket ends only this stream.
+            pass
+        except Exception:
+            # Headers have already been sent; close the stream so EventSource
+            # reconnects instead of appending an invalid JSON error response.
+            logging.exception("Job event stream failed")
+        finally:
+            self.close_connection = True
+
     def send_bytes(self, data, content_type, status=200, download=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -1701,6 +1765,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
     def route_get(self, path, query):
+        if path == "/api/jobs/events":
+            return self.stream_jobs()
         if path in ("/", "/app.js", "/app.css", "/favicon.svg"):
             filename = "index.html" if path == "/" else path[1:]
             content_type = {
@@ -1732,10 +1798,7 @@ class Handler(BaseHTTPRequestHandler):
             relative = query.get("path", [""])[0]
             return self.send_json({"path": relative, **probe_media(resolve_media(relative, file_required=True))})
         if path == "/api/jobs":
-            with jobs_lock:
-                items = sorted(jobs.values(), key=lambda x: x["created_at"], reverse=True)
-                snapshots = json.loads(json.dumps(items[:100]))
-            return self.send_json([public_job(job) for job in snapshots])
+            return self.send_json(jobs_snapshot())
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})(?:/files/([a-z]{2}))?", path)
         if match:
             job_id, language = match.groups()

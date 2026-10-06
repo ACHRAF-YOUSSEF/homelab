@@ -732,13 +732,133 @@ function renderJobs() {
   }
 }
 
+const jobsUpdates = {
+  source: null,
+  reconnectTimer: null,
+  pollTimer: null,
+  pollPending: false,
+  receivedVersion: 0,
+  requestSequence: 0,
+  lifecycle: 0,
+  hasSnapshot: false,
+  stopped: true,
+};
+
+function setJobsConnection(status) {
+  const indicator = $('jobs-connection');
+  const labels = {
+    connecting: 'Connecting to live updates…',
+    live: 'Live updates connected',
+    reconnecting: 'Reconnecting · last updates kept',
+    fallback: 'Live updates unavailable · refreshing every 5 seconds',
+  };
+  indicator.dataset.status = status;
+  indicator.textContent = labels[status];
+  indicator.className = `mt-[5px] text-[11px] ${status === 'live' ? 'text-[#70d6b0]' : 'text-[#91a3af]'}`;
+}
+
+function applyJobsSnapshot(jobs) {
+  if (!Array.isArray(jobs)) throw Error('Invalid jobs response');
+  state.jobs = jobs;
+  jobsUpdates.hasSnapshot = true;
+  renderJobs();
+}
+
 async function loadJobs() {
+  const request = ++jobsUpdates.requestSequence;
+  const version = jobsUpdates.receivedVersion;
+  const lifecycle = jobsUpdates.lifecycle;
+  const stillCurrent = () => request === jobsUpdates.requestSequence
+    && version === jobsUpdates.receivedVersion && lifecycle === jobsUpdates.lifecycle;
   try {
-    state.jobs = await api('/api/jobs');
-    renderJobs();
+    const jobs = await api('/api/jobs');
+    // A manual refresh or fallback request may finish after a newer stream event.
+    if (stillCurrent()) applyJobsSnapshot(jobs);
   } catch (error) {
-    $('jobs-list').replaceChildren(element('div', ui.empty, error.message));
+    if (stillCurrent() && !jobsUpdates.hasSnapshot) {
+      $('jobs-list').replaceChildren(element('div', ui.empty, error.message));
+    }
   }
+}
+
+function stopFallbackPolling() {
+  if (jobsUpdates.pollTimer !== null) clearInterval(jobsUpdates.pollTimer);
+  jobsUpdates.pollTimer = null;
+}
+
+function pollJobsFallback() {
+  if (jobsUpdates.stopped || jobsUpdates.pollPending) return;
+  const lifecycle = jobsUpdates.lifecycle;
+  jobsUpdates.pollPending = true;
+  loadJobs().finally(() => {
+    if (lifecycle === jobsUpdates.lifecycle) jobsUpdates.pollPending = false;
+  });
+}
+
+function startFallbackPolling() {
+  if (jobsUpdates.stopped || jobsUpdates.pollTimer !== null) return;
+  setJobsConnection('fallback');
+  pollJobsFallback();
+  jobsUpdates.pollTimer = setInterval(pollJobsFallback, 5000);
+}
+
+function jobsStreamDisconnected() {
+  if (jobsUpdates.stopped) return;
+  if (jobsUpdates.pollTimer === null) setJobsConnection('reconnecting');
+  // EventSource reconnects itself. Poll only if the outage lasts ten seconds.
+  if (jobsUpdates.reconnectTimer === null && jobsUpdates.pollTimer === null) {
+    jobsUpdates.reconnectTimer = setTimeout(() => {
+      jobsUpdates.reconnectTimer = null;
+      startFallbackPolling();
+    }, 10000);
+  }
+}
+
+function startJobsUpdates() {
+  if (!jobsUpdates.stopped) return;
+  jobsUpdates.stopped = false;
+  jobsUpdates.lifecycle += 1;
+  setJobsConnection('connecting');
+  if (typeof EventSource === 'undefined') {
+    startFallbackPolling();
+    return;
+  }
+  try {
+    const source = new EventSource('/api/jobs/events');
+    jobsUpdates.source = source;
+    source.addEventListener('jobs', event => {
+      if (jobsUpdates.stopped || jobsUpdates.source !== source) return;
+      try {
+        const jobs = JSON.parse(event.data);
+        if (!Array.isArray(jobs)) throw Error('Invalid jobs event');
+        jobsUpdates.receivedVersion += 1;
+        applyJobsSnapshot(jobs);
+        if (jobsUpdates.reconnectTimer !== null) clearTimeout(jobsUpdates.reconnectTimer);
+        jobsUpdates.reconnectTimer = null;
+        stopFallbackPolling();
+        setJobsConnection('live');
+      } catch {
+        // Keep the previous snapshot if a proxy or server sends an invalid event.
+        jobsStreamDisconnected();
+      }
+    });
+    source.onerror = () => {
+      if (jobsUpdates.source === source) jobsStreamDisconnected();
+    };
+  } catch {
+    startFallbackPolling();
+  }
+}
+
+function stopJobsUpdates() {
+  jobsUpdates.stopped = true;
+  jobsUpdates.lifecycle += 1;
+  jobsUpdates.source?.close();
+  jobsUpdates.source = null;
+  if (jobsUpdates.reconnectTimer !== null) clearTimeout(jobsUpdates.reconnectTimer);
+  jobsUpdates.reconnectTimer = null;
+  stopFallbackPolling();
+  jobsUpdates.pollPending = false;
 }
 
 $('refresh-library').onclick = () => loadFolder(state.folder);
@@ -761,5 +881,9 @@ for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
   };
 }
 renderJobs();
+startJobsUpdates();
 Promise.all([loadConfig(), loadFolder(''), loadJobs()]).catch(error => displayError(error.message));
-setInterval(loadJobs, 2500);
+window.addEventListener('pagehide', stopJobsUpdates);
+window.addEventListener('pageshow', event => {
+  if (event.persisted) startJobsUpdates();
+});

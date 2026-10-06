@@ -61,7 +61,11 @@ Cache entries are specific to the media file, its size and modification time, th
 
 ## Status and troubleshooting
 
-The UI polls job status every 2.5 seconds. Transcription progress is based on the last completed audio segment; translation progress is based on completed batches. A stalled LM Studio response can take up to `SUBTITLE_LLM_TIMEOUT` seconds per attempt. The worker retries a failed translation batch twice before marking the job failed; SRT files already produced remain downloadable. Jobs survive service restarts in `subtitle_data`; interrupted steps can be retried from the Jobs panel. Only one generation, review, or retry task runs at a time.
+The UI receives job status through Server-Sent Events (SSE) at `/api/jobs/events`. Each connection starts with the latest jobs snapshot, then receives changes as they are saved. The stream sends a heartbeat every 15 seconds and the browser automatically reconnects after a disconnect, receiving a fresh snapshot. The Jobs panel shows the connection status. After 10 seconds without a working stream, it falls back to refreshing every 5 seconds; polling stops when live updates recover. Browsers without EventSource use the same fallback. The refresh button remains available.
+
+Transcription progress is based on the last completed audio segment; translation progress is based on completed batches. A stalled LM Studio response can take up to `SUBTITLE_LLM_TIMEOUT` seconds per attempt. The worker retries a failed translation batch twice before marking the job failed; SRT files already produced remain downloadable. Jobs survive service restarts in `subtitle_data`; interrupted steps can be retried from the Jobs panel. Only one generation, review, or retry task runs at a time.
+
+The SSE endpoint emits named `jobs` events containing the same JSON array as `GET /api/jobs`, including the latest 100 jobs. Event IDs identify the server session and saved revision. Reconnecting clients always receive current state, including after a server restart. If you place the app behind a reverse proxy, disable response buffering and allow idle connections to remain open beyond the heartbeat interval.
 
 ### Cancel and retry individual steps
 
@@ -93,7 +97,7 @@ Existing translations are reviewed against their saved source SRT, or the matchi
 
 **Re-review** requests a fresh evaluation and bypasses previously cached review ratings for the selected languages. Select a different local reviewer to get another model's opinion. A successful evaluation replaces the displayed score and refreshes the review cache. If it fails, the previous completed score and all SRT files remain available. **Retry review** resumes any successful batches from the interrupted evaluation. The job's original generation status and error are preserved, while review progress appears separately. Review tasks use the same queue as generation and wait for the current task to finish.
 
-The local API supports `POST /api/jobs/{job_id}/review` with `review_model`, optional `languages`, and `force` (`true` for a fresh re-review); `POST /api/reviews/missing` with `review_model` queues missing reviews in bulk. These actions return queue status promptly and the UI polls for results. If the service restarts during review, its review task is marked interrupted; retry it to resume without changing the original generation result.
+The local API supports `POST /api/jobs/{job_id}/review` with `review_model`, optional `languages`, and `force` (`true` for a fresh re-review); `POST /api/reviews/missing` with `review_model` queues missing reviews in bulk. These actions return queue status promptly and the UI receives progress through the job event stream. If the service restarts during review, its review task is marked interrupted; retry it to resume without changing the original generation result.
 
 After rebuilding the container, run the built-in validator from the repository root with a job ID from `/api/jobs`:
 
