@@ -34,7 +34,12 @@
             <p class="text-[11px] font-extrabold tracking-[0.16em] text-[#70d6b0]">01 / SOURCE</p>
             <h2 class="mt-[5px] text-xl font-bold tracking-[-0.035em]">Media library</h2>
           </div>
-          <button id="refresh-library" type="button" aria-label="Refresh folder" title="Refresh folder" class="h-[34px] w-[34px] cursor-pointer rounded-lg border border-[#33414d] bg-[#1b2632] text-2xl leading-5 text-[#aec6d4] hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">↻</button>
+          <button id="refresh-library" type="button" aria-label="Refresh folder" title="Refresh folder" class="inline-flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-[#33414d] bg-[#1b2632] p-0 text-[#aec6d4] transition-colors hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">
+            <svg class="block h-[18px] w-[18px] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+              <path d="M21 3v5h-5" />
+            </svg>
+          </button>
         </div>
         <nav id="breadcrumb" aria-label="Media folder" class="flex items-center gap-[5px] overflow-x-auto whitespace-nowrap border-b border-[#26323c] px-[19px] py-4"></nav>
         <div id="library-list" class="max-h-[650px] overflow-y-auto p-[9px] max-[720px]:max-h-[350px]">
@@ -111,7 +116,12 @@
             <h2 class="mt-[5px] text-xl font-bold tracking-[-0.035em]">Jobs &amp; downloads</h2>
             <p id="jobs-connection" role="status" aria-live="polite" aria-atomic="true" class="mt-[5px] text-[11px] text-[#91a3af]">Connecting to live updates…</p>
           </div>
-          <button id="refresh-jobs" type="button" aria-label="Refresh jobs" title="Refresh jobs" class="h-[34px] w-[34px] cursor-pointer rounded-lg border border-[#33414d] bg-[#1b2632] text-2xl leading-5 text-[#aec6d4] hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">↻</button>
+          <button id="refresh-jobs" type="button" aria-label="Refresh jobs" title="Refresh jobs" class="inline-flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-[#33414d] bg-[#1b2632] p-0 text-[#aec6d4] transition-colors hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">
+            <svg class="block h-[18px] w-[18px] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+              <path d="M21 3v5h-5" />
+            </svg>
+          </button>
         </div>
         <div class="space-y-2 border-b border-[#28333e] px-[14px] py-3">
           <label for="jobs-review-model" class="block text-xs font-bold text-[#adbfcb]">Reviewer for saved translations</label>

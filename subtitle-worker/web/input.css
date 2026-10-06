@@ -32,3 +32,51 @@ select {
   background-size: 12px 12px;
   background-repeat: no-repeat;
 }
+
+button, a, select, .thinking-switch {
+  transition-property: background-color, border-color, color, box-shadow, opacity, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+button:active:not(:disabled) { transform: translateY(1px); }
+
+main { animation: ui-enter 300ms ease-out; }
+.ui-enter { animation: ui-enter 220ms ease-out; }
+#media-options:not([hidden]) { animation: ui-enter 220ms ease-out; }
+
+.is-refreshing svg { animation: refresh-spin 800ms linear infinite; }
+
+.progress-track {
+  @apply relative overflow-hidden rounded-full bg-[#30404b];
+}
+
+.progress-fill {
+  @apply relative h-full overflow-hidden bg-mint;
+  border-radius: inherit;
+}
+
+.progress-fill[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: repeating-linear-gradient(115deg, #ffffff38 0, #ffffff38 7px, transparent 7px, transparent 14px);
+  background-size: 40px 100%;
+  animation: progress-stripes 1s linear infinite;
+}
+
+@keyframes ui-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes refresh-spin { to { transform: rotate(360deg); } }
+@keyframes progress-stripes { to { background-position: 40px 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  button, a, select, .thinking-switch, .thinking-switch::before { transition: none; }
+  button:active:not(:disabled) { transform: none; }
+  main, .ui-enter, #media-options:not([hidden]), .is-refreshing svg,
+  .progress-fill[data-active="true"]::after { animation: none; }
+  .progress-fill[data-active="true"]::after { display: none; }
+}

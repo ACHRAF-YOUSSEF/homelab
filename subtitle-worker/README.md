@@ -67,6 +67,8 @@ Transcription progress is based on the last completed audio segment; translation
 
 The SSE endpoint emits named `jobs` events containing the same JSON array as `GET /api/jobs`, including the latest 100 jobs. Event IDs identify the server session and saved revision. Reconnecting clients always receive current state, including after a server restart. If you place the app behind a reverse proxy, disable response buffering and allow idle connections to remain open beyond the heartbeat interval.
 
+Progress bars animate between reported percentages and show moving stripes only while their job or step is running or cancelling. The animation does not advance the reported progress. Finished, failed, and cancelled work stays still. Refresh icons spin during a manual refresh, and newly displayed job cards have a brief entrance animation. These effects respect the operating system's reduced-motion setting and use the bundled offline CSS.
+
 ### Cancel and retry individual steps
 
 Expand **Processing steps** on a job to see extraction, transcription, each requested translation, and any reviews. **Cancel** stops that step; **Cancel job** stops all remaining work for the job. Extraction can terminate FFmpeg immediately. Whisper and LM Studio cancellation takes effect at the next segment or request boundary, so the UI shows **Cancelling** while the current operation finishes. Cancelling a translation or review language allows the other languages to continue. Cancelling extraction or transcription blocks the dependent translations.

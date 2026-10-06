@@ -19,6 +19,72 @@ function element(tag, className = '', text) {
   return item;
 }
 
+const progressHistory = new Map();
+const progressMotion = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null;
+let visibleJobIds = new Set();
+
+progressMotion?.addEventListener?.('change', event => {
+  if (event.matches) {
+    for (const item of progressHistory.values()) item.animation?.cancel();
+  }
+});
+
+function renderProgress(key, value, status, label, className = 'h-[5px]') {
+  const numeric = Number(value);
+  const percent = Number.isFinite(numeric) ? Math.min(100, Math.max(0, numeric)) : 0;
+  let history = progressHistory.get(key);
+  if (!history) {
+    const track = element('div');
+    const fill = element('div', 'progress-fill');
+    track.append(fill);
+    history = { track, fill, percent, animation: null, animationFrom: percent };
+    progressHistory.set(key, history);
+  }
+  const { track, fill } = history;
+  track.className = `progress-track ${className}`;
+  track.setAttribute('role', 'progressbar');
+  track.setAttribute('aria-label', label);
+  track.setAttribute('aria-valuemin', '0');
+  track.setAttribute('aria-valuemax', '100');
+  track.setAttribute('aria-valuenow', String(percent));
+  fill.dataset.active = String(['running', 'cancelling'].includes(status));
+  fill.style.width = `${percent}%`;
+  if (progressMotion?.matches) {
+    history.animation?.cancel();
+    history.animation = null;
+  } else if (percent !== history.percent && typeof fill.animate === 'function') {
+    let from = history.percent;
+    const timing = history.animation?.effect?.getComputedTiming?.();
+    if (typeof timing?.progress === 'number' && Number.isFinite(timing.progress)) {
+      from = history.animationFrom + (history.percent - history.animationFrom) * timing.progress;
+    }
+    history.animation?.cancel();
+    history.animationFrom = from;
+    history.animation = fill.animate([{ width: `${from}%` }, { width: `${percent}%` }], {
+      duration: 400,
+      easing: 'ease-out',
+    });
+  }
+  history.percent = percent;
+  // Reusing the same track preserves its running tween across SSE card rebuilds.
+  return track;
+}
+
+async function refreshButton(id, refresh) {
+  const button = $(id);
+  if (button.disabled) return;
+  button.disabled = true;
+  button.classList.add('is-refreshing');
+  button.setAttribute('aria-busy', 'true');
+  try {
+    await refresh();
+  } finally {
+    button.disabled = false;
+    button.classList.remove('is-refreshing');
+    button.setAttribute('aria-busy', 'false');
+  }
+}
+
 async function api(url, options) {
   const response = await fetch(url, options);
   let data;
@@ -429,11 +495,7 @@ function renderSteps(card, job) {
     row.append(top);
     row.append(element('p', 'mt-2 text-[10px] text-[#91a3af]', `${progress}%`));
     if (['running', 'cancelling'].includes(step.status)) {
-      const bar = element('div', 'mt-2 h-[4px] overflow-hidden rounded-[10px] bg-[#30404b]');
-      const fill = element('div', 'h-full bg-mint');
-      fill.style.width = `${progress}%`;
-      bar.append(fill);
-      row.append(bar);
+      row.append(renderProgress(`${job.id}:step:${key}`, progress, step.status, `${step.label || key} progress`, 'mt-2 h-[4px]'));
     }
     if (step.error) row.append(element('p', 'mt-2 break-words text-[11px] leading-[1.4] text-[#ffafaa]', step.error));
     const buttons = element('div', 'mt-2 flex flex-wrap gap-[6px]');
@@ -459,11 +521,7 @@ function renderStepActivity(card, job) {
     const value = Number(task.progress);
     const percent = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 0;
     section.append(element('p', 'mt-2 mb-2 text-[11px] text-[#91a3af]', `${task.stage || 'Waiting to retry'} · ${percent}%`));
-    const progress = element('div', 'h-[5px] overflow-hidden rounded-[10px] bg-[#30404b]');
-    const fill = element('div', 'h-full bg-mint');
-    fill.style.width = `${percent}%`;
-    progress.append(fill);
-    section.append(progress);
+    section.append(renderProgress(`${job.id}:retry:${task.step || 'step'}`, percent, task.status, `${label} retry progress`));
   }
   if (task.error) section.append(element('p', 'mt-2 break-words text-[11px] leading-[1.4] text-[#ffafaa]', task.error));
   card.append(section);
@@ -556,11 +614,7 @@ function renderReviewActivity(card, job) {
     const value = Number(task.progress);
     const percent = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 0;
     section.append(element('p', 'mt-2 mb-2 text-[11px] text-[#91a3af]', `${task.stage || 'Waiting for reviewer'} · ${percent}%`));
-    const progress = element('div', 'h-[5px] overflow-hidden rounded-[10px] bg-[#30404b]');
-    const fill = element('div', 'h-full bg-mint');
-    fill.style.width = `${percent}%`;
-    progress.append(fill);
-    section.append(progress);
+    section.append(renderProgress(`${job.id}:review`, percent, task.status, 'Translation review progress'));
     if (task.status === 'cancelling') section.append(element('p', 'mt-2 text-[11px] leading-[1.4] text-[#d2cc9f]', 'Stops after the current segment or model request. Completed results are kept.'));
     if (task.force && (task.languages || []).some(code => job.quality?.[code]?.status === 'completed')) {
       section.append(element('p', 'mt-2 text-[11px] leading-[1.4] text-[#8196a3]', 'The previous completed review stays visible until the new review finishes.'));
@@ -685,13 +739,22 @@ function renderJobs() {
   const list = $('jobs-list');
   list.replaceChildren();
   const visibleJobs = state.jobs.filter(job => matchesJobFilter(job, state.jobFilter));
+  const previousVisible = visibleJobIds;
+  visibleJobIds = new Set(visibleJobs.map(job => job.id));
+  const retainedJobs = new Set(state.jobs.map(job => job.id));
+  for (const [key, history] of progressHistory) {
+    if (!retainedJobs.has(key.split(':')[0])) {
+      history.animation?.cancel();
+      progressHistory.delete(key);
+    }
+  }
   if (!visibleJobs.length) {
     const message = state.jobFilter === 'all' ? 'No jobs yet.' : `No ${state.jobFilter} jobs.`;
     list.append(element('div', ui.empty, message));
     return;
   }
   for (const job of visibleJobs) {
-    const card = element('div', ui.job);
+    const card = element('div', `${ui.job}${previousVisible.has(job.id) ? '' : ' ui-enter'}`);
     const top = element('div', 'flex items-center justify-between gap-[10px]');
     top.append(
       element('div', 'min-w-0 truncate text-xs font-bold', job.filename),
@@ -705,11 +768,7 @@ function renderJobs() {
       stage += ` · ${seconds(job.position)} / ${seconds(job.duration)}`;
     }
     card.append(element('div', ui.stage, `${stage} · ${job.progress}%`));
-    const progress = element('div', 'h-[5px] overflow-hidden rounded-[10px] bg-[#30404b]');
-    const fill = element('div', 'h-full bg-mint');
-    fill.style.width = `${job.progress}%`;
-    progress.append(fill);
-    card.append(progress);
+    card.append(renderProgress(`${job.id}:job`, job.progress, job.status, `${job.filename} job progress`));
     if (job.reused?.length) card.append(element('div', ui.stage, `Reused: ${job.reused.join(', ')}`));
     if (job.error) card.append(element('div', 'mt-[9px] text-[11px] leading-[1.4] text-[#ffafaa]', job.error));
     const codes = Object.keys(job.outputs || {});
@@ -861,8 +920,8 @@ function stopJobsUpdates() {
   jobsUpdates.pollPending = false;
 }
 
-$('refresh-library').onclick = () => loadFolder(state.folder);
-$('refresh-jobs').onclick = loadJobs;
+$('refresh-library').onclick = () => refreshButton('refresh-library', () => loadFolder(state.folder));
+$('refresh-jobs').onclick = () => refreshButton('refresh-jobs', loadJobs);
 $('review-missing-jobs').onclick = reviewMissingJobs;
 $('review-enabled').onchange = updateReviewSelection;
 for (const id of ['translation-thinking', 'review-thinking', 'jobs-review-thinking']) {
