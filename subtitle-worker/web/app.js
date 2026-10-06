@@ -1,4 +1,4 @@
-const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false };
+const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', openReviews: new Set() };
 const $ = id => document.getElementById(id);
 
 const ui = {
@@ -62,10 +62,31 @@ function updateWhisperSelection() {
   $('whisper-note').textContent = `${availability}${selected.endsWith('.en') ? ' This model only supports English audio.' : ''}`;
 }
 
+function updateReviewSelection() {
+  const reviewer = $('review-model-select').value;
+  const translator = $('model-select').value;
+  const configured = /translategemma/i.test(state.defaultReviewModel) ? '' : state.defaultReviewModel;
+  const fallback = /translategemma/i.test(state.defaultTranslationModel) ? '' : state.defaultTranslationModel;
+  const automatic = configured || (translator && !/translategemma/i.test(translator) ? translator : '') || fallback || $('review-model-select').options[1]?.value;
+  let selection = 'Automatic selects a general model in LM Studio.';
+  if ((reviewer || automatic) === translator && translator) {
+    selection = 'Uses the translation model for review; self-review may miss errors.';
+  } else if (reviewer) {
+    selection = 'Uses the selected local model for final review.';
+  } else if (configured) {
+    selection = 'Automatic uses the configured local review model.';
+  } else if (!automatic) {
+    selection = 'No general review model is listed. Translations can finish with review unavailable.';
+  }
+  $('review-note').textContent = `${selection} Estimates fidelity to the source transcript and scores fluency separately. This adds processing time; it is not measured accuracy and cannot verify transcription errors.`;
+}
+
 async function loadConfig() {
   const data = await api('/api/config');
   state.languages = data.languages;
   state.whisperLocalOnly = data.whisper_local_only;
+  state.defaultReviewModel = data.default_review_model || '';
+  state.defaultTranslationModel = data.default_model || '';
   const whisperSelect = $('whisper-select');
   for (const item of data.whisper_models) {
     state.whisperModels.set(item.id, item.downloaded);
@@ -108,6 +129,14 @@ async function loadConfig() {
       : 'Load a model in LM Studio to enable translations.';
   }
   models.disabled = !data.models.length;
+  const reviewers = $('review-model-select');
+  reviewers.append(new Option('Automatic · suitable local model', ''));
+  for (const model of data.models.filter(model => !/translategemma/i.test(model))) {
+    reviewers.append(new Option(model, model));
+  }
+  models.onchange = updateReviewSelection;
+  reviewers.onchange = updateReviewSelection;
+  updateReviewSelection();
 }
 
 function showBreadcrumb(path) {
@@ -197,6 +226,7 @@ async function submitJob() {
         transcript: $('transcript').checked,
         targets: [...state.targets],
         model,
+        review_model: $('review-model-select').value,
       }),
     });
     state.jobFilter = 'all';
@@ -221,6 +251,98 @@ function filterClasses(selected) {
   return `shrink-0 cursor-pointer rounded-md border px-[9px] py-[6px] text-[11px] font-bold focus-visible:outline-2 focus-visible:outline-mint ${selected
     ? 'border-[#54c995] bg-[#1b4435] text-[#a4f2c9]'
     : 'border-[#344453] bg-[#18242e] text-[#b8c7d0] hover:border-[#5a927c]'}`;
+}
+
+function reviewScore(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
+    ? `${Number(value.toFixed(1))}/100`
+    : 'Unavailable';
+}
+
+function cueTime(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return 'Time unavailable';
+  const tenths = Math.round(value * 10);
+  return `${Math.floor(tenths / 36000)}:${String(Math.floor(tenths / 600) % 60).padStart(2, '0')}:${String(Math.floor(tenths / 10) % 60).padStart(2, '0')}.${tenths % 10}`;
+}
+
+function reviewMetric(label, value) {
+  const metric = element('div');
+  metric.append(
+    element('dt', 'text-[10px] text-[#8196a3]', label),
+    element('dd', 'mt-1 text-xs font-bold text-[#dbe6ec]', value),
+  );
+  return metric;
+}
+
+function renderQuality(card, job) {
+  const reports = Object.entries(job.quality || {});
+  if (!reports.length) {
+    const hasTranslation = (job.targets || []).some(code => code !== job.detected_language && job.outputs?.[code]);
+    if (job.status === 'completed' && hasTranslation) {
+      card.append(element('p', 'mt-3 text-[11px] text-[#8196a3]', 'No translation review saved for this job.'));
+    }
+    return;
+  }
+  const section = element('div', 'mt-3 space-y-2');
+  for (const [code, report] of reports) {
+    const complete = report.status === 'completed';
+    const unavailable = report.status === 'unavailable';
+    const details = element('details', 'rounded-lg border border-[#304351] bg-[#121c25]');
+    const key = `${job.id}:${code}`;
+    details.open = state.openReviews.has(key);
+    details.addEventListener('toggle', () => {
+      if (details.open) state.openReviews.add(key);
+      else state.openReviews.delete(key);
+    });
+    const summaryClass = complete ? 'text-[#a4f2c9]' : unavailable ? 'text-[#ffb9b2]' : 'text-[#adbfcb]';
+    let label = `${code.toUpperCase()} · Reviewing ${report.reviewed_cues || 0}/${report.total_cues || 0} cues`;
+    if (complete) label = `${code.toUpperCase()} · Estimated fidelity ${reviewScore(report.score)}`;
+    if (unavailable) label = `${code.toUpperCase()} · Review unavailable`;
+    details.append(element('summary', `cursor-pointer rounded-lg px-3 py-[10px] text-[11px] font-bold focus-visible:outline-2 focus-visible:outline-mint ${summaryClass}`, label));
+    const body = element('div', 'space-y-3 border-t border-[#304351] px-3 py-3');
+    const metrics = element('dl', 'grid grid-cols-2 gap-x-3 gap-y-3');
+    if (complete) {
+      metrics.append(reviewMetric('Estimated fidelity', reviewScore(report.score)), reviewMetric('Fluency', reviewScore(report.fluency)));
+    }
+    metrics.append(reviewMetric('Coverage', `${report.reviewed_cues || 0}/${report.total_cues || 0} cues`));
+    if (complete) metrics.append(reviewMetric('Flagged cues', String(report.flagged_cues || 0)));
+    body.append(metrics);
+    body.append(element('p', 'break-words text-[11px] leading-[1.5] text-[#91a3af]', `Reviewer: ${report.model || 'No model available'}`));
+    body.append(element('p', 'text-[11px] leading-[1.5] text-[#8196a3]', 'Model estimate against the source transcript, not measured accuracy. Transcription mistakes can affect the result.'));
+    if (report.same_model) {
+      body.append(element('p', 'text-[11px] leading-[1.5] text-[#d2cc9f]', 'The translation model also reviewed its own output; this can miss errors.'));
+    }
+    if (unavailable) {
+      body.append(element('p', 'break-words text-[11px] leading-[1.5] text-[#ffafaa]', report.error || 'The local model could not complete this review.'));
+      body.append(element('p', 'text-[11px] leading-[1.5] text-[#91a3af]', 'Generated SRT files remain available. Recreate this job to retry using cached results.'));
+    } else if (!complete) {
+      body.append(element('p', 'text-[11px] leading-[1.5] text-[#91a3af]', 'Final scores appear after every cue has been reviewed.'));
+    }
+    const issues = (Array.isArray(report.issues) ? report.issues : []).slice(0, 5);
+    if (complete && issues.length) {
+      body.append(element('p', 'text-[10px] font-bold uppercase tracking-[0.08em] text-[#91a3af]', 'Cues to check'));
+      for (const issue of issues) {
+        const item = element('div', 'space-y-2 rounded-md border border-[#304351] bg-[#16212b] p-[10px]');
+        item.append(element('p', 'text-[11px] font-bold text-[#dbe6ec]', `Cue ${issue.cue} · ${cueTime(issue.start)}`));
+        item.append(element('p', 'text-[10px] text-[#91a3af]', `Fidelity ${reviewScore(issue.fidelity)} · Fluency ${reviewScore(issue.fluency)}`));
+        for (const [heading, text] of [['Source transcript', issue.source], ['Translation', issue.translation]]) {
+          const passage = element('div');
+          passage.append(element('p', 'mb-1 text-[10px] font-bold text-[#8196a3]', heading));
+          const content = element('p', 'whitespace-pre-wrap break-words text-[11px] leading-[1.5] text-[#bdccd5] [overflow-wrap:anywhere]', text || '');
+          content.dir = 'auto';
+          passage.append(content);
+          item.append(passage);
+        }
+        if (issue.issue) item.append(element('p', 'break-words text-[11px] leading-[1.5] text-[#d2cc9f]', issue.issue));
+        body.append(item);
+      }
+    } else if (complete) {
+      body.append(element('p', 'text-[11px] text-[#91a3af]', 'No cues fell below the review threshold.'));
+    }
+    details.append(body);
+    section.append(details);
+  }
+  card.append(section);
 }
 
 function renderJobs() {
@@ -270,6 +392,7 @@ function renderJobs() {
       }
       card.append(links);
     }
+    renderQuality(card, job);
     list.append(card);
   }
 }

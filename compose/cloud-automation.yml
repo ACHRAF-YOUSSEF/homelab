@@ -45,6 +45,7 @@ services:
       - WHISPER_COMPUTE_TYPE=int8_float16
       - SUBTITLE_LLM_BASE_URL=${SUBTITLE_LLM_BASE_URL:-http://host.docker.internal:1234/v1}
       - SUBTITLE_LLM_MODEL=${SUBTITLE_LLM_MODEL:-}
+      - SUBTITLE_REVIEW_MODEL=${SUBTITLE_REVIEW_MODEL:-}
       - SUBTITLE_LLM_TIMEOUT=${SUBTITLE_LLM_TIMEOUT:-600}
     extra_hosts:
       - host.docker.internal:host-gateway

@@ -12,6 +12,11 @@ import worker
 import validate_srt
 
 
+def mock_quality_review(model, source, target, cues, texts, start):
+    return [{"id": index + 1, "fidelity": 90, "fluency": 95, "issue": ""}
+            for index in range(start, min(start + worker.REVIEW_BATCH_SIZE, len(cues)))]
+
+
 class SubtitleStudioTests(unittest.TestCase):
     def test_quality_tool_resolves_job_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -135,7 +140,8 @@ class SubtitleStudioTests(unittest.TestCase):
                   patch.object(worker, "probe_media", return_value={"tracks": [{"index": 1, "offset": 0}], "duration": 2}),
                   patch.object(worker, "extract_audio") as extract,
                   patch.object(worker, "get_speech_model", return_value=model) as load_model,
-                  patch.object(worker, "request_translation", side_effect=translate)):
+                  patch.object(worker, "request_translation", side_effect=translate),
+                  patch.object(worker, "request_quality_review", side_effect=mock_quality_review)):
                 try:
                     def submit(target, whisper_model="medium"):
                         job = worker.create_job({"path": "film.mkv", "audio_stream_index": 1,
@@ -163,6 +169,9 @@ class SubtitleStudioTests(unittest.TestCase):
                     self.assertEqual(translated_languages, ["en", "fr", "fr"])
                     self.assertIn("transcription", second["reused"])
                     self.assertIn("en", third["reused"])
+                    self.assertIn("en review", third["reused"])
+                    self.assertEqual(first["quality"]["en"]["score"], 90)
+                    self.assertEqual(second["quality"]["fr"]["status"], "completed")
                     self.assertNotIn("transcription", fourth["reused"])
                     self.assertEqual(first_download.read_text(encoding="utf-8"), saved_english)
                     self.assertIn("fr:", (root / "output" / "film.fr.srt").read_text(encoding="utf-8"))
@@ -189,7 +198,8 @@ class SubtitleStudioTests(unittest.TestCase):
                   patch.object(worker, "probe_media", return_value={"tracks": [{"index": 1, "offset": 0}], "duration": 10}),
                   patch.object(worker, "extract_audio") as extract,
                   patch.object(worker, "get_speech_model", return_value=model) as load_model,
-                  patch.object(worker, "request_translation", side_effect=translate)):
+                  patch.object(worker, "request_translation", side_effect=translate),
+                  patch.object(worker, "request_quality_review", side_effect=mock_quality_review)):
                 try:
                     def submit():
                         return worker.create_job({"path": "film.mkv", "audio_stream_index": 1,
