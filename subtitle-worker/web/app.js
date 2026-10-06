@@ -1,4 +1,4 @@
-const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', openReviews: new Set(), openSteps: new Set(), pendingReviews: new Set(), pendingStepActions: new Set(), jobActionFeedback: new Map(), reviewingMissing: false };
+const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', modelThinking: {}, thinkingError: '', openReviews: new Set(), openSteps: new Set(), pendingReviews: new Set(), pendingStepActions: new Set(), jobActionFeedback: new Map(), reviewingMissing: false };
 const $ = id => document.getElementById(id);
 
 const ui = {
@@ -62,10 +62,43 @@ function updateWhisperSelection() {
   $('whisper-note').textContent = `${availability}${selected.endsWith('.en') ? ' This model only supports English audio.' : ''}`;
 }
 
+function thinkingValue(id) {
+  return $(id).disabled ? null : $(id).checked;
+}
+
+function updateThinkingControl(id, model, enabled = true) {
+  const toggle = $(id);
+  const capability = state.modelThinking[model];
+  const supported = capability?.can_toggle && !/translategemma/i.test(model);
+  if (toggle.dataset.model !== model) {
+    toggle.dataset.model = model;
+    try { toggle.checked = localStorage.getItem(`subtitle-studio:thinking:${id}:${model}`) === 'true'; }
+    catch { toggle.checked = false; }
+  }
+  toggle.disabled = !enabled || !supported;
+  if (!supported) toggle.checked = false;
+  let note;
+  if (!enabled) note = 'Enable review to choose its thinking mode.';
+  else if (!model) note = 'Choose a specific model to override its thinking mode.';
+  else if (supported) note = toggle.checked
+    ? 'On · permits reasoning and may take longer. A different mode uses a separate cache.'
+    : 'Off · skips reasoning for faster output. A different mode uses a separate cache.';
+  else if (state.thinkingError) note = 'Thinking controls are unavailable from this LM Studio server. Its model default is used.';
+  else if ((capability?.allowed_options || []).includes('on')) note = 'This model always uses thinking; LM Studio does not offer an off setting.';
+  else note = 'This model has no switchable thinking setting. Its model default is used.';
+  $(`${id}-note`).textContent = note;
+}
+
+function updateSavedThinking() {
+  updateThinkingControl('jobs-review-thinking', $('jobs-review-model').value);
+}
+
 function updateReviewSelection() {
+  updateThinkingControl('translation-thinking', $('model-select').value);
   const enabled = $('review-enabled').checked;
   $('review-model-select').disabled = !enabled;
   if (!enabled) {
+    updateThinkingControl('review-thinking', $('review-model-select').value, false);
     $('review-note').textContent = 'Review is optional. You can review saved SRTs later from Jobs & downloads.';
     return;
   }
@@ -74,6 +107,7 @@ function updateReviewSelection() {
   const configured = /translategemma/i.test(state.defaultReviewModel) ? '' : state.defaultReviewModel;
   const fallback = /translategemma/i.test(state.defaultTranslationModel) ? '' : state.defaultTranslationModel;
   const automatic = configured || (translator && !/translategemma/i.test(translator) ? translator : '') || fallback || $('review-model-select').options[1]?.value;
+  updateThinkingControl('review-thinking', reviewer || automatic || '');
   let selection = 'Automatic selects a general model in LM Studio.';
   if ((reviewer || automatic) === translator && translator) {
     selection = 'Uses the translation model for review; self-review may miss errors.';
@@ -93,6 +127,8 @@ async function loadConfig() {
   state.whisperLocalOnly = data.whisper_local_only;
   state.defaultReviewModel = data.default_review_model || '';
   state.defaultTranslationModel = data.default_model || '';
+  state.modelThinking = data.model_thinking || {};
+  state.thinkingError = data.thinking_error || '';
   const whisperSelect = $('whisper-select');
   for (const item of data.whisper_models) {
     state.whisperModels.set(item.id, item.downloaded);
@@ -145,6 +181,9 @@ async function loadConfig() {
   }
   models.onchange = updateReviewSelection;
   reviewers.onchange = updateReviewSelection;
+  if ([...savedReviewers.options].some(option => option.value === state.defaultReviewModel)) savedReviewers.value = state.defaultReviewModel;
+  savedReviewers.onchange = updateSavedThinking;
+  updateSavedThinking();
   updateReviewSelection();
 }
 
@@ -237,6 +276,8 @@ async function submitJob() {
         model,
         review_enabled: $('review-enabled').checked,
         review_model: $('review-model-select').value,
+        translation_thinking: thinkingValue('translation-thinking'),
+        review_thinking: thinkingValue('review-thinking'),
       }),
     });
     state.jobFilter = 'all';
@@ -443,7 +484,7 @@ async function reviewJob(job, languages, force) {
     await api(`/api/jobs/${encodeURIComponent(job.id)}/review`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ review_model: $('jobs-review-model').value, force, languages }),
+      body: JSON.stringify({ review_model: $('jobs-review-model').value, review_thinking: thinkingValue('jobs-review-thinking'), force, languages }),
     });
     reviewFeedback(`Queued ${force ? 'a new review' : 'missing reviews'} for ${languages.map(code => code.toUpperCase()).join(', ')}. Saved subtitles remain available.`);
     await loadJobs();
@@ -466,7 +507,7 @@ async function reviewMissingJobs() {
     const result = await api('/api/reviews/missing', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ review_model: $('jobs-review-model').value }),
+      body: JSON.stringify({ review_model: $('jobs-review-model').value, review_thinking: thinkingValue('jobs-review-thinking') }),
     });
     const queued = Array.isArray(result.queued) ? result.queued : [];
     const skipped = Array.isArray(result.skipped) ? result.skipped : [];
@@ -510,6 +551,7 @@ function renderReviewActivity(card, job) {
   top.append(element('p', 'text-[11px] font-bold text-[#adbfcb]', task.force ? 'Re-review' : 'Translation review'));
   top.append(element('span', badgeClasses(task.status), task.status));
   section.append(top);
+  if (typeof task.thinking === 'boolean') section.append(element('p', 'mt-2 text-[11px] text-[#91a3af]', `Thinking ${task.thinking ? 'on' : 'off'}`));
   if (['queued', 'running', 'cancelling'].includes(task.status)) {
     const value = Number(task.progress);
     const percent = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 0;
@@ -593,6 +635,7 @@ function renderQuality(card, job) {
     if (complete) metrics.append(reviewMetric('Flagged cues', String(report.flagged_cues || 0)));
     body.append(metrics);
     body.append(element('p', 'break-words text-[11px] leading-[1.5] text-[#91a3af]', `Reviewer: ${report.model || 'No model available'}`));
+    if (typeof report.thinking === 'boolean') body.append(element('p', 'text-[11px] text-[#91a3af]', `Review thinking ${report.thinking ? 'on' : 'off'}`));
     body.append(element('p', 'text-[11px] leading-[1.5] text-[#8196a3]', 'Model estimate against the source transcript, not measured accuracy. Transcription mistakes can affect the result.'));
     if (report.same_model) {
       body.append(element('p', 'text-[11px] leading-[1.5] text-[#d2cc9f]', 'The translation model also reviewed its own output; this can miss errors.'));
@@ -656,6 +699,7 @@ function renderJobs() {
     );
     card.append(top);
     if (job.whisper_model) card.append(element('div', 'mt-[5px] text-[11px] text-[#91a3af]', `Whisper ${job.whisper_model}`));
+    if (typeof job.translation_thinking === 'boolean') card.append(element('div', 'mt-[5px] text-[11px] text-[#91a3af]', `Translation thinking ${job.translation_thinking ? 'on' : 'off'}`));
     let stage = job.stage;
     if (job.status === 'running' && job.stage === 'Transcribing' && job.duration) {
       stage += ` · ${seconds(job.position)} / ${seconds(job.duration)}`;
@@ -701,6 +745,14 @@ $('refresh-library').onclick = () => loadFolder(state.folder);
 $('refresh-jobs').onclick = loadJobs;
 $('review-missing-jobs').onclick = reviewMissingJobs;
 $('review-enabled').onchange = updateReviewSelection;
+for (const id of ['translation-thinking', 'review-thinking', 'jobs-review-thinking']) {
+  $(id).onchange = () => {
+    try { localStorage.setItem(`subtitle-studio:thinking:${id}:${$(id).dataset.model}`, String($(id).checked)); }
+    catch { /* The current selection still works when browser storage is unavailable. */ }
+    if (id === 'jobs-review-thinking') updateSavedThinking();
+    else updateReviewSelection();
+  };
+}
 $('submit-job').onclick = submitJob;
 for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
   button.onclick = () => {

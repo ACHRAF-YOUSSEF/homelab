@@ -50,6 +50,8 @@ speech_model = None
 speech_model_name = None
 speech_lock = threading.Lock()
 llm_step_context = threading.local()
+thinking_metadata = {"expires": 0, "models": {}}
+thinking_metadata_lock = threading.Lock()
 
 
 def now():
@@ -92,21 +94,23 @@ def transcript_key_from_fingerprint(job, fingerprint, legacy_options=False):
     })
 
 
-def translation_cache_key(transcript_key, source_code, cues, target_code, model):
+def translation_cache_key(transcript_key, source_code, cues, target_code, model, thinking=None):
     return cache_digest({
         "kind": "translation", "version": CACHE_VERSION,
         "transcript_key": transcript_key, "source_language": source_code,
         "source_cues": cues, "target_language": target_code, "model": model,
         "adapter": "translategemma-raw-v1" if is_translategemma(model) else "chat-json-v1",
+        **({"thinking": thinking} if thinking is not None else {}),
     })
 
 
-def quality_cache_key(transcript_key, source_code, cues, target_code, texts, model):
+def quality_cache_key(transcript_key, source_code, cues, target_code, texts, model, thinking=None):
     return cache_digest({
         "kind": "quality", "method": REVIEW_METHOD, "batch_size": REVIEW_BATCH_SIZE,
         "transcript_key": transcript_key, "source_language": source_code,
         "source_cues": cues, "target_language": target_code, "target_texts": texts,
         "model": model,
+        **({"thinking": thinking} if thinking is not None else {}),
     })
 
 
@@ -225,6 +229,51 @@ def list_models():
     with urlopen(request, timeout=8) as response:
         data = json.load(response)
     return [item["id"] for item in data.get("data", []) if isinstance(item.get("id"), str) and not any(term in item["id"].lower() for term in ("embedding", "embed-text", "rerank"))]
+
+
+def model_thinking_options():
+    """Read actual server capabilities; model names alone cannot establish support."""
+    with thinking_metadata_lock:
+        if time.monotonic() < thinking_metadata["expires"]:
+            return thinking_metadata["models"]
+        request = Request(LLM_BASE.removesuffix("/v1") + "/api/v1/models", headers={"Accept": "application/json"})
+        with urlopen(request, timeout=8) as response:
+            data = json.load(response)
+        options = {}
+        for model in data.get("models", []):
+            if model.get("type") != "llm":
+                continue
+            reasoning = (model.get("capabilities") or {}).get("reasoning") or {}
+            allowed = reasoning.get("allowed_options") or []
+            enabled = next((value for value in ("on", "high", "medium", "low") if value in allowed), None)
+            capability = {"can_toggle": "off" in allowed and enabled is not None,
+                          "allowed_options": allowed, "default": reasoning.get("default"),
+                          "effort_on": "high" if enabled == "on" else enabled}
+            for identifier in [model.get("key"), *[instance.get("id") for instance in model.get("loaded_instances", [])]]:
+                if isinstance(identifier, str):
+                    options[identifier] = capability
+        thinking_metadata.update(models=options, expires=time.monotonic() + 60)
+        return options
+
+
+def thinking_setting(payload, name):
+    value = payload.get(name)
+    if value is not None and type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean or null")
+    return value
+
+
+def apply_thinking(payload, model, thinking):
+    if thinking is None:
+        return
+    if type(thinking) is not bool:
+        raise ValueError("Thinking must be a boolean or null")
+    capability = model_thinking_options().get(model, {})
+    if is_translategemma(model) or not capability.get("can_toggle"):
+        raise ValueError(f"LM Studio does not expose switchable thinking for {model}. Use its default setting.")
+    # LM Studio's OpenAI-compatible transport accepts none/high, mapping these
+    # to off/on for binary models. Literal off/on is rejected by this endpoint.
+    payload["reasoning_effort"] = capability["effort_on"] if thinking else "none"
 
 
 def model_for_job(preferred):
@@ -376,11 +425,11 @@ def check_llm_step_cancelled():
         check_step_cancelled(*context)
 
 
-def call_step_model(job_id, step, function, *args):
+def call_step_model(job_id, step, function, *args, thinking=None):
     previous = getattr(llm_step_context, "step", None)
     llm_step_context.step = (job_id, step)
     try:
-        return function(*args)
+        return function(*args, **({"thinking": thinking} if thinking is not None else {}))
     finally:
         llm_step_context.step = previous
 
@@ -496,6 +545,8 @@ def create_job(payload):
     review_enabled = payload.get("review_enabled", True)
     if type(review_enabled) is not bool:
         raise ValueError("Translation review enabled must be a boolean")
+    translation_thinking = thinking_setting(payload, "translation_thinking")
+    review_thinking = thinking_setting(payload, "review_thinking")
     whisper_model = payload.get("whisper_model", WHISPER_NAME)
     if (not isinstance(whisper_model, str) or len(whisper_model) > 100
             or not whisper_model or (whisper_model != WHISPER_NAME and whisper_model not in supported_whisper_models())):
@@ -511,6 +562,7 @@ def create_job(payload):
         "source_language": source, "transcript": transcript, "targets": targets,
         "whisper_model": whisper_model,
         "review_model": review_model.strip(), "review_enabled": review_enabled, "quality": {},
+        "translation_thinking": translation_thinking, "review_thinking": review_thinking,
         "model": model.strip(), "status": "queued", "stage": "Waiting", "progress": 0,
         "duration": metadata["duration"], "position": 0, "audio_offset": selected_track.get("offset", 0), "detected_language": None,
         "media_fingerprint": media_fingerprint(media, relative), "reused": [],
@@ -706,8 +758,10 @@ def request_translategemma(model, source_code, target_code, cue):
     raise RuntimeError(f"TranslateGemma translation failed after 3 attempts: {last_error}")
 
 
-def request_translation(model, source_code, target_code, batch):
+def request_translation(model, source_code, target_code, batch, thinking=None):
     if is_translategemma(model):
+        if thinking is not None:
+            raise ValueError("TranslateGemma does not support a thinking toggle")
         return [request_translategemma(model, source_code, target_code, cue) for cue in batch]
     numbered = [{"id": i, "text": cue["text"]} for i, cue in enumerate(batch, 1)]
     prompt = (
@@ -716,7 +770,9 @@ def request_translation(model, source_code, target_code, batch):
         "Return ONLY a JSON array with one object per input, each with the same integer id and a translated text string. "
         "No timestamps, markdown, notes, or extra objects.\n\n" + json.dumps(numbered, ensure_ascii=False)
     )
-    body = json.dumps({"model": model, "messages": [{"role": "system", "content": "You are an expert audiovisual subtitle translator. Output valid JSON only."}, {"role": "user", "content": prompt}], "temperature": 0.1, "stream": False}, ensure_ascii=False).encode("utf-8")
+    payload = {"model": model, "messages": [{"role": "system", "content": "You are an expert audiovisual subtitle translator. Output valid JSON only."}, {"role": "user", "content": prompt}], "temperature": 0.1, "stream": False}
+    apply_thinking(payload, model, thinking)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = Request(LLM_BASE + "/chat/completions", data=body, headers={"Content-Type": "application/json"}, method="POST")
     last_error = None
     for attempt in range(3):
@@ -774,7 +830,7 @@ def load_quality_cache(key, expected_count):
         return []
 
 
-def request_quality_review(model, source_code, target_code, cues, texts, start):
+def request_quality_review(model, source_code, target_code, cues, texts, start, thinking=None):
     if is_translategemma(model):
         raise ValueError("TranslateGemma cannot perform translation review")
     if len(cues) != len(texts):
@@ -812,10 +868,12 @@ def request_quality_review(model, source_code, target_code, cues, texts, start):
                        "fluency": {"type": "number", "minimum": 0, "maximum": 100},
                        "issue": {"type": "string", "maxLength": 600}},
                        "required": ["id", "fidelity", "fluency", "issue"], "additionalProperties": False}}}}
-    body = json.dumps({"model": model, "messages": [{"role": "system", "content": rubric},
+    payload = {"model": model, "messages": [{"role": "system", "content": rubric},
                        {"role": "user", "content": json.dumps(content, ensure_ascii=False)}],
                        "response_format": response_format,
-                       "temperature": 0, "max_tokens": 8192, "stream": False}, ensure_ascii=False).encode("utf-8")
+                       "temperature": 0, "max_tokens": 8192, "stream": False}
+    apply_thinking(payload, model, thinking)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = Request(LLM_BASE + "/chat/completions", data=body, headers={"Content-Type": "application/json"}, method="POST")
     last_error = None
     for attempt in range(3):
@@ -839,11 +897,12 @@ def request_quality_review(model, source_code, target_code, cues, texts, start):
     raise RuntimeError(f"Translation review failed after 3 attempts: {last_error}")
 
 
-def quality_report(status, model, translation_model, cues, texts, ratings, error=None):
+def quality_report(status, model, translation_model, cues, texts, ratings, error=None, thinking=None):
     flagged = [rating for rating in ratings if min(rating["fidelity"], rating["fluency"]) < 70]
     report = {"status": status, "model": model, "method": REVIEW_METHOD,
               "reviewed_cues": len(ratings), "total_cues": len(cues), "flagged_cues": len(flagged),
               "same_model": bool(model and model == translation_model), "issues": []}
+    report["thinking"] = thinking
     for rating in sorted(flagged, key=lambda row: (min(row["fidelity"], row["fluency"]), row["id"]))[:5]:
         index = rating["id"] - 1
         report["issues"].append({"cue": rating["id"], "start": cues[index]["start"],
@@ -871,6 +930,7 @@ def review_translations(job_id, transcript_key, source_code, cues, translations,
     """Review complete target outputs, retaining subtitles and resumable ratings on any review failure."""
     with jobs_lock:
         preferred = jobs[job_id].get("review_model", "")
+        thinking = jobs[job_id].get("review_thinking")
         cancelled = set(jobs[job_id].get("cancelled_steps") or [])
     check_job_cancelled(job_id)
     for language in translations:
@@ -896,36 +956,36 @@ def review_translations(job_id, transcript_key, source_code, cues, translations,
             set_step(job_id, step, status="running", progress=0, error=None)
             if selection_error:
                 raise selection_error
-            key = quality_cache_key(transcript_key, source_code, cues, language, texts, model)
+            key = quality_cache_key(transcript_key, source_code, cues, language, texts, model, thinking)
             ratings = load_quality_cache(key, len(cues))
             set_step(job_id, step, progress=int(100 * len(ratings) / len(cues)))
-            set_quality(job_id, language, quality_report("running", model, translation_model, cues, texts, ratings),
+            set_quality(job_id, language, quality_report("running", model, translation_model, cues, texts, ratings, thinking=thinking),
                         stage=f"Reviewing {LANGUAGES[language]} translation ({len(ratings)}/{len(cues)} cues)",
                         progress=88 + int(11 * (language_index * len(cues) + len(ratings)) / total))
             if len(ratings) == len(cues):
                 reused.append(f"{language} review")
             for start in range(len(ratings), len(cues), REVIEW_BATCH_SIZE):
                 check_step_cancelled(job_id, step)
-                batch = call_step_model(job_id, step, request_quality_review, model, source_code, language, cues, texts, start)
+                batch = call_step_model(job_id, step, request_quality_review, model, source_code, language, cues, texts, start, thinking=thinking)
                 ratings.extend(validate_review_ratings(batch, list(range(start + 1, min(start + REVIEW_BATCH_SIZE, len(cues)) + 1))))
                 write_cache("quality", key, {"method": REVIEW_METHOD, "ratings": ratings})
                 set_step(job_id, step, progress=int(100 * len(ratings) / len(cues)))
                 check_step_cancelled(job_id, step)
-                set_quality(job_id, language, quality_report("running", model, translation_model, cues, texts, ratings),
+                set_quality(job_id, language, quality_report("running", model, translation_model, cues, texts, ratings, thinking=thinking),
                             stage=f"Reviewing {LANGUAGES[language]} translation ({len(ratings)}/{len(cues)} cues)",
                             progress=88 + int(11 * (language_index * len(cues) + len(ratings)) / total))
             with jobs_lock:
                 check_step_cancelled(job_id, step)
-                set_quality(job_id, language, quality_report("completed", model, translation_model, cues, texts, ratings), reused=reused[:])
+                set_quality(job_id, language, quality_report("completed", model, translation_model, cues, texts, ratings, thinking=thinking), reused=reused[:])
                 complete_step(job_id, step)
         except StepCancelled as exc:
             check_job_cancelled(job_id)
             warnings = True
-            set_quality(job_id, language, quality_report("unavailable", model, translation_model, cues, texts, ratings, exc))
+            set_quality(job_id, language, quality_report("unavailable", model, translation_model, cues, texts, ratings, exc, thinking=thinking))
         except Exception as exc:
             warnings = True
             logging.warning("Translation review unavailable for %s in job %s: %s", language, job_id, exc)
-            set_quality(job_id, language, quality_report("unavailable", model, translation_model, cues, texts, ratings, exc))
+            set_quality(job_id, language, quality_report("unavailable", model, translation_model, cues, texts, ratings, exc, thinking=thinking))
             set_step(job_id, step, status="failed", error=str(exc))
     return warnings
 
@@ -1105,6 +1165,7 @@ def public_job(job):
 
 
 def validate_review_action(payload):
+    thinking_setting(payload, "review_thinking")
     model = payload.get("review_model", "")
     if not isinstance(model, str) or len(model) > 300:
         raise ValueError("Invalid translation review model")
@@ -1123,6 +1184,7 @@ def validate_review_action(payload):
 
 def queue_review(job_id, payload):
     model, force, requested = validate_review_action(payload)
+    thinking = thinking_setting(payload, "review_thinking")
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -1142,7 +1204,7 @@ def queue_review(job_id, payload):
     if not selected:
         raise ValueError("All available translations already have completed reviews")
     task = {"status": "queued", "stage": "Waiting for translation review", "progress": 0,
-            "languages": selected, "model": model, "force": force, "error": None,
+            "languages": selected, "model": model, "thinking": thinking, "force": force, "error": None,
             "token": uuid.uuid4().hex,
             "created_at": now(), "updated_at": now()}
     with jobs_lock:
@@ -1167,7 +1229,7 @@ def queue_missing_reviews(payload):
     queued, skipped = [], []
     for job_id in identifiers:
         try:
-            queue_review(job_id, {"review_model": model})
+            queue_review(job_id, {"review_model": model, "review_thinking": thinking_setting(payload, "review_thinking")})
             queued.append(job_id)
         except (OSError, ValueError) as exc:
             skipped.append({"id": job_id, "reason": str(exc)})
@@ -1239,7 +1301,9 @@ def retry_step(job_id, step):
         snapshot = json.loads(json.dumps(job))
     if step.startswith("review:"):
         language = step.split(":")[1]
-        return queue_review(job_id, {"languages": [language], "review_model": (snapshot.get("review_task") or {}).get("model") or snapshot.get("review_model", "")})
+        previous = snapshot.get("review_task") or {}
+        return queue_review(job_id, {"languages": [language], "review_model": previous.get("model") or snapshot.get("review_model", ""),
+                                    "review_thinking": previous.get("thinking", snapshot.get("review_thinking"))})
     if step.startswith("translation:"):
         source_for_review(snapshot)
     else:
@@ -1274,6 +1338,7 @@ def run_review_task(job_id):
     with jobs_lock:
         job = json.loads(json.dumps(jobs[job_id]))
     task = job["review_task"]
+    thinking = task.get("thinking")
     check_job_cancelled(job_id)
     set_review_task(job_id, status="running", stage="Loading saved subtitles", progress=1)
     key, source, cues, translations, rejected = review_inputs(job)
@@ -1297,9 +1362,9 @@ def run_review_task(job_id):
         try:
             check_step_cancelled(job_id, step)
             set_step(job_id, step, status="running", error=None)
-            quality_key = quality_cache_key(key, source, cues, language, texts, model)
+            quality_key = quality_cache_key(key, source, cues, language, texts, model, thinking)
             content_key, content_cues = canonical_review_source(source, cues)
-            content_quality_key = quality_cache_key(content_key, source, content_cues, language, texts, model)
+            content_quality_key = quality_cache_key(content_key, source, content_cues, language, texts, model, thinking)
             cache_keys = list(dict.fromkeys((quality_key, content_quality_key)))
             if not task["force"]:
                 ratings = max((load_quality_cache(cache_key, len(cues)) for cache_key in cache_keys), key=len)
@@ -1314,13 +1379,13 @@ def run_review_task(job_id):
                 set_review_task(job_id, stage=f"Reviewing {LANGUAGES[language]} ({len(ratings)}/{len(cues)} cues)",
                                 progress=int(99 * (language_index * len(cues) + len(ratings)) / total))
                 if not keep_previous:
-                    set_quality(job_id, language, quality_report("running", model, job.get("model", ""), cues, texts, ratings))
+                    set_quality(job_id, language, quality_report("running", model, job.get("model", ""), cues, texts, ratings, thinking=thinking))
             progress_update()
             if len(ratings) == len(cues) and f"{language} review" not in reused:
                 reused.append(f"{language} review")
             for start in range(len(ratings), len(cues), REVIEW_BATCH_SIZE):
                 check_step_cancelled(job_id, step)
-                batch = call_step_model(job_id, step, request_quality_review, model, source, language, cues, texts, start)
+                batch = call_step_model(job_id, step, request_quality_review, model, source, language, cues, texts, start, thinking=thinking)
                 ratings.extend(validate_review_ratings(batch, list(range(start + 1, min(start + REVIEW_BATCH_SIZE, len(cues)) + 1))))
                 for cache_key in cache_keys:
                     write_cache("quality", cache_key, {"method": REVIEW_METHOD, "ratings": ratings})
@@ -1332,17 +1397,17 @@ def run_review_task(job_id):
                 write_cache("quality", cache_key, {"method": REVIEW_METHOD, "ratings": ratings})
             with jobs_lock:
                 check_step_cancelled(job_id, step)
-                set_quality(job_id, language, quality_report("completed", model, job.get("model", ""), cues, texts, ratings), reused=reused[:])
+                set_quality(job_id, language, quality_report("completed", model, job.get("model", ""), cues, texts, ratings, thinking=thinking), reused=reused[:])
                 complete_step(job_id, step)
         except StepCancelled as exc:
             check_job_cancelled(job_id)
             cancelled_languages.append(language)
             if not keep_previous:
-                set_quality(job_id, language, quality_report("unavailable", model, job.get("model", ""), cues, texts, ratings, exc))
+                set_quality(job_id, language, quality_report("unavailable", model, job.get("model", ""), cues, texts, ratings, exc, thinking=thinking))
         except Exception as exc:
             errors.append(f"{LANGUAGES[language]}: {exc}")
             if not keep_previous:
-                set_quality(job_id, language, quality_report("unavailable", model, job.get("model", ""), cues, texts, ratings, exc))
+                set_quality(job_id, language, quality_report("unavailable", model, job.get("model", ""), cues, texts, ratings, exc, thinking=thinking))
             logging.warning("Review-only task %s failed for %s: %s", job_id, language, exc)
             set_step(job_id, step, status="failed", error=str(exc))
     check_job_cancelled(job_id)
@@ -1469,7 +1534,8 @@ def perform_translation(job_id, job, transcript_key, source, cues, language, mod
     step = f"translation:{language}"
     check_step_cancelled(job_id, step)
     set_step(job_id, step, status="running", error=None)
-    key = translation_cache_key(transcript_key, source, cues, language, model)
+    thinking = job.get("translation_thinking")
+    key = translation_cache_key(transcript_key, source, cues, language, model, thinking)
     texts = load_translation_cache(key, len(cues))
     batch_size = 1 if is_translategemma(model) else 8
     if texts:
@@ -1479,7 +1545,7 @@ def perform_translation(job_id, job, transcript_key, source, cues, language, mod
         progress(f"Translating to {LANGUAGES[language]} ({len(texts)}/{len(cues)} cues)", len(texts))
         for start in range(len(texts), len(cues), batch_size):
             check_step_cancelled(job_id, step)
-            translated = call_step_model(job_id, step, request_translation, model, source, language, cues[start:start + batch_size])
+            translated = call_step_model(job_id, step, request_translation, model, source, language, cues[start:start + batch_size], thinking=thinking)
             if len(translated) != min(batch_size, len(cues) - start) or not all(isinstance(text, str) and text.strip() for text in translated):
                 raise ValueError("Translator returned incomplete subtitle cues")
             texts.extend(translated)
@@ -1651,10 +1717,15 @@ class Handler(BaseHTTPRequestHandler):
                 models, model_error = [], str(exc)
             if LLM_DEFAULT and LLM_DEFAULT not in models:
                 models.insert(0, LLM_DEFAULT)
+            try:
+                thinking_options, thinking_error = model_thinking_options(), None
+            except Exception as exc:
+                thinking_options, thinking_error = {}, str(exc)
             return self.send_json({"languages": LANGUAGES, "whisper_model": WHISPER_NAME,
                                    "whisper_models": whisper_model_options(), "whisper_local_only": WHISPER_LOCAL_ONLY,
                                    "models": models, "default_model": LLM_DEFAULT or (models[0] if models else ""),
-                                   "default_review_model": REVIEW_DEFAULT, "model_error": model_error})
+                                   "default_review_model": REVIEW_DEFAULT, "model_error": model_error,
+                                   "model_thinking": thinking_options, "thinking_error": thinking_error})
         if path == "/api/library":
             return self.send_json(browse(query.get("path", [""])[0]))
         if path == "/api/media":

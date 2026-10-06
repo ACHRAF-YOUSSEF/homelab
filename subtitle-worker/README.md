@@ -103,6 +103,16 @@ docker compose exec subtitle-worker python validate_srt.py --job-id 2ced752ce1c9
 
 It checks SRT structure, chronological timestamps, video duration, source/translation cue alignment, and flags subtitles that may be too brief, too long, or too dense to read. It cannot prove the speech was recognized correctly or that a translation preserves the meaning. Play the video with each SRT and review samples near the start, middle, and end. Listen for missed or invented words in the source transcript; then compare the source and translated cues for names, negation, pronouns, omissions, and sentences split across cues. For a reliable accuracy score, compare against a trusted human transcript or translation. The current Compose configuration runs Whisper on the NVIDIA GPU with `int8_float16`; LM Studio controls GPU use for translation separately.
 
+### Thinking controls
+
+The web app has separate **Translation thinking**, **Review thinking**, and **Saved review thinking** switches. Switchable models start with thinking off; each selection is remembered per model in this browser. The review switch is enabled only when review is selected. For saved reviews, select a specific reviewer to control thinking; Automatic leaves the model's own default in effect.
+
+Support comes from LM Studio's `/api/v1/models` reasoning capabilities, including loaded instance IDs. Models that cannot switch between thinking and non-thinking, TranslateGemma, and servers without this metadata show a disabled switch and use the model default. The app sends `reasoning_effort: "none"` for off and the model's supported effort for on through `/v1/chat/completions`. These values were verified against local Gemma 4 E4B with structured JSON output; the app does not change LM Studio's global settings.
+
+New generation requests accept `translation_thinking` and `review_thinking` as boolean or null. Saved review and bulk review requests accept `review_thinking`. Null or an omitted value preserves LM Studio's default and the existing cache identity. Explicit on/off values have separate translation and review caches; changing them reuses audio and transcription but computes new results for that mode. Step retries retain the mode of the original generation or review task. Job cards and completed reports record the selected mode; old results whose mode was not specified retain their previous metadata.
+
+Thinking can add latency and consume output/context tokens; it does not guarantee better subtitles. Keep an 8,192-token context for typical non-thinking batches and allow additional context space when reasoning is enabled. Review scores remain model estimates.
+
 For logs:
 
 ```powershell

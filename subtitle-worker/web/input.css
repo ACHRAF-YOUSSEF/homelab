@@ -13,6 +13,18 @@
 
 [hidden] { display: none !important; }
 
+.thinking-switch {
+  @apply relative h-5 w-9 shrink-0 cursor-pointer appearance-none rounded-full border border-[#465564] bg-[#30404b] outline-none;
+}
+.thinking-switch::before {
+  content: "";
+  @apply absolute top-[2px] left-[2px] h-[14px] w-[14px] rounded-full bg-[#bdccd5] transition-transform;
+}
+.thinking-switch:checked { @apply border-[#54c995] bg-[#1b4435]; }
+.thinking-switch:checked::before { @apply translate-x-4 bg-mint; }
+.thinking-switch:focus-visible { @apply outline-2 outline-offset-2 outline-mint; }
+.thinking-switch:disabled { @apply cursor-not-allowed opacity-50; }
+
 select {
   @apply appearance-none pr-10;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.5 4.5 6 8 9.5 4.5' stroke='%2391a3af' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
