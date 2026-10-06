@@ -49,6 +49,7 @@ job_queue = queue.Queue()
 speech_model = None
 speech_model_name = None
 speech_lock = threading.Lock()
+llm_step_context = threading.local()
 
 
 def now():
@@ -73,14 +74,21 @@ def media_fingerprint(media, relative):
 
 
 def transcript_cache_key(job, media):
+    return transcript_key_from_fingerprint(job, media_fingerprint(media, job["path"]))
+
+
+def transcript_key_from_fingerprint(job, fingerprint, legacy_options=False):
+    options = {"beam_size": 5, "vad_filter": True, "word_timestamps": True}
+    if not legacy_options:
+        options["condition_on_previous_text"] = False
     return cache_digest({
         "kind": "transcript", "version": CACHE_VERSION,
-        "media": media_fingerprint(media, job["path"]),
+        "media": fingerprint,
         "audio_stream_index": job["audio_stream_index"],
         "audio_offset": job["audio_offset"],
         "source_language": job["source_language"],
         "whisper_model": job.get("whisper_model", WHISPER_NAME),
-        "whisper_options": {"beam_size": 5, "vad_filter": True, "word_timestamps": True, "condition_on_previous_text": False},
+        "whisper_options": options,
     })
 
 
@@ -128,7 +136,8 @@ def write_cache(kind, key, payload):
 def valid_cues(cues):
     return (isinstance(cues, list) and bool(cues) and all(
         isinstance(cue, dict) and type(cue.get("start")) in (int, float)
-        and type(cue.get("end")) in (int, float) and cue["end"] > cue["start"]
+        and type(cue.get("end")) in (int, float)
+        and math.isfinite(cue["start"]) and math.isfinite(cue["end"]) and cue["end"] > cue["start"]
         and isinstance(cue.get("text"), str) and bool(cue["text"].strip())
         for cue in cues
     ))
@@ -256,13 +265,190 @@ def set_job(job_id, **changes):
         persist_locked()
 
 
+ACTIVE_WORK = {"queued", "running", "cancelling"}
+
+
+class StepCancelled(Exception):
+    def __init__(self, step):
+        super().__init__("Cancelled by user")
+        self.step = step
+
+
+def work_active(job):
+    return (job.get("status") in ACTIVE_WORK
+            or (job.get("review_task") or {}).get("status") in ACTIVE_WORK
+            or (job.get("step_task") or {}).get("status") in ACTIVE_WORK)
+
+
+def initial_steps(job):
+    source = job.get("detected_language") or job.get("source_language")
+    targets = list(dict.fromkeys([*(job.get("targets") or []),
+                                 *[code for code in (job.get("outputs") or {}) if code in LANGUAGES and code != source]]))
+    steps = {"extraction": {"label": "Extract audio", "status": "pending", "progress": 0, "error": None},
+             "transcription": {"label": "Transcribe audio", "status": "pending", "progress": 0, "error": None}}
+    for language in targets:
+        if language == source:
+            continue
+        steps[f"translation:{language}"] = {"label": f"Translate to {LANGUAGES.get(language, language)}", "status": "pending", "progress": 0, "error": None}
+        if (job.get("review_enabled", True) or language in (job.get("quality") or {})
+                or language in (job.get("review_task") or {}).get("languages", [])):
+            steps[f"review:{language}"] = {"label": f"Review {LANGUAGES.get(language, language)} translation", "status": "pending", "progress": 0, "error": None}
+    return steps
+
+
+def inferred_steps(job):
+    steps = initial_steps(job)
+    outputs, quality = job.get("outputs") or {}, job.get("quality") or {}
+    if outputs:
+        for key in ("extraction", "transcription"):
+            steps[key].update(status="completed", progress=100)
+    for key, value in steps.items():
+        if key.startswith("translation:") and key.split(":")[1] in outputs:
+            value.update(status="completed", progress=100)
+        elif key.startswith("review:"):
+            report = quality.get(key.split(":")[1]) or {}
+            status = report.get("status")
+            if status:
+                value.update(status={"unavailable": "failed"}.get(status, status),
+                             progress=100 if status == "completed" else int(100 * report.get("reviewed_cues", 0) / max(1, report.get("total_cues", 1))),
+                             error=report.get("error"))
+    stage = str(job.get("stage", "")).lower()
+    if job.get("progress", 0) >= 8 and ("transcrib" in stage or "whisper" in stage):
+        steps["extraction"].update(status="completed", progress=100)
+    active = ("extraction" if "extract" in stage else "transcription" if "transcrib" in stage or "whisper" in stage
+              else next((key for key in steps if key.startswith("review:") and steps[key]["status"] == "running"), None)
+              or next((key for key in steps if key.startswith("translation:") and steps[key]["status"] == "pending"), "extraction"))
+    if job.get("status") in ACTIVE_WORK:
+        if steps.get(active, {}).get("status") == "pending":
+            steps[active].update(status="queued" if job.get("status") == "queued" else "running")
+    else:
+        for key, value in steps.items():
+            if value["status"] == "pending":
+                value.update(status="failed" if key == active and job.get("status") == "failed" else "blocked",
+                             error=job.get("error") if key == active else "This step has not completed")
+    for key, stored in (job.get("steps") or {}).items():
+        source = job.get("detected_language") or job.get("source_language")
+        if key in (f"translation:{source}", f"review:{source}"):
+            continue
+        if isinstance(stored, dict):
+            steps[key] = {"label": key, "status": "pending", "progress": 0, "error": None, **stored}
+    return steps
+
+
+def set_step(job_id, step, **changes):
+    with jobs_lock:
+        steps = inferred_steps(jobs[job_id])
+        if step not in steps:
+            kind, _, language = step.partition(":")
+            steps[step] = {"label": f"{kind.title()} {LANGUAGES.get(language, language)}", "status": "pending", "progress": 0, "error": None}
+        if changes.get("status") == "running" and (jobs[job_id].get("cancel_requested") or step in (jobs[job_id].get("cancelled_steps") or [])):
+            changes["status"] = "cancelling"
+        steps[step].update(changes)
+        set_job(job_id, steps=steps)
+
+
+def check_step_cancelled(job_id, step):
+    with jobs_lock:
+        job = jobs[job_id]
+        cancelled = job.get("cancel_requested", False) or step in (job.get("cancelled_steps") or [])
+    if cancelled:
+        set_step(job_id, step, status="cancelled", error="Cancelled by user")
+        raise StepCancelled(step)
+
+
+def complete_step(job_id, step):
+    # Publish completion atomically with the cancellation check, so a Cancel
+    # accepted just before completion cannot be silently overwritten.
+    with jobs_lock:
+        check_step_cancelled(job_id, step)
+        set_step(job_id, step, status="completed", progress=100, error=None)
+
+
+def check_job_cancelled(job_id):
+    with jobs_lock:
+        if jobs[job_id].get("cancel_requested"):
+            raise StepCancelled("job")
+
+
+def check_llm_step_cancelled():
+    context = getattr(llm_step_context, "step", None)
+    if context:
+        check_step_cancelled(*context)
+
+
+def call_step_model(job_id, step, function, *args):
+    previous = getattr(llm_step_context, "step", None)
+    llm_step_context.step = (job_id, step)
+    try:
+        return function(*args)
+    finally:
+        llm_step_context.step = previous
+
+
+def block_dependents(job_id, step, reason):
+    with jobs_lock:
+        steps = inferred_steps(jobs[job_id])
+    for key, value in steps.items():
+        affected = (step in ("extraction", "transcription") and key != step and key != "extraction"
+                    or step.startswith("translation:") and key == step.replace("translation:", "review:"))
+        if affected and value["status"] not in ("completed", "cancelled", "failed"):
+            set_step(job_id, key, status="blocked", error=reason)
+
+
+def public_steps(job):
+    steps = inferred_steps(job)
+    busy = work_active(job)
+    source_available = None
+    for key, value in steps.items():
+        selected = (job.get("status") in ACTIVE_WORK
+                    or key == (job.get("step_task") or {}).get("step") and (job.get("step_task") or {}).get("status") in ACTIVE_WORK
+                    or key.startswith("review:") and key.split(":")[1] in (job.get("review_task") or {}).get("languages", [])
+                    and (job.get("review_task") or {}).get("status") in ACTIVE_WORK)
+        value["can_cancel"] = bool(selected and value["status"] in ("pending", "queued", "running") and not job.get("cancel_requested"))
+        retryable = not busy and value["status"] in ("failed", "cancelled", "blocked")
+        if key == "transcription" and retryable:
+            retryable = steps["extraction"]["status"] == "completed"
+        if retryable and key.startswith(("translation:", "review:")):
+            if source_available is None:
+                try:
+                    source_for_review(job)
+                    source_available = True
+                except (OSError, ValueError):
+                    source_available = False
+            retryable = source_available and (not key.startswith("review:") or key.split(":")[1] in (job.get("outputs") or {}))
+        value["can_retry"] = bool(retryable)
+    return steps
+
+
 def load_jobs():
     if not JOBS_FILE.exists():
         return
     try:
         for job in json.loads(JOBS_FILE.read_text(encoding="utf-8")):
-            if job["status"] in ("queued", "running"):
+            generation_interrupted = job["status"] in ACTIVE_WORK
+            if generation_interrupted:
                 job.update(status="failed", stage="Interrupted by service restart", error="Service restarted before this job completed")
+            task = job.get("review_task")
+            review_interrupted = isinstance(task, dict) and task.get("status") in ACTIVE_WORK
+            if review_interrupted:
+                task.update(status="failed", stage="Review interrupted by service restart",
+                            error="Service restarted before this review completed", updated_at=now())
+            step_task = job.get("step_task")
+            step_interrupted = isinstance(step_task, dict) and step_task.get("status") in ACTIVE_WORK
+            if step_interrupted:
+                step_task.update(status="failed", stage="Step interrupted by service restart",
+                                 error="Service restarted before this step completed", updated_at=now())
+            if generation_interrupted or review_interrupted or step_interrupted:
+                for step in (job.get("steps") or {}).values():
+                    if step.get("status") in ACTIVE_WORK:
+                        step.update(status="failed", error="Service restarted before this step completed")
+                    elif generation_interrupted and step.get("status") == "pending":
+                        step.update(status="blocked", error="An earlier step was interrupted by service restart")
+                for report in (job.get("quality") or {}).values():
+                    if report.get("status") == "running":
+                        report.update(status="unavailable", error="Service restarted before this review completed")
+                        report.pop("score", None)
+                        report.pop("fluency", None)
             jobs[job["id"]] = job
     except (OSError, ValueError, KeyError):
         logging.exception("Could not read previous jobs")
@@ -307,6 +493,9 @@ def create_job(payload):
         raise ValueError("Invalid translation review model")
     if review_model.strip() and is_translategemma(review_model):
         raise ValueError("Choose a general multilingual instruction model for translation review; TranslateGemma only translates")
+    review_enabled = payload.get("review_enabled", True)
+    if type(review_enabled) is not bool:
+        raise ValueError("Translation review enabled must be a boolean")
     whisper_model = payload.get("whisper_model", WHISPER_NAME)
     if (not isinstance(whisper_model, str) or len(whisper_model) > 100
             or not whisper_model or (whisper_model != WHISPER_NAME and whisper_model not in supported_whisper_models())):
@@ -321,16 +510,19 @@ def create_job(payload):
         "id": job_id, "path": relative, "filename": media.name, "audio_stream_index": index,
         "source_language": source, "transcript": transcript, "targets": targets,
         "whisper_model": whisper_model,
-        "review_model": review_model.strip(), "quality": {},
+        "review_model": review_model.strip(), "review_enabled": review_enabled, "quality": {},
         "model": model.strip(), "status": "queued", "stage": "Waiting", "progress": 0,
         "duration": metadata["duration"], "position": 0, "audio_offset": selected_track.get("offset", 0), "detected_language": None,
         "media_fingerprint": media_fingerprint(media, relative), "reused": [],
         "outputs": {}, "error": None, "created_at": now(), "updated_at": now(),
     }
+    job.update(steps=initial_steps(job), cancelled_steps=[], cancel_requested=False,
+               generation_token=uuid.uuid4().hex)
+    job["steps"]["extraction"]["status"] = "queued"
     with jobs_lock:
         jobs[job_id] = job
         persist_locked()
-    job_queue.put(job_id)
+    job_queue.put({"kind": "generation", "id": job_id, "token": job["generation_token"]})
     return job
 
 
@@ -354,13 +546,58 @@ def get_speech_model(name):
     return speech_model
 
 
-def extract_audio(media, index, destination):
-    subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(media),
-         "-map", f"0:{index}", "-vn", "-af", "aresample=async=1",
-         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(destination)],
-        check=True, timeout=3600,
-    )
+def extract_audio(media, index, destination, job_id=None):
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(media),
+               "-map", f"0:{index}", "-vn", "-af", "aresample=async=1",
+               "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(destination)]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 3600
+    try:
+        while True:
+            if job_id is not None:
+                check_step_cancelled(job_id, "extraction")
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(command, 3600)
+            try:
+                _, error = process.communicate(timeout=.5)
+                if process.returncode:
+                    raise subprocess.CalledProcessError(process.returncode, command, stderr=error)
+                return
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+
+
+def cached_audio(job_id, job, media, transcript_key):
+    destination = DATA_ROOT / "cache" / "audio" / f"{transcript_key}.wav"
+    check_step_cancelled(job_id, "extraction")
+    if destination.is_file() and destination.stat().st_size > 44:
+        complete_step(job_id, "extraction")
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{transcript_key}.{uuid.uuid4().hex}.tmp.wav")
+    set_step(job_id, "extraction", status="running", progress=0, error=None)
+    try:
+        extract_audio(media, job["audio_stream_index"], temporary, job_id=job_id)
+        check_step_cancelled(job_id, "extraction")
+        if temporary.is_file():
+            temporary.replace(destination)
+        complete_step(job_id, "extraction")
+        return destination
+    except Exception as exc:
+        if not isinstance(exc, StepCancelled):
+            set_step(job_id, "extraction", status="failed", error=str(exc))
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def timestamp(seconds):
@@ -452,6 +689,7 @@ def request_translategemma(model, source_code, target_code, cue):
     request = Request(LLM_BASE + "/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
     last_error = None
     for attempt in range(3):
+        check_llm_step_cancelled()
         try:
             with urlopen(request, timeout=LLM_TIMEOUT) as response:
                 reply = json.load(response)["choices"][0]["text"]
@@ -460,6 +698,7 @@ def request_translategemma(model, source_code, target_code, cue):
                 raise ValueError("TranslateGemma returned empty text")
             return reply
         except (TimeoutError, URLError, HTTPError, ValueError, KeyError, TypeError) as exc:
+            check_llm_step_cancelled()
             last_error = exc
             logging.warning("TranslateGemma cue attempt %d failed: %s", attempt + 1, exc)
             if attempt < 2:
@@ -481,6 +720,7 @@ def request_translation(model, source_code, target_code, batch):
     request = Request(LLM_BASE + "/chat/completions", data=body, headers={"Content-Type": "application/json"}, method="POST")
     last_error = None
     for attempt in range(3):
+        check_llm_step_cancelled()
         try:
             with urlopen(request, timeout=LLM_TIMEOUT) as response:
                 reply = json.load(response)["choices"][0]["message"]["content"].strip()
@@ -494,6 +734,7 @@ def request_translation(model, source_code, target_code, batch):
                 raise ValueError("LM Studio returned invalid subtitle cue IDs or empty text")
             return [by_id[i] for i in range(1, len(batch) + 1)]
         except (TimeoutError, URLError, HTTPError, ValueError, KeyError, TypeError) as exc:
+            check_llm_step_cancelled()
             last_error = exc
             logging.warning("LM Studio batch attempt %d failed: %s", attempt + 1, exc)
             if attempt < 2:
@@ -562,20 +803,35 @@ def request_quality_review(model, source_code, target_code, cues, texts, start):
                "target_language": LANGUAGES.get(target_code, target_code),
                "pairs": [pair(index) for index in range(start, end)],
                "context_only": [pair(index) for index in context_ids]}
+    response_format = {"type": "json_schema", "json_schema": {
+        "name": "translation_review_ratings", "strict": True,
+        "schema": {"type": "array", "minItems": len(ids), "maxItems": len(ids),
+                   "items": {"type": "object", "properties": {
+                       "id": {"type": "integer", "enum": ids},
+                       "fidelity": {"type": "number", "minimum": 0, "maximum": 100},
+                       "fluency": {"type": "number", "minimum": 0, "maximum": 100},
+                       "issue": {"type": "string", "maxLength": 600}},
+                       "required": ["id", "fidelity", "fluency", "issue"], "additionalProperties": False}}}}
     body = json.dumps({"model": model, "messages": [{"role": "system", "content": rubric},
                        {"role": "user", "content": json.dumps(content, ensure_ascii=False)}],
-                       "temperature": 0, "max_tokens": 2048, "stream": False}, ensure_ascii=False).encode("utf-8")
+                       "response_format": response_format,
+                       "temperature": 0, "max_tokens": 8192, "stream": False}, ensure_ascii=False).encode("utf-8")
     request = Request(LLM_BASE + "/chat/completions", data=body, headers={"Content-Type": "application/json"}, method="POST")
     last_error = None
     for attempt in range(3):
+        check_llm_step_cancelled()
         try:
             with urlopen(request, timeout=LLM_TIMEOUT) as response:
-                reply = json.load(response)["choices"][0]["message"]["content"]
+                choice = json.load(response)["choices"][0]
+            if choice.get("finish_reason") == "length":
+                raise ValueError("Reviewer reached the 8192-token response limit. Disable reasoning in LM Studio or choose another reviewer")
+            reply = choice["message"]["content"]
             if not isinstance(reply, str):
                 raise ValueError("Reviewer returned no text response")
             reply = re.sub(r"^```(?:json)?\s*|\s*```$", "", reply.strip(), flags=re.I).strip()
             return validate_review_ratings(json.loads(reply), ids)
         except (TimeoutError, URLError, HTTPError, ValueError, KeyError, TypeError, IndexError) as exc:
+            check_llm_step_cancelled()
             last_error = exc
             logging.warning("Translation review attempt %d failed: %s", attempt + 1, exc)
             if attempt < 2:
@@ -615,6 +871,14 @@ def review_translations(job_id, transcript_key, source_code, cues, translations,
     """Review complete target outputs, retaining subtitles and resumable ratings on any review failure."""
     with jobs_lock:
         preferred = jobs[job_id].get("review_model", "")
+        cancelled = set(jobs[job_id].get("cancelled_steps") or [])
+    check_job_cancelled(job_id)
+    for language in translations:
+        if f"review:{language}" in cancelled:
+            set_step(job_id, f"review:{language}", status="cancelled", error="Cancelled by user")
+    active_translations = {language: texts for language, texts in translations.items() if f"review:{language}" not in cancelled}
+    if not active_translations:
+        return bool(translations)
     model = preferred
     selection_error = None
     try:
@@ -623,32 +887,46 @@ def review_translations(job_id, transcript_key, source_code, cues, translations,
     except Exception as exc:
         selection_error = exc
     warnings = False
-    total = len(cues) * len(translations)
-    for language_index, (language, texts) in enumerate(translations.items()):
+    total = len(cues) * len(active_translations)
+    for language_index, (language, texts) in enumerate(active_translations.items()):
         ratings = []
+        step = f"review:{language}"
         try:
+            check_step_cancelled(job_id, step)
+            set_step(job_id, step, status="running", progress=0, error=None)
             if selection_error:
                 raise selection_error
             key = quality_cache_key(transcript_key, source_code, cues, language, texts, model)
             ratings = load_quality_cache(key, len(cues))
+            set_step(job_id, step, progress=int(100 * len(ratings) / len(cues)))
             set_quality(job_id, language, quality_report("running", model, translation_model, cues, texts, ratings),
                         stage=f"Reviewing {LANGUAGES[language]} translation ({len(ratings)}/{len(cues)} cues)",
                         progress=88 + int(11 * (language_index * len(cues) + len(ratings)) / total))
             if len(ratings) == len(cues):
                 reused.append(f"{language} review")
             for start in range(len(ratings), len(cues), REVIEW_BATCH_SIZE):
-                batch = request_quality_review(model, source_code, language, cues, texts, start)
+                check_step_cancelled(job_id, step)
+                batch = call_step_model(job_id, step, request_quality_review, model, source_code, language, cues, texts, start)
                 ratings.extend(validate_review_ratings(batch, list(range(start + 1, min(start + REVIEW_BATCH_SIZE, len(cues)) + 1))))
                 write_cache("quality", key, {"method": REVIEW_METHOD, "ratings": ratings})
+                set_step(job_id, step, progress=int(100 * len(ratings) / len(cues)))
+                check_step_cancelled(job_id, step)
                 set_quality(job_id, language, quality_report("running", model, translation_model, cues, texts, ratings),
                             stage=f"Reviewing {LANGUAGES[language]} translation ({len(ratings)}/{len(cues)} cues)",
                             progress=88 + int(11 * (language_index * len(cues) + len(ratings)) / total))
-            set_quality(job_id, language, quality_report("completed", model, translation_model, cues, texts, ratings),
-                        reused=reused[:])
+            with jobs_lock:
+                check_step_cancelled(job_id, step)
+                set_quality(job_id, language, quality_report("completed", model, translation_model, cues, texts, ratings), reused=reused[:])
+                complete_step(job_id, step)
+        except StepCancelled as exc:
+            check_job_cancelled(job_id)
+            warnings = True
+            set_quality(job_id, language, quality_report("unavailable", model, translation_model, cues, texts, ratings, exc))
         except Exception as exc:
             warnings = True
             logging.warning("Translation review unavailable for %s in job %s: %s", language, job_id, exc)
             set_quality(job_id, language, quality_report("unavailable", model, translation_model, cues, texts, ratings, exc))
+            set_step(job_id, step, status="failed", error=str(exc))
     return warnings
 
 
@@ -680,30 +958,437 @@ def write_output(job_id, language, cues):
         persist_locked()
 
 
-def run_job(job_id):
+class ReviewConflict(ValueError):
+    """The job already has work in the single processing queue."""
+
+
+class JobNotFound(ValueError):
+    pass
+
+
+class ReviewUnavailable(ValueError):
+    def __init__(self, reason, rejected):
+        super().__init__(reason)
+        self.rejected = rejected
+
+
+def saved_output_path(output):
+    if not isinstance(output, dict) or not isinstance(output.get("path"), str):
+        raise ValueError("Saved subtitle file is missing")
+    destination = Path(output["path"]).resolve()
+    if not (within(destination, OUTPUT_ROOT) or within(destination, DATA_ROOT / "job_outputs")):
+        raise ValueError("Saved subtitle path is outside the output folders")
+    if not destination.is_file():
+        raise ValueError("Saved subtitle file is missing")
+    return destination
+
+
+def read_saved_srt(output):
+    """Read the actual saved subtitle without touching the media or exported files."""
+    content = saved_output_path(output).read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    cues = []
+    timing = re.compile(r"(\d{2,}):([0-5]\d):([0-5]\d),(\d{3}) --> (\d{2,}):([0-5]\d):([0-5]\d),(\d{3})")
+    for index, block in enumerate(re.split(r"\n\s*\n", content.strip()), 1):
+        lines = block.strip().splitlines()
+        if len(lines) < 3 or lines[0].strip() != str(index):
+            raise ValueError("Saved subtitles have invalid or unordered cue numbers")
+        match = timing.fullmatch(lines[1].strip())
+        if not match:
+            raise ValueError("Saved subtitles have an invalid timestamp")
+        values = [int(value) for value in match.groups()]
+        def seconds(offset):
+            return values[offset] * 3600 + values[offset + 1] * 60 + values[offset + 2] + values[offset + 3] / 1000
+        text_lines = lines[2:]
+        # render_srt slices a single long token (including unspaced CJK text)
+        # every 42 characters. Those layout breaks must not add new spaces.
+        sliced_token = len(text_lines) > 1 and all(not re.search(r"\s", line) for line in text_lines) and all(len(line) == 42 for line in text_lines[:-1])
+        text = ("" if sliced_token else " ").join(text_lines)
+        cues.append({"start": seconds(0), "end": seconds(4), "text": normalize_text(text)})
+    if not valid_cues(cues):
+        raise ValueError("Saved subtitles contain no valid speech cues")
+    return cues
+
+
+def cached_sources_for_review(job):
+    keys = []
+    recorded = job.get("transcript_key")
+    if isinstance(recorded, str) and re.fullmatch(r"[a-f0-9]{64}", recorded):
+        keys.append(recorded)
+    fingerprint = job.get("media_fingerprint")
+    if isinstance(fingerprint, dict):
+        # Older jobs used medium before model selection existed. The current
+        # configured default must not accidentally select another transcript.
+        legacy = {**job, "whisper_model": job.get("whisper_model") or "medium"}
+        try:
+            keys.extend(transcript_key_from_fingerprint(legacy, fingerprint, old_options) for old_options in (False, True))
+        except (KeyError, TypeError, ValueError):
+            pass
+    for key in dict.fromkeys(keys):
+        cached = load_transcript_cache(key)
+        if cached and valid_source_language(cached[0]):
+            yield key, cached
+
+
+def valid_source_language(source):
+    return isinstance(source, str) and bool(re.fullmatch(r"[a-z]{2}", source))
+
+
+def source_for_review(job):
+    outputs = job.get("outputs") or {}
+    source = job.get("detected_language") or job.get("source_language")
+    if not valid_source_language(source):
+        possible = [code for code in outputs if valid_source_language(code) and code not in (job.get("targets") or [])]
+        source = possible[0] if len(possible) == 1 else None
+    # An available source snapshot is authoritative for reviewing saved target text.
+    if source and source in outputs:
+        try:
+            return source, read_saved_srt(outputs[source])
+        except (OSError, ValueError):
+            pass
+    for _, cached in cached_sources_for_review(job):
+        if source is None or cached[0] == source:
+            return cached
+    raise ValueError("Source transcript is missing. A saved source SRT or matching transcript cache is needed for review")
+
+
+def canonical_review_source(source, cues):
+    canonical = [{"start": round(cue["start"], 3), "end": round(cue["end"], 3),
+                  "text": normalize_text(cue["text"])} for cue in cues]
+    key = cache_digest({"kind": "saved-transcript", "source_language": source, "cues": canonical})
+    return key, canonical
+
+
+def review_inputs(job):
+    source, cues = source_for_review(job)
+    translations, rejected = {}, {}
+    for language, output in (job.get("outputs") or {}).items():
+        if language == source or language not in LANGUAGES:
+            continue
+        try:
+            target = read_saved_srt(output)
+            if len(target) != len(cues) or any(abs(left[key] - right[key]) > .0021
+                    for left, right in zip(cues, target) for key in ("start", "end")):
+                raise ValueError("Saved source and translation cue counts or timestamps do not match")
+            translations[language] = [cue["text"] for cue in target]
+        except (OSError, ValueError) as exc:
+            rejected[language] = str(exc)
+    if not translations:
+        reason = next(iter(rejected.values()), "No saved translated subtitles are available")
+        raise ReviewUnavailable(reason, rejected)
+    # Saved content, rather than the original media, identifies these reviews.
+    # Canonical millisecond times allow matching SRT and cache-based sources.
+    key, canonical = canonical_review_source(source, cues)
+    for original_key, (cached_source, original_cues) in cached_sources_for_review(job):
+        if cached_source == source and canonical_review_source(source, original_cues)[1] == canonical:
+            # Resume ratings produced by the generation stage using its exact
+            # original precision and identity, only after checking saved text.
+            return original_key, source, original_cues, translations, rejected
+    return key, source, canonical, translations, rejected
+
+
+def review_available(job):
+    if job.get("status") in ACTIVE_WORK:
+        return {"languages": [], "reason": "Generation is still queued or running", "rejected": {}}
+    try:
+        *_, translations, rejected = review_inputs(job)
+        return {"languages": list(translations), "reason": None, "rejected": rejected}
+    except (OSError, ValueError) as exc:
+        return {"languages": [], "reason": str(exc), "rejected": getattr(exc, "rejected", {})}
+
+
+def public_job(job):
+    result = json.loads(json.dumps(job))
+    result["review_available"] = review_available(result)
+    result["steps"] = public_steps(result)
+    result["can_cancel"] = work_active(result) and not result.get("cancel_requested", False)
+    return result
+
+
+def validate_review_action(payload):
+    model = payload.get("review_model", "")
+    if not isinstance(model, str) or len(model) > 300:
+        raise ValueError("Invalid translation review model")
+    model = model.strip()
+    if model and is_translategemma(model):
+        raise ValueError("Choose a general multilingual instruction model for translation review")
+    force = payload.get("force", False)
+    if type(force) is not bool:
+        raise ValueError("Review force must be a boolean")
+    languages = payload.get("languages")
+    if languages is not None and (not isinstance(languages, list) or not languages
+            or not all(isinstance(language, str) and language in LANGUAGES for language in languages)):
+        raise ValueError("Select valid translation languages for review")
+    return model, force, list(dict.fromkeys(languages)) if languages is not None else None
+
+
+def queue_review(job_id, payload):
+    model, force, requested = validate_review_action(payload)
     with jobs_lock:
-        job = jobs[job_id].copy()
+        job = jobs.get(job_id)
+        if not job:
+            raise JobNotFound("Job not found")
+        if work_active(job):
+            raise ReviewConflict("This job already has generation or review work queued or running")
+        snapshot = json.loads(json.dumps(job))
+    _, _, _, translations, rejected = review_inputs(snapshot)
+    if requested is not None:
+        for language in requested:
+            if language not in translations:
+                raise ValueError(f"{LANGUAGES[language]} review is unavailable: {rejected.get(language, 'No saved translated subtitle')}")
+        selected = requested
+    else:
+        quality = snapshot.get("quality") or {}
+        selected = [language for language in translations if force or (quality.get(language) or {}).get("status") != "completed"]
+    if not selected:
+        raise ValueError("All available translations already have completed reviews")
+    task = {"status": "queued", "stage": "Waiting for translation review", "progress": 0,
+            "languages": selected, "model": model, "force": force, "error": None,
+            "token": uuid.uuid4().hex,
+            "created_at": now(), "updated_at": now()}
+    with jobs_lock:
+        current = jobs[job_id]
+        if work_active(current):
+            raise ReviewConflict("This job already has generation or review work queued or running")
+        selected_steps = {f"review:{language}" for language in selected}
+        set_job(job_id, review_task=task, cancel_requested=False,
+                cancelled_steps=[step for step in current.get("cancelled_steps", []) if step not in selected_steps])
+        for step in selected_steps:
+            set_step(job_id, step, status="queued", progress=0, error=None)
+        job_queue.put({"kind": "review", "id": job_id, "token": task["token"]})
+        return public_job(jobs[job_id])
+
+
+def queue_missing_reviews(payload):
+    model, force, languages = validate_review_action(payload)
+    if force or languages is not None:
+        raise ValueError("Bulk review only accepts a review model and reviews missing scores")
+    with jobs_lock:
+        identifiers = list(jobs)
+    queued, skipped = [], []
+    for job_id in identifiers:
+        try:
+            queue_review(job_id, {"review_model": model})
+            queued.append(job_id)
+        except (OSError, ValueError) as exc:
+            skipped.append({"id": job_id, "reason": str(exc)})
+    return {"queued": queued, "skipped": skipped}
+
+
+def cancel_step(job_id, step):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise JobNotFound("Job not found")
+        available = public_steps(job)
+        if step not in available:
+            raise ValueError("Unknown processing step")
+        if not available[step]["can_cancel"]:
+            raise ReviewConflict("This step is not cancellable")
+        cancelled = list(dict.fromkeys([*(job.get("cancelled_steps") or []), step]))
+        state = "cancelling" if available[step]["status"] == "running" else "cancelled"
+        set_job(job_id, cancelled_steps=cancelled)
+        set_step(job_id, step, status=state, error="Cancellation requested" if state == "cancelling" else "Cancelled by user")
+        if step in ("extraction", "transcription"):
+            block_dependents(job_id, step, f"{available[step]['label']} was cancelled")
+            if job.get("status") == "queued":
+                set_job(job_id, status="cancelled", stage="Cancelled", error=None)
+        if (job.get("step_task") or {}).get("step") == step:
+            set_step_task(job_id, status=state, stage="Cancellation requested" if state == "cancelling" else "Cancelled", error=None)
+        task = job.get("review_task") or {}
+        if step.startswith("review:") and task.get("status") == "queued" and all(f"review:{code}" in cancelled for code in task.get("languages", [])):
+            set_review_task(job_id, status="cancelled", stage="Review cancelled", error=None)
+        return public_job(jobs[job_id])
+
+
+def cancel_job(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise JobNotFound("Job not found")
+        if not work_active(job) or job.get("cancel_requested"):
+            raise ReviewConflict("This job has no cancellable work")
+        steps = public_steps(job)
+        if not any(value["can_cancel"] or value["status"] == "cancelling" for value in steps.values()):
+            raise ReviewConflict("No processing step is still cancellable")
+        cancelled = set(job.get("cancelled_steps") or [])
+        for key, value in steps.items():
+            if value["can_cancel"] or value["status"] == "cancelling":
+                cancelled.add(key)
+                set_step(job_id, key, status="cancelling" if value["status"] in ("running", "cancelling") else "cancelled",
+                         error="Cancelled by user")
+        set_job(job_id, cancel_requested=True, cancelled_steps=sorted(cancelled))
+        if job.get("status") == "queued":
+            set_job(job_id, status="cancelled", stage="Cancelled", error=None)
+        for name, setter in (("review_task", set_review_task), ("step_task", set_step_task)):
+            task = job.get(name) or {}
+            if task.get("status") in ACTIVE_WORK:
+                setter(job_id, status="cancelled" if task["status"] == "queued" else "cancelling", stage="Cancellation requested", error=None)
+        return public_job(jobs[job_id])
+
+
+def retry_step(job_id, step):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise JobNotFound("Job not found")
+        if work_active(job):
+            raise ReviewConflict("This job already has work queued or running")
+        available = public_steps(job)
+        if step not in available or not available[step]["can_retry"]:
+            raise ValueError("This step is not retryable or its source is unavailable")
+        snapshot = json.loads(json.dumps(job))
+    if step.startswith("review:"):
+        language = step.split(":")[1]
+        return queue_review(job_id, {"languages": [language], "review_model": (snapshot.get("review_task") or {}).get("model") or snapshot.get("review_model", "")})
+    if step.startswith("translation:"):
+        source_for_review(snapshot)
+    else:
+        resolve_media(snapshot["path"], file_required=True)
+    task = {"status": "queued", "step": step, "stage": "Waiting to retry processing step", "progress": 0,
+            "error": None, "token": uuid.uuid4().hex, "created_at": now(), "updated_at": now()}
+    with jobs_lock:
+        if work_active(jobs[job_id]):
+            raise ReviewConflict("This job already has work queued or running")
+        set_job(job_id, step_task=task, cancel_requested=False,
+                cancelled_steps=[key for key in jobs[job_id].get("cancelled_steps", []) if key != step])
+        set_step(job_id, step, status="queued", progress=0, error=None)
+        job_queue.put({"kind": "step", "id": job_id, "step": step, "token": task["token"]})
+        return public_job(jobs[job_id])
+
+
+def set_step_task(job_id, **changes):
+    with jobs_lock:
+        task = dict(jobs[job_id].get("step_task") or {})
+        task.update(changes, updated_at=now())
+        set_job(job_id, step_task=task)
+
+
+def set_review_task(job_id, **changes):
+    with jobs_lock:
+        task = dict(jobs[job_id].get("review_task") or {})
+        task.update(changes, updated_at=now())
+        set_job(job_id, review_task=task)
+
+
+def run_review_task(job_id):
+    with jobs_lock:
+        job = json.loads(json.dumps(jobs[job_id]))
+    task = job["review_task"]
+    check_job_cancelled(job_id)
+    set_review_task(job_id, status="running", stage="Loading saved subtitles", progress=1)
+    key, source, cues, translations, rejected = review_inputs(job)
+    cancelled_languages = [language for language in task["languages"] if f"review:{language}" in job.get("cancelled_steps", [])]
+    selected = [language for language in task["languages"] if language not in cancelled_languages]
+    if not selected:
+        set_review_task(job_id, status="cancelled", stage="Review cancelled", progress=100, error=None)
+        return
+    for language in selected:
+        if language not in translations:
+            raise ValueError(f"Saved {LANGUAGES[language]} subtitles are unavailable: {rejected.get(language, 'Missing output')}")
+    model = review_model_for_job(task["model"], job.get("model", ""))
+    set_review_task(job_id, model=model)
+    errors, reused = [], list(job.get("reused") or [])
+    total = len(cues) * len(selected)
+    for language_index, language in enumerate(selected):
+        texts = translations[language]
+        ratings = []
+        keep_previous = ((job.get("quality") or {}).get(language) or {}).get("status") == "completed"
+        step = f"review:{language}"
+        try:
+            check_step_cancelled(job_id, step)
+            set_step(job_id, step, status="running", error=None)
+            quality_key = quality_cache_key(key, source, cues, language, texts, model)
+            content_key, content_cues = canonical_review_source(source, cues)
+            content_quality_key = quality_cache_key(content_key, source, content_cues, language, texts, model)
+            cache_keys = list(dict.fromkeys((quality_key, content_quality_key)))
+            if not task["force"]:
+                ratings = max((load_quality_cache(cache_key, len(cues)) for cache_key in cache_keys), key=len)
+            else:
+                # Clear resumable ratings for this identity before a fresh run.
+                # The previous completed report remains in the job, while even
+                # a first-batch failure can subsequently retry fresh ratings.
+                for cache_key in cache_keys:
+                    write_cache("quality", cache_key, {"method": REVIEW_METHOD, "ratings": []})
+            def progress_update():
+                set_step(job_id, step, progress=int(100 * len(ratings) / len(cues)))
+                set_review_task(job_id, stage=f"Reviewing {LANGUAGES[language]} ({len(ratings)}/{len(cues)} cues)",
+                                progress=int(99 * (language_index * len(cues) + len(ratings)) / total))
+                if not keep_previous:
+                    set_quality(job_id, language, quality_report("running", model, job.get("model", ""), cues, texts, ratings))
+            progress_update()
+            if len(ratings) == len(cues) and f"{language} review" not in reused:
+                reused.append(f"{language} review")
+            for start in range(len(ratings), len(cues), REVIEW_BATCH_SIZE):
+                check_step_cancelled(job_id, step)
+                batch = call_step_model(job_id, step, request_quality_review, model, source, language, cues, texts, start)
+                ratings.extend(validate_review_ratings(batch, list(range(start + 1, min(start + REVIEW_BATCH_SIZE, len(cues)) + 1))))
+                for cache_key in cache_keys:
+                    write_cache("quality", cache_key, {"method": REVIEW_METHOD, "ratings": ratings})
+                progress_update()
+                check_step_cancelled(job_id, step)
+            # Populate both identities when an already complete original
+            # generation review is reused, so matching saved jobs can share it.
+            for cache_key in cache_keys:
+                write_cache("quality", cache_key, {"method": REVIEW_METHOD, "ratings": ratings})
+            with jobs_lock:
+                check_step_cancelled(job_id, step)
+                set_quality(job_id, language, quality_report("completed", model, job.get("model", ""), cues, texts, ratings), reused=reused[:])
+                complete_step(job_id, step)
+        except StepCancelled as exc:
+            check_job_cancelled(job_id)
+            cancelled_languages.append(language)
+            if not keep_previous:
+                set_quality(job_id, language, quality_report("unavailable", model, job.get("model", ""), cues, texts, ratings, exc))
+        except Exception as exc:
+            errors.append(f"{LANGUAGES[language]}: {exc}")
+            if not keep_previous:
+                set_quality(job_id, language, quality_report("unavailable", model, job.get("model", ""), cues, texts, ratings, exc))
+            logging.warning("Review-only task %s failed for %s: %s", job_id, language, exc)
+            set_step(job_id, step, status="failed", error=str(exc))
+    check_job_cancelled(job_id)
+    set_review_task(job_id, status="failed" if errors else "cancelled" if cancelled_languages else "completed",
+                    stage="Translation review finished with errors" if errors else "Review finished with cancelled steps" if cancelled_languages else "Translation review complete",
+                    progress=100, error="; ".join(errors) if errors else None)
+
+
+def prepare_source(job_id, job, independent=False, extraction_only=False):
+    check_step_cancelled(job_id, "extraction")
     media = resolve_media(job["path"], file_required=True)
-    whisper_model = job.get("whisper_model", WHISPER_NAME)
-    set_job(job_id, status="running", stage="Checking cached results", progress=1)
-    if job.get("media_fingerprint") != media_fingerprint(media, job["path"]):
+    whisper_model = job.get("whisper_model") or "medium"
+    job = {**job, "whisper_model": whisper_model}
+    if job.get("media_fingerprint") and job["media_fingerprint"] != media_fingerprint(media, job["path"]):
         raise RuntimeError("The media file changed after this job was queued. Submit it again.")
     transcript_key = transcript_cache_key(job, media)
+    set_job(job_id, transcript_key=transcript_key)
     cached = load_transcript_cache(transcript_key)
     reused = []
+    def progress(stage, percent, **changes):
+        if independent:
+            set_step_task(job_id, stage=stage, progress=percent)
+            if changes:
+                set_job(job_id, **changes)
+        else:
+            set_job(job_id, stage=stage, progress=percent, **changes)
     if cached:
         source_code, cues = cached
         reused.append("transcription")
-        set_job(job_id, stage="Reusing cached transcription", progress=64,
-                detected_language=source_code, position=job["duration"], reused=reused[:])
+        complete_step(job_id, "extraction")
+        if not extraction_only:
+            check_step_cancelled(job_id, "transcription")
+            complete_step(job_id, "transcription")
+        progress("Reusing cached transcription", 64, detected_language=source_code,
+                 **({"position": job["duration"], "reused": reused[:]} if not independent else {}))
     else:
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix="subtitle-") as directory:
-            audio = Path(directory) / "audio.wav"
-            set_job(job_id, stage="Extracting audio", progress=2)
-            extract_audio(media, job["audio_stream_index"], audio)
-            set_job(job_id, stage=f"Loading Whisper {whisper_model}", progress=8)
+        progress("Extracting audio", 2)
+        audio = cached_audio(job_id, job, media, transcript_key)
+        if extraction_only:
+            return transcript_key, None, None, reused
+        check_step_cancelled(job_id, "transcription")
+        set_step(job_id, "transcription", status="running", progress=0, error=None)
+        try:
+            progress(f"Loading Whisper {whisper_model}", 8)
             model = get_speech_model(whisper_model)
+            check_step_cancelled(job_id, "transcription")
             segments, info = model.transcribe(
                 str(audio), language=None if job["source_language"] == "auto" else job["source_language"],
                 task="transcribe", beam_size=5, vad_filter=True, word_timestamps=True,
@@ -712,15 +1397,17 @@ def run_job(job_id):
             source_code = info.language or job["source_language"]
             if source_code == "auto":
                 raise RuntimeError("Whisper could not detect the audio language. Select it explicitly and retry.")
-            set_job(job_id, detected_language=source_code, stage="Transcribing", progress=10)
+            progress("Transcribing", 10, detected_language=source_code)
             collected = []
             last_percent = 10
             duration = max(job["duration"], 1)
             for segment in segments:
+                check_step_cancelled(job_id, "transcription")
                 collected.append(segment)
+                set_step(job_id, "transcription", progress=min(99, int(100 * segment.end / duration)))
                 percent = min(62, 10 + int(52 * segment.end / duration))
                 if percent >= last_percent + 2:
-                    set_job(job_id, progress=percent, position=round(segment.end, 1))
+                    progress("Transcribing", percent, **({"position": round(segment.end, 1)} if not independent else {}))
                     last_percent = percent
             cues = make_cues(collected)
             for cue in cues:
@@ -728,7 +1415,22 @@ def run_job(job_id):
                 cue["end"] += job["audio_offset"]
             if not cues:
                 raise RuntimeError("No speech was detected in the selected audio track")
+            check_step_cancelled(job_id, "transcription")
             write_cache("transcripts", transcript_key, {"language": source_code, "cues": cues})
+            complete_step(job_id, "transcription")
+        except Exception as exc:
+            if not isinstance(exc, StepCancelled):
+                set_step(job_id, "transcription", status="failed", error=str(exc))
+            raise
+    return transcript_key, source_code, cues, reused
+
+
+def run_job(job_id):
+    with jobs_lock:
+        job = jobs[job_id].copy()
+    check_job_cancelled(job_id)
+    set_job(job_id, status="running", stage="Checking cached results", progress=1)
+    transcript_key, source_code, cues, reused = prepare_source(job_id, job)
     set_job(job_id, stage="Preparing subtitles", progress=64)
     if job["transcript"] or source_code in job["targets"]:
         write_output(job_id, source_code, cues)
@@ -739,48 +1441,180 @@ def run_job(job_id):
         model_id = model_for_job(job["model"])
         set_job(job_id, model=model_id)
         batch_size = 1 if is_translategemma(model_id) else 8
-        total_batches = sum((len(cues) + batch_size - 1) // batch_size for _ in targets)
+        batches_per_language = (len(cues) + batch_size - 1) // batch_size
+        total_batches = batches_per_language * len(targets)
         finished_batches = 0
         for language in targets:
-            translation_key = translation_cache_key(transcript_key, source_code, cues, language, model_id)
-            texts = load_translation_cache(translation_key, len(cues))
-            finished_batches += (len(texts) + batch_size - 1) // batch_size
-            if texts:
-                reused.append(language if len(texts) == len(cues) else f"{language} ({len(texts)} cues)")
-                set_job(job_id, stage=f"Reusing cached {LANGUAGES[language]} cues", reused=reused[:],
-                        progress=64 + int(24 * finished_batches / total_batches))
-            for start in range(len(texts), len(cues), batch_size):
-                batch = cues[start:start + batch_size]
-                if start % max(1, len(cues) // 100) == 0:
-                    set_job(job_id, stage=f"Translating to {LANGUAGES[language]} ({start + 1}/{len(cues)} cues)")
-                translated = request_translation(model_id, source_code, language, batch)
-                texts.extend(translated)
-                write_cache("translations", translation_key, {"texts": texts})
-                finished_batches += 1
-                percent = 64 + int(24 * finished_batches / total_batches)
-                with jobs_lock:
-                    prior_percent = jobs[job_id]["progress"]
-                if percent != prior_percent:
-                    set_job(job_id, progress=percent)
-            write_output(job_id, language, [
-                {"start": cue["start"], "end": cue["end"], "text": text}
-                for cue, text in zip(cues, texts)
-            ])
-            translations[language] = texts
-        set_job(job_id, stage="Preparing translation review", progress=88)
-        review_warnings = review_translations(job_id, transcript_key, source_code, cues, translations, model_id, reused)
-    set_job(job_id, status="completed", stage="Complete with review warnings" if review_warnings else "Complete",
+            def progress(stage, count):
+                completed = (count + batch_size - 1) // batch_size
+                set_job(job_id, stage=stage, reused=reused[:], progress=64 + int(24 * (finished_batches + completed) / total_batches))
+            try:
+                texts = perform_translation(job_id, job, transcript_key, source_code, cues, language, model_id, reused, progress)
+                translations[language] = texts
+            except StepCancelled:
+                check_job_cancelled(job_id)
+                block_dependents(job_id, f"translation:{language}", "Translation was cancelled")
+            finished_batches += batches_per_language
+        if job.get("review_enabled", True):
+            set_job(job_id, stage="Preparing translation review", progress=88)
+            review_warnings = review_translations(job_id, transcript_key, source_code, cues, translations, model_id, reused)
+    check_job_cancelled(job_id)
+    with jobs_lock:
+        cancelled = bool(jobs[job_id].get("cancelled_steps"))
+    set_job(job_id, status="completed", stage="Complete with cancelled steps" if cancelled else "Complete with review warnings" if review_warnings else "Complete",
             progress=100, position=job["duration"])
+
+
+def perform_translation(job_id, job, transcript_key, source, cues, language, model, reused, progress):
+    step = f"translation:{language}"
+    check_step_cancelled(job_id, step)
+    set_step(job_id, step, status="running", error=None)
+    key = translation_cache_key(transcript_key, source, cues, language, model)
+    texts = load_translation_cache(key, len(cues))
+    batch_size = 1 if is_translategemma(model) else 8
+    if texts:
+        reused.append(language if len(texts) == len(cues) else f"{language} ({len(texts)} cues)")
+    try:
+        set_step(job_id, step, progress=int(100 * len(texts) / len(cues)))
+        progress(f"Translating to {LANGUAGES[language]} ({len(texts)}/{len(cues)} cues)", len(texts))
+        for start in range(len(texts), len(cues), batch_size):
+            check_step_cancelled(job_id, step)
+            translated = call_step_model(job_id, step, request_translation, model, source, language, cues[start:start + batch_size])
+            if len(translated) != min(batch_size, len(cues) - start) or not all(isinstance(text, str) and text.strip() for text in translated):
+                raise ValueError("Translator returned incomplete subtitle cues")
+            texts.extend(translated)
+            write_cache("translations", key, {"texts": texts})
+            set_step(job_id, step, progress=int(100 * len(texts) / len(cues)))
+            check_step_cancelled(job_id, step)
+            progress(f"Translating to {LANGUAGES[language]} ({len(texts)}/{len(cues)} cues)", len(texts))
+        with jobs_lock:
+            check_step_cancelled(job_id, step)
+            write_output(job_id, language, [{"start": cue["start"], "end": cue["end"], "text": text} for cue, text in zip(cues, texts)])
+            complete_step(job_id, step)
+        return texts
+    except Exception as exc:
+        if not isinstance(exc, StepCancelled):
+            set_step(job_id, step, status="failed", error=str(exc))
+            block_dependents(job_id, step, "Translation failed")
+        raise
+
+
+def translation_source(job):
+    source, cues = source_for_review(job)
+    key, canonical = canonical_review_source(source, cues)
+    for original_key, (cached_source, original_cues) in cached_sources_for_review(job):
+        if cached_source == source and canonical_review_source(source, original_cues)[1] == canonical:
+            return original_key, source, original_cues
+    return key, source, canonical
+
+
+def run_step_task(job_id, step):
+    with jobs_lock:
+        job = json.loads(json.dumps(jobs[job_id]))
+    check_step_cancelled(job_id, step)
+    set_step_task(job_id, status="running", stage=f"Retrying {inferred_steps(job)[step]['label']}")
+    if step in ("extraction", "transcription"):
+        key, source, cues, _ = prepare_source(job_id, job, independent=True, extraction_only=step == "extraction")
+        if step == "transcription" and (job.get("transcript") or source in job.get("targets", [])):
+            write_output(job_id, source, cues)
+    else:
+        key, source, cues = translation_source(job)
+        model = model_for_job(job.get("model", ""))
+        reused = list(job.get("reused") or [])
+        def progress(stage, count):
+            set_step_task(job_id, stage=stage, progress=int(100 * count / len(cues)))
+        perform_translation(job_id, job, key, source, cues, step.split(":")[1], model, reused, progress)
+        set_job(job_id, model=model, reused=reused)
+    check_job_cancelled(job_id)
+    set_step_task(job_id, status="completed", stage="Processing step complete", progress=100, error=None)
+
+
+def finish_cancelled_work(job_id, kind, step=None):
+    with jobs_lock:
+        job = jobs[job_id]
+        steps = inferred_steps(job)
+        for key, value in steps.items():
+            if value["status"] in ("running", "cancelling") or (key in job.get("cancelled_steps", []) and value["status"] in ("queued", "pending")):
+                set_step(job_id, key, status="cancelled", error="Cancelled by user")
+        quality = json.loads(json.dumps(job.get("quality") or {}))
+        for report in quality.values():
+            if report.get("status") == "running":
+                report.update(status="unavailable", error="Cancelled by user")
+                report.pop("score", None)
+                report.pop("fluency", None)
+        set_job(job_id, quality=quality)
+    if kind == "review":
+        set_review_task(job_id, status="cancelled", stage="Review cancelled", error=None)
+    elif kind == "step":
+        set_step_task(job_id, status="cancelled", stage="Step cancelled", error=None)
+        if step:
+            block_dependents(job_id, step, "An earlier step was cancelled")
+    else:
+        if step in ("extraction", "transcription"):
+            block_dependents(job_id, step, "An earlier step was cancelled")
+        set_job(job_id, status="cancelled", stage="Cancelled", error=None)
+
+
+def fail_work_steps(job_id, kind, error, selected=None):
+    with jobs_lock:
+        steps = inferred_steps(jobs[job_id])
+    failed = False
+    for key, value in steps.items():
+        if value["status"] in ("running", "queued", "cancelling") and (selected is None or key in selected):
+            set_step(job_id, key, status="failed", error=error)
+            block_dependents(job_id, key, "An earlier step failed")
+            failed = True
+    if kind == "generation":
+        if not failed and not any(value["status"] == "failed" for value in steps.values()):
+            first = next((key for key, value in steps.items() if value["status"] == "pending"), None)
+            if first:
+                set_step(job_id, first, status="failed", error=error)
+        for key, value in inferred_steps(jobs[job_id]).items():
+            if value["status"] == "pending":
+                set_step(job_id, key, status="blocked", error="An earlier step failed")
 
 
 def worker_loop():
     while True:
-        job_id = job_queue.get()
+        queued = job_queue.get()
+        kind = queued.get("kind", "generation") if isinstance(queued, dict) else "generation"
+        job_id = queued["id"] if isinstance(queued, dict) else queued
+        step = queued.get("step") if isinstance(queued, dict) else None
         try:
-            run_job(job_id)
+            with jobs_lock:
+                job = jobs.get(job_id)
+                if job:
+                    if kind == "review":
+                        task = job.get("review_task") or {}
+                    elif kind == "step":
+                        task = job.get("step_task") or {}
+                    else:
+                        task = job
+                    token = queued.get("token") if isinstance(queued, dict) else None
+                    expected = task.get("token") if kind != "generation" else job.get("generation_token")
+                    status = task.get("status")
+                    if (token and token != expected) or status != "queued":
+                        continue
+                elif isinstance(queued, dict):
+                    continue
+            if kind == "review":
+                run_review_task(job_id)
+            elif kind == "step":
+                run_step_task(job_id, step)
+            else:
+                run_job(job_id)
+        except StepCancelled as exc:
+            finish_cancelled_work(job_id, kind, exc.step if kind != "step" else step)
         except Exception as exc:
             logging.exception("Subtitle job %s failed", job_id)
-            set_job(job_id, status="failed", stage="Failed", error=str(exc))
+            selected = {step} if kind == "step" else {f"review:{code}" for code in (jobs.get(job_id, {}).get("review_task") or {}).get("languages", [])} if kind == "review" else None
+            fail_work_steps(job_id, kind, str(exc), selected)
+            if kind == "review":
+                set_review_task(job_id, status="failed", stage="Translation review failed", error=str(exc))
+            elif kind == "step":
+                set_step_task(job_id, status="failed", stage="Processing step failed", error=str(exc))
+            else:
+                set_job(job_id, status="failed", stage="Failed", error=str(exc))
         finally:
             job_queue.task_done()
 
@@ -801,12 +1635,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
     def route_get(self, path, query):
-        if path in ("/", "/app.js", "/app.css"):
+        if path in ("/", "/app.js", "/app.css", "/favicon.svg"):
             filename = "index.html" if path == "/" else path[1:]
             content_type = {
                 "index.html": "text/html; charset=utf-8",
                 "app.js": "application/javascript; charset=utf-8",
                 "app.css": "text/css; charset=utf-8",
+                "favicon.svg": "image/svg+xml",
             }[filename]
             return self.send_bytes((WEB_ROOT / filename).read_bytes(), content_type)
         if path == "/api/config":
@@ -828,7 +1663,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/jobs":
             with jobs_lock:
                 items = sorted(jobs.values(), key=lambda x: x["created_at"], reverse=True)
-                return self.send_json(items[:100])
+                snapshots = json.loads(json.dumps(items[:100]))
+            return self.send_json([public_job(job) for job in snapshots])
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})(?:/files/([a-z]{2}))?", path)
         if match:
             job_id, language = match.groups()
@@ -845,7 +1681,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not (within(path_on_disk, OUTPUT_ROOT) or within(path_on_disk, DATA_ROOT / "job_outputs")) or not path_on_disk.is_file():
                     return self.send_json({"error": "Subtitle file missing"}, 404)
                 return self.send_bytes(path_on_disk.read_bytes(), "application/x-subrip; charset=utf-8", download=output["name"])
-            return self.send_json(job)
+            return self.send_json(public_job(job))
         return self.send_json({"error": "Not found"}, 404)
 
     def do_GET(self):
@@ -860,7 +1696,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if urlparse(self.path).path != "/api/jobs":
+            path = unquote(urlparse(self.path).path)
+            match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})/review", path)
+            step_match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})/steps/(cancel|retry)", path)
+            cancel_match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})/cancel", path)
+            if path not in ("/api/jobs", "/api/reviews/missing") and not (match or step_match or cancel_match):
                 return self.send_json({"error": "Not found"}, 404)
             length = int(self.headers.get("Content-Length", "0"))
             if length < 1 or length > 16384:
@@ -868,7 +1708,25 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError("Expected a JSON object")
-            self.send_json(create_job(payload), 202)
+            if step_match:
+                step = payload.get("step")
+                if not isinstance(step, str):
+                    raise ValueError("Select a processing step")
+                job_id, action = step_match.groups()
+                result = (cancel_step if action == "cancel" else retry_step)(job_id, step)
+            elif cancel_match:
+                result = cancel_job(cancel_match.group(1))
+            elif match:
+                result = queue_review(match.group(1), payload)
+            elif path == "/api/reviews/missing":
+                result = queue_missing_reviews(payload)
+            else:
+                result = create_job(payload)
+            self.send_json(result, 202)
+        except ReviewConflict as exc:
+            self.send_json({"error": str(exc)}, 409)
+        except JobNotFound as exc:
+            self.send_json({"error": str(exc)}, 404)
         except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             self.send_json({"error": str(exc)}, 400)
         except Exception:

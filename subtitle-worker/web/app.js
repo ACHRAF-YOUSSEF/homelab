@@ -1,4 +1,4 @@
-const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', openReviews: new Set() };
+const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', openReviews: new Set(), openSteps: new Set(), pendingReviews: new Set(), pendingStepActions: new Set(), jobActionFeedback: new Map(), reviewingMissing: false };
 const $ = id => document.getElementById(id);
 
 const ui = {
@@ -63,6 +63,12 @@ function updateWhisperSelection() {
 }
 
 function updateReviewSelection() {
+  const enabled = $('review-enabled').checked;
+  $('review-model-select').disabled = !enabled;
+  if (!enabled) {
+    $('review-note').textContent = 'Review is optional. You can review saved SRTs later from Jobs & downloads.';
+    return;
+  }
   const reviewer = $('review-model-select').value;
   const translator = $('model-select').value;
   const configured = /translategemma/i.test(state.defaultReviewModel) ? '' : state.defaultReviewModel;
@@ -78,7 +84,7 @@ function updateReviewSelection() {
   } else if (!automatic) {
     selection = 'No general review model is listed. Translations can finish with review unavailable.';
   }
-  $('review-note').textContent = `${selection} Estimates fidelity to the source transcript and scores fluency separately. This adds processing time; it is not measured accuracy and cannot verify transcription errors.`;
+  $('review-note').textContent = `${selection} Adds estimated fidelity and fluency scores, not measured accuracy. You can also review saved SRTs later.`;
 }
 
 async function loadConfig() {
@@ -131,8 +137,11 @@ async function loadConfig() {
   models.disabled = !data.models.length;
   const reviewers = $('review-model-select');
   reviewers.append(new Option('Automatic · suitable local model', ''));
+  const savedReviewers = $('jobs-review-model');
+  savedReviewers.append(new Option('Automatic · suitable local model', ''));
   for (const model of data.models.filter(model => !/translategemma/i.test(model))) {
     reviewers.append(new Option(model, model));
+    savedReviewers.append(new Option(model, model));
   }
   models.onchange = updateReviewSelection;
   reviewers.onchange = updateReviewSelection;
@@ -226,6 +235,7 @@ async function submitJob() {
         transcript: $('transcript').checked,
         targets: [...state.targets],
         model,
+        review_enabled: $('review-enabled').checked,
         review_model: $('review-model-select').value,
       }),
     });
@@ -242,6 +252,7 @@ function badgeClasses(status) {
   const colors = {
     completed: 'bg-[#20513a] text-[#9eebbd]',
     running: 'bg-[#354825] text-[#dcf0a2]',
+    cancelling: 'bg-[#574624] text-[#f5d89d]',
     failed: 'bg-[#502e30] text-[#ffc1be]',
   };
   return `${ui.badge} ${colors[status] || 'bg-[#36404b] text-[#cad7de]'}`;
@@ -251,6 +262,15 @@ function filterClasses(selected) {
   return `shrink-0 cursor-pointer rounded-md border px-[9px] py-[6px] text-[11px] font-bold focus-visible:outline-2 focus-visible:outline-mint ${selected
     ? 'border-[#54c995] bg-[#1b4435] text-[#a4f2c9]'
     : 'border-[#344453] bg-[#18242e] text-[#b8c7d0] hover:border-[#5a927c]'}`;
+}
+
+function matchesJobFilter(job, filter) {
+  const statuses = [job.status, job.review_task?.status, job.step_task?.status];
+  if (filter === 'all') return true;
+  if (filter === 'running') return statuses.some(status => ['running', 'cancelling'].includes(status));
+  if (filter === 'queued') return statuses.includes('queued');
+  if (filter === 'cancelled') return statuses.includes('cancelled');
+  return job.status === filter;
 }
 
 function reviewScore(value) {
@@ -274,12 +294,277 @@ function reviewMetric(label, value) {
   return metric;
 }
 
+function reviewBusy(job) {
+  return ['queued', 'running', 'cancelling'].includes(job.status)
+    || ['queued', 'running', 'cancelling'].includes(job.review_task?.status)
+    || ['queued', 'running', 'cancelling'].includes(job.step_task?.status)
+    || state.pendingReviews.has(job.id)
+    || stepActionPending(job)
+    || state.reviewingMissing;
+}
+
+function stepActionPending(job) {
+  return [...state.pendingStepActions].some(key => key.startsWith(`${job.id}:`));
+}
+
+function controlButton(job, label, step, action) {
+  const button = element('button', 'cursor-pointer rounded-md border border-[#465564] px-2 py-[5px] text-[11px] font-bold text-[#bdccd5] hover:bg-[#294052] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-mint', label);
+  button.type = 'button';
+  button.disabled = stepActionPending(job) || state.pendingReviews.has(job.id) || state.reviewingMissing;
+  if (step) button.setAttribute('aria-label', `${label} ${job.steps[step].label || step}`);
+  button.onclick = () => controlJob(job, step, action);
+  return button;
+}
+
+async function controlJob(job, step, action) {
+  if (stepActionPending(job) || state.pendingReviews.has(job.id) || state.reviewingMissing) return;
+  const key = `${job.id}:${step || 'job'}:${action}`;
+  state.pendingStepActions.add(key);
+  state.jobActionFeedback.delete(job.id);
+  renderJobs();
+  const route = step ? `steps/${action}` : 'cancel';
+  try {
+    await api(`/api/jobs/${encodeURIComponent(job.id)}/${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(step ? { step } : {}),
+    });
+    const label = step ? job.steps[step].label || step : 'job';
+    state.jobActionFeedback.set(job.id, {
+      message: action === 'cancel' ? `Cancellation requested for ${label}. Completed results are kept.` : `Retry queued for ${label}.`,
+      error: false,
+    });
+    await loadJobs();
+  } catch (error) {
+    state.jobActionFeedback.set(job.id, { message: error.message, error: true });
+  } finally {
+    state.pendingStepActions.delete(key);
+    renderJobs();
+  }
+}
+
+function renderJobControls(card, job) {
+  const activeWork = ['queued', 'running', 'cancelling'].includes(job.status)
+    || ['queued', 'running', 'cancelling'].includes(job.review_task?.status)
+    || ['queued', 'running', 'cancelling'].includes(job.step_task?.status);
+  const active = typeof job.can_cancel === 'boolean' ? job.can_cancel || (job.cancel_requested && activeWork) : activeWork;
+  if (active) {
+    const cancelling = job.cancel_requested || job.status === 'cancelling';
+    const actions = element('div', 'mt-3');
+    const cancel = controlButton(job, cancelling ? 'Cancelling…' : 'Cancel job', null, 'cancel');
+    cancel.disabled ||= cancelling;
+    actions.append(cancel);
+    card.append(actions);
+  }
+  if (Object.values(job.steps || {}).some(step => step.status === 'cancelling')) {
+    card.append(element('p', 'mt-2 text-[11px] leading-[1.4] text-[#d2cc9f]', 'Stops after the current segment or model request. Completed results are kept.'));
+  }
+  const feedback = state.jobActionFeedback.get(job.id);
+  if (feedback) {
+    const message = element('p', `mt-2 text-[11px] leading-[1.4] ${feedback.error ? 'text-[#ffafaa]' : 'text-[#91a3af]'}`, feedback.message);
+    message.setAttribute('role', feedback.error ? 'alert' : 'status');
+    card.append(message);
+  }
+}
+
+function renderSteps(card, job) {
+  const steps = Object.entries(job.steps || {});
+  if (!steps.length) return;
+  const details = element('details', 'mt-3 rounded-lg border border-[#304351] bg-[#121c25]');
+  details.open = state.openSteps.has(job.id);
+  details.addEventListener('toggle', () => {
+    if (details.open) state.openSteps.add(job.id);
+    else state.openSteps.delete(job.id);
+  });
+  details.append(element('summary', 'cursor-pointer rounded-lg px-3 py-[10px] text-[11px] font-bold text-[#adbfcb] focus-visible:outline-2 focus-visible:outline-mint', 'Processing steps'));
+  const body = element('div', 'space-y-3 border-t border-[#304351] px-3 py-3');
+  for (const [key, step] of steps) {
+    const row = element('div', 'rounded-md border border-[#304351] bg-[#16212b] p-[10px]');
+    const top = element('div', 'flex items-center justify-between gap-2');
+    const value = Number(step.progress);
+    const progress = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 0;
+    top.append(element('p', 'min-w-0 text-[11px] font-bold text-[#dbe6ec]', step.label || key));
+    top.append(element('span', badgeClasses(step.status), step.status || 'pending'));
+    row.append(top);
+    row.append(element('p', 'mt-2 text-[10px] text-[#91a3af]', `${progress}%`));
+    if (['running', 'cancelling'].includes(step.status)) {
+      const bar = element('div', 'mt-2 h-[4px] overflow-hidden rounded-[10px] bg-[#30404b]');
+      const fill = element('div', 'h-full bg-mint');
+      fill.style.width = `${progress}%`;
+      bar.append(fill);
+      row.append(bar);
+    }
+    if (step.error) row.append(element('p', 'mt-2 break-words text-[11px] leading-[1.4] text-[#ffafaa]', step.error));
+    const buttons = element('div', 'mt-2 flex flex-wrap gap-[6px]');
+    if (step.can_cancel) buttons.append(controlButton(job, 'Cancel', key, 'cancel'));
+    if (step.can_retry) buttons.append(controlButton(job, 'Retry', key, 'retry'));
+    if (buttons.childElementCount) row.append(buttons);
+    body.append(row);
+  }
+  details.append(body);
+  card.append(details);
+}
+
+function renderStepActivity(card, job) {
+  const task = job.step_task;
+  if (!task) return;
+  const section = element('div', 'mt-3 rounded-lg border border-[#304351] bg-[#121c25] px-3 py-[10px]');
+  const top = element('div', 'flex items-center justify-between gap-2');
+  const label = job.steps?.[task.step]?.label || task.step || 'Processing step';
+  top.append(element('p', 'text-[11px] font-bold text-[#adbfcb]', `Retry · ${label}`));
+  top.append(element('span', badgeClasses(task.status), task.status));
+  section.append(top);
+  if (['queued', 'running', 'cancelling'].includes(task.status)) {
+    const value = Number(task.progress);
+    const percent = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 0;
+    section.append(element('p', 'mt-2 mb-2 text-[11px] text-[#91a3af]', `${task.stage || 'Waiting to retry'} · ${percent}%`));
+    const progress = element('div', 'h-[5px] overflow-hidden rounded-[10px] bg-[#30404b]');
+    const fill = element('div', 'h-full bg-mint');
+    fill.style.width = `${percent}%`;
+    progress.append(fill);
+    section.append(progress);
+  }
+  if (task.error) section.append(element('p', 'mt-2 break-words text-[11px] leading-[1.4] text-[#ffafaa]', task.error));
+  card.append(section);
+}
+
+function reviewFeedback(message, error = false) {
+  const feedback = $('review-feedback');
+  feedback.replaceChildren(element('p', error ? 'text-[#ffafaa]' : '', message));
+  feedback.hidden = !message;
+}
+
+async function reviewJob(job, languages, force) {
+  if (reviewBusy(job)) return;
+  state.pendingReviews.add(job.id);
+  renderJobs();
+  reviewFeedback(`Queuing ${force ? 'a new review' : 'missing reviews'} for ${job.filename}…`);
+  try {
+    await api(`/api/jobs/${encodeURIComponent(job.id)}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ review_model: $('jobs-review-model').value, force, languages }),
+    });
+    reviewFeedback(`Queued ${force ? 'a new review' : 'missing reviews'} for ${languages.map(code => code.toUpperCase()).join(', ')}. Saved subtitles remain available.`);
+    await loadJobs();
+  } catch (error) {
+    reviewFeedback(error.message, true);
+  } finally {
+    state.pendingReviews.delete(job.id);
+    renderJobs();
+  }
+}
+
+async function reviewMissingJobs() {
+  if (state.reviewingMissing) return;
+  state.reviewingMissing = true;
+  const button = $('review-missing-jobs');
+  button.disabled = true;
+  renderJobs();
+  reviewFeedback('Checking all saved jobs for missing reviews…');
+  try {
+    const result = await api('/api/reviews/missing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ review_model: $('jobs-review-model').value }),
+    });
+    const queued = Array.isArray(result.queued) ? result.queued : [];
+    const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+    reviewFeedback(`${queued.length} ${queued.length === 1 ? 'job queued' : 'jobs queued'} for missing reviews. ${skipped.length} skipped.`);
+    if (skipped.length) {
+      const details = element('details', 'mt-2');
+      details.append(element('summary', 'cursor-pointer text-[#91a3af] focus-visible:outline-2 focus-visible:outline-mint', 'Why jobs were skipped'));
+      const reasons = new Map();
+      for (const entry of skipped) {
+        const reason = entry.reason || 'No review needed';
+        reasons.set(reason, (reasons.get(reason) || 0) + 1);
+      }
+      const list = element('ul', 'mt-2 list-disc space-y-1 pl-4 text-[#91a3af]');
+      for (const [reason, count] of reasons) list.append(element('li', '', `${count} ${count === 1 ? 'job' : 'jobs'}: ${reason}`));
+      details.append(list);
+      $('review-feedback').append(details);
+    }
+    await loadJobs();
+  } catch (error) {
+    reviewFeedback(error.message, true);
+  } finally {
+    state.reviewingMissing = false;
+    button.disabled = false;
+    renderJobs();
+  }
+}
+
+function reviewButton(job, label, languages, force) {
+  const button = element('button', 'cursor-pointer rounded-md border border-[#3a8064] px-2 py-[6px] text-[11px] font-bold text-[#91ecc0] hover:bg-[#23503c] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-mint', label);
+  button.type = 'button';
+  button.disabled = reviewBusy(job);
+  button.onclick = () => reviewJob(job, languages, force);
+  return button;
+}
+
+function renderReviewActivity(card, job) {
+  const task = job.review_task;
+  if (!task) return;
+  const section = element('div', 'mt-3 rounded-lg border border-[#304351] bg-[#121c25] px-3 py-[10px]');
+  const top = element('div', 'flex items-center justify-between gap-2');
+  top.append(element('p', 'text-[11px] font-bold text-[#adbfcb]', task.force ? 'Re-review' : 'Translation review'));
+  top.append(element('span', badgeClasses(task.status), task.status));
+  section.append(top);
+  if (['queued', 'running', 'cancelling'].includes(task.status)) {
+    const value = Number(task.progress);
+    const percent = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 0;
+    section.append(element('p', 'mt-2 mb-2 text-[11px] text-[#91a3af]', `${task.stage || 'Waiting for reviewer'} · ${percent}%`));
+    const progress = element('div', 'h-[5px] overflow-hidden rounded-[10px] bg-[#30404b]');
+    const fill = element('div', 'h-full bg-mint');
+    fill.style.width = `${percent}%`;
+    progress.append(fill);
+    section.append(progress);
+    if (task.status === 'cancelling') section.append(element('p', 'mt-2 text-[11px] leading-[1.4] text-[#d2cc9f]', 'Stops after the current segment or model request. Completed results are kept.'));
+    if (task.force && (task.languages || []).some(code => job.quality?.[code]?.status === 'completed')) {
+      section.append(element('p', 'mt-2 text-[11px] leading-[1.4] text-[#8196a3]', 'The previous completed review stays visible until the new review finishes.'));
+    }
+  }
+  if (task.error) {
+    section.append(element('p', 'mt-2 break-words text-[11px] leading-[1.4] text-[#ffafaa]', task.error));
+    if ((task.languages || []).some(code => job.quality?.[code]?.status === 'completed')) {
+      section.append(element('p', 'mt-2 text-[11px] text-[#91a3af]', 'Previous completed reviews have been retained.'));
+    }
+  }
+  card.append(section);
+}
+
+function renderReviewActions(card, job) {
+  if (['queued', 'running', 'cancelling'].includes(job.status)) return;
+  const available = job.review_available;
+  const languages = Array.isArray(available?.languages) ? available.languages : [];
+  if (!languages.length) {
+    if (available?.reason) card.append(element('p', 'mt-3 text-[11px] leading-[1.4] text-[#8196a3]', available.reason));
+    return;
+  }
+  const missing = languages.filter(code => job.quality?.[code]?.status !== 'completed');
+  const completed = languages.filter(code => job.quality?.[code]?.status === 'completed');
+  const actions = element('div', 'mt-3 flex flex-wrap gap-[6px]');
+  const retry = job.review_task?.status === 'failed'
+    ? (job.review_task.languages || []).filter(code => languages.includes(code))
+    : [];
+  if (retry.length) actions.append(reviewButton(job, 'Retry review', retry, false));
+  if (missing.length) actions.append(reviewButton(job, 'Review missing', missing, false));
+  if (completed.length) actions.append(reviewButton(job, 'Re-review translations', completed, true));
+  card.append(actions);
+  for (const [code, reason] of Object.entries(available?.rejected || {})) {
+    card.append(element('p', 'mt-2 text-[11px] leading-[1.4] text-[#ffafaa]', `${code.toUpperCase()} review unavailable: ${reason}`));
+  }
+}
+
 function renderQuality(card, job) {
   const reports = Object.entries(job.quality || {});
   if (!reports.length) {
     const hasTranslation = (job.targets || []).some(code => code !== job.detected_language && job.outputs?.[code]);
-    if (job.status === 'completed' && hasTranslation) {
-      card.append(element('p', 'mt-3 text-[11px] text-[#8196a3]', 'No translation review saved for this job.'));
+    if (['completed', 'failed', 'cancelled'].includes(job.status) && hasTranslation) {
+      const message = job.review_enabled === false
+        ? 'Review was optional and skipped. Use Review missing to review the saved subtitles.'
+        : 'No translation review saved for this job.';
+      card.append(element('p', 'mt-3 text-[11px] text-[#8196a3]', message));
     }
     return;
   }
@@ -314,7 +599,7 @@ function renderQuality(card, job) {
     }
     if (unavailable) {
       body.append(element('p', 'break-words text-[11px] leading-[1.5] text-[#ffafaa]', report.error || 'The local model could not complete this review.'));
-      body.append(element('p', 'text-[11px] leading-[1.5] text-[#91a3af]', 'Generated SRT files remain available. Recreate this job to retry using cached results.'));
+      body.append(element('p', 'text-[11px] leading-[1.5] text-[#91a3af]', 'Generated SRT files remain available. Review missing resumes cached review batches.'));
     } else if (!complete) {
       body.append(element('p', 'text-[11px] leading-[1.5] text-[#91a3af]', 'Final scores appear after every cue has been reviewed.'));
     }
@@ -339,6 +624,9 @@ function renderQuality(card, job) {
     } else if (complete) {
       body.append(element('p', 'text-[11px] text-[#91a3af]', 'No cues fell below the review threshold.'));
     }
+    if ((job.review_available?.languages || []).includes(code) && !['queued', 'running', 'cancelling'].includes(job.status)) {
+      body.append(reviewButton(job, complete ? `Re-review ${code.toUpperCase()}` : `Retry ${code.toUpperCase()} review`, [code], complete));
+    }
     details.append(body);
     section.append(details);
   }
@@ -353,9 +641,7 @@ function renderJobs() {
   }
   const list = $('jobs-list');
   list.replaceChildren();
-  const visibleJobs = state.jobFilter === 'all'
-    ? state.jobs
-    : state.jobs.filter(job => job.status === state.jobFilter);
+  const visibleJobs = state.jobs.filter(job => matchesJobFilter(job, state.jobFilter));
   if (!visibleJobs.length) {
     const message = state.jobFilter === 'all' ? 'No jobs yet.' : `No ${state.jobFilter} jobs.`;
     list.append(element('div', ui.empty, message));
@@ -392,6 +678,11 @@ function renderJobs() {
       }
       card.append(links);
     }
+    renderReviewActivity(card, job);
+    renderStepActivity(card, job);
+    renderJobControls(card, job);
+    renderSteps(card, job);
+    renderReviewActions(card, job);
     renderQuality(card, job);
     list.append(card);
   }
@@ -408,6 +699,8 @@ async function loadJobs() {
 
 $('refresh-library').onclick = () => loadFolder(state.folder);
 $('refresh-jobs').onclick = loadJobs;
+$('review-missing-jobs').onclick = reviewMissingJobs;
+$('review-enabled').onchange = updateReviewSelection;
 $('submit-job').onclick = submitJob;
 for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
   button.onclick = () => {

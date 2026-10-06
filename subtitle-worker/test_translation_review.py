@@ -1,3 +1,4 @@
+import io
 import json
 import queue
 import tempfile
@@ -109,7 +110,7 @@ class TranslationReviewTests(unittest.TestCase):
         self.assertIn("sentences split across cues", body["messages"][0]["content"])
         self.assertTrue(calls[0].full_url.endswith("/chat/completions"))
         self.assertEqual(body["temperature"], 0)
-        self.assertLessEqual(body["max_tokens"], 2048)
+        self.assertEqual(body["max_tokens"], 8192)
 
     def test_invalid_model_ratings_retry_without_accepting_a_score(self):
         class Reply:
@@ -123,6 +124,58 @@ class TranslationReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "3 attempts"):
                 worker.request_quality_review("reviewer", "ja", "en", self.cues, self.texts, 8)
         self.assertEqual(request.call_count, 3)
+
+    def test_review_request_constrains_json_shape_and_global_ids_for_each_batch(self):
+        requests = []
+        class Reply:
+            def __init__(reply, body):
+                reply.body = body
+            def __enter__(reply):
+                return reply
+            def __exit__(reply, *args):
+                pass
+            def read(reply):
+                schema = reply.body["response_format"]["json_schema"]["schema"]
+                rows = [{"id": cue_id, "fidelity": 90, "fluency": 95, "issue": ""}
+                        for cue_id in schema["items"]["properties"]["id"]["enum"]]
+                return json.dumps({"choices": [{"message": {"content": json.dumps(rows)}}]}).encode()
+        def open_reply(request, timeout):
+            body = json.loads(request.data)
+            requests.append(body)
+            return Reply(body)
+        with patch.object(worker, "urlopen", side_effect=open_reply):
+            for start in (0, 8):
+                worker.request_quality_review("reviewer", "ja", "en", self.cues, self.texts, start)
+        for body, expected_ids in zip(requests, (list(range(1, 9)), [9])):
+            response_format = body["response_format"]
+            self.assertEqual(response_format["type"], "json_schema")
+            self.assertIs(response_format["json_schema"]["strict"], True)
+            schema = response_format["json_schema"]["schema"]
+            self.assertEqual(schema["type"], "array")
+            self.assertEqual((schema["minItems"], schema["maxItems"]), (len(expected_ids), len(expected_ids)))
+            item = schema["items"]
+            self.assertEqual(set(item["required"]), {"id", "fidelity", "fluency", "issue"})
+            self.assertIs(item["additionalProperties"], False)
+            self.assertEqual(item["properties"]["id"], {"type": "integer", "enum": expected_ids})
+            for metric in ("fidelity", "fluency"):
+                self.assertEqual(item["properties"][metric], {"type": "number", "minimum": 0, "maximum": 100})
+            self.assertEqual(item["properties"]["issue"], {"type": "string", "maxLength": 600})
+
+    def test_token_limit_responses_are_rejected_before_accepting_any_ratings(self):
+        for content in ('[{"id":9,"fidelity":90,"fluency":', json.dumps(ratings(8, 1))):
+            with self.subTest(content=content):
+                class Reply:
+                    def __enter__(reply):
+                        return reply
+                    def __exit__(reply, *args):
+                        pass
+                    def read(reply):
+                        return json.dumps({"choices": [{"finish_reason": "length", "message": {"content": content}}],
+                                           "usage": {"completion_tokens": 8192}}).encode()
+                with patch.object(worker, "urlopen", return_value=Reply()) as request, patch.object(worker.time, "sleep"):
+                    with self.assertRaisesRegex(RuntimeError, "8192-token response limit.*Disable reasoning"):
+                        worker.request_quality_review("reviewer", "ja", "en", self.cues, self.texts, 8)
+                self.assertEqual(request.call_count, 3)
 
     def test_automatic_model_prefers_configured_reviewer_and_avoids_translategemma(self):
         with patch.object(worker, "list_models", return_value=["translategemma-12b", "general"]) as listed:
@@ -208,6 +261,49 @@ class TranslationReviewTests(unittest.TestCase):
                         self.assertEqual(finished["quality"]["en"]["status"], "unavailable")
                     else:
                         self.assertEqual(finished["quality"]["en"]["status"], "completed")
+
+    def test_optional_review_skips_reviewer_and_keeps_all_subtitle_outputs(self):
+        (self.root / "film.mkv").write_bytes(b"media")
+        with (patch.object(worker, "LIBRARY_ROOT", self.root),
+              patch.object(worker, "OUTPUT_ROOT", self.root / "output"),
+              patch.object(worker, "job_queue", queue.Queue()),
+              patch.object(worker, "probe_media", return_value={"tracks": [{"index": 1}], "duration": 10}),
+              patch.object(worker, "load_transcript_cache", return_value=("ja", self.cues)),
+              patch.object(worker, "load_translation_cache", return_value=[]),
+              patch.object(worker, "request_translation", side_effect=lambda m, s, t, batch: [f"{t} {cue['text']}" for cue in batch]),
+              patch.object(worker, "review_model_for_job") as select_reviewer,
+              patch.object(worker, "request_quality_review") as reviewer):
+            job = worker.create_job({"path": "film.mkv", "audio_stream_index": 1,
+                                     "source_language": "ja", "targets": ["en", "fr"],
+                                     "transcript": True, "model": "translator", "review_enabled": False})
+            worker.run_job(job["id"])
+            select_reviewer.assert_not_called()
+            reviewer.assert_not_called()
+        finished = worker.jobs[job["id"]]
+        self.assertIs(finished["review_enabled"], False)
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["progress"], 100)
+        self.assertEqual(finished["stage"], "Complete")
+        self.assertEqual(finished["quality"], {})
+        self.assertEqual(set(finished["outputs"]), {"ja", "en", "fr"})
+        self.assertTrue(all(Path(output["path"]).is_file() for output in finished["outputs"].values()))
+
+    def test_review_enabled_requires_boolean_and_defaults_on_for_existing_clients(self):
+        (self.root / "film.mkv").write_bytes(b"media")
+        payload = {"path": "film.mkv", "audio_stream_index": 1, "transcript": True}
+        with (patch.object(worker, "LIBRARY_ROOT", self.root), patch.object(worker, "job_queue", queue.Queue()),
+              patch.object(worker, "probe_media", return_value={"tracks": [{"index": 1}], "duration": 10})):
+            self.assertIs(worker.create_job(payload)["review_enabled"], True)
+            for invalid in (None, 0, 1, "false", [], {}):
+                with self.subTest(value=invalid):
+                    handler = worker.Handler.__new__(worker.Handler)
+                    body = json.dumps({**payload, "review_enabled": invalid}).encode()
+                    handler.path, handler.headers, handler.rfile = "/api/jobs", {"Content-Length": str(len(body))}, io.BytesIO(body)
+                    sent = []
+                    handler.send_json = lambda value, status=200: sent.append((value, status))
+                    handler.do_POST()
+                    self.assertEqual(sent[0][1], 400)
+                    self.assertIn("boolean", sent[0][0]["error"])
 
 
 if __name__ == "__main__":
