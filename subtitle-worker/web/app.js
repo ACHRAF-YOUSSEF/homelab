@@ -1,4 +1,4 @@
-const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', modelThinking: {}, thinkingError: '', openReviews: new Set(), openSteps: new Set(), pendingReviews: new Set(), pendingStepActions: new Set(), jobActionFeedback: new Map(), reviewingMissing: false };
+const state = { folder: '', media: null, targets: new Set(['en']), languages: {}, jobs: [], jobFilter: 'all', jobPage: 1, jobPageSize: 5, jobTotal: 0, jobTotalAll: 0, jobPageCount: 1, jobsLoading: true, workspaceTab: 'library', whisperModels: new Map(), whisperLocalOnly: false, defaultReviewModel: '', defaultTranslationModel: '', modelThinking: {}, thinkingError: '', openReviews: new Set(), openSteps: new Set(), pendingReviews: new Set(), pendingStepActions: new Set(), jobActionFeedback: new Map(), reviewingMissing: false };
 const $ = id => document.getElementById(id);
 
 const ui = {
@@ -17,6 +17,54 @@ function element(tag, className = '', text) {
   item.className = className;
   if (text !== undefined) item.textContent = text;
   return item;
+}
+
+const workspacePanels = ['library', 'setup', 'jobs'];
+const workspaceMobile = typeof matchMedia === 'function' ? matchMedia('(max-width: 1024px)') : null;
+
+function updateWorkspaceTabs() {
+  const mobile = Boolean(workspaceMobile?.matches);
+  $('workspace-tabs').hidden = !mobile;
+  for (const name of workspacePanels) {
+    const selected = state.workspaceTab === name;
+    const tab = $(`tab-${name}`);
+    tab.dataset.active = String(selected);
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = mobile && selected ? 0 : -1;
+    const panel = $(`panel-${name}`);
+    panel.hidden = mobile && !selected;
+    panel.dataset.panelActive = String(selected);
+    panel.setAttribute('role', mobile ? 'tabpanel' : 'region');
+    panel.setAttribute('aria-labelledby', mobile ? `tab-${name}` : `${name}-title`);
+    panel.tabIndex = mobile ? 0 : -1;
+  }
+}
+
+function setWorkspaceTab(name, { focus = false } = {}) {
+  if (!workspacePanels.includes(name)) return;
+  state.workspaceTab = name;
+  updateWorkspaceTabs();
+  if (focus && workspaceMobile?.matches) $(`tab-${name}`).focus();
+}
+
+function initializeWorkspaceTabs() {
+  for (const name of workspacePanels) {
+    const tab = $(`tab-${name}`);
+    tab.onclick = () => setWorkspaceTab(name);
+    tab.onkeydown = event => {
+      const current = workspacePanels.indexOf(name);
+      let index;
+      if (['ArrowRight', 'ArrowDown'].includes(event.key)) index = (current + 1) % workspacePanels.length;
+      else if (['ArrowLeft', 'ArrowUp'].includes(event.key)) index = (current + workspacePanels.length - 1) % workspacePanels.length;
+      else if (event.key === 'Home') index = 0;
+      else if (event.key === 'End') index = workspacePanels.length - 1;
+      else return;
+      event.preventDefault();
+      setWorkspaceTab(workspacePanels[index], { focus: true });
+    };
+  }
+  workspaceMobile?.addEventListener?.('change', updateWorkspaceTabs);
+  updateWorkspaceTabs();
 }
 
 const progressHistory = new Map();
@@ -315,6 +363,7 @@ async function selectMedia(path) {
       tracks.append(new Option(label, String(track.index)));
     }
     loadFolder(state.folder);
+    if (workspaceMobile?.matches) setWorkspaceTab('setup');
   } catch (error) {
     displayError(error.message);
   }
@@ -346,8 +395,8 @@ async function submitJob() {
         review_thinking: thinkingValue('review-thinking'),
       }),
     });
-    state.jobFilter = 'all';
-    await loadJobs();
+    if (workspaceMobile?.matches) setWorkspaceTab('jobs');
+    await changeJobsView({ filter: 'all', page: 1 });
   } catch (error) {
     displayError(error.message);
   } finally {
@@ -731,14 +780,17 @@ function renderQuality(card, job) {
 }
 
 function renderJobs() {
+  const scrollTop = $('jobs-content').scrollTop;
   for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
     const selected = button.dataset.jobFilter === state.jobFilter;
     button.className = filterClasses(selected);
     button.setAttribute('aria-pressed', String(selected));
   }
+  renderJobsPagination();
   const list = $('jobs-list');
   list.replaceChildren();
-  const visibleJobs = state.jobs.filter(job => matchesJobFilter(job, state.jobFilter));
+  // Status filtering happens before pagination on the server, across all history.
+  const visibleJobs = state.jobs;
   const previousVisible = visibleJobIds;
   visibleJobIds = new Set(visibleJobs.map(job => job.id));
   const retainedJobs = new Set(state.jobs.map(job => job.id));
@@ -749,8 +801,9 @@ function renderJobs() {
     }
   }
   if (!visibleJobs.length) {
-    const message = state.jobFilter === 'all' ? 'No jobs yet.' : `No ${state.jobFilter} jobs.`;
+    const message = state.jobsLoading ? 'Loading jobs…' : state.jobFilter === 'all' ? 'No jobs yet.' : `No ${state.jobFilter} jobs.`;
     list.append(element('div', ui.empty, message));
+    $('jobs-content').scrollTop = scrollTop;
     return;
   }
   for (const job of visibleJobs) {
@@ -789,6 +842,7 @@ function renderJobs() {
     renderQuality(card, job);
     list.append(card);
   }
+  $('jobs-content').scrollTop = scrollTop;
 }
 
 const jobsUpdates = {
@@ -803,6 +857,46 @@ const jobsUpdates = {
   stopped: true,
 };
 
+function jobsViewQuery() {
+  return new URLSearchParams({
+    page: String(state.jobPage),
+    page_size: String(state.jobPageSize),
+    status: state.jobFilter,
+  }).toString();
+}
+
+function renderJobsPagination() {
+  $('jobs-page-size').value = String(state.jobPageSize);
+  $('jobs-prev').disabled = state.jobsLoading || state.jobPage <= 1;
+  $('jobs-next').disabled = state.jobsLoading || state.jobPage >= state.jobPageCount;
+  $('jobs-pagination').setAttribute('aria-busy', String(state.jobsLoading));
+  if (state.jobsLoading) {
+    $('jobs-page-summary').textContent = 'Loading jobs…';
+    return;
+  }
+  const first = state.jobTotal ? (state.jobPage - 1) * state.jobPageSize + 1 : 0;
+  const last = Math.min(state.jobPage * state.jobPageSize, state.jobTotal);
+  const total = state.jobFilter === 'all' ? '' : ` · ${state.jobTotalAll} total`;
+  $('jobs-page-summary').textContent = `Page ${state.jobPage} of ${state.jobPageCount} · ${first}–${last} of ${state.jobTotal} jobs${total}`;
+}
+
+async function changeJobsView({ page = state.jobPage, pageSize = state.jobPageSize, filter = state.jobFilter } = {}) {
+  const changed = page !== state.jobPage || pageSize !== state.jobPageSize || filter !== state.jobFilter;
+  state.jobPage = page;
+  state.jobPageSize = pageSize;
+  state.jobFilter = filter;
+  $('jobs-content').scrollTop = 0;
+  if (changed) {
+    state.jobs = [];
+    state.jobsLoading = true;
+    jobsUpdates.hasSnapshot = false;
+    renderJobs();
+    stopJobsUpdates();
+    startJobsUpdates();
+  }
+  await loadJobs();
+}
+
 function setJobsConnection(status) {
   const indicator = $('jobs-connection');
   const labels = {
@@ -816,11 +910,32 @@ function setJobsConnection(status) {
   indicator.className = `mt-[5px] text-[11px] ${status === 'live' ? 'text-[#70d6b0]' : 'text-[#91a3af]'}`;
 }
 
-function applyJobsSnapshot(jobs) {
-  if (!Array.isArray(jobs)) throw Error('Invalid jobs response');
-  state.jobs = jobs;
+function validateJobsSnapshot(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.jobs)
+    || !['page', 'page_size', 'total', 'total_all', 'page_count'].every(key => Number.isInteger(snapshot[key]))
+    || snapshot.page < 1 || snapshot.page_size < 1 || snapshot.page_count < 1
+    || snapshot.page > snapshot.page_count || snapshot.total < 0 || snapshot.total_all < snapshot.total) {
+    throw Error('Invalid jobs response');
+  }
+}
+
+function applyJobsSnapshot(snapshot) {
+  validateJobsSnapshot(snapshot);
+  const clamped = snapshot.page !== state.jobPage || snapshot.page_size !== state.jobPageSize;
+  state.jobs = snapshot.jobs;
+  state.jobPage = snapshot.page;
+  state.jobPageSize = snapshot.page_size;
+  state.jobTotal = snapshot.total;
+  state.jobTotalAll = snapshot.total_all;
+  state.jobPageCount = snapshot.page_count;
+  state.jobsLoading = false;
   jobsUpdates.hasSnapshot = true;
   renderJobs();
+  // Track the server's clamped page so later inserts do not jump to an old request.
+  if (clamped && !jobsUpdates.stopped) {
+    stopJobsUpdates();
+    startJobsUpdates();
+  }
 }
 
 async function loadJobs() {
@@ -830,7 +945,7 @@ async function loadJobs() {
   const stillCurrent = () => request === jobsUpdates.requestSequence
     && version === jobsUpdates.receivedVersion && lifecycle === jobsUpdates.lifecycle;
   try {
-    const jobs = await api('/api/jobs');
+    const jobs = await api(`/api/jobs?${jobsViewQuery()}`);
     // A manual refresh or fallback request may finish after a newer stream event.
     if (stillCurrent()) applyJobsSnapshot(jobs);
   } catch (error) {
@@ -883,15 +998,16 @@ function startJobsUpdates() {
     return;
   }
   try {
-    const source = new EventSource('/api/jobs/events');
+    const source = new EventSource(`/api/jobs/events?${jobsViewQuery()}`);
     jobsUpdates.source = source;
     source.addEventListener('jobs', event => {
       if (jobsUpdates.stopped || jobsUpdates.source !== source) return;
       try {
         const jobs = JSON.parse(event.data);
-        if (!Array.isArray(jobs)) throw Error('Invalid jobs event');
+        validateJobsSnapshot(jobs);
         jobsUpdates.receivedVersion += 1;
         applyJobsSnapshot(jobs);
+        if (jobsUpdates.source !== source) return;
         if (jobsUpdates.reconnectTimer !== null) clearTimeout(jobsUpdates.reconnectTimer);
         jobsUpdates.reconnectTimer = null;
         stopFallbackPolling();
@@ -935,10 +1051,20 @@ for (const id of ['translation-thinking', 'review-thinking', 'jobs-review-thinki
 $('submit-job').onclick = submitJob;
 for (const button of $('job-filters').querySelectorAll('[data-job-filter]')) {
   button.onclick = () => {
-    state.jobFilter = button.dataset.jobFilter;
-    renderJobs();
+    void changeJobsView({ filter: button.dataset.jobFilter, page: 1 });
   };
 }
+$('jobs-prev').onclick = () => {
+  if (!state.jobsLoading && state.jobPage > 1) void changeJobsView({ page: state.jobPage - 1 });
+};
+$('jobs-next').onclick = () => {
+  if (!state.jobsLoading && state.jobPage < state.jobPageCount) void changeJobsView({ page: state.jobPage + 1 });
+};
+$('jobs-page-size').onchange = () => {
+  const pageSize = Number($('jobs-page-size').value);
+  if ([5, 10, 25].includes(pageSize)) void changeJobsView({ pageSize, page: 1 });
+};
+initializeWorkspaceTabs();
 renderJobs();
 startJobsUpdates();
 Promise.all([loadConfig(), loadFolder(''), loadJobs()]).catch(error => displayError(error.message));

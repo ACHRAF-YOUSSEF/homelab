@@ -7,59 +7,64 @@
   <title>Subtitle Studio</title>
   <link rel="stylesheet" href="/app.css">
 </head>
-<body class="min-h-screen bg-canvas bg-[radial-gradient(circle_at_78%_-10%,#18283b_0%,transparent_38%)] font-sans text-copy [color-scheme:dark]">
-  <header class="sticky top-0 z-50 flex h-[72px] items-center justify-between border-b border-[#26313d] bg-[#0e141cdb] px-[max(3vw,24px)] backdrop-blur-md max-[720px]:px-[15px]">
+<body class="flex h-dvh min-h-0 flex-col overflow-hidden bg-canvas bg-[radial-gradient(circle_at_78%_-10%,#18283b_0%,transparent_38%)] font-sans text-copy [color-scheme:dark]">
+  <header class="app-header sticky top-0 z-50 flex h-16 shrink-0 items-center justify-between gap-3 border-b border-[#26313d] bg-[#0e141cdb] px-6 backdrop-blur-md">
     <div class="flex items-center gap-3 text-lg tracking-[-0.04em]">
       <span class="grid h-[34px] w-[34px] place-items-center rounded-[9px] bg-[#48cfa2] text-[21px] font-black text-[#0c221a]">S</span>
       <span>Subtitle <b class="text-[#7ce3bf]">Studio</b></span>
     </div>
-    <span class="rounded-full border border-[#285843] bg-[#18382f] px-[13px] py-[10px] text-[11px] font-bold tracking-[0.12em] text-[#94d5bc]">
+    <span class="workspace-badge whitespace-nowrap rounded-full border border-[#285843] bg-[#18382f] px-[13px] py-2 text-[10px] font-bold tracking-[0.12em] text-[#94d5bc]">
       <i class="mr-[6px] inline-block h-[7px] w-[7px] rounded-full bg-[#6ae2a7]"></i> LOCAL WORKSPACE
     </span>
   </header>
 
-  <main class="mx-auto max-w-[1600px] px-9 py-[47px] max-[720px]:px-[15px] max-[720px]:py-[30px]">
-    <div class="mb-[31px] flex items-end justify-between gap-5 max-[720px]:flex-col max-[720px]:items-start">
-      <div>
-        <p class="mb-[11px] text-[11px] font-extrabold tracking-[0.16em] text-[#70d6b0]">MEDIA TRANSLATION</p>
-        <h1 class="mb-3 text-[40px] leading-[1.1] font-bold tracking-[-0.05em] max-[720px]:text-[32px]">Create subtitles</h1>
-        <p class="max-w-[620px] leading-normal text-[#9baab9]">Choose a video, pick its audio track, and export timed subtitles in the languages you need.</p>
-      </div>
+  <main class="workspace-main flex min-h-0 w-full flex-1 flex-col gap-5 overflow-hidden px-6 py-5">
+    <div class="workspace-hero shrink-0">
+      <p class="hero-eyebrow mb-2 text-[10px] font-extrabold tracking-[0.16em] text-[#70d6b0]">MEDIA TRANSLATION</p>
+      <h1 class="text-[32px] leading-[1.1] font-bold tracking-[-0.05em]">Create subtitles</h1>
+      <p class="hero-description mt-2 text-[13px] leading-normal text-[#9baab9]">Choose a video, pick its audio track, and export timed subtitles in the languages you need.</p>
     </div>
 
-    <div class="grid grid-cols-1 items-start gap-[18px] min-[721px]:grid-cols-2 min-[1151px]:grid-cols-[minmax(250px,1fr)_minmax(345px,1.25fr)_minmax(300px,1fr)]">
-      <section class="min-h-[550px] overflow-hidden rounded-[17px] border border-stroke bg-surface shadow-[0_15px_30px_#0000001a] max-[720px]:min-h-0">
-        <div class="flex items-center justify-between border-b border-[#28333e] px-[23px] pt-[23px] pb-5">
-          <div>
+    <nav id="workspace-tabs" role="tablist" aria-label="Subtitle workspace" class="workspace-tabs shrink-0 gap-1 rounded-xl border border-stroke bg-surface p-1">
+      <button id="tab-library" type="button" role="tab" aria-selected="true" aria-controls="panel-library" data-workspace-tab="library" data-active="true" class="workspace-tab" tabindex="0">Library</button>
+      <button id="tab-setup" type="button" role="tab" aria-selected="false" aria-controls="panel-setup" data-workspace-tab="setup" data-active="false" class="workspace-tab" tabindex="-1">Setup</button>
+      <button id="tab-jobs" type="button" role="tab" aria-selected="false" aria-controls="panel-jobs" data-workspace-tab="jobs" data-active="false" class="workspace-tab" tabindex="-1">Jobs</button>
+    </nav>
+
+    <div class="workspace-panels grid min-h-0 flex-1 gap-4">
+      <section id="panel-library" data-workspace-panel="library" data-panel-active="true" role="region" aria-labelledby="library-title" class="workspace-panel">
+        <div class="panel-header flex shrink-0 items-center justify-between gap-3 border-b border-[#28333e] px-5 py-4">
+          <div class="min-w-0">
             <p class="text-[11px] font-extrabold tracking-[0.16em] text-[#70d6b0]">01 / SOURCE</p>
-            <h2 class="mt-[5px] text-xl font-bold tracking-[-0.035em]">Media library</h2>
+            <h2 id="library-title" class="mt-[5px] text-lg font-bold tracking-[-0.035em]">Media library</h2>
           </div>
-          <button id="refresh-library" type="button" aria-label="Refresh folder" title="Refresh folder" class="inline-flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-[#33414d] bg-[#1b2632] p-0 text-[#aec6d4] transition-colors hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">
+          <button id="refresh-library" type="button" aria-label="Refresh folder" title="Refresh folder" class="icon-button inline-flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-[#33414d] bg-[#1b2632] p-0 text-[#aec6d4] transition-colors hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">
             <svg class="block h-[18px] w-[18px] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
               <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
               <path d="M21 3v5h-5" />
             </svg>
           </button>
         </div>
-        <nav id="breadcrumb" aria-label="Media folder" class="flex items-center gap-[5px] overflow-x-auto whitespace-nowrap border-b border-[#26323c] px-[19px] py-4"></nav>
-        <div id="library-list" class="max-h-[650px] overflow-y-auto p-[9px] max-[720px]:max-h-[350px]">
+        <nav id="breadcrumb" aria-label="Media folder" class="flex shrink-0 items-center gap-[5px] overflow-x-auto whitespace-nowrap border-b border-[#26323c] px-4 py-3"></nav>
+        <div id="library-list" tabindex="0" aria-label="Media files" class="panel-scroll min-h-0 flex-1 overflow-y-auto p-[9px]">
           <div class="px-6 py-10 text-center text-[13px] text-[#7f92a2]">Loading library…</div>
         </div>
       </section>
 
-      <section class="min-h-[550px] overflow-hidden rounded-[17px] border border-stroke bg-surface pb-6 shadow-[0_15px_30px_#0000001a] max-[720px]:min-h-0">
-        <div class="flex items-center justify-between border-b border-[#28333e] px-[23px] pt-[23px] pb-5">
-          <div>
+      <section id="panel-setup" data-workspace-panel="setup" data-panel-active="false" role="region" aria-labelledby="setup-title" class="workspace-panel">
+        <div class="panel-header flex shrink-0 items-center justify-between gap-3 border-b border-[#28333e] px-5 py-4">
+          <div class="min-w-0">
             <p class="text-[11px] font-extrabold tracking-[0.16em] text-[#70d6b0]">02 / SETUP</p>
-            <h2 class="mt-[5px] text-xl font-bold tracking-[-0.035em]">Subtitle options</h2>
+            <h2 id="setup-title" class="mt-[5px] text-lg font-bold tracking-[-0.035em]">Subtitle options</h2>
           </div>
         </div>
-        <div id="media-empty" class="flex h-[450px] flex-col items-center justify-center px-[30px] text-center text-[#8ba0af]">
+        <div id="setup-content" tabindex="0" aria-label="Subtitle settings" class="panel-scroll min-h-0 flex-1 overflow-y-auto">
+        <div id="media-empty" class="flex min-h-full flex-col items-center justify-center px-6 py-8 text-center text-[#8ba0af]">
           <div class="mb-5 text-[40px] text-[#63bda2]">▣</div>
           <h3 class="mb-[7px] text-lg font-bold">Select a video</h3>
           <p class="max-w-[250px] text-[13px] leading-normal">Browse your library and select an MKV or another supported video file.</p>
         </div>
-        <div id="media-options" class="px-[23px] py-[21px]" hidden>
+        <div id="media-options" class="px-5 py-5" hidden>
           <div class="mb-[21px] flex min-w-0 items-center gap-3 rounded-[11px] border border-[#304351] bg-[#1c2935] p-[15px]">
             <div class="grid h-[33px] w-[33px] shrink-0 place-items-center rounded-lg bg-[#265448] text-[#86e9c5]">▶︎</div>
             <div class="min-w-0">
@@ -107,23 +112,35 @@
           <button id="submit-job" type="button" class="mt-[22px] flex w-full cursor-pointer items-center justify-between rounded-[9px] bg-mint px-4 py-[14px] text-sm font-extrabold text-[#092118] hover:bg-[#87edbd] disabled:cursor-wait disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-white">Create subtitles <span class="text-xl">→</span></button>
           <p id="form-error" role="alert" class="mt-3 rounded-[7px] border border-[#894744] bg-[#492524] p-[10px] text-xs text-[#ffb9b2]" hidden></p>
         </div>
+        </div>
       </section>
 
-      <section class="min-h-[550px] overflow-hidden rounded-[17px] border border-stroke bg-surface shadow-[0_15px_30px_#0000001a] min-[721px]:max-[1150px]:col-span-2 min-[721px]:max-[1150px]:min-h-[150px] max-[720px]:min-h-0">
-        <div class="flex items-center justify-between border-b border-[#28333e] px-[23px] pt-[23px] pb-5">
-          <div>
+      <section id="panel-jobs" data-workspace-panel="jobs" data-panel-active="false" role="region" aria-labelledby="jobs-title" class="workspace-panel">
+        <div class="panel-header flex shrink-0 items-center justify-between gap-3 border-b border-[#28333e] px-5 py-4">
+          <div class="min-w-0">
             <p class="text-[11px] font-extrabold tracking-[0.16em] text-[#70d6b0]">03 / ACTIVITY</p>
-            <h2 class="mt-[5px] text-xl font-bold tracking-[-0.035em]">Jobs &amp; downloads</h2>
+            <h2 id="jobs-title" class="mt-[5px] text-lg font-bold tracking-[-0.035em]">Jobs &amp; downloads</h2>
             <p id="jobs-connection" role="status" aria-live="polite" aria-atomic="true" class="mt-[5px] text-[11px] text-[#91a3af]">Connecting to live updates…</p>
           </div>
-          <button id="refresh-jobs" type="button" aria-label="Refresh jobs" title="Refresh jobs" class="inline-flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-[#33414d] bg-[#1b2632] p-0 text-[#aec6d4] transition-colors hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">
+          <button id="refresh-jobs" type="button" aria-label="Refresh jobs" title="Refresh jobs" class="icon-button inline-flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-[#33414d] bg-[#1b2632] p-0 text-[#aec6d4] transition-colors hover:bg-[#294052] focus-visible:outline-2 focus-visible:outline-mint">
             <svg class="block h-[18px] w-[18px] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
               <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
               <path d="M21 3v5h-5" />
             </svg>
           </button>
         </div>
-        <div class="space-y-2 border-b border-[#28333e] px-[14px] py-3">
+        <div id="job-filters" role="group" aria-label="Filter jobs by status" class="flex shrink-0 flex-wrap gap-[6px] border-b border-[#28333e] px-[11px] py-[10px]">
+          <button type="button" data-job-filter="all" aria-pressed="true">All</button>
+          <button type="button" data-job-filter="completed" aria-pressed="false">Completed</button>
+          <button type="button" data-job-filter="failed" aria-pressed="false">Failed</button>
+          <button type="button" data-job-filter="running" aria-pressed="false">Running</button>
+          <button type="button" data-job-filter="queued" aria-pressed="false">Queued</button>
+          <button type="button" data-job-filter="cancelled" aria-pressed="false">Cancelled</button>
+        </div>
+        <div id="jobs-content" tabindex="0" aria-label="Saved jobs and reviews" class="panel-scroll min-h-0 flex-1 overflow-y-auto">
+        <details class="mx-[11px] mt-[11px] rounded-lg border border-[#304351] bg-[#121c25]">
+          <summary class="cursor-pointer rounded-lg px-3 py-3 text-xs font-bold text-[#adbfcb] focus-visible:outline-2 focus-visible:outline-mint">Saved translation reviews</summary>
+        <div class="space-y-2 border-t border-[#28333e] px-3 py-3">
           <label for="jobs-review-model" class="block text-xs font-bold text-[#adbfcb]">Reviewer for saved translations</label>
           <select id="jobs-review-model" aria-describedby="jobs-review-note" class="h-[38px] w-full rounded-lg border border-[#3a4a58] bg-[#17222c] px-3 text-xs text-[#e5eff4] outline-none focus:border-[#62cca3]"></select>
           <label for="jobs-review-thinking" class="flex items-center gap-3 text-xs font-bold text-[#adbfcb]">
@@ -136,17 +153,25 @@
           <p class="text-[11px] leading-[1.4] text-[#8196a3]">Checks all saved jobs, including jobs outside the current filter. Resumes incomplete reviews.</p>
           <div id="review-feedback" role="status" aria-live="polite" class="text-[11px] leading-[1.5] text-[#adbfcb]" hidden></div>
         </div>
-        <div id="job-filters" role="group" aria-label="Filter jobs by status" class="flex gap-[6px] overflow-x-auto border-b border-[#28333e] px-[11px] py-[10px]">
-          <button type="button" data-job-filter="all" aria-pressed="true">All</button>
-          <button type="button" data-job-filter="completed" aria-pressed="false">Completed</button>
-          <button type="button" data-job-filter="failed" aria-pressed="false">Failed</button>
-          <button type="button" data-job-filter="running" aria-pressed="false">Running</button>
-          <button type="button" data-job-filter="queued" aria-pressed="false">Queued</button>
-          <button type="button" data-job-filter="cancelled" aria-pressed="false">Cancelled</button>
-        </div>
+        </details>
         <div id="jobs-list" class="p-[11px]">
           <div class="px-6 py-10 text-center text-[13px] text-[#7f92a2]">No jobs yet.</div>
         </div>
+        </div>
+        <nav id="jobs-pagination" aria-label="Jobs pagination" class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-[#28333e] px-3 py-3">
+          <p id="jobs-page-summary" role="status" aria-live="polite" class="w-full text-[11px] text-[#91a3af]">No jobs</p>
+          <label for="jobs-page-size" class="flex items-center gap-2 text-[11px] text-[#adbfcb]">Per page
+            <select id="jobs-page-size" class="h-10 w-[72px] rounded-lg border border-[#3a4a58] bg-[#17222c] pl-3 text-xs text-[#e5eff4] outline-none focus:border-[#62cca3]">
+              <option value="5" selected>5</option>
+              <option value="10">10</option>
+              <option value="25">25</option>
+            </select>
+          </label>
+          <div class="flex items-center gap-2">
+            <button id="jobs-prev" type="button" aria-label="Previous page of jobs" disabled class="pagination-button">Previous</button>
+            <button id="jobs-next" type="button" aria-label="Next page of jobs" disabled class="pagination-button">Next</button>
+          </div>
+        </nav>
       </section>
     </div>
   </main>

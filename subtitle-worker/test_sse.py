@@ -14,11 +14,11 @@ import worker
 
 
 class EventClient:
-    def __init__(self, address, headers=None):
+    def __init__(self, address, headers=None, path="/api/jobs/events"):
         self.connection = http.client.HTTPConnection(*address, timeout=2)
         self.connection.connect()
         self.socket = self.connection.sock
-        self.connection.request("GET", "/api/jobs/events", headers=headers or {})
+        self.connection.request("GET", path, headers=headers or {})
         self.response = self.connection.getresponse()
 
     def frame(self):
@@ -85,12 +85,12 @@ class JobsEventTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-            def stream_jobs(self):
+            def stream_jobs(self, view=None):
                 with owner.stream_condition:
                     owner.active_streams += 1
                     owner.stream_condition.notify_all()
                 try:
-                    super().stream_jobs()
+                    super().stream_jobs(view)
                 finally:
                     with owner.stream_condition:
                         owner.active_streams -= 1
@@ -131,8 +131,8 @@ class JobsEventTests(unittest.TestCase):
             worker.jobs[identifier] = job
         return job
 
-    def connect(self, headers=None):
-        client = EventClient(self.address, headers)
+    def connect(self, headers=None, path="/api/jobs/events"):
+        client = EventClient(self.address, headers, path)
         self.clients.append(client)
         return client
 
@@ -331,6 +331,110 @@ class JobsEventTests(unittest.TestCase):
                 released.set()
             self.assertEqual(client.jobs()[1][0]["progress"], 0)
             self.assertEqual(client.jobs()[1][0]["progress"], 42)
+
+    def test_pagination_reads_full_history_beyond_legacy_latest_hundred(self):
+        worker.jobs.clear()
+        for number in range(105):
+            self.seed(f"{number:012x}", created_at=f"2026-10-06T10:{number // 60:02}:{number % 60:02}+00:00")
+        status, first = self.request("GET", "/api/jobs?page=1&page_size=5&status=all")
+        self.assertEqual(status, 200)
+        self.assertEqual({key: value for key, value in first.items() if key != "jobs"}, {
+            "page": 1, "page_size": 5, "total": 105, "total_all": 105, "page_count": 21,
+        })
+        self.assertEqual([job["id"] for job in first["jobs"]], [f"{number:012x}" for number in range(104, 99, -1)])
+        _, last = self.request("GET", "/api/jobs?page=21&page_size=5&status=all")
+        self.assertEqual([job["id"] for job in last["jobs"]], [f"{number:012x}" for number in range(4, -1, -1)])
+        self.assertEqual(len(self.request("GET", "/api/jobs")[1]), 100)
+        self.assertEqual(self.connect(path="/api/jobs/events?page=21&page_size=5&status=all").jobs()[1], last)
+
+    def test_filters_include_independent_work_before_paginating(self):
+        worker.jobs.clear()
+        fixtures = [
+            {"status": "completed"},
+            {"status": "failed", "review_task": {"status": "running"}},
+            {"status": "completed", "step_task": {"status": "cancelling"}},
+            {"status": "running"},
+            {"status": "queued"},
+            {"status": "cancelled"},
+            {"status": "failed", "step_task": {"status": "cancelled"}},
+            {"status": "completed", "review_task": {"status": "queued"}},
+            {"status": "failed", "review_task": {"status": "failed"}},
+        ]
+        for number, fixture in enumerate(fixtures, 1):
+            self.seed(f"{number:012x}", created_at=f"2026-10-06T10:00:{number:02}+00:00", **fixture)
+        expected = {
+            "all": list(range(9, 0, -1)), "completed": [8, 3, 1], "failed": [9, 7, 2],
+            "running": [4, 3, 2], "queued": [8, 5], "cancelled": [7, 6],
+        }
+        for status, identifiers in expected.items():
+            with self.subTest(status=status):
+                code, snapshot = self.request("GET", f"/api/jobs?page=2&page_size=1&status={status}")
+                self.assertEqual(code, 200)
+                self.assertEqual(snapshot["jobs"][0]["id"], f"{identifiers[1]:012x}")
+                self.assertEqual((snapshot["page"], snapshot["total"], snapshot["total_all"], snapshot["page_count"]),
+                                 (2, len(identifiers), 9, len(identifiers)))
+        _, defaulted = self.request("GET", "/api/jobs?status=running")
+        self.assertEqual((defaulted["page"], defaulted["page_size"]), (1, 5))
+        self.assertEqual([job["id"] for job in defaulted["jobs"]], [f"{number:012x}" for number in [4, 3, 2]])
+
+    def test_out_of_range_page_clamps_and_empty_filter_has_one_page(self):
+        _, clamped = self.request("GET", "/api/jobs?page=999&page_size=5&status=all")
+        self.assertEqual((clamped["page"], clamped["page_count"], clamped["total"]), (1, 1, 1))
+        status, empty = self.request("GET", "/api/jobs?page=999&page_size=5&status=completed")
+        self.assertEqual(status, 200)
+        self.assertEqual(empty, {"jobs": [], "page": 1, "page_size": 5, "total": 0, "total_all": 1, "page_count": 1})
+        self.assertEqual(self.connect(path="/api/jobs/events?page=999&page_size=5&status=completed").jobs()[1], empty)
+        worker.jobs.clear()
+        self.assertEqual(self.request("GET", "/api/jobs?page=2")[1], {
+            "jobs": [], "page": 1, "page_size": 5, "total": 0, "total_all": 0, "page_count": 1,
+        })
+
+    def test_invalid_paging_returns_json_400_before_stream_headers(self):
+        queries = ["page=0", "page=-1", "page=1.5", "page=", "page=x", "page=1&page=2",
+                   "page_size=0", "page_size=51", "page_size=-1", "page_size=", "page_size=2.5",
+                   "page_size=5&page_size=10", "status=unknown", "status=", "status=all&status=queued"]
+        for path in ("/api/jobs", "/api/jobs/events"):
+            for query in queries:
+                with self.subTest(path=path, query=query):
+                    status, response = self.request("GET", f"{path}?{query}")
+                    self.assertEqual(status, 400)
+                    self.assertIsInstance(response.get("error"), str)
+        self.assertEqual(self.active_streams, 0)
+        self.assertEqual(worker.jobs_revision, 0)
+
+    def test_paged_streams_keep_separate_pages_and_push_changed_counts(self):
+        worker.jobs.clear()
+        for number in range(6):
+            self.seed(f"{number:012x}", created_at=f"2026-10-06T10:00:{number:02}+00:00")
+        first = self.connect(path="/api/jobs/events?page=1&page_size=2&status=all")
+        second = self.connect(path="/api/jobs/events?page=2&page_size=2&status=all")
+        self.assertEqual([job["id"] for job in first.jobs()[1]["jobs"]], [f"{number:012x}" for number in (5, 4)])
+        self.assertEqual([job["id"] for job in second.jobs()[1]["jobs"]], [f"{number:012x}" for number in (3, 2)])
+        self.seed("000000000006", created_at="2026-10-06T10:00:06+00:00")
+        worker.set_job("000000000006", progress=7)
+        for client, page, numbers in ((first, 1, (6, 5)), (second, 2, (4, 3))):
+            event_id, snapshot = client.jobs()
+            self.assertEqual(event_id, "test-epoch:1")
+            self.assertEqual((snapshot["page"], snapshot["total"], snapshot["total_all"], snapshot["page_count"]),
+                             (page, 7, 7, 4))
+            self.assertEqual([job["id"] for job in snapshot["jobs"]], [f"{number:012x}" for number in numbers])
+        replay = self.connect({"Last-Event-ID": "test-epoch:1"}, path="/api/jobs/events?page=2&page_size=2&status=all")
+        self.assertEqual(replay.jobs()[1], self.request("GET", "/api/jobs?page=2&page_size=2&status=all")[1])
+
+    def test_filtered_stream_clamps_page_when_jobs_leave_selected_status(self):
+        worker.jobs.clear()
+        for number in range(3):
+            self.seed(f"{number:012x}", created_at=f"2026-10-06T10:00:{number:02}+00:00")
+        client = self.connect(path="/api/jobs/events?page=3&page_size=1&status=queued")
+        self.assertEqual(client.jobs()[1]["jobs"][0]["id"], "000000000000")
+        worker.set_job("000000000000", status="completed")
+        _, updated = client.jobs()
+        self.assertEqual((updated["page"], updated["page_count"], updated["total"], updated["total_all"]), (2, 2, 2, 3))
+        self.assertEqual(updated["jobs"][0]["id"], "000000000001")
+        for number in (1, 2):
+            worker.set_job(f"{number:012x}", status="completed")
+            _, updated = client.jobs()
+        self.assertEqual((updated["page"], updated["page_count"], updated["total"], updated["jobs"]), (1, 1, 0, []))
 
 
 if __name__ == "__main__":

@@ -1174,15 +1174,66 @@ def public_job(job):
     return result
 
 
-def jobs_snapshot_locked():
+def jobs_view_query(query):
+    """Validate optional paging before any stream response headers are sent."""
+    if not any(name in query for name in ("page", "page_size", "status")):
+        return None
+
+    def integer(name, default, minimum, maximum=None):
+        values = query.get(name, [str(default)])
+        if len(values) != 1 or not re.fullmatch(r"[0-9]+", values[0]):
+            raise ValueError(f"{name} must be an integer")
+        try:
+            value = int(values[0])
+        except ValueError:
+            raise ValueError(f"{name} must be an integer") from None
+        if value < minimum or (maximum is not None and value > maximum):
+            limit = f" between {minimum} and {maximum}" if maximum is not None else f" of at least {minimum}"
+            raise ValueError(f"{name} must be an integer{limit}")
+        return value
+
+    statuses = query.get("status", ["all"])
+    if len(statuses) != 1 or statuses[0] not in ("all", "completed", "failed", "running", "queued", "cancelled"):
+        raise ValueError("Unsupported job status filter")
+    return {"page": integer("page", 1, 1), "page_size": integer("page_size", 5, 1, 50), "status": statuses[0]}
+
+
+def matches_job_filter(job, status):
+    statuses = [job.get("status"), (job.get("review_task") or {}).get("status"),
+                (job.get("step_task") or {}).get("status")]
+    if status == "all":
+        return True
+    if status == "running":
+        return any(value in ("running", "cancelling") for value in statuses)
+    if status in ("queued", "cancelled"):
+        return status in statuses
+    return job.get("status") == status
+
+
+def jobs_snapshot_locked(view=None):
     items = sorted(jobs.values(), key=lambda job: job["created_at"], reverse=True)
-    return json.loads(json.dumps(items[:100]))
+    if view is None:
+        return json.loads(json.dumps(items[:100]))
+    filtered = [job for job in items if matches_job_filter(job, view["status"])]
+    total = len(filtered)
+    page_count = max(1, (total + view["page_size"] - 1) // view["page_size"])
+    page = min(view["page"], page_count)
+    start = (page - 1) * view["page_size"]
+    return {"jobs": json.loads(json.dumps(filtered[start:start + view["page_size"]])),
+            "page": page, "page_size": view["page_size"], "total": total,
+            "total_all": len(items), "page_count": page_count}
 
 
-def jobs_snapshot():
+def public_jobs_snapshot(snapshot):
+    if isinstance(snapshot, list):
+        return [public_job(job) for job in snapshot]
+    return {**snapshot, "jobs": [public_job(job) for job in snapshot["jobs"]]}
+
+
+def jobs_snapshot(view=None):
     with jobs_lock:
-        snapshots = jobs_snapshot_locked()
-    return [public_job(job) for job in snapshots]
+        snapshots = jobs_snapshot_locked(view)
+    return public_jobs_snapshot(snapshots)
 
 
 def validate_review_action(payload):
@@ -1707,7 +1758,7 @@ def worker_loop():
 
 
 class Handler(BaseHTTPRequestHandler):
-    def stream_jobs(self):
+    def stream_jobs(self, view=None):
         """Send fresh state on connect/reconnect, then wake on persisted changes."""
         # Each client has its own HTTP thread. Slow/disconnected clients cannot
         # block job processing: enrichment and network writes occur outside the
@@ -1730,9 +1781,9 @@ class Handler(BaseHTTPRequestHandler):
                                                     timeout=SSE_HEARTBEAT_SECONDS)
                     if changed:
                         revision = jobs_revision
-                        snapshots = jobs_snapshot_locked()
+                        snapshots = jobs_snapshot_locked(view)
                 if changed:
-                    data = json.dumps([public_job(job) for job in snapshots], ensure_ascii=False,
+                    data = json.dumps(public_jobs_snapshot(snapshots), ensure_ascii=False,
                                       separators=(",", ":"))
                     packet = f"id: {jobs_stream_epoch}:{revision}\nevent: jobs\ndata: {data}\n\n".encode("utf-8")
                     last_revision = revision
@@ -1766,7 +1817,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_get(self, path, query):
         if path == "/api/jobs/events":
-            return self.stream_jobs()
+            return self.stream_jobs(jobs_view_query(query))
         if path in ("/", "/app.js", "/app.css", "/favicon.svg"):
             filename = "index.html" if path == "/" else path[1:]
             content_type = {
@@ -1798,7 +1849,7 @@ class Handler(BaseHTTPRequestHandler):
             relative = query.get("path", [""])[0]
             return self.send_json({"path": relative, **probe_media(resolve_media(relative, file_required=True))})
         if path == "/api/jobs":
-            return self.send_json(jobs_snapshot())
+            return self.send_json(jobs_snapshot(jobs_view_query(query)))
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})(?:/files/([a-z]{2}))?", path)
         if match:
             job_id, language = match.groups()
@@ -1821,7 +1872,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
-            self.route_get(unquote(parsed.path), parse_qs(parsed.query))
+            self.route_get(unquote(parsed.path), parse_qs(parsed.query, keep_blank_values=True))
         except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             self.send_json({"error": str(exc)}, 400)
         except Exception:
