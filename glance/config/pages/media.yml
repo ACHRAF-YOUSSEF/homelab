@@ -19,11 +19,6 @@
               url: ${HOMELAB_URL}:5055
               check-url: http://seerr:5055
               icon: sh:seerr
-            - title: Dispatcharr
-              url: ${HOMELAB_URL}:9191
-              check-url: http://dispatcharr:9191
-              icon: sh:dispatcharr
-              timeout: 10s
             - title: TubeArchivist
               url: ${HOMELAB_URL}:8000
               check-url: http://tubearchivist:8000
@@ -109,9 +104,6 @@
                 - title: Seerr
                   url: ${HOMELAB_URL}:5055
                   icon: sh:seerr
-                - title: Dispatcharr
-                  url: ${HOMELAB_URL}:9191
-                  icon: sh:dispatcharr
             - title: Automation
               color: 38 90 58
               links:

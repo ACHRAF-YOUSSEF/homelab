@@ -58,9 +58,6 @@
               icon: si:cloudflare
             cloudflared:
               icon: si:cloudflare
-            dispatcharr:
-              icon: sh:dispatcharr
-              url: ${HOMELAB_URL}:9191
             glance:
               name: Glance
               description: Homelab dashboard

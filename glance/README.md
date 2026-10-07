@@ -22,10 +22,11 @@ Glance reads Docker status through the existing read-only Docker socket proxy at
 `tcp://docker-proxy:2375`; the Docker socket is not mounted into Glance.
 
 Configuration files are watched and reloaded automatically. Changes to
-environment variables require recreating the container:
+environment variables require recreating the container. Run this command from the
+repository root; [Docker Compose automatically loads the root `.env` file](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/#env-file):
 
 ```powershell
-docker compose --env-file .env up -d glance --force-recreate
+docker compose up -d glance --force-recreate
 ```
 
 The Media page has a 14-day release calendar from Sonarr and Radarr, plus Seerr
