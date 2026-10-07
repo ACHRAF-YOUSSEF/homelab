@@ -1,12 +1,20 @@
 include:
-  - compose/infrastructure.yml
-  - compose/dns.yml
-  - compose/media.yml
-  - compose/ai.yml
-  - compose/cloud-automation.yml
-  - compose/nextcloud-aio.yml
-  - compose/tools.yml
-  - compose/remote.yml
+  - path: compose/infrastructure.yml
+    env_file: .env
+  - path: compose/dns.yml
+    env_file: .env
+  - path: compose/media.yml
+    env_file: .env
+  - path: compose/ai.yml
+    env_file: .env
+  - path: compose/cloud-automation.yml
+    env_file: .env
+  - path: compose/nextcloud-aio.yml
+    env_file: .env
+  - path: compose/tools.yml
+    env_file: .env
+  - path: compose/remote.yml
+    env_file: .env
 
 networks:
   homelab:
