@@ -1,4 +1,18 @@
-__pycache__/
-*.pyc
-test_worker.py
-README.md
+# Send only inputs consumed by the Dockerfile; secrets, dependencies, test files,
+# model downloads, and local runtime state remain outside the build context.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!worker.py
+!download_model.py
+!validate_srt.py
+!web/
+web/**
+!web/index.html
+!web/app.js
+!web/app.css
+!web/favicon.svg
+!web/input.css
+
+# Add explicit entries here when introducing new runtime assets.

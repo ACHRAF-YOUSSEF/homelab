@@ -9,7 +9,6 @@ services:
       - "3001:8080"
     volumes:
       - ../open-webui:/app/backend/data
-      - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

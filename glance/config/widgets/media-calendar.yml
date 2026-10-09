@@ -5,13 +5,13 @@
   template: |
     {{ $start := now | formatTime "2006-01-02" }}
     {{ $end := offsetNow "+336h" | formatTime "2006-01-02" }}
-    {{ $episodes := newRequest "http://sonarr:8989/api/v3/calendar"
+    {{ $episodes := newRequest "${SONARR_INTERNAL_URL}/api/v3/calendar"
       | withParameter "start" $start
       | withParameter "end" $end
       | withParameter "includeSeries" "true"
       | withHeader "X-Api-Key" "${SONARR_API_KEY}"
       | getResponse }}
-    {{ $movies := newRequest "http://radarr:7878/api/v3/calendar"
+    {{ $movies := newRequest "${RADARR_INTERNAL_URL}/api/v3/calendar"
       | withParameter "start" $start
       | withParameter "end" $end
       | withHeader "X-Api-Key" "${RADARR_API_KEY}"

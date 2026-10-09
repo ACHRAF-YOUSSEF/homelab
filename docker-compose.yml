@@ -19,3 +19,5 @@ include:
 networks:
   homelab:
     name: homelab
+  docker-monitoring:
+    internal: true

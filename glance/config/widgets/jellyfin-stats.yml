@@ -3,7 +3,7 @@
   title-url: ${HOMELAB_URL}:8096
   css-class: media-live-jellyfin
   cache: 15s
-  url: http://host.docker.internal:8096/Sessions
+  url: ${JELLYFIN_INTERNAL_URL}/Sessions
   headers:
     Authorization: MediaBrowser Client="Glance", Device="Glance", DeviceId="glance-dashboard", Version="1.0", Token="${JELLYFIN_API_KEY}"
   template: |

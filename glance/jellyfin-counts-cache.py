@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
 
-JELLYFIN_URL = "http://host.docker.internal:8096/Items/Counts"
+JELLYFIN_URL = os.environ["JELLYFIN_INTERNAL_URL"].rstrip("/") + "/Items/Counts"
 TOKEN = os.environ["JELLYFIN_API_KEY"]
 COUNTS = None
 LOCK = threading.Lock()

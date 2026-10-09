@@ -12,19 +12,19 @@
           sites:
             - title: qBittorrent
               url: ${HOMELAB_URL}:8080
-              check-url: http://qbittorrent:8080
+              check-url: ${QBITTORRENT_INTERNAL_URL}
               icon: sh:qbittorrent
             - title: Prowlarr
               url: ${HOMELAB_URL}:9696
-              check-url: http://prowlarr:9696
+              check-url: ${GLANCE_PROWLARR_INTERNAL_URL}
               icon: sh:prowlarr
             - title: MeTube
               url: ${HOMELAB_URL}:8085
-              check-url: http://metube:8081
+              check-url: ${GLANCE_METUBE_INTERNAL_URL}
               icon: sh:metube
             - title: TubeArchivist
               url: ${HOMELAB_URL}:8000
-              check-url: http://tubearchivist:8000
+              check-url: ${GLANCE_TUBEARCHIVIST_INTERNAL_URL}
               icon: sh:tube-archivist.png
   
     - size: full
@@ -82,13 +82,13 @@
           sites:
             - title: Tdarr
               url: ${HOMELAB_URL}:8265
-              check-url: http://tdarr:8265
+              check-url: ${GLANCE_TDARR_INTERNAL_URL}
               icon: sh:tdarr.png
             - title: Sonarr
               url: ${HOMELAB_URL}:8989
-              check-url: http://sonarr:8989
+              check-url: ${SONARR_INTERNAL_URL}
               icon: sh:sonarr
             - title: Radarr
               url: ${HOMELAB_URL}:7878
-              check-url: http://radarr:7878
+              check-url: ${RADARR_INTERNAL_URL}
               icon: sh:radarr

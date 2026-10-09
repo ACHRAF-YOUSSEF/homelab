@@ -23,16 +23,16 @@ services:
       - PGID=1000
       - TZ=${TZ}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-      - DOMAINS=jellyfin.achrafyoussef.tech, ai.achrafyoussef.tech
+      - DOMAINS=${CLOUDFLARE_DDNS_DOMAINS}
       - IP6_PROVIDER=none
       - PROXIED=false
       - UPDATE_CRON=@every 5m
     networks:
       - homelab
 
-  # Proxy to expose Docker API securely to other containers without giving them direct access to the Docker socket
+  # Permit selected Docker GET endpoints on the isolated monitoring network.
   docker-proxy:
-    image: tecnativa/docker-socket-proxy:latest
+    image: tecnativa/docker-socket-proxy:v0.5.0
     container_name: portracker-docker-proxy
     mem_limit: 128m
     restart: unless-stopped
@@ -43,11 +43,9 @@ services:
       - NETWORKS=1
       - POST=0
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    ports:
-      - "2375:2375"
+      - ${DOCKER_SOCKET_SOURCE:-/var/run/docker.sock}:/var/run/docker.sock:ro
     networks:
-      - homelab
+      - docker-monitoring
 
   # Application for monitoring and tracking Docker containers
   portracker:
@@ -71,6 +69,7 @@ services:
       - docker-proxy
     networks:
       - homelab
+      - docker-monitoring
 
   # Reverse proxy to manage and route traffic to different services
   nginx-proxy-manager:
@@ -101,6 +100,7 @@ services:
     command: python /app/jellyfin-counts-cache.py
     environment:
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
+      - JELLYFIN_INTERNAL_URL=${JELLYFIN_INTERNAL_URL}
     volumes:
       - ../glance/jellyfin-counts-cache.py:/app/jellyfin-counts-cache.py:ro
     extra_hosts:
@@ -117,11 +117,64 @@ services:
       - ../glance/config:/app/config:ro
     environment:
       - TZ=${TZ}
+      - GLANCE_ADGUARD_INTERNAL_URL=${GLANCE_ADGUARD_INTERNAL_URL}
+      - GLANCE_APP_NAME=${GLANCE_APP_NAME}
+      - GLANCE_ARS_TECHNICA_FEED_URL=${GLANCE_ARS_TECHNICA_FEED_URL}
+      - GLANCE_BAZARR_INTERNAL_URL=${GLANCE_BAZARR_INTERNAL_URL}
+      - GLANCE_BLEEPINGCOMPUTER_FEED_URL=${GLANCE_BLEEPINGCOMPUTER_FEED_URL}
+      - GLANCE_CHATGPT_URL=${GLANCE_CHATGPT_URL}
+      - GLANCE_CLOUDFLARE_DASHBOARD_URL=${GLANCE_CLOUDFLARE_DASHBOARD_URL}
+      - GLANCE_COMMUNITY_WIDGETS_REGISTRY_URL=${GLANCE_COMMUNITY_WIDGETS_REGISTRY_URL}
+      - GLANCE_DOCKER_HOST=${GLANCE_DOCKER_HOST}
+      - GLANCE_DOCKER_HUB_URL=${GLANCE_DOCKER_HUB_URL}
+      - GLANCE_EPIC_GAMES_URL=${GLANCE_EPIC_GAMES_URL}
+      - GLANCE_GITHUB_URL=${GLANCE_GITHUB_URL}
+      - GLANCE_GOG_URL=${GLANCE_GOG_URL}
+      - GLANCE_HUGGING_FACE_FEED_URL=${GLANCE_HUGGING_FACE_FEED_URL}
+      - GLANCE_HUGGING_FACE_URL=${GLANCE_HUGGING_FACE_URL}
+      - GLANCE_INTERNAL_URL=${GLANCE_INTERNAL_URL}
+      - GLANCE_IT_TOOLS_INTERNAL_URL=${GLANCE_IT_TOOLS_INTERNAL_URL}
+      - GLANCE_JELLYFIN_COUNTS_INTERNAL_URL=${GLANCE_JELLYFIN_COUNTS_INTERNAL_URL}
+      - GLANCE_KREBS_FEED_URL=${GLANCE_KREBS_FEED_URL}
+      - GLANCE_LOGO_TEXT=${GLANCE_LOGO_TEXT}
+      - GLANCE_METUBE_INTERNAL_URL=${GLANCE_METUBE_INTERNAL_URL}
+      - GLANCE_N8N_INTERNAL_URL=${GLANCE_N8N_INTERNAL_URL}
+      - GLANCE_NGINX_PROXY_MANAGER_INTERNAL_URL=${GLANCE_NGINX_PROXY_MANAGER_INTERNAL_URL}
+      - GLANCE_OPEN_WEBUI_INTERNAL_URL=${GLANCE_OPEN_WEBUI_INTERNAL_URL}
+      - GLANCE_PHORONIX_FEED_URL=${GLANCE_PHORONIX_FEED_URL}
+      - GLANCE_PORTRACKER_INTERNAL_URL=${GLANCE_PORTRACKER_INTERNAL_URL}
+      - GLANCE_PROTONDB_URL=${GLANCE_PROTONDB_URL}
+      - GLANCE_PROWLARR_INTERNAL_URL=${GLANCE_PROWLARR_INTERNAL_URL}
+      - GLANCE_PUBLIC_URL=${GLANCE_PUBLIC_URL}
+      - GLANCE_REDDIT_URL=${GLANCE_REDDIT_URL}
+      - GLANCE_REGISTER_FEED_URL=${GLANCE_REGISTER_FEED_URL}
+      - GLANCE_SCHNEIER_FEED_URL=${GLANCE_SCHNEIER_FEED_URL}
+      - GLANCE_SEARXNG_INTERNAL_URL=${GLANCE_SEARXNG_INTERNAL_URL}
+      - GLANCE_SELFH_FEED_URL=${GLANCE_SELFH_FEED_URL}
+      - GLANCE_STACK_OVERFLOW_URL=${GLANCE_STACK_OVERFLOW_URL}
+      - GLANCE_STEAM_URL=${GLANCE_STEAM_URL}
+      - GLANCE_STIRLING_PDF_INTERNAL_URL=${GLANCE_STIRLING_PDF_INTERNAL_URL}
+      - GLANCE_SUBTITLE_STUDIO_INTERNAL_URL=${GLANCE_SUBTITLE_STUDIO_INTERNAL_URL}
+      - GLANCE_TDARR_INTERNAL_URL=${GLANCE_TDARR_INTERNAL_URL}
+      - GLANCE_TUBEARCHIVIST_INTERNAL_URL=${GLANCE_TUBEARCHIVIST_INTERNAL_URL}
+      - GLANCE_UPTIME_KUMA_INTERNAL_URL=${GLANCE_UPTIME_KUMA_INTERNAL_URL}
+      - GLANCE_WEATHER_LOCATION=${GLANCE_WEATHER_LOCATION}
+      - GLANCE_YOUTUBE_URL=${GLANCE_YOUTUBE_URL}
       - HOMELAB_URL=${HOMELAB_URL}
+      - IT_TOOLS_PUBLIC_URL=${IT_TOOLS_PUBLIC_URL}
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
-      - SONARR_API_KEY=${SONARR_API_KEY}
+      - JELLYFIN_INTERNAL_URL=${JELLYFIN_INTERNAL_URL}
+      - JELLYFIN_PUBLIC_URL=${JELLYFIN_PUBLIC_URL}
+      - N8N_PUBLIC_URL=${N8N_PUBLIC_URL}
+      - NEXTCLOUD_PUBLIC_URL=${NEXTCLOUD_PUBLIC_URL}
+      - OPEN_WEBUI_PUBLIC_URL=${OPEN_WEBUI_PUBLIC_URL}
+      - QBITTORRENT_INTERNAL_URL=${QBITTORRENT_INTERNAL_URL}
       - RADARR_API_KEY=${RADARR_API_KEY}
+      - RADARR_INTERNAL_URL=${RADARR_INTERNAL_URL}
       - SEERR_API_KEY=${SEERR_API_KEY}
+      - SEERR_INTERNAL_URL=${SEERR_INTERNAL_URL}
+      - SONARR_API_KEY=${SONARR_API_KEY}
+      - SONARR_INTERNAL_URL=${SONARR_INTERNAL_URL}
     ports:
       - "7575:8080"
     extra_hosts:
@@ -131,6 +184,7 @@ services:
       - jellyfin-counts-cache
     networks:
       - homelab
+      - docker-monitoring
 
   uptime-kuma:
     image: louislam/uptime-kuma:2
@@ -138,7 +192,6 @@ services:
     mem_limit: 512m
     volumes:
       - ../uptime-kuma:/app/data
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
       - "47028:3001"
     restart: unless-stopped
@@ -158,3 +211,6 @@ services:
         max-file: "3"
     networks:
       - homelab
+      - docker-monitoring
+    depends_on:
+      - docker-proxy

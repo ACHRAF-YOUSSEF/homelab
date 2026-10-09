@@ -3,7 +3,7 @@
   title-url: ${HOMELAB_URL}:8096
   css-class: media-live-jellyfin-library
   cache: 15s
-  url: http://jellyfin-counts-cache:8765/counts
+  url: ${GLANCE_JELLYFIN_COUNTS_INTERNAL_URL}/counts
   template: |
     {{ if eq .Response.StatusCode 200 }}
       <style>

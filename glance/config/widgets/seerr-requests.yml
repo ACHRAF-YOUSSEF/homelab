@@ -3,7 +3,7 @@
   title-url: ${HOMELAB_URL}:5055/requests
   css-class: media-live-seerr
   cache: 15s
-  url: http://seerr:5055/api/v1/request/count
+  url: ${SEERR_INTERNAL_URL}/api/v1/request/count
   headers:
     X-Api-Key: ${SEERR_API_KEY}
   template: |

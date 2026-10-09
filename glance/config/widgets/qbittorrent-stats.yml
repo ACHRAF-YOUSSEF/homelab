@@ -7,13 +7,13 @@
     mode: default
   subrequests:
     transfer:
-      url: http://qbittorrent:8080/api/v2/transfer/info
+      url: ${QBITTORRENT_INTERNAL_URL}/api/v2/transfer/info
     seeding:
-      url: http://qbittorrent:8080/api/v2/torrents/info
+      url: ${QBITTORRENT_INTERNAL_URL}/api/v2/torrents/info
       parameters:
         filter: seeding
     leeching:
-      url: http://qbittorrent:8080/api/v2/torrents/info
+      url: ${QBITTORRENT_INTERNAL_URL}/api/v2/torrents/info
       parameters:
         filter: downloading
   template: |

@@ -23,16 +23,16 @@
               color: 215 80 65
               links:
                 - title: Steam
-                  url: https://store.steampowered.com/
+                  url: ${GLANCE_STEAM_URL}/
                   icon: si:steam
                 - title: Epic Games
-                  url: https://store.epicgames.com/
+                  url: ${GLANCE_EPIC_GAMES_URL}/
                   icon: si:epicgames
                 - title: GOG
-                  url: https://www.gog.com/
+                  url: ${GLANCE_GOG_URL}/
                   icon: si:gogdotcom
                 - title: ProtonDB
-                  url: https://www.protondb.com/
+                  url: ${GLANCE_PROTONDB_URL}/
                   icon: si:protondb
   
     - size: full

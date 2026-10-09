@@ -1,0 +1,4 @@
+# This proxy image installs its tools without copying application files.
+**
+!Dockerfile
+!.dockerignore

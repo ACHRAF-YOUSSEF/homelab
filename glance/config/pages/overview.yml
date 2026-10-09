@@ -11,13 +11,13 @@
       bangs:
         - title: YouTube
           shortcut: "!yt"
-          url: https://www.youtube.com/results?search_query={QUERY}
+          url: ${GLANCE_YOUTUBE_URL}/results?search_query={QUERY}
         - title: GitHub
           shortcut: "!gh"
-          url: https://github.com/search?q={QUERY}
+          url: ${GLANCE_GITHUB_URL}/search?q={QUERY}
         - title: Reddit
           shortcut: "!r"
-          url: https://www.reddit.com/search/?q={QUERY}
+          url: ${GLANCE_REDDIT_URL}/search/?q={QUERY}
   
   columns:
     - size: small
@@ -26,7 +26,7 @@
           hour-format: 24h
   
         - type: weather
-          location: Tunis, Tunisia
+          location: ${GLANCE_WEATHER_LOCATION}
           units: metric
           hour-format: 24h
   
@@ -37,7 +37,7 @@
       widgets:
         - type: docker-containers
           title: Docker containers
-          sock-path: tcp://docker-proxy:2375
+          sock-path: ${GLANCE_DOCKER_HOST}
           format-container-names: true
           containers:
             homarr:
@@ -190,24 +190,24 @@
           cache: 1m
           sites:
             - title: Jellyfin
-              url: https://jellyfin.achrafyoussef.tech/
-              check-url: http://host.docker.internal:8096
+              url: ${JELLYFIN_PUBLIC_URL}
+              check-url: ${JELLYFIN_INTERNAL_URL}
               icon: sh:jellyfin
             - title: Nextcloud
-              url: https://cloud.achrafyoussef.tech/
+              url: ${NEXTCLOUD_PUBLIC_URL}
               icon: sh:nextcloud
               alt-status-codes: [301, 302, 307, 308]
             - title: Open WebUI
-              url: https://ai.achrafyoussef.tech/
-              check-url: http://open-webui:8080
+              url: ${OPEN_WEBUI_PUBLIC_URL}
+              check-url: ${GLANCE_OPEN_WEBUI_INTERNAL_URL}
               icon: sh:open-webui
             - title: AdGuard Home
               url: ${HOMELAB_URL}:8180
-              check-url: http://adguardhome:80
+              check-url: ${GLANCE_ADGUARD_INTERNAL_URL}
               icon: sh:adguard-home
             - title: Uptime Kuma
               url: ${HOMELAB_URL}:47028
-              check-url: http://uptime-kuma:3001
+              check-url: ${GLANCE_UPTIME_KUMA_INTERNAL_URL}
               icon: sh:uptime-kuma
   
         - type: bookmarks
@@ -217,11 +217,11 @@
               color: 4 88 64
               links:
                 - title: Nextcloud
-                  url: https://cloud.achrafyoussef.tech/
+                  url: ${NEXTCLOUD_PUBLIC_URL}
                   icon: sh:nextcloud
                 - title: Open WebUI
-                  url: https://ai.achrafyoussef.tech/
+                  url: ${OPEN_WEBUI_PUBLIC_URL}
                   icon: sh:open-webui
                 - title: IT-Tools
-                  url: https://tools.achrafyoussef.tech/
+                  url: ${IT_TOOLS_PUBLIC_URL}
                   icon: sh:it-tools

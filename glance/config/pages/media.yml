@@ -12,16 +12,16 @@
           cache: 30s
           sites:
             - title: Jellyfin
-              url: https://jellyfin.achrafyoussef.tech/
-              check-url: http://host.docker.internal:8096
+              url: ${JELLYFIN_PUBLIC_URL}
+              check-url: ${JELLYFIN_INTERNAL_URL}
               icon: sh:jellyfin
             - title: Seerr
               url: ${HOMELAB_URL}:5055
-              check-url: http://seerr:5055
+              check-url: ${SEERR_INTERNAL_URL}
               icon: sh:seerr
             - title: TubeArchivist
               url: ${HOMELAB_URL}:8000
-              check-url: http://tubearchivist:8000
+              check-url: ${GLANCE_TUBEARCHIVIST_INTERNAL_URL}
               icon: sh:tube-archivist.png
   
         - type: bookmarks
@@ -32,7 +32,7 @@
               links:
                 - title: Jellyfin
                   description: Movies, shows and IPTV
-                  url: https://jellyfin.achrafyoussef.tech/
+                  url: ${JELLYFIN_PUBLIC_URL}
                   icon: sh:jellyfin
                 - title: TubeArchivist
                   description: Archived YouTube library
@@ -55,27 +55,27 @@
           sites:
             - title: Sonarr
               url: ${HOMELAB_URL}:8989
-              check-url: http://sonarr:8989
+              check-url: ${SONARR_INTERNAL_URL}
               icon: sh:sonarr
             - title: Radarr
               url: ${HOMELAB_URL}:7878
-              check-url: http://radarr:7878
+              check-url: ${RADARR_INTERNAL_URL}
               icon: sh:radarr
             - title: Bazarr
               url: ${HOMELAB_URL}:6767
-              check-url: http://bazarr:6767
+              check-url: ${GLANCE_BAZARR_INTERNAL_URL}
               icon: sh:bazarr
             - title: Subtitle Studio
               url: ${HOMELAB_URL}:8099
-              check-url: http://subtitle-worker:8099
+              check-url: ${GLANCE_SUBTITLE_STUDIO_INTERNAL_URL}
               icon: /assets/subtitle-studio.svg
             - title: Prowlarr
               url: ${HOMELAB_URL}:9696
-              check-url: http://prowlarr:9696
+              check-url: ${GLANCE_PROWLARR_INTERNAL_URL}
               icon: sh:prowlarr
             - title: Tdarr
               url: ${HOMELAB_URL}:8265
-              check-url: http://tdarr:8265
+              check-url: ${GLANCE_TDARR_INTERNAL_URL}
               icon: sh:tdarr.png
   
         - type: releases

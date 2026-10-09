@@ -8,8 +8,8 @@ document:
     <script defer src="/assets/media-live.js"></script>
 
 branding:
-  app-name: Achraf's Homelab
-  logo-text: AY
+  app-name: ${GLANCE_APP_NAME}
+  logo-text: ${GLANCE_LOGO_TEXT}
   hide-footer: true
   app-background-color: "#181a1f"
 

@@ -12,11 +12,11 @@
           collapse-after: 10
           cache: 1h
           feeds:
-            - url: https://www.bleepingcomputer.com/feed/
+            - url: ${GLANCE_BLEEPINGCOMPUTER_FEED_URL}
               title: BleepingComputer
-            - url: https://krebsonsecurity.com/feed/
+            - url: ${GLANCE_KREBS_FEED_URL}
               title: Krebs on Security
-            - url: https://www.schneier.com/feed/atom/
+            - url: ${GLANCE_SCHNEIER_FEED_URL}
               title: Schneier on Security
   
     - size: full
@@ -54,15 +54,15 @@
           collapse-after: 12
           cache: 1h
           feeds:
-            - url: https://feeds.arstechnica.com/arstechnica/index
+            - url: ${GLANCE_ARS_TECHNICA_FEED_URL}
               title: Ars Technica
-            - url: https://www.theregister.com/headlines.atom
+            - url: ${GLANCE_REGISTER_FEED_URL}
               title: The Register
-            - url: https://selfh.st/rss/
+            - url: ${GLANCE_SELFH_FEED_URL}
               title: selfh.st
-            - url: https://www.phoronix.com/rss.php
+            - url: ${GLANCE_PHORONIX_FEED_URL}
               title: Phoronix
-            - url: https://huggingface.co/blog/feed.xml
+            - url: ${GLANCE_HUGGING_FACE_FEED_URL}
               title: Hugging Face
   
         - type: videos

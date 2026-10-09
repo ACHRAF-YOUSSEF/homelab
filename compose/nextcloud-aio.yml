@@ -1,4 +1,31 @@
 services:
+  # AIO needs lifecycle writes. Keep its Unix API separate from monitoring.
+  nextcloud-docker-proxy:
+    build:
+      context: ../docker-proxy/aio
+    mem_limit: 128m
+    restart: unless-stopped
+    network_mode: none
+    environment:
+      BIND_CONFIG: "/proxy/docker.sock mode 660 uid 0 gid 33"
+      BUILD: "1"
+      CONTAINERS: "1"
+      EXEC: "1"
+      IMAGES: "1"
+      INFO: "1"
+      NETWORKS: "1"
+      VOLUMES: "1"
+      POST: "1"
+    volumes:
+      - ${DOCKER_SOCKET_SOURCE:-/var/run/docker.sock}:/var/run/docker.sock:ro
+      - nextcloud_aio_docker_socket:/proxy
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --unix-socket /proxy/docker.sock http://localhost/_ping | grep -qx OK"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   nextcloud-aio-mastercontainer:
     image: ghcr.io/nextcloud-releases/all-in-one:latest
     container_name: nextcloud-aio-mastercontainer
@@ -11,10 +38,18 @@ services:
       APACHE_PORT: "11000"
       APACHE_IP_BINDING: "0.0.0.0"
       SKIP_DOMAIN_VALIDATION: "true"
+      WATCHTOWER_DOCKER_SOCKET_PATH: ${AIO_PROXY_SOCKET_PATH:-/var/lib/docker/volumes/nextcloud_aio_docker_socket/_data/docker.sock}
     volumes:
       - nextcloud_aio_mastercontainer:/mnt/docker-aio-config
-      - //var/run/docker.sock:/var/run/docker.sock:ro
+      # AIO's PHP client requires /var/run/docker.sock; this is the proxy socket.
+      # Writable because AIO also creates its PHP/runtime sockets in /var/run.
+      - nextcloud_aio_docker_socket:/var/run
+    depends_on:
+      nextcloud-docker-proxy:
+        condition: service_healthy
 
 volumes:
   nextcloud_aio_mastercontainer:
     name: nextcloud_aio_mastercontainer
+  nextcloud_aio_docker_socket:
+    name: nextcloud_aio_docker_socket

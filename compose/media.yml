@@ -217,7 +217,7 @@ services:
       - REDIS_CON=redis://archivist-redis:6379
       - HOST_UID=1000
       - HOST_GID=1000
-      - TA_HOST=http://192.168.0.163:8000
+      - TA_HOST=${TUBEARCHIVIST_PUBLIC_URL}
       - TA_USERNAME=${YT_TA_USERNAME}
       - TA_PASSWORD=${YT_TA_PASSWORD}
       - ELASTIC_PASSWORD=${YT_ELASTIC_PASSWORD}
