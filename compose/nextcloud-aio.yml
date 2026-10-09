@@ -6,8 +6,15 @@ services:
     mem_limit: 128m
     restart: unless-stopped
     network_mode: none
+    # Match the real daemon socket's group without running the proxy as root.
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
-      BIND_CONFIG: "/proxy/docker.sock mode 660 uid 0 gid 33"
+      BIND_CONFIG: "/proxy/docker.sock mode 660 uid 99 gid 33"
       BUILD: "1"
       CONTAINERS: "1"
       EXEC: "1"
@@ -43,7 +50,12 @@ services:
       - nextcloud_aio_mastercontainer:/mnt/docker-aio-config
       # AIO's PHP client requires /var/run/docker.sock; this is the proxy socket.
       # Writable because AIO also creates its PHP/runtime sockets in /var/run.
-      - nextcloud_aio_docker_socket:/var/run
+      # Only the proxy image initializes the shared volume's ownership.
+      - type: volume
+        source: nextcloud_aio_docker_socket
+        target: /var/run
+        volume:
+          nocopy: true
     depends_on:
       nextcloud-docker-proxy:
         condition: service_healthy

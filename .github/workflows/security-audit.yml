@@ -105,8 +105,13 @@ jobs:
           bandit --severity-level medium --confidence-level medium \
             --format custom --msg-template '{relpath}:{line}: {test_id} {severity}/{confidence}' \
             subtitle-worker/worker.py subtitle-worker/download_model.py \
-            subtitle-worker/validate_srt.py glance/jellyfin-counts-cache.py \
+            subtitle-worker/validate_srt.py subtitle-worker/http_client.py \
+            glance/jellyfin-counts-cache.py \
             .github/scripts/audit_repository.py
+
+      - name: Test HTTP request security boundaries
+        if: ${{ !cancelled() }}
+        run: python -m unittest discover -s subtitle-worker -p test_http_client.py
 
       - name: Audit resolved Python dependencies
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}

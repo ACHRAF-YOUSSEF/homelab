@@ -99,7 +99,7 @@ class TranslationReviewTests(unittest.TestCase):
         def open_reply(request, timeout):
             calls.append(request)
             return Reply()
-        with patch.object(worker, "urlopen", side_effect=open_reply):
+        with patch.object(worker, "open_http", side_effect=open_reply):
             result = worker.request_quality_review("reviewer", "ja", "en", self.cues, self.texts, 8)
         body = json.loads(calls[0].data)
         data = json.loads(body["messages"][1]["content"])
@@ -120,7 +120,7 @@ class TranslationReviewTests(unittest.TestCase):
                 pass
             def read(reply):
                 return json.dumps({"choices": [{"message": {"content": '[{"id":9,"fidelity":999,"fluency":90,"issue":""}]'}}]}).encode()
-        with patch.object(worker, "urlopen", return_value=Reply()) as request, patch.object(worker.time, "sleep"):
+        with patch.object(worker, "open_http", return_value=Reply()) as request, patch.object(worker.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "3 attempts"):
                 worker.request_quality_review("reviewer", "ja", "en", self.cues, self.texts, 8)
         self.assertEqual(request.call_count, 3)
@@ -143,7 +143,7 @@ class TranslationReviewTests(unittest.TestCase):
             body = json.loads(request.data)
             requests.append(body)
             return Reply(body)
-        with patch.object(worker, "urlopen", side_effect=open_reply):
+        with patch.object(worker, "open_http", side_effect=open_reply):
             for start in (0, 8):
                 worker.request_quality_review("reviewer", "ja", "en", self.cues, self.texts, start)
         for body, expected_ids in zip(requests, (list(range(1, 9)), [9])):
@@ -172,7 +172,7 @@ class TranslationReviewTests(unittest.TestCase):
                     def read(reply):
                         return json.dumps({"choices": [{"finish_reason": "length", "message": {"content": content}}],
                                            "usage": {"completion_tokens": 8192}}).encode()
-                with patch.object(worker, "urlopen", return_value=Reply()) as request, patch.object(worker.time, "sleep"):
+                with patch.object(worker, "open_http", return_value=Reply()) as request, patch.object(worker.time, "sleep"):
                     with self.assertRaisesRegex(RuntimeError, "8192-token response limit.*Disable reasoning"):
                         worker.request_quality_review("reviewer", "ja", "en", self.cues, self.texts, 8)
                 self.assertEqual(request.call_count, 3)

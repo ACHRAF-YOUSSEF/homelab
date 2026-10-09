@@ -17,7 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from http_client import open_http
 
 
 LIBRARY_ROOT = Path(os.getenv("SUBTITLE_LIBRARY_ROOT", "/library")).resolve()
@@ -28,6 +30,7 @@ LLM_BASE = os.getenv("SUBTITLE_LLM_BASE_URL", "http://host.docker.internal:1234/
 LLM_DEFAULT = os.getenv("SUBTITLE_LLM_MODEL", "").strip()
 REVIEW_DEFAULT = os.getenv("SUBTITLE_REVIEW_MODEL", "").strip()
 LLM_TIMEOUT = int(os.getenv("SUBTITLE_LLM_TIMEOUT", "600"))
+BIND_ADDRESS = os.getenv("SUBTITLE_BIND_ADDRESS", "").strip() or "127.0.0.1"
 WHISPER_NAME = os.getenv("WHISPER_MODEL", "medium").strip() or "medium"
 WHISPER_CACHE_DIR = os.getenv("HF_HUB_CACHE", "/models/hub")
 WHISPER_LOCAL_ONLY = os.getenv("WHISPER_LOCAL_FILES_ONLY", "false").lower() == "true"
@@ -231,7 +234,7 @@ def probe_media(path):
 
 def list_models():
     request = Request(LLM_BASE + "/models", headers={"Accept": "application/json"})
-    with urlopen(request, timeout=8) as response:
+    with open_http(request, timeout=8) as response:
         data = json.load(response)
     return [item["id"] for item in data.get("data", []) if isinstance(item.get("id"), str) and not any(term in item["id"].lower() for term in ("embedding", "embed-text", "rerank"))]
 
@@ -242,7 +245,7 @@ def model_thinking_options():
         if time.monotonic() < thinking_metadata["expires"]:
             return thinking_metadata["models"]
         request = Request(LLM_BASE.removesuffix("/v1") + "/api/v1/models", headers={"Accept": "application/json"})
-        with urlopen(request, timeout=8) as response:
+        with open_http(request, timeout=8) as response:
             data = json.load(response)
         options = {}
         for model in data.get("models", []):
@@ -753,7 +756,7 @@ def request_translategemma(model, source_code, target_code, cue):
     for attempt in range(3):
         check_llm_step_cancelled()
         try:
-            with urlopen(request, timeout=LLM_TIMEOUT) as response:
+            with open_http(request, timeout=LLM_TIMEOUT) as response:
                 reply = json.load(response)["choices"][0]["text"]
             reply = normalize_text(reply.split("<end_of_turn>", 1)[0])
             if not reply:
@@ -788,7 +791,7 @@ def request_translation(model, source_code, target_code, batch, thinking=None):
     for attempt in range(3):
         check_llm_step_cancelled()
         try:
-            with urlopen(request, timeout=LLM_TIMEOUT) as response:
+            with open_http(request, timeout=LLM_TIMEOUT) as response:
                 reply = json.load(response)["choices"][0]["message"]["content"].strip()
             if reply.startswith("```"):
                 reply = re.sub(r"^```(?:json)?\s*|\s*```$", "", reply, flags=re.I).strip()
@@ -889,7 +892,7 @@ def request_quality_review(model, source_code, target_code, cues, texts, start, 
     for attempt in range(3):
         check_llm_step_cancelled()
         try:
-            with urlopen(request, timeout=LLM_TIMEOUT) as response:
+            with open_http(request, timeout=LLM_TIMEOUT) as response:
                 choice = json.load(response)["choices"][0]
             if choice.get("finish_reason") == "length":
                 raise ValueError("Reviewer reached the 8192-token response limit. Disable reasoning in LM Studio or choose another reviewer")
@@ -1923,6 +1926,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_jobs()
     threading.Thread(target=worker_loop, daemon=True).start()
-    server = ThreadingHTTPServer(("0.0.0.0", 8099), Handler)
-    logging.info("Subtitle Studio listening on port 8099")
+    server = ThreadingHTTPServer((BIND_ADDRESS, 8099), Handler)
+    logging.info("Subtitle Studio listening on %s:8099", BIND_ADDRESS)
     server.serve_forever()

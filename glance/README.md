@@ -64,7 +64,7 @@ if [ ! -f .env ]; then cp .env.example .env; fi
 
 | Template group | Configure |
 | --- | --- |
-| Host and public service addresses | `TZ`, `HOMELAB_URL`, and `*_PUBLIC_URL` browser destinations |
+| Host and browser service addresses | `TZ`, `HOMELAB_URL`, and `*_PUBLIC_URL` browser destinations, which may use local or reverse-proxy routes and do not publish services |
 | Private credentials | `JELLYFIN_API_KEY`, `SONARR_API_KEY`, `RADARR_API_KEY`, and `SEERR_API_KEY` for server-side API requests |
 | Docker API proxies | `GLANCE_DOCKER_HOST` for the internal read-only Docker proxy |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values for checks and the counts helper |
@@ -77,8 +77,9 @@ the pages append service ports for shared-host links, including the SearxNG
 search destination on port `8088`. The template uses
 `http://localhost` and `TZ=Etc/UTC` as examples. For another machine's browser,
 use an address that machine can reach. Service-specific public URLs are complete
-browser destinations and can use your own domains. Keep deployment addresses,
-private links, and credentials in `.env`.
+browser destinations and can point to a LAN address or reverse proxy. A URL
+value does not publish the service or create DNS/tunnel routes. Keep deployment
+addresses, private links, and credentials in `.env`.
 
 Internal URLs are addresses reachable **from the containers** and have no
 trailing slash. They are separate from public browser URLs. The Jellyfin example
@@ -110,7 +111,7 @@ publishes no host port. See
 
 ## Security and proxy access
 
-Glance uses the internal read-only Docker API proxy on the isolated `docker-monitoring` network. Its allowed API groups are configured in Compose; changes to those permissions change what connected monitoring clients can inspect. Glance's configuration and assets are mounted read-only. Keep API credentials and deployment-specific addresses in `.env`, and review the repository [security guidance](../SECURITY.md) before exposing services or changing proxy access.
+Glance uses the internal read-only Docker API proxy on the isolated `docker-monitoring` network. Its allowed API groups are configured in Compose; changes to those permissions change what connected monitoring clients can inspect. Glance's configuration and assets are mounted read-only. The Jellyfin counts helper runs as UID/GID `1000:1000`, drops all Linux capabilities, and has no published host port; native mode defaults to loopback, while Compose binds it to the homelab network for Glance. Its source plus shared `http_client.py` are mounted read-only. That HTTP client accepts valid HTTP/HTTPS URLs, verifies TLS normally, rejects embedded credentials and malformed URLs, and blocks redirects. Keep API credentials and deployment-specific addresses in `.env`, and review the repository [security guidance](../SECURITY.md) before exposing services or changing proxy access.
 
 ## Custom widgets and refresh behavior
 

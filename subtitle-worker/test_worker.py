@@ -80,7 +80,7 @@ class SubtitleStudioTests(unittest.TestCase):
             def read(self):
                 return json.dumps({"choices": [{"message": {"content": '[{"id":2,"text":"Deux"},{"id":1,"text":"Un"}]'}}]}).encode()
         cues = [{"text": "One"}, {"text": "Two"}]
-        with patch.object(worker, "urlopen", return_value=Reply()):
+        with patch.object(worker, "open_http", return_value=Reply()):
             self.assertEqual(worker.request_translation("local", "en", "fr", cues), ["Un", "Deux"])
 
     def test_translategemma_uses_raw_completions_and_language_template(self):
@@ -95,7 +95,7 @@ class SubtitleStudioTests(unittest.TestCase):
         def fake_open(request, timeout):
             calls.append(request)
             return Reply()
-        with patch.object(worker, "urlopen", side_effect=fake_open):
+        with patch.object(worker, "open_http", side_effect=fake_open):
             result = worker.request_translation("mradermacher/translategemma-12b-it-GGUF", "ja", "en", [{"text": "こんにちは、世界！"}])
         self.assertEqual(result, ["Hello, world!"])
         self.assertTrue(calls[0].full_url.endswith("/completions"))

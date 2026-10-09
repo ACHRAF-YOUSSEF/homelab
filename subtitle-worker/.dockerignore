@@ -7,6 +7,7 @@
 !worker.py
 !download_model.py
 !validate_srt.py
+!http_client.py
 !web/
 web/**
 !web/index.html

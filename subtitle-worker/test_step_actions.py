@@ -265,7 +265,7 @@ class StepActionTests(unittest.TestCase):
                 worker.cancel_step(job["id"], "review:en")
                 return json.dumps({"choices": [{"message": {"content": "invalid json"}}]}).encode()
         cues = worker.make_cues(self.segments)
-        with patch.object(worker, "urlopen", return_value=Reply()) as request, patch.object(worker.time, "sleep") as sleep:
+        with patch.object(worker, "open_http", return_value=Reply()) as request, patch.object(worker.time, "sleep") as sleep:
             with self.assertRaises(worker.StepCancelled):
                 worker.call_step_model(job["id"], "review:en", worker.request_quality_review, "translator", "ja", "en", cues, ["text"] * 9, 0)
         request.assert_called_once()

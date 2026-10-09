@@ -421,7 +421,7 @@ docker compose up -d adguardhome unbound
 docker compose up -d sonarr radarr prowlarr qbittorrent
 ```
 
-On a configured NVIDIA host, Subtitle Studio can be built and started independently with `docker compose up -d --build subtitle-worker`. On macOS or a host without NVIDIA, use its [native CPU setup](subtitle-worker/README.md#native-cpu-setup-windows-macos-and-linux). Both serve the UI at `http://localhost:8099`; see the [component guide](subtitle-worker/README.md) for model downloads and translation setup. Compose publishes this port on all host interfaces and the app has no authentication, so choose a suitable bind address or access control for your deployment.
+On a configured NVIDIA host, Subtitle Studio can be built and started independently with `docker compose up -d --build subtitle-worker`. On macOS or a host without NVIDIA, use its [native CPU setup](subtitle-worker/README.md#native-cpu-setup-windows-macos-and-linux). Both serve the UI at `http://localhost:8099`; see the [component guide](subtitle-worker/README.md) for model downloads and translation setup. The app has no authentication. `SUBTITLE_BIND_ADDRESS` defaults the native bind and Compose host publication to loopback; change it only when you intend remote access and can restrict it to trusted clients.
 
 `docker compose down` leaves named volumes and bind-mounted data in place. Subtitle Studio uses named `subtitle_models` and `subtitle_data` volumes; Nextcloud AIO uses `nextcloud_aio_mastercontainer` and the proxy socket volume `nextcloud_aio_docker_socket`, and manages additional volumes itself. Keep those volumes and the ignored application directories when moving or restoring the stack.
 
@@ -458,10 +458,12 @@ uses `network_mode: none` and exposes a Unix socket through the named volume
 `nextcloud_aio_docker_socket`. AIO mounts that volume at `/var/run` and connects
 to the proxy socket at `/var/run/docker.sock`; it does not mount the host socket.
 The volume is writable because AIO also creates runtime sockets in `/var/run`.
+Its `nocopy: true` mount option prevents Docker from copying AIO's `/var/run`
+image contents over the ownership seeded by the proxy on a fresh volume.
 
-Start the proxy first to create the volume, then inspect its daemon-side mount
-path. These commands work in PowerShell and Unix terminals; include your local
-`-f` override flags if configured:
+For a fresh installation, start the proxy first to create the volume, then
+inspect its daemon-side mount path. These commands work in PowerShell and Unix
+terminals; include your local `-f` override flags if configured:
 
 ```shell
 docker compose up -d --build nextcloud-docker-proxy
@@ -478,7 +480,22 @@ uses this daemon-side path for socket mounts in its update and HaRP/legacy proxy
 containers, so those Docker clients also connect through the proxy. `DOCKER_SOCKET_SOURCE` separately selects the real daemon socket mounted
 by the proxy.
 
-After updating `.env`, start AIO:
+Check the socket's group as seen inside the proxy container:
+
+```shell
+docker compose exec nextcloud-docker-proxy stat -c '%g' /var/run/docker.sock
+```
+
+Set `DOCKER_SOCKET_GID` to that numeric group in `.env` and recreate the proxy
+if the value differs. Docker Desktop commonly reports `0`; native Linux often
+uses the host socket's group, but rootless Docker and user-namespace mappings
+can change the group seen inside the container. This in-container check is the
+reliable value for the proxy. Do not change ownership or permissions on the
+real daemon socket.
+
+For a fresh installation, after updating `.env`, start AIO. For an existing
+installation, follow [the one-time proxy socket migration](#existing-installation-migration)
+first; that procedure starts the proxy and AIO master when it is complete.
 
 ```shell
 docker compose up -d nextcloud-aio-mastercontainer
@@ -488,6 +505,16 @@ Open the management interface at `https://localhost:30917`; its host port is
 bound to `127.0.0.1`. The master container is outside `homelab`. AIO creates its
 own supporting containers, networks, and volumes.
 
+The management proxy runs as UID `99`, GID `33`, with no Linux capabilities.
+It uses `network_mode: none`, so it is isolated from Compose networks and has no
+published TCP port; container loopback remains available. Its Unix socket is
+mode `660`, owned by `99:33`, under a
+mode `2770` proxy directory. `DOCKER_SOCKET_GID` adds the numeric group that can
+read the daemon socket as seen inside the proxy container; Docker Desktop
+commonly reports `0`. Use the in-container `stat` command above, especially with
+rootless Docker, user namespaces, or a custom `DOCKER_SOCKET_SOURCE`. Do not
+change ownership or permissions on the host daemon socket.
+
 The management proxy permits the `BUILD`, `CONTAINERS`, `EXEC`, `IMAGES`, `INFO`,
 `NETWORKS`, and `VOLUMES` endpoint groups, with `POST=1` for lifecycle writes.
 Its client and server timeouts are one hour to accommodate long AIO shutdowns.
@@ -495,15 +522,38 @@ This access is separate from the read-only monitoring proxy. The full AIO
 installation, backup, restore, and update lifecycle has not been tested with
 this proxy configuration.
 
-After restarting or recreating `nextcloud-docker-proxy`, AIO-managed child
-containers with a socket file mount can retain the old socket. Once the proxy
-is healthy, use **Stop containers** in the AIO interface, wait for shutdown, then
-choose **Start containers** or **Start and update containers**. AIO
-[recreates stopped children when starting them](https://github.com/nextcloud/all-in-one/blob/main/php/src/Controller/DockerController.php#L26-L44),
-which reconnects their socket mounts. For an existing AIO installation, run the
-same Stop → wait → Start sequence once after applying the new master environment
-and proxy settings to replace any children's previous raw socket mounts;
-restarting a child alone retains its configured socket source.
+#### Existing installation migration
+
+Migrate the proxy socket volume once after backing it up. First use **Stop containers** in the AIO interface and wait for
+all children to stop. Then stop the master and proxy, rebuild the proxy, and
+confirm the named volume exists:
+
+```shell
+docker compose stop nextcloud-aio-mastercontainer nextcloud-docker-proxy
+docker compose build nextcloud-docker-proxy
+docker volume inspect nextcloud_aio_docker_socket
+```
+
+Run this one-off ownership repair against only the proxy volume. It adjusts the
+proxy directory and socket ownership/mode; it does not recursively change AIO's
+PHP or runtime files:
+
+```shell
+docker run --rm --network none --user 0:33 --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --security-opt no-new-privileges --mount type=volume,source=nextcloud_aio_docker_socket,target=/proxy --entrypoint sh tecnativa/docker-socket-proxy:v0.5.0 -c 'chown 99:33 /proxy && chmod 2770 /proxy && if [ -S /proxy/docker.sock ]; then chown 99:33 /proxy/docker.sock && chmod 660 /proxy/docker.sock; fi'
+```
+
+Start the rebuilt proxy and AIO master, wait for the proxy health check, then
+use **Start containers** in AIO to recreate the children with the new proxy
+socket:
+
+```shell
+docker compose up -d nextcloud-docker-proxy nextcloud-aio-mastercontainer
+```
+ AIO [recreates stopped children when starting them](https://github.com/nextcloud/all-in-one/blob/main/php/src/Controller/DockerController.php#L26-L44),
+which reconnects their socket mounts. After a later proxy restart or recreation,
+children with socket file mounts can retain an old socket inode; repeat the
+AIO **Stop containers** → wait → **Start containers** sequence after the proxy
+is healthy. Restarting a child alone retains its configured socket source.
 
 `APACHE_PORT=11000` and `APACHE_IP_BINDING=0.0.0.0` configure the Apache endpoint
 created by AIO after setup; the master does not directly publish that port.
@@ -537,15 +587,15 @@ edits to deployment addresses in the dashboard YAML.
 
 | Template group | Main settings and purpose |
 | --- | --- |
-| Host and public service addresses | `TZ=Etc/UTC` and `HOMELAB_URL=http://localhost` are generic defaults. `*_PUBLIC_URL` values are browser destinations; `TUBEARCHIVIST_PUBLIC_URL` also configures TubeArchivist's `TA_HOST`. `N8N_HOST` and `N8N_WEBHOOK_URL` configure n8n's advertised address. |
+| Host and browser service addresses | `TZ=Etc/UTC` and `HOMELAB_URL=http://localhost` are generic defaults. `*_PUBLIC_URL` values are browser destinations that can point to a LAN address or reverse proxy; setting one does not publish a service or create DNS/tunnel routes. `TUBEARCHIVIST_PUBLIC_URL` also configures TubeArchivist's `TA_HOST`. `N8N_HOST` and `N8N_WEBHOOK_URL` configure n8n's advertised address. |
 | Private credentials | Cloudflare tokens and `CLOUDFLARE_DDNS_DOMAINS`; Jellyfin, Sonarr, Radarr, and Seerr API keys; TubeArchivist username/password and its Elasticsearch password. Fill only the integrations you use. |
-| Docker API proxies | `DOCKER_SOCKET_SOURCE` selects the daemon-side socket mounted only by the proxies. `GLANCE_DOCKER_HOST` selects the monitoring proxy. `AIO_PROXY_SOCKET_PATH` identifies the daemon-side Nextcloud proxy socket used by AIO-managed child containers. See [Docker API access](#docker-api-access). |
+| Docker API proxies | `DOCKER_SOCKET_SOURCE` selects the daemon-side socket mounted only by the proxies. `DOCKER_SOCKET_GID` selects the socket's numeric group as seen inside the unprivileged AIO proxy (Docker Desktop commonly reports `0`). `GLANCE_DOCKER_HOST` selects the monitoring proxy. `AIO_PROXY_SOCKET_PATH` identifies the daemon-side Nextcloud proxy socket used by AIO-managed child containers. See [Docker API access](#docker-api-access). |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values are reachable from containers, with no trailing slash. They control dashboard checks, APIs, and the library-count helper independently of browser links. |
 | Glance appearance | `GLANCE_APP_NAME`, `GLANCE_LOGO_TEXT`, and `GLANCE_WEATHER_LOCATION` replace example branding and weather. |
 | Public external bookmarks and search providers | `GLANCE_*_URL` values customize external links and search shortcuts. |
 | Glance public RSS feed sources | `GLANCE_*_FEED_URL` values customize RSS sources. |
 | Media paths | `EXAMPLE_MEDIA_ROOT` supports the portable override example. `SUBTITLE_MEDIA_DIR` and `SUBTITLE_LIBRARY_DIR` choose the worker's writable output and read-only source mounts. Use absolute paths for your OS. |
-| Subtitle models and local inference | `WHISPER_MODEL`, `WHISPER_LOCAL_FILES_ONLY`, `SUBTITLE_LLM_MODEL`, `SUBTITLE_REVIEW_MODEL`, `SUBTITLE_LLM_BASE_URL`, and `SUBTITLE_LLM_TIMEOUT` configure transcription and translation/review. Blank LLM model IDs select automatically. See the [worker guide](subtitle-worker/README.md). |
+| Subtitle models and local inference | `WHISPER_MODEL`, `WHISPER_LOCAL_FILES_ONLY`, `SUBTITLE_LLM_MODEL`, `SUBTITLE_REVIEW_MODEL`, `SUBTITLE_LLM_BASE_URL`, and `SUBTITLE_LLM_TIMEOUT` configure transcription and translation/review. Blank LLM model IDs select automatically. `SUBTITLE_BIND_ADDRESS` controls the native worker bind and Docker host publication; it defaults to loopback. See the [worker guide](subtitle-worker/README.md). |
 
 `HOMELAB_URL` contains a scheme and host without a port or trailing slash; Glance
 appends ports for shared-host links. A localhost public URL works for a browser
@@ -739,15 +789,15 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 
 | Check | Coverage |
 | --- | --- |
-| Gitleaks | Full reachable Git history and current files; redacts findings. |
-| Repository privacy checks | Unit tests and the checker for private deployment data, credentials, and literal Glance endpoints. |
-| actionlint | GitHub Actions workflow syntax. |
-| Bandit | Worker, model downloader, subtitle validator, Glance counts helper, and privacy checker Python sources at medium severity and confidence. |
-| pip-audit | Resolved transitive dependencies from the subtitle worker requirements, strict mode. |
-| pnpm audit | The subtitle worker lockfile, including development dependencies, without installing project packages. |
-| Trivy | Dependency-manifest vulnerabilities and Dockerfile misconfiguration findings at high or critical severity. Compose misconfiguration and OS vulnerabilities in supplied container images are outside this scan. |
+| Gitleaks | Current files and full reachable Git history; complete redaction, zero findings in the latest scan of 68 commits. |
+| Repository privacy checks | 14 unit tests and the checker for private deployment data, credentials, and literal Glance endpoints; passed. |
+| actionlint | GitHub Actions workflow syntax; pinned version 1.7.12 passed. |
+| Bandit | Worker, shared HTTP client, model downloader, subtitle validator, Glance counts helper, and privacy checker Python sources at medium severity and confidence; zero findings. |
+| pip-audit | Strict audit of resolved Python 3.12 dependencies; zero known vulnerabilities. |
+| pnpm audit | Subtitle worker lockfile, including development dependencies, without installing project packages; zero moderate-or-higher findings. |
+| Trivy | Filesystem dependency-manifest vulnerability and Dockerfile misconfiguration scan, including development dependencies; zero high or critical findings. Compose misconfiguration and supplied-image OS vulnerabilities are outside this scan. |
 
-See [SECURITY.md](SECURITY.md) for reporting guidance and deployment notes. Initial runs may report existing dependency or source findings; the dated baseline is documented there. For task-focused repository help, reusable Codex profiles are documented in [.codex/agents/README.md](.codex/agents/README.md).
+The latest full pinned audit passed every gate. See [SECURITY.md](SECURITY.md) for the initial findings, their remediation, scan limits, and deployment guidance. For task-focused repository help, reusable Codex profiles are documented in [.codex/agents/README.md](.codex/agents/README.md).
 
 The [component guides](#component-guides) document local proxy and service exposure.
 

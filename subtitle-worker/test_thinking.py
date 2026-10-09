@@ -31,7 +31,7 @@ class ThinkingTests(unittest.TestCase):
                            model("graded", ["off", "low", "medium", "high"]),
                            model("always", ["on"]), model("plain", [])]}
         with (patch.object(worker, "thinking_metadata", {"expires": 0, "models": {}}),
-              patch.object(worker, "urlopen", return_value=io.BytesIO(json.dumps(data).encode())) as open_model):
+              patch.object(worker, "open_http", return_value=io.BytesIO(json.dumps(data).encode())) as open_model):
             options = self.read_options()
             self.assertTrue(options["gemma-instance"]["can_toggle"])
             self.assertEqual(options["gemma"]["effort_on"], "high")
@@ -49,7 +49,7 @@ class ThinkingTests(unittest.TestCase):
             reply = (mock_ratings("", "", "", self.fixture.cues, [], 0)
                      if "response_format" in body else [{"id": 1, "text": "Hello"}])
             return io.BytesIO(json.dumps({"choices": [{"message": {"content": json.dumps(reply)}}]}).encode())
-        with patch.object(worker, "urlopen", side_effect=response):
+        with patch.object(worker, "open_http", side_effect=response):
             for thinking, effort in ((False, "none"), (True, "high"), (None, None)):
                 worker.request_translation("translator", "ja", "en", self.fixture.cues[:1], thinking=thinking)
                 self.assertEqual(calls[-1].get("reasoning_effort"), effort)

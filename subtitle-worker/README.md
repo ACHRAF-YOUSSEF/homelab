@@ -79,7 +79,7 @@ ffprobe -version
 
 The worker invokes FFmpeg and FFprobe directly, even though Faster Whisper's decoder bundles its own libraries. Native execution reads the process environment and does **not** load the root `.env`. `SUBTITLE_LIBRARY_DIR` and `SUBTITLE_MEDIA_DIR` are Compose host-mount settings; native execution needs the `*_ROOT` variables shown below.
 
-These examples keep the virtual environment, library, outputs, job history, and model cache under a separate `subtitle-studio-example` folder in your home directory. Copy a supported video into its `library` folder, or replace `SUBTITLE_LIBRARY_ROOT` with your existing media folder. Start LM Studio's server on port 1234 if you want translations; source-only transcription can run without it. The native URL uses `127.0.0.1`, because the worker and LM Studio are on the same host.
+These examples keep the virtual environment, library, outputs, job history, and model cache under a separate `subtitle-studio-example` folder in your home directory. Copy a supported video into its `library` folder, or replace `SUBTITLE_LIBRARY_ROOT` with your existing media folder. Start LM Studio's server on port 1234 if you want translations; source-only transcription can run without it. The native worker binds to `127.0.0.1` by default; set `SUBTITLE_BIND_ADDRESS` in the same shell to choose another host interface deliberately. The native LM Studio URL uses `127.0.0.1` because both processes run on the same host.
 
 From the repository root in **Windows PowerShell**:
 
@@ -100,6 +100,7 @@ $env:WHISPER_DEVICE = 'cpu'
 $env:WHISPER_COMPUTE_TYPE = 'int8'
 $env:WHISPER_MODEL = 'small'
 $env:WHISPER_LOCAL_FILES_ONLY = 'false'
+$env:SUBTITLE_BIND_ADDRESS = '127.0.0.1'
 $env:SUBTITLE_LLM_BASE_URL = 'http://127.0.0.1:1234/v1'
 $env:SUBTITLE_LLM_MODEL = ''
 $env:SUBTITLE_REVIEW_MODEL = ''
@@ -131,6 +132,7 @@ export WHISPER_DEVICE=cpu
 export WHISPER_COMPUTE_TYPE=int8
 export WHISPER_MODEL=small
 export WHISPER_LOCAL_FILES_ONLY=false
+export SUBTITLE_BIND_ADDRESS=127.0.0.1
 export SUBTITLE_LLM_BASE_URL=http://127.0.0.1:1234/v1
 export SUBTITLE_LLM_MODEL=""
 export SUBTITLE_REVIEW_MODEL=""
@@ -145,11 +147,11 @@ The examples select `small` for an initial CPU run; choose another supported Whi
 
 Open <http://localhost:8099>. In Docker, the media library is a read-only mount of `SUBTITLE_LIBRARY_DIR`; in native mode, it is the directory set by `SUBTITLE_LIBRARY_ROOT`. Choose a video, an audio track, the source language (or auto), a Whisper transcription model, whether to save its transcript, and any target languages. Select an LM Studio translation model, then create the job. For a source-only SRT, clear the output-language selections and enable **Save original transcript**; this does not need LM Studio inference. The Jobs panel displays progress, the Whisper model used, and download links. Completed SRT files mirror the source media folder structure as `<video-stem>.<language>.srt` under `SUBTITLE_MEDIA_DIR/output` in Docker, or `SUBTITLE_OUTPUT_ROOT` in native mode.
 
-The Python server listens on `0.0.0.0:8099` in both native and container modes, and the app has no authentication. The checked-in Compose mapping is `8099:8099`, which publishes it on all host interfaces. For Docker access limited to the host, use a local Compose override with `127.0.0.1:8099:8099` and recreate the service. Native mode also requires a host firewall rule or other network restriction because `SUBTITLE_BIND_ADDRESS` is not read by the current worker. See the repository [security guidance](../SECURITY.md) before exposing the UI; the worker can read mounted media and write subtitle data, so allow access only to trusted clients.
+The app has no authentication. In native mode, `SUBTITLE_BIND_ADDRESS` controls the server listener and defaults to `127.0.0.1`. In Compose, the worker listens on `0.0.0.0:8099` inside its Docker network while the host publication defaults to `127.0.0.1:8099`; these are separate bindings. Set `SUBTITLE_BIND_ADDRESS` in the root `.env` only when you intend to publish the host port on another interface, then recreate the service and apply suitable firewall rules. The worker can read mounted media and write subtitle data, so allow access only to trusted clients. See the repository [security guidance](../SECURITY.md).
 
 The UI serves a compiled Tailwind CSS file from the container and needs no browser access to a CDN. The generated `web/app.css` is checked in, so Docker builds do not need Node to build the UI. Building the image still requires access to the base image and Ubuntu/Python package sources unless those are cached. After changing classes in `web/index.html` or `web/app.js`, regenerate the CSS with the development commands below, include the updated CSS with your changes, then rebuild the container.
 
-LM Studio's server must be reachable at `SUBTITLE_LLM_BASE_URL` with a model available for translation. The selector displays IDs returned by its `/v1/models` endpoint, excluding embedding and reranking models. If `SUBTITLE_LLM_MODEL` is set, that model is selected by default and added to the selector if the server does not list it; otherwise the first available model is selected. Whisper's CUDA settings come from Compose; native examples explicitly use CPU with `int8`. LM Studio controls its own model loading and GPU settings; the worker does not configure them. When both use the GPU, they can compete for GPU memory.
+LM Studio's server must be reachable at `SUBTITLE_LLM_BASE_URL` with a model available for translation. The shared HTTP client accepts valid HTTP and HTTPS URLs, verifies HTTPS certificates normally, rejects embedded credentials and malformed URLs, and does not follow redirects. Configure the direct API endpoint rather than a URL that redirects. The selector displays IDs returned by its `/v1/models` endpoint, excluding embedding and reranking models. If `SUBTITLE_LLM_MODEL` is set, that model is selected by default and added to the selector if the server does not list it; otherwise the first available model is selected. Whisper's CUDA settings come from Compose; native examples explicitly use CPU with `int8`. LM Studio controls its own model loading and GPU settings; the worker does not configure them. When both use the GPU, they can compete for GPU memory.
 
 Model IDs containing `translategemma` use a separate adapter: it sends the language-specific translation template through LM Studio's raw `/v1/completions` endpoint and translates one timed cue per request. General instruction models use `/v1/chat/completions` in batches of eight cues. Both adapters validate their responses before saving translations. The unit suite covers request formats and responses with mocks; it does not establish live model quality or memory requirements.
 
@@ -169,6 +171,7 @@ The root `.env.example` documents the host-facing settings used by Compose. Host
 
 | Setting | Example/value | Purpose |
 | --- | --- | --- |
+| `SUBTITLE_BIND_ADDRESS` | `127.0.0.1` | Native listener address and Docker host publication address; Compose's container listener stays on its internal network. |
 | `SUBTITLE_LIBRARY_DIR` | `D:/homelab-media` | Host media directory mounted read-only at `/library`. |
 | `SUBTITLE_MEDIA_DIR` | `D:/homelab-subtitles` | Host directory mounted at `/media`; conventional SRT exports go to `/media/output`. |
 | `WHISPER_MODEL` | `medium` | Default model selected for new jobs. |
@@ -178,7 +181,21 @@ The root `.env.example` documents the host-facing settings used by Compose. Host
 | `SUBTITLE_REVIEW_MODEL` | empty | Preferred reviewer; an empty value uses the automatic selection described below. |
 | `SUBTITLE_LLM_TIMEOUT` | `600` | Timeout in seconds for each translation or review HTTP attempt. |
 
-Compose fixes the container paths as `SUBTITLE_LIBRARY_ROOT=/library`, `SUBTITLE_OUTPUT_ROOT=/media/output`, and `SUBTITLE_DATA_ROOT=/data`. The `subtitle_models` named volume mounts at `/models`, with the model cache at `HF_HUB_CACHE=/models/hub`. The `subtitle_data` volume holds `/data/jobs.json`, transcript/translation/review caches, cached WAV audio, and `/data/job_outputs/<job_id>/` SRT snapshots. Ordinary service rebuilds and restarts preserve these volumes. Removing them, for example with `docker compose down -v`, removes the saved state and models.
+The image runs as UID/GID `1000:1000` and creates `/data`, `/models`, `/media/output`, and `/library` for that user so fresh named volumes are writable. Compose separately drops all Linux capabilities and enables `no-new-privileges` for the worker service. Compose fixes the container paths as `SUBTITLE_LIBRARY_ROOT=/library`, `SUBTITLE_OUTPUT_ROOT=/media/output`, and `SUBTITLE_DATA_ROOT=/data`. The `subtitle_models` named volume mounts at `/models`, with the model cache at `HF_HUB_CACHE=/models/hub`. The `subtitle_data` volume holds `/data/jobs.json`, transcript/translation/review caches, cached WAV audio, and `/data/job_outputs/<job_id>/` SRT snapshots. Ordinary service rebuilds and restarts preserve these volumes. Removing them, for example with `docker compose down -v`, removes the saved state and models.
+
+Existing named volumes created by a root-running image need a one-time ownership migration for `/data` and `/models` before the UID `1000` worker can write to them. Back up the volumes first. This procedure uses the stopped Compose container to pass its mounts to an isolated helper. Confirm that `/data` and `/models` are the expected named volumes before changing ownership; the command does not touch `/library` or `/media`. The host output directory mounted at `/media` must separately be writable by the container user. The library remains read-only inside the container.
+
+Run from the repository root. If you use a local Compose override, include the same `-f` flags on each Compose command below. Do not run `down` or remove the stopped worker container before the one-off command, because the helper uses its mounts:
+
+```shell
+docker compose stop subtitle-worker
+docker compose build subtitle-worker
+docker inspect subtitle-worker --format '{{json .Mounts}}'
+docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE --security-opt no-new-privileges --volumes-from subtitle-worker busybox:1.37.0 sh -c 'chown -R 1000:1000 /data /models'
+docker compose up -d --force-recreate subtitle-worker
+```
+
+Review the local mount inspection output before running the helper. It recursively changes ownership only under `/data` and `/models`, including `/models/hub` and cached model files. The helper has no network access, receives no worker environment or GPU, and has no Docker socket mount. If the prior worker container was already removed, identify and verify the actual volume names and mount them explicitly rather than using this recipe.
 
 Native mode stores the same job records and cache layout inside your configured `SUBTITLE_DATA_ROOT`, with exports in `SUBTITLE_OUTPUT_ROOT` and models in `HF_HUB_CACHE`. These directories are ordinary host folders rather than Docker volumes. Keep the same paths when restarting and back them up if you need to preserve jobs and generated files. The native examples do not alter the Compose service or its existing volumes.
 
@@ -328,16 +345,16 @@ The repository [security audit workflow](../.github/workflows/security-audit.yml
 
 ## Development and checks
 
-From `subtitle-worker`, regenerate the bundled stylesheet using the checked-in pnpm lockfile:
+From `subtitle-worker`, regenerate the bundled stylesheet using Node.js 24, pnpm 12.10.1, and the checked-in lockfile:
 
 ```shell
 pnpm install --frozen-lockfile
 pnpm build:css
 ```
 
-`pnpm watch:css` rebuilds while editing. The package has CSS build/watch scripts only; the frontend tests use Node's built-in test runner. Include `web/app.css` whenever changes to `web/input.css`, `web/index.html`, or `web/app.js` affect styles.
+`pnpm watch:css` rebuilds while editing. The scripts use the `@tailwindcss/node` and `@tailwindcss/oxide` APIs directly; they no longer use the Tailwind CLI or its CLI-only dependency chain. Watch mode polls source files declared by `@source` and CSS dependencies imported by `web/input.css`. The input uses `source(none)`; watch mode rejects globbed or negated `@source` patterns, so add each scanned file explicitly. Keep the `@tailwindcss/node`, `@tailwindcss/oxide`, and `tailwindcss` versions aligned (currently `4.3.3`). Build mode minifies the CSS and watch mode leaves it unminified; after upgrading the compiler, compare their generated rules and rendered styles. The frontend tests use Node's built-in test runner. Include `web/app.css` whenever changes to `web/input.css`, `web/index.html`, or `web/app.js` affect styles.
 
-The worker image uses `subtitle-worker/` as its build context and its `.dockerignore` is a strict allowlist: the Dockerfile, `requirements.txt`, `worker.py`, `download_model.py`, `validate_srt.py`, and the five current files in `web/` (`app.css`, `app.js`, `favicon.svg`, `index.html`, and `input.css`). Files such as tests, README content, Python caches, and local environments stay out of the build context. If the image later needs another source or web asset, add that file explicitly to the allowlist and check the Dockerfile copy steps; broadening the rule to all of `web/` would also send unreviewed files into the build context.
+The worker image uses `subtitle-worker/` as its build context and its `.dockerignore` is a strict allowlist: the Dockerfile, `.dockerignore`, `requirements.txt`, `worker.py`, `download_model.py`, `validate_srt.py`, `http_client.py`, and the five current files in `web/` (`app.css`, `app.js`, `favicon.svg`, `index.html`, and `input.css`). Files such as tests, README content, Python caches, and local environments stay out of the build context. If the image later needs another source or web asset, add that file explicitly to the allowlist and check the Dockerfile copy steps; broadening the rule to all of `web/` would also send unreviewed files into the build context.
 
 From the repository root, run the Python suite using **Windows PowerShell**:
 
@@ -357,7 +374,7 @@ The Node test command is the same on every OS:
 node --test subtitle-worker/test_animation_frontend.cjs subtitle-worker/test_job_disclosure_frontend.cjs subtitle-worker/test_sse_frontend.cjs subtitle-worker/test_workspace_frontend.cjs
 ```
 
-The Python tests cover library containment, timing, model adapters, cache reuse, review validation, saved-review actions, thinking, cancel/retry behavior, HTTP routes, pagination, and SSE. The Node tests use controlled DOM/event fixtures for workspace tabs, job disclosure, progress animation, pagination, and SSE/polling recovery. They require Python and Node, but no live GPU, model download, LM Studio server, or Node dependencies. These checks do not replace a live media-generation test and playback review.
+The Python tests cover library containment, timing, model adapters, cache reuse, review validation, saved-review actions, thinking, cancel/retry behavior, HTTP routes, pagination, SSE, and HTTP URL security boundaries. In the latest validation, 84 Python tests (including five HTTP-boundary tests), 14 repository privacy tests, and 35 Node tests passed. CSS build/watch parity and dynamic addition/removal of watched sources also passed. The Node tests use controlled DOM/event fixtures for workspace tabs, job disclosure, progress animation, pagination, and SSE/polling recovery. They require Python and Node, but no live GPU, model download, LM Studio server, or Node dependencies. These checks do not replace a live media-generation test and playback review.
 
 For Docker logs:
 

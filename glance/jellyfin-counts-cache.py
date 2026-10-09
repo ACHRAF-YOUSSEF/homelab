@@ -3,14 +3,23 @@
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.request import Request, urlopen
+from pathlib import Path
+from urllib.request import Request
+
+# Direct repository execution shares the same client that Compose mounts in /app.
+client_directory = Path(__file__).resolve().parents[1] / "subtitle-worker"
+if client_directory.is_dir():
+    sys.path.insert(0, str(client_directory))
+from http_client import open_http
 
 
 JELLYFIN_URL = os.environ["JELLYFIN_INTERNAL_URL"].rstrip("/") + "/Items/Counts"
 TOKEN = os.environ["JELLYFIN_API_KEY"]
+BIND_ADDRESS = os.getenv("JELLYFIN_COUNTS_BIND_ADDRESS", "").strip() or "127.0.0.1"
 COUNTS = None
 LOCK = threading.Lock()
 
@@ -29,7 +38,7 @@ def refresh_counts():
                     )
                 },
             )
-            with urlopen(request, timeout=30) as response:
+            with open_http(request, timeout=30) as response:
                 data = json.load(response)
             counts = {
                 "MovieCount": int(data["MovieCount"]),
@@ -68,4 +77,4 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     threading.Thread(target=refresh_counts, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", 8765), Handler).serve_forever()
+    ThreadingHTTPServer((BIND_ADDRESS, 8765), Handler).serve_forever()

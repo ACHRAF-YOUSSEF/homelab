@@ -25,6 +25,10 @@ services:
       context: ../subtitle-worker
     container_name: subtitle-worker
     mem_limit: 6g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     deploy:
       resources:
         reservations:
@@ -34,8 +38,9 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     ports:
-      - "8099:8099"
+      - "${SUBTITLE_BIND_ADDRESS:-127.0.0.1}:8099:8099"
     environment:
+      - SUBTITLE_BIND_ADDRESS=0.0.0.0
       - SUBTITLE_LIBRARY_ROOT=/library
       - SUBTITLE_OUTPUT_ROOT=/media/output
       - SUBTITLE_DATA_ROOT=/data
