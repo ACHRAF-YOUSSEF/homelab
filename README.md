@@ -797,7 +797,7 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | pnpm audit | Subtitle worker lockfile, including development dependencies, without installing project packages; zero moderate-or-higher findings. |
 | Trivy | Filesystem dependency-manifest vulnerability and Dockerfile misconfiguration scan, including development dependencies; zero high or critical findings. Compose misconfiguration and supplied-image OS vulnerabilities are outside this scan. |
 
-The latest full pinned audit passed every gate. See [SECURITY.md](SECURITY.md) for the initial findings, their remediation, scan limits, and deployment guidance. For task-focused repository help, reusable Codex profiles are documented in [.codex/agents/README.md](.codex/agents/README.md).
+The latest full pinned audit passed every gate. See [SECURITY.md](SECURITY.md) for the initial findings, their remediation, scan limits, and deployment guidance. For task-focused repository help, global personal Codex agents and cross-platform setup are documented in [.codex/agents/README.md](.codex/agents/README.md). The role definitions live in the user's Codex home, so they can be reused across projects; cloning this repository does not install them.
 
 The [component guides](#component-guides) document local proxy and service exposure.
 

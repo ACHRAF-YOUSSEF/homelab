@@ -4,9 +4,12 @@ This is a reusable homelab example. Keep implementation and documentation in syn
 
 ## Reusable agents
 
-Use the project agents in `.codex/agents/`. Reuse an existing specialist session
-with follow-up tasks before spawning another agent for the same role. New chats
-reuse the saved profiles; they do not retain a previous agent's conversation.
+Use the personal agents installed in the user-level Codex `agents/` directory
+when available. See [.codex/agents/README.md](.codex/agents/README.md) for global
+setup and usage. Reuse an existing specialist session with follow-up tasks before
+spawning another agent for the same role. New chats reuse the saved profiles;
+they do not retain a previous agent's conversation. If a personal profile is
+unavailable, assign the same scoped responsibility to an available agent.
 
 | Role | Model | Work |
 | --- | --- | --- |
@@ -15,9 +18,11 @@ reuse the saved profiles; they do not retain a previous agent's conversation.
 | `validation_runner` | `gpt-6-luna`, medium | Scoped tests, workflow linting, privacy and config checks |
 | `security_reviewer` | `gpt-6.1-sol`, high | Docker access, CI trust boundaries, leak/security review |
 
-The project default for subagents is the smaller model. Assign a stronger model
-for ambiguous or security-sensitive reasoning. Give each agent a clear file
-scope; agents share the checkout, so avoid concurrent edits to the same files.
+The project default for subagents is the smaller model; the role definitions
+are personal global configuration rather than repository files. Assign a
+stronger model for ambiguous or security-sensitive reasoning. Give each agent
+a clear file scope; agents share the checkout, so avoid concurrent edits to
+the same files.
 
 ## Privacy and Docker access
 

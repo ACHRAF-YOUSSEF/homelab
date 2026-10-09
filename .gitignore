@@ -85,4 +85,4 @@ Thumbs.db
 [Dd]esktop.ini
 .history/
 
-# .github/ and the reusable .codex/ profiles are intentionally versioned.
+# .github/ and .codex/ project defaults and agent setup guidance are versioned.
