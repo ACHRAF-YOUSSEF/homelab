@@ -142,6 +142,10 @@ neither. If they remain blank, qBittorrent must allow the gateway container
 through its network authentication whitelist. The first server-rendered widget
 still uses Glance API subrequests without a login, so the Glance container must
 also be allowed through qBittorrent's whitelist for that initial fallback. The
+relay accepts qBittorrent's HTTP 204 empty login response and its legacy HTTP
+200 `Ok.` response, retaining the returned session cookie for API requests and
+reauthenticating after an authentication-required response. Recreate
+`glance-live` after changing its credentials. The
 widget defaults to `view: detailed` and `mode: default`; `mode: upload` switches
 one summary statistic to upload speed. The fallback remains visible if browser
 live updates are unavailable.

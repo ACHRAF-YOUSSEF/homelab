@@ -21,6 +21,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.qb_requires_auth = False
         self.qb_login_failures = 0
         self.qb_login_calls = 0
+        self.qb_login_status = 200
+        self.qb_login_body = "Ok."
+        self.qb_login_redirect = False
         self.qb_expire_once = False
         self.redirect_websocket = False
         self.leak_calls = 0
@@ -73,10 +76,14 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             form = await request.post()
             self.assertEqual(form.get("username"), "fixture-user")
             self.assertEqual(form.get("password"), "fixture-pass")
+            if self.qb_login_redirect:
+                return web.Response(status=307, headers={"Location": str(self.leak_server.make_url("/leak"))})
             if self.qb_login_failures:
                 self.qb_login_failures -= 1
-                return web.Response(text="Fails")
-            return web.Response(text="Ok.", headers={"Set-Cookie": "SID=valid; Path=/"})
+                return web.Response(text="Fails.")
+            if self.qb_login_status == 204:
+                return web.Response(status=204, headers={"Set-Cookie": "SID=valid; Path=/"})
+            return web.Response(status=self.qb_login_status, text=self.qb_login_body, headers={"Set-Cookie": "SID=valid; Path=/"})
 
         async def proxy_target(_request):
             response = web.Response(text="proxy-body")
@@ -123,7 +130,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.remote.router.add_get("/Sessions", jelly_sessions)
         self.remote.router.add_get("/socket", jelly_socket)
         leak_app = web.Application()
-        leak_app.router.add_get("/leak", leak_target)
+        leak_app.router.add_route("*", "/leak", leak_target)
         self.leak_server = TestServer(leak_app)
         await self.leak_server.start_server()
         self.remote_server = TestServer(self.remote)
@@ -133,6 +140,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             "QBITTORRENT_INTERNAL_URL": str(self.remote_server.make_url("/" )).rstrip("/"),
             "JELLYFIN_INTERNAL_URL": str(self.remote_server.make_url("/" )).rstrip("/"),
             "JELLYFIN_API_KEY": "fixture-key",
+            "QBITTORRENT_USERNAME": "",
+            "QBITTORRENT_PASSWORD": "",
             "GLANCE_LIVE_QBITTORRENT_INTERVAL": "0.5",
             "GLANCE_LIVE_JELLYFIN_INTERVAL": "2",
         })
@@ -286,6 +295,53 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(self.qb_login_calls, 3)
             self.assertEqual(relay.event("qbittorrent")["status"], "ok")
             await relay.unsubscribe("qbittorrent", queue)
+
+    async def test_qbittorrent_204_login_and_expired_session_reauthentication(self):
+        self.qb_requires_auth = True
+        self.qb_login_status = 204
+        self.qb_expire_once = True
+        relay: LiveRelay = self.client.server.app[RELAY_KEY]
+        with patch.dict(os.environ, {"QBITTORRENT_USERNAME": "fixture-user", "QBITTORRENT_PASSWORD": "fixture-pass"}):
+            queue = await relay.subscribe("qbittorrent")
+            try:
+                deadline = asyncio.get_running_loop().time() + 3
+                while asyncio.get_running_loop().time() < deadline:
+                    event = await asyncio.wait_for(queue.get(), timeout=2)
+                    if event["status"] == "ok":
+                        break
+                self.assertEqual(relay.event("qbittorrent")["status"], "ok")
+                self.assertEqual(self.qb_login_calls, 2)
+                self.assertEqual(relay.snapshots["qbittorrent"]["downloadSpeed"], 123)
+            finally:
+                await relay.unsubscribe("qbittorrent", queue)
+
+    async def test_qbittorrent_rejected_login_does_not_fetch_or_publish_data(self):
+        relay: LiveRelay = self.client.server.app[RELAY_KEY]
+        with patch.dict(os.environ, {"QBITTORRENT_USERNAME": "fixture-user", "QBITTORRENT_PASSWORD": "fixture-pass"}):
+            for status, body in ((200, "Fails."), (200, ""), (200, "unexpected"), (401, ""), (403, "")):
+                with self.subTest(status=status, body=body):
+                    self.qb_login_status, self.qb_login_body = status, body
+                    queue = await relay.subscribe("qbittorrent")
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=2)
+                        self.assertEqual(event["status"], "stale")
+                        self.assertIsNone(event["data"])
+                        self.assertEqual(self.qb_calls, 0)
+                    finally:
+                        await relay.unsubscribe("qbittorrent", queue)
+
+    async def test_qbittorrent_login_redirect_does_not_forward_credentials(self):
+        self.qb_login_redirect = True
+        relay: LiveRelay = self.client.server.app[RELAY_KEY]
+        with patch.dict(os.environ, {"QBITTORRENT_USERNAME": "fixture-user", "QBITTORRENT_PASSWORD": "fixture-pass"}):
+            queue = await relay.subscribe("qbittorrent")
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=2)
+                self.assertEqual(event["status"], "stale")
+                self.assertEqual(self.leak_calls, 0)
+                self.assertEqual(self.qb_calls, 0)
+            finally:
+                await relay.unsubscribe("qbittorrent", queue)
 
     async def test_proxy_preserves_multiple_set_cookie_and_blocks_upgrades(self):
         response = await self.client.get("/plain")

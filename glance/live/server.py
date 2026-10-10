@@ -254,7 +254,8 @@ class LiveRelay:
                             await asyncio.sleep(min(delay, 5))
                             continue
                         async with session.post(f"{base}/api/v2/auth/login", data={"username": username, "password": password}, allow_redirects=False) as response:
-                            logged_in = response.status == 200 and (await response.text()) == "Ok."
+                            # qBittorrent 5.2+ returns 204; older releases return 200/Ok.
+                            logged_in = response.status == 204 or (response.status == 200 and (await response.text()) == "Ok.")
                         if not logged_in:
                             LOG.warning("collector failed provider=qbittorrent category=authentication")
                             self.fail("qbittorrent")
