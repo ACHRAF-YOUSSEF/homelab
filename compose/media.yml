@@ -50,6 +50,7 @@ services:
     volumes:
       - ../sonarr:/config
       - D:/tv show:/tv
+      - C:/tv show:/tv-C
       - D:/downloads:/downloads
     ports:
       - 8989:8989
@@ -69,6 +70,7 @@ services:
     volumes:
       - ../radarr:/config
       - D:/film:/media
+      - C:/film:/media-C
       - D:/downloads:/downloads
     ports:
       - 7878:7878
@@ -111,7 +113,9 @@ services:
     volumes:
       - ../bazarr:/config
       - D:/film:/movies
+      - C:/film:/movies-C
       - D:/tv show:/tv
+      - C:/tv show:/tv-C
     ports:
       - 6767:6767
     restart: unless-stopped
@@ -139,7 +143,9 @@ services:
       - ../tdarr/configs:/app/configs
       - ../tdarr/logs:/app/logs
       - /d/film:/movies
+      - /c/film:/movies-C
       - /d/tv show:/tv
+      - /c/tv show:/tv-C
       - /d/transcode_cache:/temp
     ports:
       - 8265:8265
