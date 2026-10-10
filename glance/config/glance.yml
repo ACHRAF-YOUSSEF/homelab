@@ -6,6 +6,8 @@ server:
 document:
   head: |
     <script defer src="/assets/media-live.js"></script>
+    <script defer src="/assets/widget-live.js"></script>
+    <link rel="stylesheet" href="/assets/widget-live.css">
 
 branding:
   app-name: ${GLANCE_APP_NAME}

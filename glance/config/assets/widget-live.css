@@ -1,0 +1,45 @@
+.glance-live-status { margin-top: 1rem; }
+.glance-live-details { margin-top: 15px; }
+.glance-live-torrents { --list-gap: 15px; }
+.glance-live-torrent { gap: 10px; }
+.glance-live-torrent-icon { flex-shrink: 0; }
+.glance-live-torrent-main { flex-grow: 1; min-width: 0; }
+.glance-live-torrent-end { flex-shrink: 0; text-align: right; width: 80px; }
+.glance-live-torrent-progress {
+  background: rgba(128, 128, 128, .2);
+  border-radius: 5px;
+  height: 6px;
+  margin-top: 5px;
+  overflow: hidden;
+}
+.glance-live-torrent-progress > div {
+  background: var(--color-positive);
+  height: 100%;
+  border-radius: 5px;
+  transition: width .3s linear;
+}
+.media-live-jellyfin .jellyfin-streams {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+.media-live-jellyfin .jellyfin-progress {
+  height: .4rem;
+  overflow: hidden;
+  border-radius: var(--border-radius);
+  background: var(--color-background);
+}
+.media-live-jellyfin .jellyfin-progress > div {
+  height: 100%;
+  background: var(--color-primary);
+  transition: width .8s linear;
+}
+.glance-live-details[hidden], .glance-live-torrents[hidden],
+.media-live-jellyfin [hidden] { display: none; }
+@media (max-width: 768px) {
+  .media-live-jellyfin .jellyfin-streams { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .glance-live-torrent-progress > div, .media-live-jellyfin .jellyfin-progress > div { transition: none; }
+}

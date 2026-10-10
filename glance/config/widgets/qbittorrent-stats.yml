@@ -1,6 +1,7 @@
 - type: custom-api
   title: qBittorrent
   title-url: ${HOMELAB_URL}:8080
+  css-class: downloads-live-qbittorrent
   cache: 10s
   options:
     view: detailed
@@ -17,6 +18,7 @@
       parameters:
         filter: downloading
   template: |
+    <div data-live-view="{{ .Options.StringOr "view" "detailed" }}" data-live-mode="{{ .Options.StringOr "mode" "default" }}" hidden></div>
     {{ $transfer := .Subrequest "transfer" }}
     {{ $seeding := .Subrequest "seeding" }}
     {{ $leeching := .Subrequest "leeching" }}

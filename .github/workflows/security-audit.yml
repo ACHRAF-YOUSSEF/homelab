@@ -107,6 +107,7 @@ jobs:
             subtitle-worker/worker.py subtitle-worker/download_model.py \
             subtitle-worker/validate_srt.py subtitle-worker/http_client.py \
             glance/jellyfin-counts-cache.py \
+            glance/live/server.py \
             .github/scripts/audit_repository.py
 
       - name: Test HTTP request security boundaries
@@ -116,6 +117,19 @@ jobs:
       - name: Audit resolved Python dependencies
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: pip-audit --strict --requirement subtitle-worker/requirements.txt --progress-spinner off
+
+      - name: Install live relay dependencies
+        id: live-deps
+        if: ${{ !cancelled() }}
+        run: python -m pip install --disable-pip-version-check --requirement glance/live/requirements.txt
+
+      - name: Test live relay with disposable HTTP and WebSocket fixtures
+        if: ${{ !cancelled() && steps.live-deps.outcome == 'success' }}
+        run: python -m unittest discover -s glance/live -p test_server.py
+
+      - name: Audit live relay dependencies
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: pip-audit --strict --requirement glance/live/requirements.txt --progress-spinner off
 
   frontend-dependencies:
     name: Frontend dependency audit including build tools
@@ -135,6 +149,11 @@ jobs:
 
       - name: Install pinned pnpm
         run: npm install --global --ignore-scripts pnpm@12.10.1
+
+      - name: Validate dashboard scripts
+        run: |
+          node --check glance/config/assets/media-live.js
+          node --check glance/config/assets/widget-live.js
 
       # Audit the lockfile without installing or executing repository packages.
       - name: Audit frontend and development dependencies

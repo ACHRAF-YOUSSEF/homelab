@@ -5,7 +5,6 @@
 
   const widgets = [
     "media-live-services",
-    "media-live-jellyfin",
     "media-live-jellyfin-library",
     "media-live-calendar",
     "media-live-automation",

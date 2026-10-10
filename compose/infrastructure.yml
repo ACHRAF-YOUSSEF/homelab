@@ -182,8 +182,6 @@ services:
       - SEERR_INTERNAL_URL=${SEERR_INTERNAL_URL}
       - SONARR_API_KEY=${SONARR_API_KEY}
       - SONARR_INTERNAL_URL=${SONARR_INTERNAL_URL}
-    ports:
-      - "7575:8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -192,6 +190,45 @@ services:
     networks:
       - homelab
       - docker-monitoring
+
+  # Same-origin LAN gateway: proxies Glance and streams sanitized live widget data.
+  glance-live:
+    build:
+      context: ../glance/live
+    container_name: glance-live
+    mem_limit: 128m
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      - GLANCE_UPSTREAM_URL=http://glance:8080
+      - GLANCE_LIVE_BIND_ADDRESS=0.0.0.0
+      - GLANCE_LIVE_PORT=8081
+      - GLANCE_LIVE_ALLOWED_HOSTS=${GLANCE_LIVE_ALLOWED_HOSTS:-localhost,127.0.0.1},${GLANCE_BIND_ADDRESS:-127.0.0.1}
+      - GLANCE_LIVE_QBITTORRENT_INTERVAL=${GLANCE_LIVE_QBITTORRENT_INTERVAL:-2}
+      - GLANCE_LIVE_JELLYFIN_INTERVAL=${GLANCE_LIVE_JELLYFIN_INTERVAL:-5}
+      - GLANCE_LIVE_JELLYFIN_WS=${GLANCE_LIVE_JELLYFIN_WS:-true}
+      - JELLYFIN_INTERNAL_URL=${JELLYFIN_INTERNAL_URL}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
+      - QBITTORRENT_INTERNAL_URL=${QBITTORRENT_INTERNAL_URL}
+      - QBITTORRENT_USERNAME=${QBITTORRENT_USERNAME:-}
+      - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:-}
+    ports:
+      - "${GLANCE_BIND_ADDRESS:-127.0.0.1}:7575:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - glance
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/live/health', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - homelab
 
   uptime-kuma:
     image: louislam/uptime-kuma:2

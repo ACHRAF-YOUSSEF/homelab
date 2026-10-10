@@ -10,7 +10,7 @@
 [![Nextcloud AIO](https://img.shields.io/badge/Nextcloud-AIO-0082C9?style=for-the-badge&logo=nextcloud&logoColor=white)](https://github.com/nextcloud/all-in-one)
 [![Jellyfin](https://img.shields.io/badge/Jellyfin-Media%20Server-00A4DC?style=for-the-badge&logo=jellyfin&logoColor=white)](https://jellyfin.org/)
 
-> A self-hosted homelab example for Windows, macOS, and Linux, with 31 Compose service definitions covering media automation, local AI, subtitles, DNS, cloud storage, remote access, and monitoring. Adapt the example paths, networking, and hardware settings for your system using the platform guide below.
+> A self-hosted homelab example for Windows, macOS, and Linux, with 32 Compose service definitions covering media automation, local AI, subtitles, DNS, cloud storage, remote access, and monitoring. Adapt the example paths, networking, and hardware settings for your system using the platform guide below.
 
 </div>
 
@@ -85,7 +85,7 @@ Replace the example domain, LAN address, timezone, credentials, and media folder
 Internet
   +-- Cloudflare Tunnel -> nginx-proxy-manager:80
   |                         |
-  |                         +-- Glance / media / tools / n8n
+  |                         +-- media / tools / n8n (Glance stays LAN-only)
   |                         `-- AIO-managed Apache on host:11000
   |
   `-- DNS-only hostnames from CLOUDFLARE_DDNS_DOMAINS
@@ -95,8 +95,10 @@ Internet
                  `-- open-webui:8080 -> host LM Studio:1234
 
 Shared homelab Docker network
-  +-- AdGuard Home -> Unbound:5053 (requires local resolver config)
+  +-- Browser -> host:7575 -> glance-live:8081 -> Glance:8080
+  +-- glance-live -> qBittorrent sync API and host Jellyfin:8096
   +-- Glance -> jellyfin-counts-cache:8765 -> host Jellyfin:8096
+  +-- AdGuard Home -> Unbound:5053 (requires local resolver config)
   `-- Subtitle Studio:8099 -> Whisper GPU + host LM Studio:1234
 
 Isolated docker-monitoring network
@@ -107,7 +109,7 @@ Nextcloud AIO -> separate Unix socket proxy -> Docker socket
 Nextcloud AIO manages its own containers and networks.
 ```
 
-This describes the configured connections; it does not verify public DNS, router forwarding, or running services. Container-to-container connections use container ports, while browser and router connections use the published host ports below.
+The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays on internal container port `8080`. `GLANCE_BIND_ADDRESS` defaults to loopback. For LAN clients, set it in the ignored root `.env` to the Docker host's LAN interface address and set `GLANCE_PUBLIC_URL` to the corresponding browser URL. This dashboard is unauthenticated and intended for the LAN: keep the bind private, firewall it to trusted LAN clients, and do not forward it from the Internet or add it to a public tunnel route. Do not change an Nginx Proxy Manager or tunnel route to publish this gateway. These settings do not verify the firewall or running services.
 
 ---
 
@@ -118,7 +120,8 @@ This describes the configured connections; it does not verify public DNS, router
 | **Infrastructure** | Cloudflare Tunnel | `cloudflare/cloudflared` | - | Tunnel client for proxied Cloudflare routes |
 | **Infrastructure** | Cloudflare DDNS | `favonia/cloudflare-ddns` | - | Updates the configured DNS-only records |
 | **Infrastructure** | Nginx Proxy Manager | `jc21/nginx-proxy-manager` | 80, 81, 4443 | Reverse proxy and TLS; host 4443 maps to container 443 |
-| **Infrastructure** | [Glance](https://github.com/glanceapp/glance) | `glanceapp/glance` | 7575 | Responsive dashboard with seven navigation pages |
+| **Infrastructure** | [Glance](https://github.com/glanceapp/glance) | `glanceapp/glance` | Internal 8080 | Responsive dashboard with seven navigation pages; served through the live gateway |
+| **Infrastructure** | Glance live gateway | Local build from `glance/live/` | 7575 (host, configurable bind) | Same-origin dashboard proxy and server-side SSE relay for qBittorrent and Jellyfin widgets |
 | **Infrastructure** | [Portracker](https://github.com/mostafa-wahied/portracker) | `mostafawahied/portracker` | 4999 | Docker container monitor |
 | **Infrastructure** | [Docker Socket Proxy](https://github.com/Tecnativa/docker-socket-proxy) | `tecnativa/docker-socket-proxy` | Internal 2375 | Read-only Docker API for monitoring clients |
 | **Infrastructure** | [Uptime Kuma](https://github.com/louislam/uptime-kuma) | `louislam/uptime-kuma` | 47028 | Uptime monitoring and alerting |
@@ -155,7 +158,7 @@ The stack is split into smaller Compose files under `./compose/`, grouped by ser
 | File | Services |
 |------|----------|
 | `docker-compose.yml` | Compose entrypoint and service network definitions |
-| `compose/infrastructure.yml` | Cloudflared, Cloudflare DDNS, Nginx Proxy Manager, Glance, Jellyfin counts cache, Portracker, Docker Socket Proxy, Uptime Kuma |
+| `compose/infrastructure.yml` | Cloudflared, Cloudflare DDNS, Nginx Proxy Manager, Glance, Glance live gateway, Jellyfin counts cache, Portracker, Docker Socket Proxy, Uptime Kuma |
 | `compose/dns.yml` | AdGuard Home, Unbound |
 | `compose/media.yml` | qBittorrent, Prowlarr, Sonarr, Radarr, Seerr, Bazarr, Tdarr, MeTube, TubeArchivist, Redis, Elasticsearch |
 | `compose/ai.yml` | Open WebUI, SearxNG |
@@ -172,7 +175,7 @@ Bind mounts beginning with `../` are relative to the included file in `compose/`
 
 ## Component Guides
 
-- [Glance dashboard](glance/README.md): seven pages, API keys, media widgets, and the Jellyfin counts helper.
+- [Glance dashboard](glance/README.md): seven pages, live qBittorrent/Jellyfin widgets, LAN binding, API keys, and the Jellyfin counts helper.
 - [Subtitle Studio](subtitle-worker/README.md): setup, caching, cancellation and retries, translation reviews, API endpoints, and development checks.
 
 ---
@@ -429,7 +432,7 @@ On a configured NVIDIA host, Subtitle Studio can be built and started independen
 
 1. Navigate to `http://<your-server-ip>:81`.
 2. Complete the initial account setup required by the installed image.
-3. Create proxy hosts for the internal services you want to expose.
+3. Create proxy hosts for the internal services you want to expose. Keep Glance LAN-only; do not create an Internet-facing host for it. If an existing proxy is restricted to the LAN, its upstream must be `glance-live:8081` so SSE can stream through the same origin.
 4. Request and attach TLS certificates through Nginx Proxy Manager.
 5. For Jellyfin, use `host.docker.internal:8096` as the upstream and enable WebSockets.
 
@@ -563,7 +566,7 @@ native Linux. Configure administrator credentials through AIO's setup interface.
 
 ### 8. Set Up Cloudflare Tunnel
 
-The `tunnel` service runs Cloudflared using `CLOUDFLARE_TUNNEL_TOKEN`. Configure public routes in Cloudflare for the services you want to serve through the tunnel. Set the matching dashboard `*_PUBLIC_URL` values separately; these values do not create DNS or tunnel routes.
+The `tunnel` service runs Cloudflared using `CLOUDFLARE_TUNNEL_TOKEN`. Configure public routes in Cloudflare for the services you want to serve through the tunnel. Keep Glance out of public tunnel routes because it has no authentication and is intended for LAN access. Set the matching dashboard `*_PUBLIC_URL` values separately; these values do not create DNS or tunnel routes.
 
 1. Go to [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/).
 2. Navigate to **Networks -> Tunnels -> Create a Tunnel**.
@@ -588,7 +591,8 @@ edits to deployment addresses in the dashboard YAML.
 | Template group | Main settings and purpose |
 | --- | --- |
 | Host and browser service addresses | `TZ=Etc/UTC` and `HOMELAB_URL=http://localhost` are generic defaults. `*_PUBLIC_URL` values are browser destinations that can point to a LAN address or reverse proxy; setting one does not publish a service or create DNS/tunnel routes. `TUBEARCHIVIST_PUBLIC_URL` also configures TubeArchivist's `TA_HOST`. `N8N_HOST` and `N8N_WEBHOOK_URL` configure n8n's advertised address. |
-| Private credentials | Cloudflare tokens and `CLOUDFLARE_DDNS_DOMAINS`; Jellyfin, Sonarr, Radarr, and Seerr API keys; TubeArchivist username/password and its Elasticsearch password. Fill only the integrations you use. |
+| Glance LAN access and live updates | `GLANCE_BIND_ADDRESS` controls host publication of port `7575` and defaults to `127.0.0.1`; use the host's LAN interface address in private `.env` for LAN clients. Compose adds that address to the live gateway's host allowlist; add any LAN DNS hostname used in the browser to `GLANCE_LIVE_ALLOWED_HOSTS`. `GLANCE_LIVE_QBITTORRENT_INTERVAL` defaults to 2 seconds; `GLANCE_LIVE_JELLYFIN_INTERVAL` to 5 seconds; `GLANCE_LIVE_JELLYFIN_WS` enables Jellyfin WebSocket updates with REST reconciliation/fallback. Optional `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD` supply relay credentials; leave both blank when qBittorrent's network whitelist permits access. |
+| Private credentials | Cloudflare tokens and `CLOUDFLARE_DDNS_DOMAINS`; Jellyfin, Sonarr, Radarr, and Seerr API keys; optional qBittorrent username/password for the live relay; TubeArchivist username/password and its Elasticsearch password. Fill only the integrations you use. |
 | Docker API proxies | `DOCKER_SOCKET_SOURCE` selects the daemon-side socket mounted only by the proxies. `DOCKER_SOCKET_GID` selects the socket's numeric group as seen inside the unprivileged AIO proxy (Docker Desktop commonly reports `0`). `GLANCE_DOCKER_HOST` selects the monitoring proxy. `AIO_PROXY_SOCKET_PATH` identifies the daemon-side Nextcloud proxy socket used by AIO-managed child containers. See [Docker API access](#docker-api-access). |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values are reachable from containers, with no trailing slash. They control dashboard checks, APIs, and the library-count helper independently of browser links. |
 | Glance appearance | `GLANCE_APP_NAME`, `GLANCE_LOGO_TEXT`, and `GLANCE_WEATHER_LOCATION` replace example branding and weather. |
@@ -648,7 +652,7 @@ mount `DOCKER_SOCKET_SOURCE`; applications connect to a proxy endpoint.
 
 ## Port Reference
 
-These are host ports unless explicitly marked AIO-managed. Compose mappings without a host address publish on all interfaces; `30917` is bound to loopback. The read-only Docker proxy listens on container port `2375` only and has no published host port. Jellyfin's `8096` listener belongs to the separately installed host application.
+These are host ports unless explicitly marked AIO-managed. Compose mappings without a host address publish on all interfaces; `30917` is bound to loopback, and dashboard port `7575` defaults to loopback through `GLANCE_BIND_ADDRESS`. The read-only Docker proxy listens on container port `2375` only and has no published host port. Jellyfin's `8096` listener belongs to the separately installed host application.
 
 | Port | Protocol | Service |
 |------|----------|---------|
@@ -667,7 +671,7 @@ These are host ports unless explicitly marked AIO-managed. Compose mappings with
 | 5678 | TCP | n8n |
 | 6767 | TCP | Bazarr |
 | 6881 | TCP/UDP | qBittorrent torrenting |
-| 7575 | TCP | Glance dashboard (container port 8080) |
+| 7575 | TCP | Glance live gateway (container port 8081; proxies Glance container port 8080). Bind defaults to loopback; set `GLANCE_BIND_ADDRESS` for LAN-only access. |
 | 7878 | TCP | Radarr |
 | 8000 | TCP | TubeArchivist |
 | 8080 | TCP | qBittorrent Web UI |
@@ -779,7 +783,7 @@ After adding lists, enable them in AdGuard Home and check the query log to confi
 
 ## Dashboard and Public URLs
 
-Set public browser links through the `*_PUBLIC_URL` group in [`.env.example`](.env.example), including `GLANCE_PUBLIC_URL`, `JELLYFIN_PUBLIC_URL`, `N8N_PUBLIC_URL`, `OPEN_WEBUI_PUBLIC_URL`, `NEXTCLOUD_PUBLIC_URL`, and `IT_TOOLS_PUBLIC_URL`. The template uses generic local examples. Replace them with addresses reachable from your browser; internal `*_INTERNAL_URL` values must be reachable from the service containers.
+Set browser destinations through the `*_PUBLIC_URL` group in [`.env.example`](.env.example), including `GLANCE_PUBLIC_URL`, `JELLYFIN_PUBLIC_URL`, `N8N_PUBLIC_URL`, `OPEN_WEBUI_PUBLIC_URL`, `NEXTCLOUD_PUBLIC_URL`, and `IT_TOOLS_PUBLIC_URL`. For Glance on other LAN devices, use a reachable LAN URL in your ignored `.env` and bind `GLANCE_BIND_ADDRESS` to the host's LAN interface. The dashboard has no authentication and is intended for LAN access; do not create a public tunnel route, WAN port forward, or externally reachable proxy host for it. The template uses generic local examples. Internal `*_INTERNAL_URL` values must be reachable from the service containers.
 
 `HOMELAB_URL` supplies the common scheme/host used by dashboard links that append a service port. Public URLs and internal health checks are independent: a successful container check does not prove a public DNS, tunnel, or reverse-proxy route works. Keep personal deployment details in `.env` rather than in Markdown or shared YAML.
 
