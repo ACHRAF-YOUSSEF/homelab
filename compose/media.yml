@@ -122,6 +122,37 @@ services:
     networks:
       - homelab
 
+  # Opt-in local conversion of embedded and sidecar subtitles, including OCR.
+  subtitle-converter:
+    build:
+      context: ../subtitle-converter
+    profiles: [subtitle-conversion]
+    container_name: subtitle-converter
+    init: true
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 128
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      # Self-contained .NET extracts native libraries here for loading.
+      - /tmp:rw,nosuid,nodev,size=512m
+    environment:
+      - CONVERTER_SCAN_INTERVAL=${CONVERTER_SCAN_INTERVAL:-300}
+      - CONVERTER_MIN_AGE=${CONVERTER_MIN_AGE:-120}
+      - CONVERTER_TIMEOUT=${CONVERTER_TIMEOUT:-7200}
+      - CONVERTER_RETRY_INTERVAL=${CONVERTER_RETRY_INTERVAL:-3600}
+      - CONVERTER_OCR_LANGUAGE=${CONVERTER_OCR_LANGUAGE:-eng}
+    volumes:
+      - ${CONVERTER_MOVIES_DIR:-D:/film}:/movies
+      - ${CONVERTER_MOVIES_C_DIR:-C:/film}:/movies-C
+      - ${CONVERTER_TV_DIR:-D:/tv show}:/tv
+      - ${CONVERTER_TV_C_DIR:-C:/tv show}:/tv-C
+      - subtitle_converter_data:/data
+    restart: unless-stopped
+
   # Transcoding and Media Management
   tdarr:
     image: ghcr.io/haveagitgat/tdarr:latest
@@ -277,3 +308,6 @@ services:
       - "9200"
     networks:
       - homelab
+
+volumes:
+  subtitle_converter_data:

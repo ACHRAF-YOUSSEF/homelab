@@ -10,7 +10,7 @@
 [![Nextcloud AIO](https://img.shields.io/badge/Nextcloud-AIO-0082C9?style=for-the-badge&logo=nextcloud&logoColor=white)](https://github.com/nextcloud/all-in-one)
 [![Jellyfin](https://img.shields.io/badge/Jellyfin-Media%20Server-00A4DC?style=for-the-badge&logo=jellyfin&logoColor=white)](https://jellyfin.org/)
 
-> A self-hosted homelab example for Windows, macOS, and Linux, with 32 Compose service definitions covering media automation, local AI, subtitles, DNS, cloud storage, remote access, and monitoring. Adapt the example paths, networking, and hardware settings for your system using the platform guide below.
+> A self-hosted homelab example for Windows, macOS, and Linux, with 33 Compose service definitions covering media automation, local AI, subtitles, DNS, cloud storage, remote access, and monitoring. Adapt the example paths, networking, and hardware settings for your system using the platform guide below.
 
 </div>
 
@@ -45,6 +45,7 @@
   - [Port Reference](#port-reference)
   - [Media Stack Setup](#media-stack-setup)
     - [Jellyfin Plugins](#jellyfin-plugins)
+    - [Automatic Subtitle Conversion](#automatic-subtitle-conversion)
   - [AI Stack Setup](#ai-stack-setup)
     - [Open WebUI (Local LLM Interface)](#open-webui-local-llm-interface)
     - [SearxNG (Private Search Engine)](#searxng-private-search-engine)
@@ -74,6 +75,7 @@ Replace the example domain, LAN address, timezone, credentials, and media folder
 - **Self-hosted cloud** - [Nextcloud All-in-One](https://github.com/nextcloud/all-in-one) manages the Nextcloud deployment.
 - **Automation** - [n8n](https://github.com/n8n-io/n8n) for workflow automation.
 - **Local subtitles** - Subtitle Studio transcribes media with Faster Whisper, translates and optionally reviews subtitles through LM Studio, and provides a browser UI with resumable jobs.
+- **Automatic subtitle conversion** - An opt-in local watcher exports embedded tracks and supported subtitle sidecars as UTF-8 SRT files next to their sources, using Subtitle Edit and Tesseract OCR.
 - **Remote access** - Self-hosted [RustDesk](https://github.com/rustdesk/rustdesk) relay/rendezvous server.
 - **Self-hosted PDF tools** - [Stirling PDF](https://github.com/Stirling-Tools/Stirling-PDF) for PDF management, OCR, conversion, and automated pipeline processing.
 
@@ -109,6 +111,8 @@ Nextcloud AIO -> separate Unix socket proxy -> Docker socket
 Nextcloud AIO manages its own containers and networks.
 ```
 
+The opt-in `subtitle-converter` runs outside these Docker networks. It scans its configured movie and TV mounts locally and writes SRT sidecars beside media.
+
 The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays on internal container port `8080`. `GLANCE_BIND_ADDRESS` defaults to loopback. For LAN clients, set it in the ignored root `.env` to the Docker host's LAN interface address and set `GLANCE_PUBLIC_URL` to the corresponding browser URL. This dashboard is unauthenticated and intended for the LAN: keep the bind private, firewall it to trusted LAN clients, and do not forward it from the Internet or add it to a public tunnel route. Do not change an Nginx Proxy Manager or tunnel route to publish this gateway. These settings do not verify the firewall or running services.
 
 ---
@@ -135,6 +139,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Media** | [Radarr](https://github.com/linuxserver/docker-radarr) | `lscr.io/linuxserver/radarr` | 7878 | Movie automation |
 | **Media** | [Seerr](https://github.com/seerr-team/seerr) | `ghcr.io/seerr-team/seerr` | 5055 | Media discovery and requests |
 | **Media** | [Bazarr](https://github.com/linuxserver/docker-bazarr) | `lscr.io/linuxserver/bazarr` | 6767 | Subtitle automation |
+| **Media** | Subtitle converter *(opt-in profile)* | Local build from `subtitle-converter/` | - | Converts embedded tracks and supported subtitle sidecars to SRT, including OCR for image subtitles |
 | **Media** | [Tdarr](https://github.com/HaveAGitGat/Tdarr) | `ghcr.io/haveagitgat/tdarr` | 8265, 8266 | GPU media transcoding |
 | **Media** | [TubeArchivist](https://github.com/tubearchivist/tubearchivist) | `bbilly1/tubearchivist` | 8000 | YouTube archiving and management |
 | **Media** | [MeTube](https://github.com/alexta69/metube) | `ghcr.io/alexta69/metube` | 8085 | YouTube downloader |
@@ -160,7 +165,7 @@ The stack is split into smaller Compose files under `./compose/`, grouped by ser
 | `docker-compose.yml` | Compose entrypoint and service network definitions |
 | `compose/infrastructure.yml` | Cloudflared, Cloudflare DDNS, Nginx Proxy Manager, Glance, Glance live gateway, Jellyfin counts cache, Portracker, Docker Socket Proxy, Uptime Kuma |
 | `compose/dns.yml` | AdGuard Home, Unbound |
-| `compose/media.yml` | qBittorrent, Prowlarr, Sonarr, Radarr, Seerr, Bazarr, Tdarr, MeTube, TubeArchivist, Redis, Elasticsearch |
+| `compose/media.yml` | qBittorrent, Prowlarr, Sonarr, Radarr, Seerr, Bazarr, opt-in subtitle converter, Tdarr, MeTube, TubeArchivist, Redis, Elasticsearch |
 | `compose/ai.yml` | Open WebUI, SearxNG |
 | `compose/cloud-automation.yml` | n8n, Subtitle Studio, and its model/data volumes |
 | `compose/nextcloud-aio.yml` | Nextcloud AIO master container, its Unix socket Docker proxy, and named volumes |
@@ -177,6 +182,7 @@ Bind mounts beginning with `../` are relative to the included file in `compose/`
 
 - [Glance dashboard](glance/README.md): seven pages, live qBittorrent/Jellyfin widgets, LAN binding, API keys, and the Jellyfin counts helper.
 - [Subtitle Studio](subtitle-worker/README.md): setup, caching, cancellation and retries, translation reviews, API endpoints, and development checks.
+- [Automatic subtitle converter](subtitle-converter/README.md): opt-in watcher setup, language handling, configuration, limitations, and native use.
 
 ---
 
@@ -705,7 +711,8 @@ Seerr (requests) -> Sonarr/Radarr <- Prowlarr (indexers)
                        |
                        v
                  qBittorrent -> imported media
-                                  +-- Bazarr (subtitles)
+                                  +-- Bazarr (downloaded subtitles)
+                                  +-- subtitle-converter (SRT exports, opt-in)
                                   +-- Tdarr (transcode)
                                   +-- Jellyfin (playback)
                                   `-- Subtitle Studio (manual local subtitles)
@@ -722,6 +729,12 @@ Seerr (requests) -> Sonarr/Radarr <- Prowlarr (indexers)
 7. **Seerr** - Connect Jellyfin, Sonarr, and Radarr for media requests.
 
 Use Compose service names and container ports for connections between services, such as `qbittorrent:8080`, `sonarr:8989`, and `radarr:7878`. Sonarr sees TV files at `/tv`, Radarr sees movies at `/media`, and Bazarr sees movies at `/movies`; configure path mappings where an integration needs to translate those container paths. Jellyfin runs on the host and uses the host's media paths. Subtitle Studio writes to its separate output mount; copy exported SRTs beside the media when needed for playback.
+
+If Glance's Sonarr/Radarr calendar reports an HTTP `400`, check **Settings > General > Host > Allowed Hosts** in the affected service. Preserve the current list and add `sonarr` or `radarr` (the hostname from its `*_INTERNAL_URL`, without a scheme or port), then save and restart the affected service(s). `docker compose restart sonarr radarr` restarts both. See the [Glance guide](glance/README.md#sonarr-and-radarr-calendar-troubleshooting) for status-code and API-key troubleshooting.
+
+### Automatic Subtitle Conversion
+
+The optional `subtitle-converter` service scans the movie and TV folders configured for its four read/write library mounts. It checks every five minutes by default and processes nonempty inputs whose modification age is at least two minutes. For setup, portable path configuration, language behavior, and conversion limits, see the [subtitle-converter guide](subtitle-converter/README.md). Start it with `docker compose up -d --build subtitle-converter`; it has no published port and is separate from Bazarr's subtitle downloads.
 
 ### Jellyfin Plugins
 
@@ -796,7 +809,8 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | Gitleaks | Current files and full reachable Git history; complete redaction, zero findings in the latest scan of 68 commits. |
 | Repository privacy checks | 14 unit tests and the checker for private deployment data, credentials, and literal Glance endpoints; passed. |
 | actionlint | GitHub Actions workflow syntax; pinned version 1.7.12 passed. |
-| Bandit | Worker, shared HTTP client, model downloader, subtitle validator, Glance counts helper, and privacy checker Python sources at medium severity and confidence; zero findings. |
+| Bandit | Worker, shared HTTP client, model downloader, subtitle validator, subtitle converter, Glance helpers, and privacy checker Python sources at medium severity and confidence; findings gate the workflow. |
+| Subtitle conversion tests | Disposable unit fixtures plus a pinned container build and isolated text/OCR fixtures with networking disabled and no host media bind. |
 | pip-audit | Strict audit of resolved Python 3.12 dependencies; zero known vulnerabilities. |
 | pnpm audit | Subtitle worker lockfile, including development dependencies, without installing project packages; zero moderate-or-higher findings. |
 | Trivy | Filesystem dependency-manifest vulnerability and Dockerfile misconfiguration scan, including development dependencies; zero high or critical findings. Compose misconfiguration and supplied-image OS vulnerabilities are outside this scan. |
@@ -817,7 +831,7 @@ docker compose config --services
 git diff --check
 ```
 
-The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes and widget troubleshooting. Subtitle Studio's [guide](subtitle-worker/README.md) includes Python and Node tests and the command to rebuild the checked-in Tailwind CSS. Rebuild `subtitle-worker` after changing its Python or bundled web files because those files are copied into the image.
+The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes and widget troubleshooting. Subtitle Studio's [guide](subtitle-worker/README.md) includes Python and Node tests and the command to rebuild the checked-in Tailwind CSS. The [subtitle-converter guide](subtitle-converter/README.md) documents its disposable fixture tests and isolated container OCR checks. Rebuild `subtitle-worker` after changing its Python or bundled web files because those files are copied into the image.
 
 Application runtime data, API credentials, proxy hosts, certificates, router forwarding, LM Studio models, and Nextcloud's child containers are not fully represented by the tracked files. A successful Compose configuration check verifies the service definitions; use service logs and the component guides to verify your local deployment.
 

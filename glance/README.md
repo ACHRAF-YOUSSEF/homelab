@@ -182,6 +182,27 @@ Before the first success, `/counts` returns `503` with a warming-up response.
 Restarting the cache clears those in-memory counts. The helper listens on
 container port `8765` without publishing a host port.
 
+### Sonarr and Radarr calendar troubleshooting
+
+The calendar calls `${SONARR_INTERNAL_URL}/api/v3/calendar` and
+`${RADARR_INTERNAL_URL}/api/v3/calendar` from the Glance container. If either
+service returns HTTP `400`, check its **Settings > General > Host > Allowed
+Hosts** list. Preserve existing entries and add `sonarr` for Sonarr or `radarr`
+for Radarr, matching the hostname in the corresponding `*_INTERNAL_URL`. Enter
+only the hostname: no scheme or port. Save the setting and restart the affected
+service; the Arr host setting takes effect after restart. Do not clear the
+allowlist or disable authentication.
+
+HTTP `401` points to authentication or an API key problem; verify the matching
+`SONARR_API_KEY` or `RADARR_API_KEY` in the private `.env`. A connection error
+instead points to service status, container networking, or the internal URL.
+After changing an API key in `.env`, recreate Glance so it receives the new
+value:
+
+```shell
+docker compose up -d --force-recreate glance
+```
+
 ## Maintenance
 
 The Docker commands below work in PowerShell on Windows and terminals on macOS
@@ -259,7 +280,8 @@ Check the browser script syntax from the repository root with
 
 If library counts stay unavailable, check the cache logs, `JELLYFIN_INTERNAL_URL`,
 and `JELLYFIN_API_KEY`. Check qBittorrent credentials or its network whitelist
-if the Downloads feed is stale. Calendar and Seerr errors point to their API
-keys or service availability. To add a page, create its YAML under
+if the Downloads feed is stale. For calendar failures, see [Sonarr and Radarr
+calendar troubleshooting](#sonarr-and-radarr-calendar-troubleshooting); Seerr
+errors point to its API key or service availability. To add a page, create its YAML under
 `config/pages/` and add an include to `config/glance.yml`; to live-update another
 widget, add its topic and renderer to `widget-live.js` and the gateway.

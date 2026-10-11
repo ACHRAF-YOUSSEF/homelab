@@ -106,9 +106,14 @@ jobs:
             --format custom --msg-template '{relpath}:{line}: {test_id} {severity}/{confidence}' \
             subtitle-worker/worker.py subtitle-worker/download_model.py \
             subtitle-worker/validate_srt.py subtitle-worker/http_client.py \
+            subtitle-converter/converter.py \
             glance/jellyfin-counts-cache.py \
             glance/live/server.py \
             .github/scripts/audit_repository.py
+
+      - name: Test automatic subtitle conversion with disposable fixtures
+        if: ${{ !cancelled() }}
+        run: python -m unittest discover -s subtitle-converter -p test_converter.py
 
       - name: Test HTTP request security boundaries
         if: ${{ !cancelled() }}
@@ -130,6 +135,28 @@ jobs:
       - name: Audit live relay dependencies
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: pip-audit --strict --requirement glance/live/requirements.txt --progress-spinner off
+
+  subtitle-conversion:
+    name: Subtitle conversion with isolated media and OCR fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build pinned converter
+        run: docker build --tag subtitle-converter-test subtitle-converter
+
+      - name: Test text extraction and local OCR without network or host media
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 2g --cpus 2 --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter,target=/tests,readonly" \
+            --workdir /tests --env CONVERTER_INTEGRATION=1 --entrypoint python \
+            subtitle-converter-test -m unittest discover -s . -p 'test_*.py'
 
   frontend-dependencies:
     name: Frontend dependency audit including build tools
