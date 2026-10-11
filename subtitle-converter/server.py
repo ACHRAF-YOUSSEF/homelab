@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+import errno
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import signal
@@ -28,6 +30,38 @@ LOG = logging.getLogger("subtitle-converter")
 WEB = Path(__file__).parent / "web"
 MAX_BODY = 65536
 MAX_INVENTORY = 2000
+
+
+class StartupError(ValueError):
+    """A controlled startup diagnostic containing no configuration values."""
+
+
+def interval_setting(name, default, minimum):
+    message = f"{name} must be an integer of at least {minimum} seconds"
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        raise StartupError(message) from None
+    if value < minimum:
+        raise StartupError(message)
+    return value
+
+
+def startup_os_error(phase, error):
+    """Do not expose exception text, private paths or configuration values."""
+    reasons = {
+        errno.EACCES: "permission denied; check the process user and state-directory permissions (container UID/GID 1000)",
+        errno.EPERM: "operation not permitted; check permissions for the process user",
+        errno.EROFS: "filesystem is read-only; state storage must be writable",
+        errno.ENOSPC: "storage is full",
+        errno.ENOTDIR: "a required directory path points to a file",
+        errno.EEXIST: "a required path already exists; check for a file where a directory is required",
+        errno.EISDIR: "a required state-file path points to a directory",
+        errno.ENOENT: "a required file or directory is missing",
+        errno.EADDRINUSE: "listener port is already in use; check --port",
+        errno.EADDRNOTAVAIL: "listener address is unavailable; check --host",
+    }
+    return f"Cannot initialize {phase}: {reasons.get(error.errno, 'filesystem or network operation failed')}"
 
 
 def write_private(path, value):
@@ -48,16 +82,16 @@ def write_private(path, value):
 def ui_password(data_dir):
     configured = os.environ.get("CONVERTER_UI_PASSWORD", "")
     if configured:
-        if len(configured) < 12 or len(configured) > 256 or any(ord(char) < 32 for char in configured):
-            raise ValueError("CONVERTER_UI_PASSWORD must have 12–256 printable characters")
+        if not 12 <= len(configured) <= 256 or not configured.isprintable():
+            raise StartupError("CONVERTER_UI_PASSWORD must have 12–256 printable characters; set a valid private password or leave it blank to generate one")
         return configured
     path = data_dir / "ui-password"
     if path.exists():
         if path.is_symlink():
-            raise ValueError("Dashboard password file must not be a symlink")
+            raise StartupError("Saved dashboard password file must not be a symlink")
         password = path.read_text(encoding="utf-8").strip()
-        if len(password) < 12:
-            raise ValueError("Invalid saved dashboard password")
+        if not 12 <= len(password) <= 256 or not password.isprintable():
+            raise StartupError("Saved dashboard password must have 12–256 printable characters; replace the password file or set CONVERTER_UI_PASSWORD privately")
         return password
     data_dir.mkdir(parents=True, exist_ok=True)
     password = secrets.token_urlsafe(32)
@@ -524,31 +558,39 @@ def main(argv=None):
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     data = Path(args.data)
+    phase = "dashboard password and state storage"
     try:
         password = ui_password(data)
-        interval = int(os.environ.get("CONVERTER_SCAN_INTERVAL", "300"))
-        min_age = int(os.environ.get("CONVERTER_MIN_AGE", "120"))
-        timeout = int(os.environ.get("CONVERTER_TIMEOUT", "7200"))
-        retry = int(os.environ.get("CONVERTER_RETRY_INTERVAL", "3600"))
-        if interval < 1 or timeout < 1 or retry < 1 or min_age < 0:
-            raise ValueError("Invalid scan intervals")
-        import re
+        phase = "scan settings"
+        interval = interval_setting("CONVERTER_SCAN_INTERVAL", 300, 1)
+        min_age = interval_setting("CONVERTER_MIN_AGE", 120, 0)
+        timeout = interval_setting("CONVERTER_TIMEOUT", 7200, 1)
+        retry = interval_setting("CONVERTER_RETRY_INTERVAL", 3600, 1)
         fallback = os.environ.get("CONVERTER_OCR_LANGUAGE", "eng")
         if not re.fullmatch(r"[a-zA-Z_]+(?:\+[a-zA-Z_]+)*", fallback):
-            raise ValueError("Invalid OCR fallback language")
+            raise StartupError("CONVERTER_OCR_LANGUAGE must contain Tesseract language codes separated by '+' (for example eng+fra)")
+        phase = "conversion tools"
         tools = {name: shutil.which(os.environ.get("CONVERTER_" + name.upper(), name)) for name in ("seconv", "ffprobe", "mkvmerge")}
-        if any(value is None for value in tools.values()):
-            raise ValueError("seconv, ffprobe and mkvmerge must be installed")
+        missing = [name for name, value in tools.items() if value is None]
+        if missing:
+            raise StartupError("Required conversion tools were not found: " + ", ".join(missing) + "; install them or configure their CONVERTER_* executable paths")
+        phase = "converter state"
         converter = Converter(args.root or ["/movies", "/movies-C", "/tv", "/tv-C"], data / "state.json",
                               min_age=min_age, timeout=timeout, retry_interval=retry, ocr_language=fallback, **tools)
+        phase = "dashboard preferences and integration settings"
         manager = JobManager(converter, Integrations(data / "settings.json"), interval=interval, auto_scan=not args.no_auto_scan)
-        log_handler = ActivityLog(manager)
-        LOG.addHandler(log_handler)
         allowed = [value.strip().lower() for value in os.environ.get("CONVERTER_ALLOWED_HOSTS", "localhost,127.0.0.1,::1,subtitle-converter").split(",") if value.strip()]
+        phase = "dashboard listener"
         server = DashboardServer((args.host, args.port), manager, password, allowed,
                                  os.environ.get("CONVERTER_WEBHOOK_TOKEN", ""))
-    except (OSError, ValueError):
-        parser.error("Dashboard configuration is invalid; check paths, tools, intervals and password length")
+    except StartupError as error:
+        parser.error(str(error))
+    except OSError as error:
+        parser.error(startup_os_error(phase, error))
+    except ValueError:
+        parser.error(f"Cannot initialize {phase}: invalid configuration; check the documented settings")
+    log_handler = ActivityLog(manager)
+    LOG.addHandler(log_handler)
     def shutdown(*_):
         threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, shutdown)

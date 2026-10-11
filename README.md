@@ -736,7 +736,7 @@ If Glance's Sonarr/Radarr calendar reports an HTTP `400`, check **Settings > Gen
 
 ### Automatic Subtitle Conversion
 
-The optional `subtitle-converter` service (dashboard name **Subforge**) scans the movie and TV folders configured for its four read/write library mounts and checks every five minutes by default. Its responsive, authenticated dashboard at `http://localhost:8100` lets you inspect tracks, select languages, queue or cancel extraction jobs, and view activity. For setup, password retrieval, network binding, media-server integrations, and conversion limits, see the [Subforge guide](subtitle-converter/README.md). Start only this service with `docker compose --profile subtitle-conversion up -d --build subtitle-converter`; it remains separate from Bazarr's subtitle downloads.
+The optional `subtitle-converter` service (dashboard name **Subforge**) scans the movie and TV folders configured for its four read/write library mounts and checks every five minutes by default. Its responsive, authenticated dashboard at `http://localhost:8100` lets you inspect tracks, select languages, queue or cancel extraction jobs, and view activity. If it exits during startup, check the sanitized service logs for the invalid setting; the [Subforge guide](subtitle-converter/README.md#troubleshoot-startup) covers the password fix. The guide also covers setup, password retrieval, network binding, media-server integrations, and conversion limits. Start only this service with `docker compose --profile subtitle-conversion up -d --build subtitle-converter`; it remains separate from Bazarr's subtitle downloads.
 
 ### Jellyfin Plugins
 

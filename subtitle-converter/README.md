@@ -20,6 +20,16 @@ docker compose --profile subtitle-conversion exec subtitle-converter cat /data/u
 
 Alternatively, set `CONVERTER_UI_PASSWORD` in the ignored root `.env` to a private password of at least 12 characters. The named `subtitle_converter_data` volume preserves the generated password, jobs, settings, and scan state across container rebuilds.
 
+### Troubleshoot startup
+
+If the service exits during startup and its logs identify `CONVERTER_UI_PASSWORD` as invalid, set it privately in the ignored root `.env` to a strong printable password of 12–256 characters, or leave it blank to use the persistent generated password. Recreate only this service:
+
+```shell
+docker compose --profile subtitle-conversion up -d --build subtitle-converter
+```
+
+When using the generated password, retrieve it with the command above. Startup validation reports the setting and phase without printing its value; never paste credentials into logs or shared documentation.
+
 Compose publishes container port `8100` on host port `8100`, bound to `127.0.0.1` by default through `CONVERTER_BIND_ADDRESS`. The service joins `homelab` so the dashboard can reach configured Sonarr, Radarr, and Jellyfin servers and receive their webhooks. Add the hostname used in your browser to `CONVERTER_ALLOWED_HOSTS` when you use a non-local URL; retain the default entries. The host allowlist complements the bind setting and firewall. Keep Basic Authentication traffic on loopback or a trusted private network; use HTTPS through a trusted reverse proxy for remote browser access.
 
 The build downloads Subtitle Edit's Linux `seconv` v5.2.0 release and checks its SHA-256 digest for `amd64` or `arm64`. Docker needs network access while building, and the running service uses the `homelab` network for its web UI and configured integrations. It has no GPU reservation or Docker socket. The process runs as UID/GID 1000 with a read-only container root, dropped capabilities, and `no-new-privileges`; it writes generated SRTs into the mounted libraries and private state into `/data`.

@@ -1,15 +1,20 @@
 """Focused dashboard tests using loopback HTTP and disposable media paths."""
 
 import base64
+from contextlib import redirect_stderr
 import http.client
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from converter import Converter
+import server
 from server import DashboardServer, JobManager, MAX_BODY
 
 
@@ -320,6 +325,110 @@ class DashboardServerTest(unittest.TestCase):
             release_first.set()
             self._close_manager(manager)
 
+
+class DashboardStartupConfigurationTest(unittest.TestCase):
+    """Startup failures are exercised with disposable state, never deployment data."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.data = self.base / "data"
+        self.environment = {
+            "CONVERTER_UI_PASSWORD": "fixture-startup-password",
+            "CONVERTER_SCAN_INTERVAL": "300",
+            "CONVERTER_MIN_AGE": "120",
+            "CONVERTER_TIMEOUT": "7200",
+            "CONVERTER_RETRY_INTERVAL": "3600",
+            "CONVERTER_OCR_LANGUAGE": "eng",
+        }
+
+    def assert_startup_failure(self, expected_message, *, extra_environment=None, missing_tool=False,
+                               data_path=None, integrations_error=None):
+        environment = dict(self.environment)
+        environment.update(extra_environment or {})
+        errors = io.StringIO()
+        patches = [patch.dict(os.environ, environment, clear=False),
+                   patch.object(server.shutil, "which", return_value=None if missing_tool else "/fixture/tool")]
+        if integrations_error is not None:
+            patches.append(patch.object(server, "Integrations", side_effect=integrations_error))
+        for item in patches:
+            item.start()
+        with redirect_stderr(errors):
+            try:
+                with self.assertRaises(SystemExit) as raised:
+                    server.main(["--data", str(data_path or self.data), "--no-auto-scan"])
+            finally:
+                for item in reversed(patches):
+                    item.stop()
+        self.assertEqual(raised.exception.code, 2)
+        output = errors.getvalue()
+        self.assertIn(expected_message, output)
+        for sentinel in ["fixture-startup-password", "fixture-secret-sentinel",
+                         "private-path-sentinel", "environment-value-sentinel",
+                         str(data_path or self.data)]:
+            self.assertNotIn(sentinel, output)
+
+    def test_invalid_or_unparseable_interval_fails_before_server_start(self):
+        for name, value in [("CONVERTER_SCAN_INTERVAL", "not-an-integer"),
+                            ("CONVERTER_MIN_AGE", "-1"),
+                            ("CONVERTER_TIMEOUT", "0"),
+                            ("CONVERTER_RETRY_INTERVAL", "0")]:
+            with self.subTest(setting=name, value=value):
+                self.assert_startup_failure(f"{name} must be an integer", extra_environment={name: value})
+
+    def test_invalid_password_and_ocr_fallback_fail_before_server_start(self):
+        for name, value, expected in [("CONVERTER_UI_PASSWORD", "short", "CONVERTER_UI_PASSWORD must have 12–256 printable characters"),
+                                      ("CONVERTER_UI_PASSWORD", "fixture-secret-sentinel\nwith-control", "CONVERTER_UI_PASSWORD must have 12–256 printable characters"),
+                                      ("CONVERTER_OCR_LANGUAGE", "environment-value-sentinel", "CONVERTER_OCR_LANGUAGE must contain Tesseract language codes")]:
+            with self.subTest(setting=name):
+                self.assert_startup_failure(expected, extra_environment={name: value})
+
+    def test_missing_required_tool_fails_before_server_start(self):
+        self.assert_startup_failure("Required conversion tools were not found: seconv, ffprobe, mkvmerge",
+                                    missing_tool=True)
+
+    def test_unwritable_data_path_fails_as_configuration_error(self):
+        blocker = self.base / "not-a-directory"
+        blocker.write_text("fixture", encoding="utf-8")
+        path = blocker / "private-path-sentinel"
+        reason = ("a required path already exists; check for a file where a directory is required"
+                  if os.name == "nt" else "a required directory path points to a file")
+        self.assert_startup_failure(
+            f"Cannot initialize dashboard preferences and integration settings: {reason}",
+            data_path=path,
+        )
+
+    def test_invalid_saved_password_is_rejected(self):
+        self.data.mkdir()
+        (self.data / "ui-password").write_text("too-short\n", encoding="utf-8")
+        self.assert_startup_failure("Saved dashboard password must have 12–256 printable characters",
+                                    extra_environment={"CONVERTER_UI_PASSWORD": ""})
+
+    def test_symlinked_saved_password_is_rejected(self):
+        self.data.mkdir()
+        target = self.base / "fixture-password-target"
+        target.write_text("fixture-only-password-long-enough\n", encoding="utf-8")
+        try:
+            (self.data / "ui-password").symlink_to(target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {type(error).__name__}")
+        self.assert_startup_failure("Saved dashboard password file must not be a symlink",
+                                    extra_environment={"CONVERTER_UI_PASSWORD": ""})
+
+    def test_unexpected_oserror_reports_phase_and_static_reason_only(self):
+        error = OSError(13, "fixture-secret-sentinel", "/tmp/private-path-sentinel")
+        self.assert_startup_failure(
+            "Cannot initialize dashboard preferences and integration settings: permission denied",
+            integrations_error=error,
+        )
+
+    def test_unexpected_valueerror_reports_phase_without_exception_text(self):
+        error = ValueError("environment-value-sentinel /private-path-sentinel fixture-secret-sentinel")
+        self.assert_startup_failure(
+            "Cannot initialize dashboard preferences and integration settings: invalid configuration",
+            integrations_error=error,
+        )
 
 if __name__ == "__main__":
     unittest.main()
