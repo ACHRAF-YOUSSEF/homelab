@@ -8,6 +8,9 @@
   ];
   const state = { csrf: '', status: null, settings: null, selectedLanguages: ['*'], draftLanguages: ['*'], languageTarget: 'quick', inventory: [], selectedFile: null, currentPage: 'overview', lastToast: 0, pollBusy: false };
   state.jellyfinLibraries=[];
+  state.sidebarCollapsed=false;
+  state.rootFolders={roots:[],mounts:[]};
+  state.folderRequest=0;
   const integrationDefaults = () => ({enabled:false,url:'',api_key:'',api_key_set:false,path_mappings:[]});
   const setText = (el, value) => { if (el) el.textContent = value == null ? '' : String(value); };
   const escStatus = value => String(value || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
@@ -75,7 +78,7 @@
     card.append(icon,detail,status);
     if (job.status === 'running' || job.status === 'queued') {
       const progress = document.createElement('div'); progress.className='job-progress'; const bar=document.createElement('span'); bar.style.width=`${jobPercent(job)}%`; progress.append(bar); card.append(progress);
-      if (job.id) { const cancel=document.createElement('button'); cancel.className='text-button cancel-job'; cancel.textContent='Cancel'; cancel.dataset.jobId=job.id; card.append(cancel); }
+      if (job.id) { const cancel=document.createElement('button'); cancel.className='text-button cancel-job'; cancel.textContent='Cancel'; cancel.dataset.jobId=job.id; status.append(cancel); }
     } else if (job.summary) {
       const chips=document.createElement('div'); chips.className='job-summary';
       for (const [key,label] of [['converted','converted'],['cached','already ready'],['pending','pending'],['planned','planned'],['inspected','inspected'],['failed','failed']]) if (Number(job.summary[key] || 0)) { const chip=document.createElement('span'); chip.textContent=`${job.summary[key]} ${label}`; chips.append(chip); }
@@ -151,7 +154,7 @@
     updateLanguageCount();
   };
   const updateLanguageCount = () => setText($('#language-count'),isAll(state.draftLanguages)?'All languages selected':`${state.draftLanguages.length} language${state.draftLanguages.length===1?'':'s'} selected`);
-  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...state.selectedLanguages]; $('#language-search').value=''; $('#language-modal').classList.remove('hidden'); renderLanguageList(); $('#language-search').focus(); };
+  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...state.selectedLanguages]; $('#language-search').value=''; $('#language-modal').classList.remove('hidden'); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
   const closeDialog = backdrop => { if (!backdrop || backdrop.classList.contains('hidden')) return; backdrop.classList.add('hidden'); if (state.modalTrigger?.isConnected) state.modalTrigger.focus(); };
   const addCustomLanguage = () => { const input=$('#custom-language'), code=input.value.trim().toLowerCase(); if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/.test(code)) { notify('Enter a valid ISO language code, such as pl or pt-BR.','error'); return; } languages.push([code,code.toUpperCase()]); state.draftLanguages=isAll(state.draftLanguages)?[code]:[...new Set([...state.draftLanguages,code])]; input.value=''; renderLanguageList(); };
   const buildIntegrationCard = (provider, config={}) => {
@@ -197,6 +200,56 @@
   };
   const readMappings = card => $$('.path-map-row',card).map(row=>({remote:$('.map-remote',row).value.trim(),local:$('.map-local',row).value.trim()})).filter(item=>item.remote || item.local);
   const readSelectedLibraries = (card,selector) => $(`${selector}`,card) ? $$('.library-check input:checked',$(selector,card)).map(input=>input.value) : [];
+  const formatSpace = bytes => {
+    if(typeof bytes!=='number'||!Number.isFinite(bytes)||bytes<0)return '—';
+    const units=['B','KiB','MiB','GiB','TiB'];let value=bytes,index=0;
+    while(value>=1024&&index<units.length-1){value/=1024;index++;}
+    return `${value.toLocaleString(undefined,{maximumFractionDigits:index?1:0})} ${units[index]}`;
+  };
+  const renderRootFolders = () => {
+    const body=$('#root-folder-body');body.replaceChildren();
+    const roots=state.rootFolders.roots || [];
+    if(!roots.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;cell.className='table-empty';cell.textContent='No root folders selected. Add a folder to enable scanning.';row.append(cell);body.append(row);return;}
+    for(const root of roots){
+      const row=document.createElement('tr'),path=document.createElement('td'),space=document.createElement('td'),status=document.createElement('td'),actions=document.createElement('td');
+      const pathButton=document.createElement('button');pathButton.type='button';pathButton.className='root-folder-path';pathButton.textContent=root.path;pathButton.title='Browse this folder';pathButton.disabled=root.status!=='ready';pathButton.addEventListener('click',()=>openRootFolderDialog(root.path));path.append(pathButton);
+      space.textContent=formatSpace(root.free_bytes);
+      const badge=document.createElement('span');badge.className=`status-pill ${root.status==='ready'?'success':'failed'}`;badge.textContent=root.status==='ready'?'Available':'Unavailable';status.append(badge);
+      const group=document.createElement('div');group.className='root-folder-actions';
+      const scan=document.createElement('button');scan.type='button';scan.className='icon-button scan-root-folder';scan.textContent='↻';scan.title='Scan this folder';scan.setAttribute('aria-label',`Scan ${root.path}`);scan.disabled=root.status!=='ready';scan.addEventListener('click',()=>startJob({kind:'scan',rootIds:[root.id]}));
+      const remove=document.createElement('button');remove.type='button';remove.className='icon-button remove-root-folder';remove.textContent='×';remove.title='Remove from scan folders';remove.setAttribute('aria-label',`Remove ${root.path}`);remove.addEventListener('click',()=>saveRootFolders(roots.filter(item=>item.path!==root.path).map(item=>item.path)));
+      group.append(scan,remove);actions.append(group);row.append(path,space,status,actions);body.append(row);
+    }
+  };
+  const loadRootFolders = async () => {
+    try{state.rootFolders=await api('/api/root-folders');renderRootFolders();}
+    catch(error){notify(`Could not load root folders: ${error.message}`,'error');}
+  };
+  const saveRootFolders = async paths => {
+    const controls=$$('.remove-root-folder,#select-root-folder');controls.forEach(button=>button.disabled=true);
+    try{state.rootFolders=await api('/api/root-folders',{method:'PUT',body:JSON.stringify({paths})});renderRootFolders();closeDialog($('#root-folder-modal'));await pollStatus();notify('Root folders saved. Changes apply to future scans.','success');}
+    catch(error){notify(`Root folders not saved: ${error.message}`,'error');}
+    finally{controls.filter(button=>button.isConnected).forEach(button=>button.disabled=false);}
+  };
+  const browseRootFolder = async path => {
+    const request=++state.folderRequest,button=$('#select-root-folder'),list=$('#folder-browser-list');button.disabled=true;state.currentFolder=null;list.replaceChildren();setText($('#folder-browser-note'),'Loading folders…');
+    try{
+      const folder=await api(`/api/folders?path=${encodeURIComponent(path || '')}`);if(request!==state.folderRequest)return;
+      state.currentFolder=folder.path;state.folderParent=folder.parent;$('#folder-path').value=folder.path || '';setText($('#folder-current-path'),folder.path || 'Media locations');$('#folder-parent-button').disabled=!folder.parent;
+      for(const item of folder.folders || []){const child=document.createElement('button');child.type='button';child.className='folder-browser-item';const icon=document.createElement('span');icon.textContent='▱';icon.setAttribute('aria-hidden','true');const name=document.createElement('span');name.textContent=item.name;child.append(icon,name);child.addEventListener('click',()=>browseRootFolder(item.path));list.append(child);}
+      if(!list.children.length){const empty=document.createElement('div');empty.className='folder-browser-empty';empty.textContent='No subfolders here. You can select this folder.';list.append(empty);}
+      const alreadySelected=state.rootFolders.roots.some(root=>root.path===folder.path);button.disabled=!folder.path||alreadySelected;
+      setText($('#folder-browser-note'),alreadySelected?'This folder is already selected. Browse a subfolder or choose another media location.':folder.truncated?'Showing the first 200 subfolders. Enter a folder path to browse further.':'Only folders inside the available media locations can be selected.');
+    }catch(error){if(request!==state.folderRequest)return;setText($('#folder-browser-note'),error.message);state.folderParent=null;$('#folder-parent-button').disabled=true;}
+  };
+  const openRootFolderDialog = async path => {
+    state.modalTrigger=document.activeElement;await loadRootFolders();const select=$('#folder-mount');select.replaceChildren();
+    for(const mount of state.rootFolders.mounts || []){const option=new Option(`${mount.path}${mount.status==='ready'?'':' · unavailable'}`,mount.path);option.disabled=mount.status!=='ready';select.add(option);}
+    const selected=path || state.rootFolders.mounts.find(mount=>mount.status==='ready')?.path || '';
+    const mount=state.rootFolders.mounts.filter(item=>selected===item.path||selected.startsWith(item.path.replace(/[\\/]$/,'')+'/')||selected.startsWith(item.path.replace(/[\\/]$/,'')+'\\')).sort((a,b)=>b.path.length-a.path.length)[0];
+    if(mount)select.value=mount.path;
+    $('#root-folder-modal').classList.remove('hidden');$('#folder-path').focus();await browseRootFolder(selected);
+  };
   const persistSettings = async () => { const data=await api('/api/settings',{method:'PUT',body:JSON.stringify(gatherSettings())}); state.settings=data; return data; };
   const loadSettings = async () => {
     try {
@@ -235,16 +288,17 @@
   const loadLibraries = async card => { try { const data=await api('/api/integrations/jellyfin/libraries'); state.jellyfinLibraries=data.libraries||[]; const config=state.settings?.integrations?.jellyfin || {}; populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]); notify('Jellyfin libraries loaded.','success'); } catch(error) { notify(error.message,'error'); } };
   const updateHookStates = () => { const integrations=state.status?.settings?.integrations || state.settings?.integrations || {}; for(const name of ['sonarr','radarr']) { const enabled=!!integrations[name]?.webhook_enabled; const node=$(`#${name}-hook-state`); if(node){node.className=`connection-state ${enabled?'is-on':''}`;setText(node,enabled?'READY':'TOKEN REQUIRED');} } };
   const pageNames={overview:'Overview',library:'Library',activity:'Activity',settings:'Settings'};
-  const closeMobileMenu = (restoreFocus=false) => { const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'); sidebar.classList.remove('mobile-open'); sidebar.inert=window.matchMedia('(max-width: 800px)').matches; button.setAttribute('aria-expanded','false'); button.setAttribute('aria-label','Open navigation'); backdrop.classList.remove('visible'); backdrop.setAttribute('aria-hidden','true'); if(restoreFocus)button.focus(); };
-  const toggleMobileMenu = () => { const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'),open=!sidebar.classList.contains('mobile-open'); sidebar.classList.toggle('mobile-open',open); sidebar.inert=!open; button.setAttribute('aria-expanded',String(open)); button.setAttribute('aria-label',open?'Close navigation':'Open navigation'); backdrop.classList.toggle('visible',open); backdrop.setAttribute('aria-hidden',String(!open)); if(open)$('.nav-link[data-page]',sidebar)?.focus(); else button.focus(); };
+  const syncNavigation = () => {const mobile=window.matchMedia('(max-width: 800px)').matches,open=$('#sidebar').classList.contains('mobile-open'),button=$('#mobile-menu'),collapse=$('#sidebar-collapse');$('.shell').classList.toggle('sidebar-collapsed',!mobile&&state.sidebarCollapsed);$('#sidebar').inert=mobile&&!open;const mobileLabel=open?'Close navigation':'Open navigation',desktopLabel=state.sidebarCollapsed?'Expand sidebar':'Collapse sidebar';button.setAttribute('aria-expanded',String(mobile&&open));button.setAttribute('aria-label',mobileLabel);button.title=mobileLabel;collapse.setAttribute('aria-expanded',String(!state.sidebarCollapsed));collapse.setAttribute('aria-label',desktopLabel);collapse.title=desktopLabel;};
+  const closeMobileMenu = (restoreFocus=false) => { const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'); sidebar.classList.remove('mobile-open');backdrop.classList.remove('visible');backdrop.setAttribute('aria-hidden','true');syncNavigation();if(restoreFocus)button.focus(); };
+  const toggleMobileMenu = () => {if(!window.matchMedia('(max-width: 800px)').matches){state.sidebarCollapsed=!state.sidebarCollapsed;try{localStorage.setItem('subforge.sidebar-collapsed',String(state.sidebarCollapsed));}catch{}syncNavigation();return;}const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'),open=!sidebar.classList.contains('mobile-open');sidebar.classList.toggle('mobile-open',open);backdrop.classList.toggle('visible',open);backdrop.setAttribute('aria-hidden',String(!open));syncNavigation();if(open)$('.nav-link[data-page]',sidebar)?.focus();else button.focus();};
   const navigate = page => { if (!pageNames[page]) return; const fromMobileMenu=$('#sidebar').classList.contains('mobile-open'); state.currentPage=page; $$('.page').forEach(node=>node.classList.toggle('active',node.id===`page-${page}`)); $$('.nav-link[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page)); $$('.text-button[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page)); setText($('#page-crumb'),pageNames[page]); closeMobileMenu(); if(fromMobileMenu){const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} if(page==='settings'&&!state.settings)loadSettings(); };
   const cancelJob = async id => { try { const result=await api(`/api/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:'{}'}); notify(result.message || 'Cancellation requested.'); await pollStatus(); } catch(error) { notify(error.message,'error'); } };
   const bind = () => {
-    const mobileBackdrop=document.createElement('button'); mobileBackdrop.type='button'; mobileBackdrop.className='sidebar-backdrop'; mobileBackdrop.setAttribute('aria-label','Close navigation'); mobileBackdrop.setAttribute('aria-hidden','true'); document.body.append(mobileBackdrop); $('#sidebar').inert=window.matchMedia('(max-width: 800px)').matches;
+    const mobileBackdrop=document.createElement('button'); mobileBackdrop.type='button'; mobileBackdrop.className='sidebar-backdrop'; mobileBackdrop.setAttribute('aria-label','Close navigation'); mobileBackdrop.setAttribute('aria-hidden','true'); document.body.append(mobileBackdrop);try{state.sidebarCollapsed=localStorage.getItem('subforge.sidebar-collapsed')==='true';}catch{}syncNavigation();
     $('.brand')?.addEventListener('click',event=>{event.preventDefault();navigate('overview');});
     $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>node.addEventListener('click',()=>navigate(node.dataset.page)));
-    $('#mobile-menu').setAttribute('aria-controls','sidebar'); $('#mobile-menu').setAttribute('aria-expanded','false'); $('#mobile-menu').addEventListener('click',toggleMobileMenu); mobileBackdrop.addEventListener('click',()=>closeMobileMenu(true));
-    window.addEventListener('resize',()=>{if(!window.matchMedia('(max-width: 800px)').matches)closeMobileMenu();else if(!$('#sidebar').classList.contains('mobile-open'))$('#sidebar').inert=true;});
+    $('#mobile-menu').addEventListener('click',toggleMobileMenu); $('#sidebar-collapse').addEventListener('click',toggleMobileMenu); mobileBackdrop.addEventListener('click',()=>closeMobileMenu(true));
+    window.addEventListener('resize',()=>{if(!window.matchMedia('(max-width: 800px)').matches)closeMobileMenu();else syncNavigation();});
     $('#refresh-button').addEventListener('click',()=>pollStatus()); $('#clear-view-button').addEventListener('click',()=>pollStatus());
     $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>startJob({kind:'scan'})));
     $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{navigate('library');await inspect();}));
@@ -256,13 +310,16 @@
     $('#apply-languages').addEventListener('click',()=>{if(!state.draftLanguages.length){notify('Select at least one language or choose All languages.','error');return;}state.selectedLanguages=[...state.draftLanguages];updateLanguageLabels();const backdrop=$('#language-modal');closeDialog(backdrop);if(state.languageTarget==='settings')setText($('#settings-save-note'),'Save changes to keep this default.');});
     $$('.modal-close').forEach(button=>button.addEventListener('click',()=>closeDialog(button.closest('.modal-backdrop'))));
     $$('.modal-backdrop').forEach(backdrop=>backdrop.addEventListener('click',event=>{if(event.target===backdrop)closeDialog(backdrop);}));
-    $$('.settings-tab').forEach(button=>button.addEventListener('click',()=>{const tab=button.dataset.settingTab;$$('.settings-tab').forEach(item=>item.classList.toggle('active',item===button));$$('.settings-section').forEach(item=>item.classList.toggle('active',item.id===`settings-${tab}`));}));
+    $('#add-root-folder').addEventListener('click',()=>openRootFolderDialog());$('#refresh-root-folders').addEventListener('click',loadRootFolders);
+    $('#folder-mount').addEventListener('change',()=>browseRootFolder($('#folder-mount').value));$('#browse-root-folder').addEventListener('click',()=>browseRootFolder($('#folder-path').value.trim()));$('#folder-path').addEventListener('input',()=>{state.folderRequest++;state.currentFolder=null;$('#select-root-folder').disabled=true;setText($('#folder-browser-note'),'Browse to check this folder before adding it.');});$('#folder-path').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();browseRootFolder($('#folder-path').value.trim());}});
+    $('#folder-parent-button').addEventListener('click',()=>{if(state.folderParent)browseRootFolder(state.folderParent);});$('#select-root-folder').addEventListener('click',()=>{if(state.currentFolder)saveRootFolders([...state.rootFolders.roots.map(root=>root.path),state.currentFolder]);});
+    $$('.settings-tab').forEach(button=>button.addEventListener('click',()=>{const tab=button.dataset.settingTab;$$('.settings-tab').forEach(item=>item.classList.toggle('active',item===button));$$('.settings-section').forEach(item=>item.classList.toggle('active',item.id===`settings-${tab}`));if(tab==='media')loadRootFolders();}));
     document.addEventListener('keydown',event=>{
       const modal=$$('.modal-backdrop').find(item=>!item.classList.contains('hidden'));
       if(event.key==='Escape'){if(modal){event.preventDefault();closeDialog(modal);}else if($('#sidebar').classList.contains('mobile-open')){event.preventDefault();closeMobileMenu(true);}return;}
       if(event.key!=='Tab')return;
-      if(modal){const focusable=$$('button:not(:disabled),input:not(:disabled),select:not(:disabled),[href],[tabindex]:not([tabindex="-1"])',modal).filter(node=>!node.closest('.hidden'));if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}return;}
-      if($('#sidebar').classList.contains('mobile-open')){const focusable=$$('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled)', $('#sidebar')).filter(node=>!node.closest('[inert]'));if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}
+      if(modal){const focusable=$$('button:not(:disabled),input:not(:disabled),select:not(:disabled),[href],[tabindex]:not([tabindex="-1"])',modal).filter(node=>node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}return;}
+      if($('#sidebar').classList.contains('mobile-open')){const focusable=$$('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled)', $('#sidebar')).filter(node=>!node.closest('[inert]')&&node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}
     });
   };
   const initialize = async () => { bind(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } setInterval(pollStatus,2000); };

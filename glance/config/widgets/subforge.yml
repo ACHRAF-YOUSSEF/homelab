@@ -1,0 +1,59 @@
+- type: custom-api
+  title: Subforge
+  title-url: ${SUBFORGE_PUBLIC_URL}
+  css-class: media-live-subforge
+  cache: 15s
+  url: ${GLANCE_SUBFORGE_INTERNAL_URL}/api/widget
+  headers:
+    Authorization: Bearer ${CONVERTER_WIDGET_TOKEN}
+  template: |
+    {{ if eq .Response.StatusCode 200 }}
+      {{ $runStatus := .JSON.String "current_run.status" }}
+      {{ $runKind := .JSON.String "current_run.kind" }}
+      {{ $processed := .JSON.Int "current_run.processed" }}
+      {{ $total := .JSON.Int "current_run.total" }}
+      {{ $progressValue := .JSON.String "current_run.progress_percent" }}
+      {{ $progress := .JSON.Int "current_run.progress_percent" }}
+      <div class="subforge-stats">
+        <div><div class="color-highlight size-h3">{{ .JSON.Int "converted_count" | formatNumber }}</div><div class="size-h6">CONVERTED</div></div>
+        <div><div class="color-primary size-h3">{{ .JSON.Int "queued_count" }}</div><div class="size-h6">QUEUED</div></div>
+        <div><div class="color-highlight size-h3">{{ .JSON.Int "configured_root_count" }}</div><div class="size-h6">ROOTS</div></div>
+        <div><div class="{{ if gt (.JSON.Int "recent_failures_count") 0 }}color-negative{{ else }}color-positive{{ end }} size-h3">{{ .JSON.Int "recent_failures_count" }}</div><div class="size-h6">RECENT FAILURES</div></div>
+      </div>
+      <div class="flex justify-between items-center gap-10 margin-top-15">
+        <span class="size-h6">CURRENT RUN</span>
+        {{ if eq $runStatus "running" }}
+          {{ if and (gt $total 0) (ne $progressValue "") }}<span class="color-positive">Running{{ if ne $runKind "" }} · {{ $runKind }}{{ end }} · {{ $processed }}/{{ $total }}</span>{{ else }}<span class="color-positive">Preparing{{ if ne $runKind "" }} · {{ $runKind }}{{ end }}</span>{{ end }}
+        {{ else if eq $runStatus "cancelling" }}<span class="color-primary">Cancelling{{ if ne $runKind "" }} · {{ $runKind }}{{ end }}</span>
+        {{ else if eq $runStatus "queued" }}<span class="color-primary">Queued</span>
+        {{ else }}<span class="color-subdue">Idle</span>{{ end }}
+      </div>
+      {{ if and (eq $runStatus "running") (gt $total 0) (ne $progressValue "") }}
+        <div class="subforge-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ $progress }}" aria-label="{{ $progress }}% complete"><div style="width: {{ $progress }}%"></div></div>
+      {{ end }}
+      <div class="margin-top-15">
+        <div class="size-h6 color-subdue">LANGUAGES</div>
+        <div class="subforge-languages">
+          {{ $languages := .JSON.Array "selected_languages" }}
+          {{ if eq (.JSON.String "selected_languages.0") "*" }}<span class="color-highlight">All languages</span>
+          {{ else if gt (len $languages) 0 }}
+            {{ range $languages }}<span class="subforge-language">{{ .String "" }}</span>{{ end }}
+          {{ else }}<span class="color-highlight">All languages</span>{{ end }}
+        </div>
+      </div>
+      <a class="block margin-top-15 color-primary" href="${SUBFORGE_PUBLIC_URL}">Open Subforge ↗</a>
+      <style>
+        .media-live-subforge .subforge-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; text-align: center; }
+        .media-live-subforge .subforge-stats > div { min-width: 0; }
+        .media-live-subforge .subforge-stats .size-h6 { overflow-wrap: anywhere; }
+        .media-live-subforge .subforge-languages { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .35rem; }
+        .media-live-subforge .subforge-progress { height: 5px; margin-top: 10px; overflow: hidden; border-radius: 99px; background: var(--color-background); }
+        .media-live-subforge .subforge-progress > div { height: 100%; background: var(--color-positive); }
+        .media-live-subforge .subforge-language { padding: 3px 7px; border-radius: 99px; background: var(--color-background); color: var(--color-paragraph); font-size: var(--font-size-h6); }
+        @media (max-width: 500px) { .media-live-subforge .subforge-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: .8rem; } }
+      </style>
+    {{ else if eq .Response.StatusCode 404 }}
+      <p class="color-subdue">The read-only widget is disabled. Set a shared widget token to enable it.</p>
+    {{ else }}
+      <p class="color-negative">Could not load Subforge status. Check that the converter is running and the widget token matches.</p>
+    {{ end }}

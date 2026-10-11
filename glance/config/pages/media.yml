@@ -46,6 +46,7 @@
             - $include: ../widgets/jellyfin-stats.yml
             - $include: ../widgets/jellyfin-library.yml
 
+        - $include: ../widgets/subforge.yml
         - $include: ../widgets/media-calendar.yml
 
         - type: monitor
@@ -69,6 +70,10 @@
               url: ${HOMELAB_URL}:8099
               check-url: ${GLANCE_SUBTITLE_STUDIO_INTERNAL_URL}
               icon: /assets/subtitle-studio.svg
+            - title: Subforge
+              url: ${SUBFORGE_PUBLIC_URL}
+              check-url: ${GLANCE_SUBFORGE_INTERNAL_URL}/health
+              icon: /assets/subforge.svg
             - title: Prowlarr
               url: ${HOMELAB_URL}:9696
               check-url: ${GLANCE_PROWLARR_INTERNAL_URL}
@@ -120,6 +125,10 @@
                   description: Transcribe and translate subtitles
                   url: ${HOMELAB_URL}:8099
                   icon: /assets/subtitle-studio.svg
+                - title: Subforge
+                  description: Extract and convert subtitles to SRT
+                  url: ${SUBFORGE_PUBLIC_URL}
+                  icon: /assets/subforge.svg
                 - title: Prowlarr
                   url: ${HOMELAB_URL}:9696
                   icon: sh:prowlarr

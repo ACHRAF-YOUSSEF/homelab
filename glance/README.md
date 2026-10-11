@@ -20,12 +20,13 @@ networking. DNS, tunnel routes, and reverse-proxy hosts are configured separatel
 | --- | --- |
 | [config/glance.yml](config/glance.yml) | Server settings, branding, theme, asset directory, script, and page includes |
 | [config/pages/](config/pages/) | One YAML file per navigation tab |
-| [config/widgets/](config/widgets/) | Reusable custom API widgets for Jellyfin, Sonarr/Radarr, Seerr, and qBittorrent |
+| [config/widgets/](config/widgets/) | Reusable custom API widgets for Jellyfin, Sonarr/Radarr, Seerr, qBittorrent, and Subforge |
 | [config/assets/media-live.js](config/assets/media-live.js) | Refreshes Media widgets outside the live Jellyfin session feed |
 | [config/assets/widget-live.js](config/assets/widget-live.js) | Connects visible Media and Downloads widgets to the same-origin SSE stream |
 | [live/server.py](live/server.py) | Internal Glance proxy and SSE relay for qBittorrent and Jellyfin |
 | [live/test_server.py](live/test_server.py) | Offline relay tests using local fake upstream services |
 | [config/assets/subtitle-studio.svg](config/assets/subtitle-studio.svg) | Local Subtitle Studio icon |
+| [config/assets/subforge.svg](config/assets/subforge.svg) | Local Subforge icon used by the Media service monitor |
 | [jellyfin-counts-cache.py](jellyfin-counts-cache.py) | Internal HTTP service caching Jellyfin library counts |
 
 Compose mounts `glance/config` read-only at `/app/config`; assets are served from
@@ -39,7 +40,7 @@ root `.env` file; edit YAML when changing the dashboard layout or widget behavio
 | Tab | Configured content |
 | --- | --- |
 | [Overview](config/pages/overview.yml) | SearxNG search with `!yt`, `!gh`, and `!r` shortcuts; clock; configured weather; calendar; Docker containers; core service status; quick links |
-| [Media](config/pages/media.yml) | Jellyfin sessions and library totals; 14-day Sonarr/Radarr calendar; Seerr request counts; media and automation status including Subtitle Studio; links and project releases |
+| [Media](config/pages/media.yml) | Jellyfin sessions and library totals; 14-day Sonarr/Radarr calendar; Seerr request counts; media and automation status including Subtitle Studio and Subforge; links and project releases |
 | [Downloads](config/pages/downloads.yml) | qBittorrent transfer and torrent statistics; download and processing service status; bookmarks; download stack releases |
 | [Network](config/pages/network.yml) | AdGuard Home, Nginx Proxy Manager, Uptime Kuma, and Portracker status; public-service links and checks; infrastructure releases; administration links |
 | [Tools](config/pages/tools.yml) | Tool status; AI, automation, document, and cloud links; latest Glance community widgets; developer links |
@@ -76,6 +77,7 @@ if [ ! -f .env ]; then cp .env.example .env; fi
 | Host and browser service addresses | `TZ`, `HOMELAB_URL`, and `*_PUBLIC_URL` browser destinations, which may use local or reverse-proxy routes and do not publish services |
 | LAN binding and live refresh | `GLANCE_BIND_ADDRESS` defaults to `127.0.0.1`; set the Docker host's LAN interface address privately for LAN clients. Compose adds that address to the gateway host allowlist. If browsers use a LAN DNS name, add it to comma-separated `GLANCE_LIVE_ALLOWED_HOSTS`. `GLANCE_LIVE_QBITTORRENT_INTERVAL` defaults to 2 seconds; `GLANCE_LIVE_JELLYFIN_INTERVAL` to 5 seconds; `GLANCE_LIVE_JELLYFIN_WS` enables Jellyfin WebSocket events with REST reconciliation/fallback. These polling intervals apply while a matching page is open and visible. |
 | Private credentials | `JELLYFIN_API_KEY`, optional `QBITTORRENT_USERNAME` plus `QBITTORRENT_PASSWORD`, `SONARR_API_KEY`, `RADARR_API_KEY`, and `SEERR_API_KEY` for server-side requests |
+| Subforge widget | Optional `CONVERTER_WIDGET_TOKEN`, a dedicated random bearer token shared with the Subforge converter; blank disables the read-only widget endpoint |
 | Docker API proxies | `GLANCE_DOCKER_HOST` for the internal read-only Docker proxy |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values for checks and the counts helper |
 | Glance appearance | `GLANCE_APP_NAME`, `GLANCE_LOGO_TEXT`, and `GLANCE_WEATHER_LOCATION` |
@@ -134,7 +136,35 @@ The gateway proxies Glance and emits sanitized JSON snapshots, keeping Jellyfin 
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
 | [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Sonarr and Radarr `/api/v3/calendar`; renders the next 14 days | `30s` |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
+| [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; converted count, queued jobs, configured roots, recent failures, current run/progress, and selected languages | `15s` |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
+
+The Subforge widget is optional. The Compose service `subtitle-converter` uses
+the opt-in `subtitle-conversion` profile, so a token does not start it. To enable
+the widget, set a private random `CONVERTER_WIDGET_TOKEN` of 32–256 characters
+in the ignored root `.env`; the same variable is supplied to Glance and
+Subforge. It is separate from dashboard, webhook, and media-server credentials.
+The widget endpoint returns only aggregate status and does not expose media
+paths or accept actions. Its link uses `SUBFORGE_PUBLIC_URL` (default
+`http://localhost:8100`); its server-side request uses
+`GLANCE_SUBFORGE_INTERNAL_URL` (default
+`http://subtitle-converter:8100`). The internal URL must be reachable on the
+Compose network. A blank token disables the endpoint; a 401 response means the
+two token values do not match.
+
+The separate Subforge service monitor checks the converter's unauthenticated
+`/health` endpoint. This reports whether the service is reachable even when the
+optional widget token is blank; the Subforge dashboard itself still requires
+Basic Authentication.
+
+After changing the token in `.env`, recreate both containers to apply it:
+
+```shell
+docker compose --profile subtitle-conversion up -d --force-recreate glance subtitle-converter
+```
+
+The command works in PowerShell, Bash, and Zsh when run from the repository
+root. After changing only a Subforge public or internal URL, recreate Glance.
 
 The qBittorrent relay can use optional `QBITTORRENT_USERNAME` and
 `QBITTORRENT_PASSWORD` values kept in the ignored `.env`; configure both or

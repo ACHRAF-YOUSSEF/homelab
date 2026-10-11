@@ -32,9 +32,25 @@ When using the generated password, retrieve it with the command above. Startup v
 
 Compose publishes container port `8100` on host port `8100`, bound to `127.0.0.1` by default through `CONVERTER_BIND_ADDRESS`. The service joins `homelab` so the dashboard can reach configured Sonarr, Radarr, and Jellyfin servers and receive their webhooks. Add the hostname used in your browser to `CONVERTER_ALLOWED_HOSTS` when you use a non-local URL; retain the default entries. The host allowlist complements the bind setting and firewall. Keep Basic Authentication traffic on loopback or a trusted private network; use HTTPS through a trusted reverse proxy for remote browser access.
 
+The breadcrumb and refresh button stay fixed at the top while scrolling. On desktop, the small chevron at the bottom of the sidebar collapses or expands navigation; the preference is remembered in that browser. On mobile, a separate hamburger button in the header opens and closes the navigation drawer.
+
 The build downloads Subtitle Edit's Linux `seconv` v5.2.0 release and checks its SHA-256 digest for `amd64` or `arm64`. Docker needs network access while building, and the running service uses the `homelab` network for its web UI and configured integrations. It has no GPU reservation or Docker socket. The process runs as UID/GID 1000 with a read-only container root, dropped capabilities, and `no-new-privileges`; it writes generated SRTs into the mounted libraries and private state into `/data`.
 
 The dashboard's Overview shows conversion progress, queue, recent activity, and live logs. **Library → Inspect** lists files and subtitle tracks without changing media; select an item to extract tracks with the selected languages. **Scan library** queues automatic conversion for the chosen roots. The Activity page shows queued, running, and completed jobs and lets you cancel queued or running work. Settings stores default languages in the data volume.
+
+### Glance status widget
+
+The Glance **Media** page includes a Subforge custom API widget. It displays the converted-file count, queue length, configured scan-root count, recent failures, current run and progress, and selected languages. It only reads an aggregate from Subforge's `/api/widget` endpoint; the response contains no media paths and the widget cannot start or change jobs. Glance refreshes the widget every 15 seconds. The widget uses the copied [Subforge SVG icon](../glance/config/assets/subforge.svg) in the dashboard service list.
+
+The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. The Compose file passes this dedicated token only to Glance and Subforge. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is Glance's container-to-container base URL and defaults to `http://subtitle-converter:8100`.
+
+Subforge remains in the opt-in `subtitle-conversion` Compose profile. A token does not start or enable that profile. Start the service explicitly as described above. After changing the token, recreate both containers so each receives the same value:
+
+```shell
+docker compose --profile subtitle-conversion up -d --force-recreate glance subtitle-converter
+```
+
+After changing only either URL, recreate Glance. A `404` status means the widget endpoint is disabled; `401` means the tokens do not match. A connection error usually means Subforge is stopped or `GLANCE_SUBFORGE_INTERNAL_URL` cannot reach it on the Compose network.
 
 ## What it converts
 
@@ -48,14 +64,14 @@ The converter stages each output beside its source, validates the completed SRT,
 
 ## Configuration
 
-The Compose service mounts each host directory at a separate container path:
+The Compose service lets you change the four host-side library folders through `.env`; the container destinations are fixed by the standard Compose file and define the available media mounts:
 
-| Variable | Purpose | Default |
+| Variable | Host folder mounted at | Default |
 |---|---|---|
-| `CONVERTER_MOVIES_DIR` | First movie library host path | See `.env.example` |
-| `CONVERTER_MOVIES_C_DIR` | Second movie library host path | See `.env.example` |
-| `CONVERTER_TV_DIR` | First TV library host path | See `.env.example` |
-| `CONVERTER_TV_C_DIR` | Second TV library host path | See `.env.example` |
+| `CONVERTER_MOVIES_DIR` | `/movies` | `D:/film` |
+| `CONVERTER_MOVIES_C_DIR` | `/movies-C` | `C:/film` |
+| `CONVERTER_TV_DIR` | `/tv` | `D:/tv show` |
+| `CONVERTER_TV_C_DIR` | `/tv-C` | `C:/tv show` |
 | `CONVERTER_SCAN_INTERVAL` | Seconds between scans | `300` |
 | `CONVERTER_MIN_AGE` | Minimum file modification age before conversion, in seconds | `120` |
 | `CONVERTER_TIMEOUT` | Maximum runtime for an individual conversion operation, in seconds | `7200` |
@@ -66,7 +82,7 @@ The Compose service mounts each host directory at a separate container path:
 | `CONVERTER_UI_PASSWORD` | Dashboard password (12–256 printable characters); blank generates and saves one in `/data/ui-password` | Blank |
 | `CONVERTER_WEBHOOK_TOKEN` | Shared Sonarr/Radarr webhook token; blank disables the hook endpoints | Blank |
 
-The mounted library directories must be writable by container UID/GID 1000 so the converter can create SRT sidecars. Keep the host paths and container mounts aligned with Bazarr and your media manager roots. To use different folders, change only the applicable `CONVERTER_*_DIR` values in your private `.env`; do not put private deployment paths in shared documentation. `.env.example` also contains blank API-key entries for the Arr applications and Jellyfin; keep real keys and any chosen dashboard or webhook passwords in the ignored `.env`.
+For example, to use `/srv/media/movies` as the first movie library on Linux, set `CONVERTER_MOVIES_DIR=/srv/media/movies` in `.env`; the container will still see it at `/movies`. On Windows, use a drive path available to Docker Desktop, such as the example `D:/film`. The mounted host folders must be writable by container UID/GID 1000 so the converter can create SRT sidecars. Keep them aligned with Bazarr and media-manager access. In Subforge, **Settings → Media Management** lets you select which mounted folders or subfolders to scan; add, browse, scan, or remove roots there. This selection is saved immediately and applies to future scans. Folder browsing is restricted to the configured mounts. Changing a `CONVERTER_*_DIR` changes the host folder behind its corresponding mount; changing container-side destinations instead requires updating the Compose mount and matching `server.py --root` arguments. The `subtitle_converter_data` named volume mounted at `/data` separately persists the generated dashboard password, settings, selected scan roots, job history, and scan state across rebuilds. `.env.example` also contains blank API-key entries for the Arr applications and Jellyfin; keep real keys and any chosen dashboard or webhook passwords in the ignored `.env`.
 
 ## Media server connections
 

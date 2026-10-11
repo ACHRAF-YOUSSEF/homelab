@@ -13,28 +13,31 @@
 <body>
   <div class="shell">
     <aside class="sidebar" id="sidebar">
+      <div class="sidebar-content">
       <a class="brand" href="#overview" aria-label="Subforge home">
         <span class="brand-mark" aria-hidden="true"><img src="/static/icon.svg" width="40" height="40" alt=""></span>
-        <span><strong>Sub<span class="brand-light">forge</span></strong><small>SUBTITLE AUTOMATION</small></span>
+        <span class="brand-copy"><strong>Sub<span class="brand-light">forge</span></strong><small>SUBTITLE AUTOMATION</small></span>
       </a>
       <div class="sidebar-label">WORKSPACE</div>
       <nav class="nav" aria-label="Main navigation">
-        <button class="nav-link active" data-page="overview"><span class="nav-icon">◫</span> Overview</button>
-        <button class="nav-link" data-page="library"><span class="nav-icon">▤</span> Library</button>
-        <button class="nav-link" data-page="activity"><span class="nav-icon">◷</span> Activity <span id="activity-badge" class="nav-badge hidden">0</span></button>
+        <button class="nav-link active" data-page="overview" aria-label="Overview" title="Overview"><span class="nav-icon" aria-hidden="true">◫</span><span class="nav-label">Overview</span></button>
+        <button class="nav-link" data-page="library" aria-label="Library" title="Library"><span class="nav-icon" aria-hidden="true">▤</span><span class="nav-label">Library</span></button>
+        <button class="nav-link" data-page="activity" aria-label="Activity" title="Activity"><span class="nav-icon" aria-hidden="true">◷</span><span class="nav-label">Activity</span><span id="activity-badge" class="nav-badge hidden">0</span></button>
       </nav>
       <div class="sidebar-label library-label">SCAN ROOTS</div>
       <div id="root-list" class="root-list"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>
+      </div>
       <div class="sidebar-bottom">
         <div class="connection"><span class="status-dot" id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
-        <button class="nav-link settings-link" data-page="settings"><span class="nav-icon">⚙</span> Settings</button>
+        <button class="nav-link settings-link" data-page="settings" aria-label="Settings" title="Settings"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></button>
+        <div class="sidebar-controls"><button class="sidebar-toggle" id="sidebar-collapse" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="sidebar-chevron" d="m15 6-6 6 6 6"/></svg></button></div>
         <div class="sidebar-footer">Subforge <span id="version-label">LOCAL</span></div>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <button class="mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open navigation" title="Open navigation" aria-controls="sidebar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
         <div class="crumb"><span>Subforge</span><span class="crumb-slash">/</span><strong id="page-crumb">Overview</strong></div>
         <div class="top-actions"><span id="last-updated" class="updated-label">Waiting for service</span><button class="icon-button" id="refresh-button" title="Refresh status" aria-label="Refresh status">↻</button></div>
       </header>
@@ -88,10 +91,11 @@
       <section class="page" id="page-settings">
         <div class="page-heading"><div><div class="eyebrow">PREFERENCES & CONNECTIONS</div><h1>Settings</h1><p class="lede">Choose extraction languages and connect your media servers.</p></div><button class="button button-primary" id="save-settings">Save changes</button></div>
         <div class="settings-layout">
-          <nav class="settings-nav" aria-label="Settings sections"><button class="settings-tab active" data-setting-tab="general">General</button><button class="settings-tab" data-setting-tab="sonarr">Sonarr</button><button class="settings-tab" data-setting-tab="radarr">Radarr</button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin</button></nav>
+          <nav class="settings-nav" aria-label="Settings sections"><button class="settings-tab active" data-setting-tab="general">General</button><button class="settings-tab" data-setting-tab="media">Media Management</button><button class="settings-tab" data-setting-tab="sonarr">Sonarr</button><button class="settings-tab" data-setting-tab="radarr">Radarr</button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin</button></nav>
           <div class="settings-content">
             <section class="settings-section active" id="settings-general"><article class="panel settings-card"><div class="panel-heading"><div><h2>Default languages</h2><p>Choose which subtitle tracks to export by default.</p></div></div><div class="settings-control"><div><strong>Extraction languages</strong><p>Used for scheduled scans and quick extraction.</p></div><button class="language-summary setting-language-button" type="button" data-open-languages="settings"><span class="language-globe">◎</span><span id="settings-languages">All languages</span><span class="chevron">⌄</span></button></div></article>
               <article class="panel settings-card"><div class="panel-heading"><div><h2>Automation hooks</h2><p>Trigger an inspect or extraction when Sonarr or Radarr imports media.</p></div></div><div class="hook-row"><div><strong>Sonarr webhook</strong><p><code>/hooks/sonarr</code> · Configure the shared token in the service environment.</p></div><span id="sonarr-hook-state" class="connection-state">Checking</span></div><div class="hook-row"><div><strong>Radarr webhook</strong><p><code>/hooks/radarr</code> · Configure the shared token in the service environment.</p></div><span id="radarr-hook-state" class="connection-state">Checking</span></div></article></section>
+            <section class="settings-section" id="settings-media"><article class="panel settings-card root-folders-card"><div class="panel-heading"><div><h2>Root folders</h2><p>Choose which media folders Subforge scans.</p></div><button class="icon-button" id="refresh-root-folders" type="button" aria-label="Refresh root folders" title="Refresh root folders">↻</button></div><div class="table-wrap"><table class="root-folders-table"><thead><tr><th>PATH</th><th>FREE SPACE</th><th>STATUS</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="root-folder-body"><tr><td colspan="4" class="table-empty">Loading folders…</td></tr></tbody></table></div><div class="root-folders-footer"><button class="button button-primary" type="button" id="add-root-folder"><span>＋</span> Add Root Folder</button><p class="form-hint">Select mounted folders or their subfolders. Folder changes apply to future scans.</p></div></article></section>
             <section class="settings-section" id="settings-sonarr"><div id="sonarr-settings"></div></section>
             <section class="settings-section" id="settings-radarr"><div id="radarr-settings"></div></section>
             <section class="settings-section" id="settings-jellyfin"><div id="jellyfin-settings"></div></section>
@@ -105,11 +109,28 @@
   <div id="language-modal" class="modal-backdrop hidden" role="presentation">
     <section class="modal" role="dialog" aria-modal="true" aria-labelledby="language-title">
       <div class="modal-heading"><div><div class="eyebrow">SUBTITLE PREFERENCES</div><h2 id="language-title">Choose languages</h2></div><button class="icon-button modal-close" aria-label="Close">×</button></div>
+      <div class="language-modal-body">
       <p class="modal-copy">Select the languages to extract. “All languages” includes every detected subtitle track.</p>
       <label class="search-box"><span>⌕</span><input id="language-search" type="search" placeholder="Search or enter a language code" autocomplete="off"></label>
       <div id="language-list" class="language-list"></div>
       <div class="custom-language-row"><span>Custom ISO code</span><input id="custom-language" class="input" placeholder="e.g. pl or pt-BR" maxlength="15"><button class="button button-secondary" id="add-language">Add</button></div>
+      </div>
       <div class="modal-footer"><span id="language-count" class="muted">All languages selected</span><button class="button button-secondary modal-close">Cancel</button><button class="button button-primary" id="apply-languages">Apply selection</button></div>
+    </section>
+  </div>
+
+  <div id="root-folder-modal" class="modal-backdrop hidden" role="presentation">
+    <section class="modal folder-modal" role="dialog" aria-modal="true" aria-labelledby="root-folder-title">
+      <div class="modal-heading"><div><div class="eyebrow">MEDIA MANAGEMENT</div><h2 id="root-folder-title">Add Root Folder</h2></div><button class="icon-button modal-close" aria-label="Close">×</button></div>
+      <div class="folder-modal-body">
+      <p class="modal-copy">Choose a folder from the media locations available to Subforge.</p>
+      <label class="form-field"><span>Media location</span><select id="folder-mount" class="input"></select></label>
+      <label class="form-field folder-path-field"><span>Folder path</span><span class="folder-path-row"><input class="input" id="folder-path" autocomplete="off" spellcheck="false"><button class="button button-secondary" type="button" id="browse-root-folder">Browse</button></span></label>
+      <div class="folder-browser-heading"><button class="text-button" type="button" id="folder-parent-button">↑ Parent folder</button><span id="folder-current-path" class="muted"></span></div>
+      <div id="folder-browser-list" class="folder-browser-list" aria-label="Subfolders"></div>
+      <p id="folder-browser-note" class="form-hint" role="status"></p>
+      </div>
+      <div class="modal-footer"><button class="button button-secondary modal-close">Cancel</button><button class="button button-primary" type="button" id="select-root-folder">Add this folder</button></div>
     </section>
   </div>
 

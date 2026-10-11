@@ -6,6 +6,7 @@ import argparse
 import base64
 from collections import deque
 import errno
+import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -20,7 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from converter import Converter, SIDECARS, VIDEOS, candidates
 from integrations import Integrations
@@ -30,6 +31,8 @@ LOG = logging.getLogger("subtitle-converter")
 WEB = Path(__file__).parent / "web"
 MAX_BODY = 65536
 MAX_INVENTORY = 2000
+MAX_ROOTS = 32
+MAX_FOLDERS = 200
 
 
 class StartupError(ValueError):
@@ -45,6 +48,15 @@ def interval_setting(name, default, minimum):
     if value < minimum:
         raise StartupError(message)
     return value
+
+
+def widget_token_setting():
+    token = os.environ.get("CONVERTER_WIDGET_TOKEN", "")
+    if token and (not 32 <= len(token) <= 256 or not token.isascii() or not token.isprintable()
+                  or any(character.isspace() for character in token)
+                  or not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token)):
+        raise StartupError("CONVERTER_WIDGET_TOKEN must be a 32–256 character bearer token or blank to disable the widget")
+    return token
 
 
 def startup_os_error(phase, error):
@@ -131,13 +143,42 @@ class JobManager:
         self.preferences = converter.state_path.parent / "preferences.json"
         self.history_path = converter.state_path.parent / "jobs.json"
         self.languages = ["*"]
+        self.converted_sources = {path for path, item in converter.state.items()
+                                  if isinstance(path, str) and isinstance(item, dict) and item.get("ok") is True}
+        # The converter's startup roots are immutable mount boundaries. The
+        # dashboard may select these directories or safe descendants only.
+        self.mounts = [self._validate_mount(root) for root in converter.roots]
+        self.root_paths = list(self.mounts)
         try:
             saved = json.loads(self.preferences.read_text(encoding="utf-8"))
-            self.languages = converter.normalize_languages(saved.get("languages", ["*"]))
         except FileNotFoundError:
-            pass
-        except (OSError, ValueError, AttributeError):
-            LOG.warning("Dashboard preferences could not be loaded; using all languages")
+            saved = None
+        except (OSError, ValueError):
+            saved = {}
+            self.root_paths = []
+            LOG.warning("Dashboard preferences could not be loaded; scan roots disabled")
+        if saved is not None:
+            if not isinstance(saved, dict):
+                self.root_paths = []
+                saved = {}
+                LOG.warning("Dashboard preferences are invalid; scan roots disabled")
+            try:
+                self.languages = converter.normalize_languages(saved.get("languages", ["*"]))
+            except (ValueError, TypeError, AttributeError):
+                # Language corruption must never change the root selection.
+                self.languages = ["*"]
+                LOG.warning("Dashboard language preferences are invalid; using all languages")
+            if "root_paths" in saved:
+                paths = saved["root_paths"]
+                try:
+                    if not isinstance(paths, list) or len(paths) > MAX_ROOTS:
+                        raise ValueError
+                    # Keep removed mounts visible as unavailable roots, but
+                    # reject the whole configuration if any entry is invalid.
+                    self.root_paths = [self._validate_root(value, require_exists=False) for value in paths]
+                except (OSError, ValueError, TypeError):
+                    self.root_paths = []
+                    LOG.warning("Dashboard root preferences are invalid; scan roots disabled")
         try:
             saved = json.loads(self.history_path.read_text(encoding="utf-8"))
             if isinstance(saved, list):
@@ -149,8 +190,100 @@ class JobManager:
         self.thread = threading.Thread(target=self._worker, name="subtitle-jobs", daemon=True)
 
     def roots(self):
-        return [{"id": str(index), "path": str(root), "label": root.name or str(root)}
-                for index, root in enumerate(self.converter.roots)]
+        return [self._root_info(root) for root in self.root_paths]
+
+    @staticmethod
+    def _has_symlink_component(path):
+        path = Path(path)
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+                    return True
+            except OSError:
+                return True
+        return False
+
+    def _validate_mount(self, value):
+        path = Path(value).absolute()
+        if self._has_symlink_component(path):
+            raise ValueError("Configured scan roots must not contain symlinks")
+        if path.exists() and not path.is_dir():
+            raise ValueError("Configured scan roots must be directories")
+        if path.exists() and not os.access(path, os.R_OK | os.X_OK):
+            raise ValueError("Configured scan roots must be readable directories")
+        resolved = path.resolve(strict=False)
+        if resolved == Path(resolved.anchor) or str(resolved).lower() in {
+                "/etc", "/proc", "/sys", "/dev", "/bin", "/sbin", "/usr", "/var", "/root",
+                "c:\\", "c:\\windows", "c:\\program files", "c:\\program files (x86)"}:
+            raise ValueError("System directories cannot be used as media scan roots")
+        return resolved
+
+    def _validate_root(self, value, *, require_exists=True):
+        if not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value:
+            raise ValueError("Choose a directory inside a configured media mount")
+        path = Path(value)
+        if not path.is_absolute() or ".." in path.parts or self._has_symlink_component(path):
+            raise ValueError("Symlink and parent traversal paths are not supported")
+        try:
+            resolved = path.resolve(strict=require_exists)
+            exists = resolved.is_dir()
+            readable = os.access(resolved, os.R_OK | os.X_OK)
+        except (OSError, RuntimeError):
+            raise ValueError("Directory is unavailable or unreadable") from None
+        if not any(resolved == mount or resolved.is_relative_to(mount) for mount in self.mounts):
+            raise ValueError("Directory is outside configured media mounts")
+        if require_exists and (not exists or not readable):
+            raise ValueError("Choose an existing readable directory")
+        return resolved
+
+    def _root_info(self, root):
+        root = Path(root)
+        exact_mount = next((index for index, mount in enumerate(self.mounts) if root == mount), None)
+        identifier = str(exact_mount) if exact_mount is not None else "r" + hashlib.sha256(str(root).encode()).hexdigest()[:12]
+        available = root.exists() and root.is_dir() and not self._has_symlink_component(root)
+        readable = available and os.access(root, os.R_OK | os.X_OK)
+        try:
+            free_bytes = shutil.disk_usage(root).free if readable else None
+        except OSError:
+            free_bytes = None
+        return {"id": identifier, "path": str(root), "label": root.name or str(root),
+                "status": "ready" if readable else "unavailable", "free_bytes": free_bytes}
+
+    def folders(self, value):
+        if value is None:
+            path = self.mounts[0] if self.mounts else None
+        else:
+            path = self._validate_root(value)
+        if path is None:
+            return {"path": "", "parent": None, "folders": []}
+        parent = path.parent if any(path.parent == mount or path.parent.is_relative_to(mount) for mount in self.mounts) else None
+        folders = []
+        truncated = False
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_dir(follow_symlinks=False) or entry.is_symlink():
+                            continue
+                        if len(folders) >= MAX_FOLDERS:
+                            truncated = True
+                            break
+                        child = self._validate_root(entry.path)
+                    except (OSError, ValueError):
+                        continue
+                    folders.append({"name": entry.name, "path": str(child)})
+        except OSError:
+            raise ValueError("Directory is unavailable or unreadable") from None
+        folders.sort(key=lambda item: item["name"].casefold())
+        return {"path": str(path), "parent": str(parent) if parent else None, "folders": folders,
+                "truncated": truncated}
+
+    def save_preferences(self, *, languages=None, roots=None):
+        with self.lock:
+            write_private(self.preferences, {"languages": list(self.languages if languages is None else languages),
+                                              "root_paths": [str(path) for path in (self.root_paths if roots is None else roots)]})
 
     def safe_path(self, value, roots=None):
         if not isinstance(value, str) or len(value) > 4096 or "\x00" in value:
@@ -158,7 +291,7 @@ class JobManager:
         path = Path(value)
         if not path.is_absolute() or ".." in path.parts:
             raise ValueError("Choose an absolute file path inside a configured library")
-        for root in roots or self.converter.roots:
+        for root in (self.root_paths if roots is None else roots):
             try:
                 relative = path.relative_to(root)
             except ValueError:
@@ -170,7 +303,7 @@ class JobManager:
                 current /= part
                 if current.is_symlink():
                     raise ValueError("Symlink inputs are not supported")
-            if not path.resolve().is_relative_to(root.resolve()):
+            if self._has_symlink_component(path) or not path.resolve().is_relative_to(root.resolve()):
                 raise ValueError("Media path is outside its library")
             if not path.is_file() or path.suffix.lower() not in VIDEOS | SIDECARS:
                 raise ValueError("Media file is missing or unsupported")
@@ -196,9 +329,27 @@ class JobManager:
             update["path_mappings"] = data["path_mappings"]
         self.integrations.update(update)
         with self.lock:
-            write_private(self.preferences, {"languages": languages})
+            self.save_preferences(languages=languages)
             self.languages = languages
         return self.settings()
+
+    def update_roots(self, paths):
+        if not isinstance(paths, list) or len(paths) > MAX_ROOTS:
+            raise ValueError(f"Select at most {MAX_ROOTS} scan folders")
+        normalized = []
+        for value in paths:
+            root = self._validate_root(value)
+            if root not in normalized:
+                normalized.append(root)
+        with self.lock:
+            # Write first: failed persistence must not change the live scan set.
+            self.save_preferences(roots=normalized)
+            self.root_paths = normalized
+        return {"roots": self.roots(), "mounts": self.mount_options()}
+
+    def mount_options(self):
+        return [{"path": str(root), "label": root.name or str(root), "status": self._root_info(root)["status"]}
+                for root in self.mounts]
 
     def status(self):
         settings = self.settings()
@@ -208,6 +359,36 @@ class JobManager:
                                           "history": list(reversed(self.history)), "logs": list(self.logs),
                                           "roots": self.roots(), "settings": settings}))
 
+    def widget_status(self):
+        """A path-free, read-only aggregate for small external status widgets."""
+        with self.lock:
+            running = self.running
+            current = None
+            if isinstance(running, dict):
+                processed = self._widget_counter(running.get("processed"))
+                total = self._widget_counter(running.get("total"))
+                current = {
+                    "kind": running.get("kind") if running.get("kind") in {"scan", "inspect", "extract", "refresh"} else "unknown",
+                    "status": running.get("status") if running.get("status") in {"queued", "running", "cancelling"} else "running",
+                    "processed": processed,
+                    "total": total,
+                    "progress_percent": min(100, int(processed * 100 / total)) if total else None,
+                }
+            failures = 0
+            for job in self.history:
+                summary = job.get("summary", {}) if isinstance(job, dict) else {}
+                count = self._widget_counter(summary.get("failed")) if isinstance(summary, dict) else 0
+                if job.get("status") == "failed" and count == 0:
+                    count = 1
+                failures += count
+            return {"converted_count": len(self.converted_sources), "current_run": current,
+                    "queued_count": len(self.queue), "configured_root_count": len(self.root_paths),
+                    "selected_languages": list(self.languages), "recent_failures_count": failures}
+
+    @staticmethod
+    def _widget_counter(value):
+        return value if type(value) is int and value >= 0 else 0
+
     def enqueue(self, data, *, origin="manual"):
         kind = data.get("kind", "scan")
         if kind not in {"scan", "inspect", "extract", "refresh"}:
@@ -216,9 +397,16 @@ class JobManager:
         if kind == "refresh" and provider not in {"sonarr", "radarr", "jellyfin"}:
             raise ValueError("Unknown integration")
         root_ids = data.get("root_ids", [])
-        if not isinstance(root_ids, list) or any(not isinstance(index, str) or index not in {root["id"] for root in self.roots()} for index in root_ids):
-            raise ValueError("Invalid library selection")
-        selected_roots = [self.converter.roots[int(index)] for index in root_ids] if root_ids else self.converter.roots
+        with self.lock:
+            available_roots = self.roots()
+            root_config_snapshot = tuple(str(root) for root in self.root_paths)
+            root_lookup = {root["id"]: Path(root["path"]) for root in available_roots}
+            if not isinstance(root_ids, list) or any(not isinstance(index, str) or index not in root_lookup for index in root_ids):
+                raise ValueError("Invalid library selection")
+            # Empty root_ids retains the dashboard's “all configured folders” job
+            # behavior. An empty configured folder list itself stays empty.
+            selected_roots = [root_lookup[index] for index in root_ids] if root_ids else [Path(root["path"]) for root in available_roots]
+            selected_root_ids = [self._root_info(root)["id"] for root in selected_roots]
         paths = data.get("paths", [])
         if not isinstance(paths, list) or len(paths) > 256:
             raise ValueError("Select at most 256 files per job")
@@ -229,13 +417,16 @@ class JobManager:
         if not isinstance(data.get("retry", False), bool):
             raise ValueError("Invalid retry option")
         with self.lock:
+            if tuple(str(root) for root in self.root_paths) != root_config_snapshot:
+                raise ValueError("Scan folders changed while preparing this job; retry it")
             if origin == "schedule" and (self.running or self.queue):
                 return None
             if len(self.queue) >= 32:
                 raise ValueError("Job queue is full")
             job = {"id": secrets.token_hex(8), "kind": kind, "status": "queued", "created": time.time(),
                    "started": None, "finished": None, "current": None, "summary": {}, "error": None,
-                   "results": [], "languages": languages, "root_ids": root_ids, "paths": paths,
+                   "results": [], "languages": languages, "root_ids": selected_root_ids,
+                   "root_paths": [str(root) for root in selected_roots], "paths": paths,
                    "retry": data.get("retry", False), "origin": origin, "provider": provider,
                    "processed": 0, "total": 0}
             self.queue.append(job)
@@ -275,6 +466,8 @@ class JobManager:
                 self.running["summary"] = event["summary"]
             if event["status"] in {"converted", "failed", "pending", "cached"}:
                 self.running["processed"] += 1
+            if event.get("status") == "converted" and isinstance(event.get("path"), str):
+                self.converted_sources.add(event["path"])
         if event.get("new_outputs"):
             notifications = self.integrations.notify(event["new_outputs"])
             with self.lock:
@@ -288,7 +481,8 @@ class JobManager:
             if not job["results"][0].get("ok"):
                 job["error"] = job["results"][0].get("message", "Refresh failed")
             return
-        roots = [self.converter.roots[int(index)] for index in job["root_ids"]] if job["root_ids"] else self.converter.roots
+        roots = [self._validate_root(str(root), require_exists=False)
+                 for root in job.get("root_paths", [])]
         paths = [self.safe_path(value, roots) for value in job["paths"]] if job["paths"] else list(candidates(roots))
         with self.lock:
             job["total"] = len(paths)
@@ -296,7 +490,10 @@ class JobManager:
         self.converter.progress = self._progress
         self.converter.selected_languages = job["languages"]
         if job["kind"] != "inspect":
-            job["summary"] = self.converter.scan(paths, retry=job["retry"])
+            # Revalidate every discovered candidate lazily immediately before
+            # the converter fingerprints or opens it.
+            checked_paths = (self.safe_path(str(path), roots) for path in paths)
+            job["summary"] = self.converter.scan(checked_paths, retry=job["retry"])
             return
         summary = {"inspected": 0, "failed": 0}
         results = []
@@ -310,7 +507,8 @@ class JobManager:
                 tracks = self.converter.describe(path)
                 tracks = [dict(track, language=self.converter.short_language(track["language"])) for track in tracks]
                 result = {"path": str(path), "name": path.name, "type": "video" if path.suffix.lower() in VIDEOS else "sidecar",
-                          "root_id": next(root["id"] for root in self.roots() if path.is_relative_to(Path(root["path"]))),
+                          "root_id": next(identifier for identifier, root in zip(job["root_ids"], roots)
+                                          if path.is_relative_to(root)),
                           "tracks": tracks}
                 summary["inspected"] += 1
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -327,8 +525,13 @@ class JobManager:
     def _worker(self):
         next_scan = time.monotonic()
         while not self.stop.is_set():
-            if self.auto_scan and time.monotonic() >= next_scan:
-                self.enqueue({"kind": "scan"}, origin="schedule")
+            with self.lock:
+                has_roots = bool(self.root_paths)
+            if self.auto_scan and has_roots and time.monotonic() >= next_scan:
+                try:
+                    self.enqueue({"kind": "scan"}, origin="schedule")
+                except ValueError:
+                    LOG.warning("Scheduled scan skipped; check the configured scan folders")
                 next_scan = time.monotonic() + self.interval
             with self.lock:
                 job = self.queue.popleft() if self.queue else None
@@ -363,11 +566,12 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, manager, password, allowed_hosts=None, webhook_token=""):
+    def __init__(self, address, manager, password, allowed_hosts=None, webhook_token="", widget_token=""):
         self.manager = manager
         self.password = password
         self.allowed_hosts = set(allowed_hosts or ["localhost", "127.0.0.1", "::1", "subtitle-converter"])
         self.webhook_token = webhook_token
+        self.widget_token = widget_token
         self.slots = threading.BoundedSemaphore(32)
         super().__init__(address, Handler)
 
@@ -414,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def guard(self, *, hook=False):
+    def guard(self, *, hook=False, widget=False):
         host = self.headers.get("Host", "")
         try:
             parsed = urlsplit("http://" + host)
@@ -433,6 +637,19 @@ class Handler(BaseHTTPRequestHandler):
             token = self.server.webhook_token
             if not token or not hmac.compare_digest(self.headers.get("X-Webhook-Token", "").encode(), token.encode()):
                 self.respond(401, {"error": "Webhook token is missing or invalid"})
+                return False
+            return True
+        if widget:
+            token = self.server.widget_token
+            auth = self.headers.get("Authorization", "")
+            scheme, separator, supplied = auth.partition(" ")
+            if not token:
+                self.respond(404, {"error": "Not found"})
+                return False
+            if (not separator or scheme.lower() != "bearer" or not supplied
+                    or not hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))):
+                self.respond(401, {"error": "Widget token is missing or invalid"},
+                             extra={"WWW-Authenticate": 'Bearer realm="Subforge widget"'})
                 return False
             return True
         if self.path == "/health" and self.command == "GET":
@@ -468,7 +685,8 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     def do_GET(self):
-        if not self.guard():
+        widget = self.path == "/api/widget"
+        if not self.guard(widget=widget):
             return
         routes = {"/": ("index.html", "text/html; charset=utf-8"),
                   "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -488,8 +706,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, {"csrf_token": self.server.manager.csrf})
             elif self.path == "/api/status":
                 self.respond(200, self.server.manager.status())
+            elif self.path == "/api/widget":
+                self.respond(200, self.server.manager.widget_status())
             elif self.path == "/api/settings":
                 self.respond(200, self.server.manager.settings())
+            elif self.path == "/api/root-folders":
+                manager = self.server.manager
+                self.respond(200, {"roots": manager.roots(), "mounts": manager.mount_options()})
+            elif self.path == "/api/folders" or self.path.startswith("/api/folders?"):
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                values = query.get("path", [])
+                if len(values) > 1:
+                    raise ValueError("Choose one folder path")
+                self.respond(200, self.server.manager.folders(values[0] if values and values[0] else None))
             elif self.path == "/api/integrations/jellyfin/libraries":
                 self.respond(200, {"libraries": self.server.manager.integrations.libraries()})
             else:
@@ -502,9 +731,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if self.path != "/api/settings":
-                self.respond(404, {"error": "Not found"})
-                return
-            self.respond(200, self.server.manager.update_settings(self.body()))
+                if self.path != "/api/root-folders":
+                    self.respond(404, {"error": "Not found"})
+                    return
+                self.respond(200, self.server.manager.update_roots(self.body().get("paths")))
+            else:
+                self.respond(200, self.server.manager.update_settings(self.body()))
         except (OSError, ValueError, RuntimeError) as error:
             self.respond(400, {"error": str(error) if isinstance(error, ValueError) else "Settings could not be saved"})
 
@@ -563,6 +795,7 @@ def main(argv=None):
         password = ui_password(data)
         phase = "scan settings"
         interval = interval_setting("CONVERTER_SCAN_INTERVAL", 300, 1)
+        widget_token = widget_token_setting()
         min_age = interval_setting("CONVERTER_MIN_AGE", 120, 0)
         timeout = interval_setting("CONVERTER_TIMEOUT", 7200, 1)
         retry = interval_setting("CONVERTER_RETRY_INTERVAL", 3600, 1)
@@ -582,7 +815,7 @@ def main(argv=None):
         allowed = [value.strip().lower() for value in os.environ.get("CONVERTER_ALLOWED_HOSTS", "localhost,127.0.0.1,::1,subtitle-converter").split(",") if value.strip()]
         phase = "dashboard listener"
         server = DashboardServer((args.host, args.port), manager, password, allowed,
-                                 os.environ.get("CONVERTER_WEBHOOK_TOKEN", ""))
+                                 os.environ.get("CONVERTER_WEBHOOK_TOKEN", ""), widget_token)
     except StartupError as error:
         parser.error(str(error))
     except OSError as error:
