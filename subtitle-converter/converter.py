@@ -1,7 +1,8 @@
 """Periodically export embedded and sidecar subtitles through Subtitle Edit.
 
 Only new SRT sidecars and the private state file are written. Source files and
-existing destination files are never replaced. No external service is called.
+existing destination files are never replaced. Network integrations live in the
+separate dashboard service.
 """
 
 from __future__ import annotations
@@ -30,7 +31,12 @@ def run_command(command, *, timeout, stop=None):
     """Bound runtime and captured output; stop OCR descendants with their parent."""
     with tempfile.TemporaryDirectory(prefix="subtitle-tool-") as temporary, \
             tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        environment = dict(os.environ, TMPDIR=temporary, TEMP=temporary, TMP=temporary)
+        # Conversion tools consume untrusted media. Do not give them dashboard
+        # credentials or other service secrets inherited from the container.
+        allowed = {"PATH", "SystemRoot", "WINDIR", "HOME", "LANG", "LC_ALL",
+                   "DOTNET_BUNDLE_EXTRACT_BASE_DIR", "OMP_THREAD_LIMIT", "FONTCONFIG_PATH"}
+        environment = {key: value for key, value in os.environ.items() if key in allowed}
+        environment.update(TMPDIR=temporary, TEMP=temporary, TMP=temporary)
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
                                    start_new_session=os.name != "nt", env=environment)
         deadline = time.monotonic() + timeout
@@ -155,7 +161,7 @@ def publish(source: Path, destination: Path) -> bool:
 class Converter:
     def __init__(self, roots, state_path, *, min_age=120, timeout=7200, retry_interval=3600,
                  seconv="seconv", ffprobe="ffprobe", mkvmerge="mkvmerge", ocr_language="eng", dry_run=False,
-                 stop=None):
+                 stop=None, selected_languages=None, progress=None):
         self.roots = [Path(root).absolute() for root in roots]
         self.state_path = Path(state_path)
         self.min_age = min_age
@@ -168,6 +174,8 @@ class Converter:
         self.dry_run = dry_run
         self.stop = stop or threading.Event()
         self.languages = language_map()
+        self.selected_languages = self.normalize_languages(selected_languages or ["*"])
+        self.progress = progress or (lambda event: None)
         self.state = {}
         try:
             loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -197,6 +205,22 @@ class Converter:
         canonical = self.languages.get(language.lower(), language.lower())
         return next((code for code, mapped in self.languages.items() if len(code) == 2 and mapped == canonical), canonical)
 
+    def normalize_languages(self, languages):
+        if not isinstance(languages, list) or not 1 <= len(languages) <= 64:
+            raise ValueError("Choose all languages or at least one language code")
+        if languages == ["*"]:
+            return ["*"]
+        if any(not isinstance(code, str) or not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", code)
+               for code in languages):
+            raise ValueError("Invalid subtitle language selection")
+        return sorted({self.short_language(code.lower()) for code in languages})
+
+    def wants(self, language):
+        actual = self.short_language(language)
+        return "*" in self.selected_languages or any(
+            actual == code or ("-" not in code and actual.split("-")[0] == code)
+            for code in self.selected_languages)
+
     def tracks(self, path):
         """Use container-native IDs; stream ordinals are not Matroska track IDs."""
         if path.suffix.lower() in {".mkv", ".mks", ".webm"}:
@@ -207,10 +231,11 @@ class Converter:
                     properties = track["properties"]
                     tracks.append({"number": properties["number"],
                                    "language": properties.get("language_ietf") or properties.get("language", "und"),
+                                   "format": str(track.get("codec", "Unknown")),
                                    "forced": properties.get("forced_track", False),
                                    "hi": properties.get("hearing_impaired", False)})
             return tracks
-        data = json.loads(self.run([self.ffprobe, "-v", "error", "-select_streams", "s",
+        data = json.loads(self.run([self.ffprobe, "-protocol_whitelist", "file,pipe", "-v", "error", "-select_streams", "s",
                                    "-show_streams", "-of", "json", str(path)], 120))
         tracks = []
         for stream in data.get("streams", []):
@@ -220,8 +245,24 @@ class Converter:
                 number = int(str(stream["id"]), 0)
             disposition = stream.get("disposition", {})
             tracks.append({"number": number, "language": stream.get("tags", {}).get("language", "und"),
+                           "format": str(stream.get("codec_name", "Unknown")),
                            "forced": bool(disposition.get("forced")), "hi": bool(disposition.get("hearing_impaired"))})
         return tracks
+
+    def describe(self, path):
+        if path.suffix.lower() in VIDEOS:
+            return self.tracks(path)
+        idx = path if path.suffix.lower() == ".idx" else path.with_suffix(".idx")
+        if path.suffix.lower() in {".idx", ".sub"} and idx.exists():
+            if idx.is_symlink():
+                raise ValueError("Symlink subtitle index")
+            text = idx.read_text(encoding="utf-8-sig")
+            return [{"number": int(match[2]), "language": self.short_language(match[1]),
+                     "forced": False, "hi": False, "format": "VobSub"}
+                    for match in re.finditer(r"(?mi)^id:\s*([a-zA-Z-]+),\s*index:\s*(\d+).*$", text)]
+        return [{"number": None, "language": self.short_language(filename_language(path)),
+                 "forced": ".forced" in path.stem.lower(), "hi": ".hi" in path.stem.lower(),
+                 "format": path.suffix.lstrip(".").upper()}]
 
     def jobs(self, path, staging):
         if path.suffix.lower() in VIDEOS:
@@ -238,6 +279,8 @@ class Converter:
                     stem += ".forced"
                 if track["hi"]:
                     stem += ".hi"
+                if not self.wants(track["language"]):
+                    continue
                 jobs.append((path, stem + ".srt", track["number"], self.ocr_for(track["language"])))
             return jobs
         idx = path if path.suffix.lower() == ".idx" else path.with_suffix(".idx")
@@ -255,8 +298,17 @@ class Converter:
             shutil.copyfile(payload, staged_payload)
             header = re.sub(r"(?mi)^langidx:.*$", "langidx: 0", text[:sections[0].start()])
             jobs = []
+            names = set()
             for index, section in enumerate(sections):
                 language = section[1].lower()
+                stem = path.stem
+                if filename_language(path) != language:
+                    stem += f".{self.short_language(language)}"
+                if stem + ".srt" in names:
+                    stem += f".track{index}"
+                names.add(stem + ".srt")
+                if not self.wants(language):
+                    continue
                 end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
                 body = text[section.start():end]
                 body = re.sub(r"(?mi)^(id:.*index:)\s*\d+", r"\g<1> 0", body)
@@ -264,13 +316,10 @@ class Converter:
                 # Each IDX needs a matching payload basename.
                 shutil.copyfile(staged_payload, staged_idx.with_suffix(".sub"))
                 staged_idx.write_text(header + body, encoding="utf-8")
-                stem = path.stem
-                if filename_language(path) != language:
-                    stem += f".{self.short_language(language)}"
-                if any(job[1] == stem + ".srt" for job in jobs):
-                    stem += f".track{index}"
                 jobs.append((staged_idx, stem + ".srt", None, self.ocr_for(language)))
             return jobs
+        if not self.wants(filename_language(path)):
+            return []
         return [(path, path.stem + ".srt", None, self.ocr_for(filename_language(path)))]
 
     def save(self):
@@ -300,6 +349,8 @@ class Converter:
                 destinations.append(name)
                 if destination.exists() or destination.is_symlink():
                     continue
+                self.progress({"status": "extracting", "path": str(path), "output": name,
+                               "track": number, "language": language})
                 command = [self.seconv, str(source), "subrip", "--output-folder", str(staging),
                            "--output-filename", name, "--overwrite", "--encoding", "utf-8-no-bom",
                            "--ocr-engine", "tesseract", "--ocr-language", language, "--json"]
@@ -322,18 +373,20 @@ class Converter:
                     pass
             return destinations
 
-    def scan(self):
+    def scan(self, paths=None, *, retry=False):
         summary = {"converted": 0, "cached": 0, "pending": 0, "failed": 0, "planned": 0}
-        for path in candidates(self.roots):
+        for path in candidates(self.roots) if paths is None else paths:
             if self.stop.is_set():
                 break
             key = str(path)
             current = []
+            self.progress({"status": "processing", "path": str(path), "summary": dict(summary)})
             try:
                 current = fingerprint(path)
                 now = time.time()
                 if any(size == 0 or now - modified / 1e9 < self.min_age for size, modified in current):
                     summary["pending"] += 1
+                    self.progress({"status": "pending", "path": str(path), "summary": dict(summary)})
                     continue
                 previous = self.state.get(key, {})
                 if not isinstance(previous, dict):
@@ -343,29 +396,48 @@ class Converter:
                     previous = {}
                     previous_outputs = []
                 if previous.get("fingerprint") == current:
-                    if previous.get("ok") and all((path.parent / name).is_file() or (path.parent / name).is_symlink() for name in previous_outputs):
+                    covered = previous.get("languages", ["*"])
+                    if not isinstance(covered, list) or any(not isinstance(code, str) for code in covered):
+                        covered = []
+                    selection_covered = "*" in covered or set(self.selected_languages).issubset(covered)
+                    if previous.get("ok") and selection_covered and all((path.parent / name).is_file() or (path.parent / name).is_symlink() for name in previous_outputs):
                         summary["cached"] += 1
+                        self.progress({"status": "cached", "path": str(path), "summary": dict(summary)})
                         continue
                     attempt = previous.get("attempt", 0)
                     if not isinstance(attempt, (int, float)):
                         attempt = 0
-                    if not previous.get("ok") and now - attempt < self.retry_interval:
+                    if not retry and not previous.get("ok") and now - attempt < self.retry_interval:
                         summary["pending"] += 1
+                        self.progress({"status": "pending", "path": str(path), "summary": dict(summary)})
                         continue
                 if self.dry_run:
                     summary["planned"] += 1
                     LOG.info("Would inspect/convert: %s", path.name)
                     continue
                 LOG.info("Processing: %s", path.name)
+                before_outputs = {item.name for item in path.parent.glob("*.srt")}
                 outputs = self.convert(path)
                 if fingerprint(path) != current:
                     raise RuntimeError("Source changed during conversion")
-                self.state[key] = {"fingerprint": current, "outputs": outputs, "ok": True}
+                completed = list(self.selected_languages)
+                if previous.get("fingerprint") == current and previous.get("ok"):
+                    completed = sorted(set(completed + covered))
+                    outputs = sorted(set(outputs + previous_outputs))
+                self.state[key] = {"fingerprint": current, "outputs": outputs, "ok": True,
+                                   "languages": completed}
                 self.save()
                 summary["converted"] += 1
+                self.progress({"status": "converted", "path": str(path), "outputs": outputs,
+                               "new_outputs": [str(path.parent / name) for name in outputs if name not in before_outputs],
+                               "summary": dict(summary)})
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                if self.stop.is_set():
+                    break
                 LOG.warning("Conversion failed for %s (%s); source and existing SRTs preserved", path.name, type(error).__name__)
                 summary["failed"] += 1
+                self.progress({"status": "failed", "path": str(path), "error": type(error).__name__,
+                               "summary": dict(summary)})
                 if not self.dry_run:
                     self.state[key] = {"fingerprint": current, "ok": False, "attempt": time.time()}
                     self.save()
@@ -379,6 +451,7 @@ def main(argv=None):
     parser.add_argument("--once", action="store_true", help="Scan once then exit")
     parser.add_argument("--dry-run", action="store_true", help="List pending inputs; write nothing")
     parser.add_argument("--state", default=os.environ.get("CONVERTER_STATE", "/data/state.json"))
+    parser.add_argument("--language", action="append", help="Extract only this language; repeat for several, default all")
     args = parser.parse_args(argv)
     interval = int(os.environ.get("CONVERTER_SCAN_INTERVAL", "300"))
     min_age = int(os.environ.get("CONVERTER_MIN_AGE", "120"))
@@ -400,6 +473,8 @@ def main(argv=None):
     converter = Converter(roots, args.state, min_age=min_age, timeout=timeout, retry_interval=retry,
                           seconv=seconv, ffprobe=ffprobe, mkvmerge=mkvmerge, dry_run=args.dry_run, stop=stop,
                           ocr_language=fallback_language)
+    if args.language:
+        converter.selected_languages = converter.normalize_languages(args.language)
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     while not stop.is_set():

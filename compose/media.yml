@@ -132,7 +132,12 @@ services:
     mem_limit: 2g
     cpus: 2
     pids_limit: 128
-    network_mode: none
+    ports:
+      - ${CONVERTER_BIND_ADDRESS:-127.0.0.1}:8100:8100
+    networks:
+      - homelab
+    extra_hosts:
+      - host.docker.internal:host-gateway
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -145,6 +150,15 @@ services:
       - CONVERTER_TIMEOUT=${CONVERTER_TIMEOUT:-7200}
       - CONVERTER_RETRY_INTERVAL=${CONVERTER_RETRY_INTERVAL:-3600}
       - CONVERTER_OCR_LANGUAGE=${CONVERTER_OCR_LANGUAGE:-eng}
+      - CONVERTER_UI_PASSWORD=${CONVERTER_UI_PASSWORD:-}
+      - CONVERTER_ALLOWED_HOSTS=${CONVERTER_ALLOWED_HOSTS:-localhost,127.0.0.1,::1,subtitle-converter}
+      - CONVERTER_WEBHOOK_TOKEN=${CONVERTER_WEBHOOK_TOKEN:-}
+      - SONARR_INTERNAL_URL=${SONARR_INTERNAL_URL:-http://sonarr:8989}
+      - SONARR_API_KEY=${SONARR_API_KEY:-}
+      - RADARR_INTERNAL_URL=${RADARR_INTERNAL_URL:-http://radarr:7878}
+      - RADARR_API_KEY=${RADARR_API_KEY:-}
+      - JELLYFIN_INTERNAL_URL=${JELLYFIN_INTERNAL_URL:-http://host.docker.internal:8096}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
     volumes:
       - ${CONVERTER_MOVIES_DIR:-D:/film}:/movies
       - ${CONVERTER_MOVIES_C_DIR:-C:/film}:/movies-C

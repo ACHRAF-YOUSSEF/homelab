@@ -46,6 +46,51 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(second["cached"], 1)
         self.assertEqual(calls, [self.video.name])
 
+    def test_selected_language_scans_expand_cache_without_replacing_outputs(self):
+        tracks = [
+            {"number": 2, "language": "eng", "forced": False, "hi": False},
+            {"number": 3, "language": "fra", "forced": False, "hi": False},
+        ]
+        calls = []
+        progress = []
+
+        def run(command, timeout=None):
+            name = command[command.index("--output-filename") + 1]
+            staging = Path(command[command.index("--output-folder") + 1])
+            calls.append(name)
+            (staging / name).write_text(SRT.replace("Example subtitle", name), encoding="utf-8")
+            return json.dumps({"success": True}).encode()
+
+        self.converter.run = run
+        self.converter.progress = progress.append
+        with patch.object(self.converter, "tracks", return_value=tracks):
+            self.converter.selected_languages = ["en"]
+            english = self.converter.scan([self.video])
+            en_before = (self.library / "Example.en.srt").read_bytes()
+            self.assertEqual(english["converted"], 1)
+            self.assertEqual(self.converter.state[str(self.video)]["languages"], ["en"])
+            self.assertEqual(self.converter.state[str(self.video)]["outputs"], ["Example.en.srt"])
+
+            self.converter.selected_languages = ["fr"]
+            french = self.converter.scan([self.video])
+            self.assertEqual(french["converted"], 1)
+            self.assertEqual(self.converter.state[str(self.video)]["languages"], ["en", "fr"])
+            self.assertEqual(self.converter.state[str(self.video)]["outputs"], ["Example.en.srt", "Example.fr.srt"])
+            self.assertEqual((self.library / "Example.en.srt").read_bytes(), en_before)
+            fr_events = [event for event in progress if event.get("status") == "converted"][-1]
+            self.assertEqual(fr_events["new_outputs"], [str(self.library / "Example.fr.srt")])
+
+            self.converter.selected_languages = ["*"]
+            all_languages = self.converter.scan([self.video])
+            self.assertEqual(all_languages["converted"], 1)
+            self.assertEqual(self.converter.state[str(self.video)]["outputs"], ["Example.en.srt", "Example.fr.srt"])
+            self.assertEqual((self.library / "Example.en.srt").read_bytes(), en_before)
+            self.assertEqual(calls, ["Example.en.srt", "Example.fr.srt"])
+
+            cached = self.converter.scan([self.video])
+            self.assertEqual(cached["cached"], 1)
+            self.assertEqual(calls, ["Example.en.srt", "Example.fr.srt"])
+
     def test_missing_cached_output_retries_conversion(self):
         calls = []
         def convert(path):

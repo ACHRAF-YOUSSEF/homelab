@@ -28,9 +28,14 @@ RUN groupadd --gid 1000 converter \
     && mkdir /data \
     && chown converter:converter /data
 WORKDIR /app
-COPY converter.py ./
+COPY converter.py server.py integrations.py http_client.py ./
+COPY web/ ./web/
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet \
     OMP_THREAD_LIMIT=2
 USER 1000:1000
-CMD ["python", "converter.py"]
+EXPOSE 8100
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)" || exit 1
+# Container listener; Compose publishes only the configured host interface.
+CMD ["python", "server.py", "--host", "0.0.0.0"]

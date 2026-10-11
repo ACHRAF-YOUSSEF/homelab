@@ -106,14 +106,15 @@ jobs:
             --format custom --msg-template '{relpath}:{line}: {test_id} {severity}/{confidence}' \
             subtitle-worker/worker.py subtitle-worker/download_model.py \
             subtitle-worker/validate_srt.py subtitle-worker/http_client.py \
-            subtitle-converter/converter.py \
+            subtitle-converter/converter.py subtitle-converter/server.py \
+            subtitle-converter/integrations.py subtitle-converter/http_client.py \
             glance/jellyfin-counts-cache.py \
             glance/live/server.py \
             .github/scripts/audit_repository.py
 
       - name: Test automatic subtitle conversion with disposable fixtures
         if: ${{ !cancelled() }}
-        run: python -m unittest discover -s subtitle-converter -p test_converter.py
+        run: python -m unittest discover -s subtitle-converter -p 'test_*.py'
 
       - name: Test HTTP request security boundaries
         if: ${{ !cancelled() }}
@@ -181,6 +182,7 @@ jobs:
         run: |
           node --check glance/config/assets/media-live.js
           node --check glance/config/assets/widget-live.js
+          node --check subtitle-converter/web/app.js
 
       # Audit the lockfile without installing or executing repository packages.
       - name: Audit frontend and development dependencies

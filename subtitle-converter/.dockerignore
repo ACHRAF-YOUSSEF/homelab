@@ -1,3 +1,11 @@
 *
 !Dockerfile
 !converter.py
+!server.py
+!integrations.py
+!http_client.py
+!web/
+!web/index.html
+!web/app.js
+!web/style.css
+!web/icon.svg

@@ -75,7 +75,7 @@ Replace the example domain, LAN address, timezone, credentials, and media folder
 - **Self-hosted cloud** - [Nextcloud All-in-One](https://github.com/nextcloud/all-in-one) manages the Nextcloud deployment.
 - **Automation** - [n8n](https://github.com/n8n-io/n8n) for workflow automation.
 - **Local subtitles** - Subtitle Studio transcribes media with Faster Whisper, translates and optionally reviews subtitles through LM Studio, and provides a browser UI with resumable jobs.
-- **Automatic subtitle conversion** - An opt-in local watcher exports embedded tracks and supported subtitle sidecars as UTF-8 SRT files next to their sources, using Subtitle Edit and Tesseract OCR.
+- **Subforge subtitle conversion** - An opt-in authenticated, responsive dashboard and watcher export embedded tracks and supported subtitle sidecars as UTF-8 SRT files next to their sources, using Subtitle Edit and Tesseract OCR.
 - **Remote access** - Self-hosted [RustDesk](https://github.com/rustdesk/rustdesk) relay/rendezvous server.
 - **Self-hosted PDF tools** - [Stirling PDF](https://github.com/Stirling-Tools/Stirling-PDF) for PDF management, OCR, conversion, and automated pipeline processing.
 
@@ -98,6 +98,7 @@ Internet
 
 Shared homelab Docker network
   +-- Browser -> host:7575 -> glance-live:8081 -> Glance:8080
+  +-- Browser -> host:8100 -> subtitle-converter:8100 (loopback by default)
   +-- glance-live -> qBittorrent sync API and host Jellyfin:8096
   +-- Glance -> jellyfin-counts-cache:8765 -> host Jellyfin:8096
   +-- AdGuard Home -> Unbound:5053 (requires local resolver config)
@@ -111,7 +112,7 @@ Nextcloud AIO -> separate Unix socket proxy -> Docker socket
 Nextcloud AIO manages its own containers and networks.
 ```
 
-The opt-in `subtitle-converter` runs outside these Docker networks. It scans its configured movie and TV mounts locally and writes SRT sidecars beside media.
+The opt-in `subtitle-converter` joins `homelab` for its authenticated dashboard and configured media-server integrations. Its UI defaults to `http://localhost:8100`; the host bind defaults to loopback.
 
 The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays on internal container port `8080`. `GLANCE_BIND_ADDRESS` defaults to loopback. For LAN clients, set it in the ignored root `.env` to the Docker host's LAN interface address and set `GLANCE_PUBLIC_URL` to the corresponding browser URL. This dashboard is unauthenticated and intended for the LAN: keep the bind private, firewall it to trusted LAN clients, and do not forward it from the Internet or add it to a public tunnel route. Do not change an Nginx Proxy Manager or tunnel route to publish this gateway. These settings do not verify the firewall or running services.
 
@@ -139,7 +140,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Media** | [Radarr](https://github.com/linuxserver/docker-radarr) | `lscr.io/linuxserver/radarr` | 7878 | Movie automation |
 | **Media** | [Seerr](https://github.com/seerr-team/seerr) | `ghcr.io/seerr-team/seerr` | 5055 | Media discovery and requests |
 | **Media** | [Bazarr](https://github.com/linuxserver/docker-bazarr) | `lscr.io/linuxserver/bazarr` | 6767 | Subtitle automation |
-| **Media** | Subtitle converter *(opt-in profile)* | Local build from `subtitle-converter/` | - | Converts embedded tracks and supported subtitle sidecars to SRT, including OCR for image subtitles |
+| **Media** | Subforge *(subtitle-converter; opt-in profile)* | Local build from `subtitle-converter/` | 8100 (loopback by default) | Responsive authenticated UI and SRT conversion for embedded tracks and supported subtitle sidecars |
 | **Media** | [Tdarr](https://github.com/HaveAGitGat/Tdarr) | `ghcr.io/haveagitgat/tdarr` | 8265, 8266 | GPU media transcoding |
 | **Media** | [TubeArchivist](https://github.com/tubearchivist/tubearchivist) | `bbilly1/tubearchivist` | 8000 | YouTube archiving and management |
 | **Media** | [MeTube](https://github.com/alexta69/metube) | `ghcr.io/alexta69/metube` | 8085 | YouTube downloader |
@@ -182,7 +183,7 @@ Bind mounts beginning with `../` are relative to the included file in `compose/`
 
 - [Glance dashboard](glance/README.md): seven pages, live qBittorrent/Jellyfin widgets, LAN binding, API keys, and the Jellyfin counts helper.
 - [Subtitle Studio](subtitle-worker/README.md): setup, caching, cancellation and retries, translation reviews, API endpoints, and development checks.
-- [Automatic subtitle converter](subtitle-converter/README.md): opt-in watcher setup, language handling, configuration, limitations, and native use.
+- [Subforge subtitle conversion](subtitle-converter/README.md): responsive authenticated dashboard, watcher setup, media-server integrations, configuration, language handling, limitations, and native use.
 
 ---
 
@@ -658,7 +659,7 @@ mount `DOCKER_SOCKET_SOURCE`; applications connect to a proxy endpoint.
 
 ## Port Reference
 
-These are host ports unless explicitly marked AIO-managed. Compose mappings without a host address publish on all interfaces; `30917` is bound to loopback, and dashboard port `7575` defaults to loopback through `GLANCE_BIND_ADDRESS`. The read-only Docker proxy listens on container port `2375` only and has no published host port. Jellyfin's `8096` listener belongs to the separately installed host application.
+These are host ports unless explicitly marked AIO-managed. Compose mappings without a host address publish on all interfaces; `30917` is bound to loopback, and dashboard ports `7575` and `8100` default to loopback through their `*_BIND_ADDRESS` settings. The read-only Docker proxy listens on container port `2375` only and has no published host port. Jellyfin's `8096` listener belongs to the separately installed host application.
 
 | Port | Protocol | Service |
 |------|----------|---------|
@@ -685,6 +686,7 @@ These are host ports unless explicitly marked AIO-managed. Compose mappings with
 | 8088 | TCP | SearxNG |
 | 8096 | TCP | Separately installed Jellyfin on the host |
 | 8099 | TCP | Subtitle Studio |
+| 8100 | TCP | Subforge dashboard (container port 8100; loopback bind by default) |
 | 8180 | TCP | AdGuard Home Web UI |
 | 8265 | TCP | Tdarr Web UI |
 | 8266 | TCP | Tdarr server |
@@ -734,7 +736,7 @@ If Glance's Sonarr/Radarr calendar reports an HTTP `400`, check **Settings > Gen
 
 ### Automatic Subtitle Conversion
 
-The optional `subtitle-converter` service scans the movie and TV folders configured for its four read/write library mounts. It checks every five minutes by default and processes nonempty inputs whose modification age is at least two minutes. For setup, portable path configuration, language behavior, and conversion limits, see the [subtitle-converter guide](subtitle-converter/README.md). Start it with `docker compose up -d --build subtitle-converter`; it has no published port and is separate from Bazarr's subtitle downloads.
+The optional `subtitle-converter` service (dashboard name **Subforge**) scans the movie and TV folders configured for its four read/write library mounts and checks every five minutes by default. Its responsive, authenticated dashboard at `http://localhost:8100` lets you inspect tracks, select languages, queue or cancel extraction jobs, and view activity. For setup, password retrieval, network binding, media-server integrations, and conversion limits, see the [Subforge guide](subtitle-converter/README.md). Start only this service with `docker compose --profile subtitle-conversion up -d --build subtitle-converter`; it remains separate from Bazarr's subtitle downloads.
 
 ### Jellyfin Plugins
 
