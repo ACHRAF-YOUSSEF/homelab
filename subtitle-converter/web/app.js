@@ -14,6 +14,8 @@
   state.inventoryPage=1;
   state.inventoryPageSize=25;
   state.inventoryTruncated=false;
+  state.collapsedPanels=new Set();
+  state.errorViews=new Map();
   const integrationDefaults = () => ({enabled:false,url:'',api_key:'',api_key_set:false,path_mappings:[]});
   const setText = (el, value) => { if (el) el.textContent = value == null ? '' : String(value); };
   const escStatus = value => String(value || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
@@ -35,6 +37,44 @@
   const langLabel = code => { const base = String(code || '').split('-')[0].toLowerCase(); return languages.find(item => item[0] === base)?.[1] || String(code || '').toUpperCase(); };
   const isAll = list => !Array.isArray(list) || list.includes('*');
   const languageDescription = list => isAll(list) ? 'All languages' : `${list.length} ${list.length === 1 ? 'language' : 'languages'} · ${list.slice(0,3).map(langLabel).join(', ')}${list.length > 3 ? ` +${list.length - 3}` : ''}`;
+  const disclosureIcon = () => {
+    const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');
+    const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d','m6 9 6 6 6-6');svg.append(path);return svg;
+  };
+  const makePanelCollapsible = card => {
+    const key=card.dataset.collapse;if(!key||$('.collapse-toggle',card))return;
+    const header=$(':scope > .panel-heading,:scope > .inventory-toolbar',card);if(!header)return;
+    const title=$('h2',header)?.textContent || 'panel',content=document.createElement('div');content.className='collapsible-content';content.id=`panel-content-${key}`;
+    while(header.nextSibling)content.append(header.nextSibling);card.append(content);
+    const button=document.createElement('button');button.type='button';button.className='icon-button collapse-toggle';button.setAttribute('aria-controls',content.id);button.append(disclosureIcon());
+    const sync=()=>{const collapsed=state.collapsedPanels.has(key);content.hidden=collapsed;card.classList.toggle('is-collapsed',collapsed);button.setAttribute('aria-expanded',String(!collapsed));button.setAttribute('aria-label',`${collapsed?'Expand':'Collapse'} ${title}`);button.title=`${collapsed?'Expand':'Collapse'} ${title}`;};
+    button.addEventListener('click',()=>{if(state.collapsedPanels.has(key))state.collapsedPanels.delete(key);else state.collapsedPanels.add(key);sync();try{localStorage.setItem('subforge.collapsed-panels',JSON.stringify([...state.collapsedPanels]));}catch{}});
+    if(header.classList.contains('inventory-toolbar')){const heading=header.firstElementChild;heading.classList.add('inventory-heading-title');heading.append(button);}
+    else{const actions=document.createElement('div');actions.className='panel-heading-actions';while(header.children.length>1)actions.append(header.children[1]);actions.append(button);header.append(actions);}
+    sync();
+  };
+  const errorViewKey = (job,compact) => `${compact?'overview':'activity'}:${job.id || `${job.kind}:${job.created}`}`;
+  const groupedErrors = job => {
+    const groups=new Map(),providers={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin'};
+    const add=(source,item)=>{const message=typeof item.message==='string'?item.message.trim():'';if(!message)return;const provider=typeof item.provider==='string'&&Object.hasOwn(providers,item.provider)?item.provider:null,key=JSON.stringify([source,provider,message]);const group=groups.get(key)||{source,provider,message,label:provider?providers[provider]:'Integration',count:0};group.count++;groups.set(key,group);};
+    if(job.error)add('job',{message:job.error});
+    for(const item of Array.isArray(job.notifications)?job.notifications:[])if(item?.ok===false)add('notification',item);
+    for(const item of Array.isArray(job.results)?job.results:[])if(item?.ok===false)add('result',item);
+    return [...groups.values()];
+  };
+  const renderErrors = (job,compact) => {
+    const groups=groupedErrors(job);if(!groups.length)return null;
+    const key=errorViewKey(job,compact),saved=state.errorViews.get(key)||{open:false,scroll:0},count=groups.reduce((sum,group)=>sum+group.count,0);
+    const details=document.createElement('details');details.className='job-error';details.dataset.errorKey=key;details.open=saved.open;
+    const summary=document.createElement('summary');summary.dataset.jobFocus=`${key}:errors`;const copy=document.createElement('span');copy.className='job-error-summary-copy';const title=document.createElement('strong');title.textContent=`${count.toLocaleString()} reported error${count===1?'':'s'} · ${groups.length} group${groups.length===1?'':'s'}`;
+    const preview=document.createElement('span');preview.className='job-error-preview';preview.textContent=`${groups[0].source==='job'?'Job':groups[0].label}: ${groups[0].message}`;copy.append(title,preview);summary.append(copy,disclosureIcon());details.append(summary);
+    const content=document.createElement('div');content.className='job-error-content';const list=document.createElement('ul');
+    for(const group of groups){const row=document.createElement('li'),heading=document.createElement('div');heading.className='job-error-heading';const label=document.createElement('strong');label.textContent=group.source==='job'?'Job error':`${group.label} · ${group.source==='notification'?'Scan notification':'Refresh result'}`;const repeats=document.createElement('span');repeats.className='job-error-count';repeats.textContent=`${group.count.toLocaleString()}×`;heading.append(label,repeats);const message=document.createElement('p');message.textContent=group.message;row.append(heading,message);
+      if(group.provider){const settings=document.createElement('button');settings.type='button';settings.className='text-button';settings.textContent=`Review ${group.label} settings`;settings.dataset.jobFocus=`${key}:${group.source}:${group.provider}:${group.message}`;settings.addEventListener('click',()=>{navigate('settings');$(`[data-setting-tab="${group.provider}"]`).click();const card=$(`[data-provider="${group.provider}"]`);if(card?.classList.contains('is-collapsed'))$('.collapse-toggle',card).click();});row.append(settings);}
+      list.append(row);
+    }
+    content.append(list);details.append(content);details.addEventListener('toggle',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});content.addEventListener('scroll',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});return details;
+  };
   const renderRootSelectors = roots => {
     const rootList = $('#root-list'); rootList.replaceChildren();
     const quick = $('#quick-root'), inventoryRoot = $('#inventory-root');
@@ -81,24 +121,28 @@
     card.append(icon,detail,status);
     if (job.status === 'running' || job.status === 'queued') {
       const progress = document.createElement('div'); progress.className='job-progress'; const bar=document.createElement('span'); bar.style.width=`${jobPercent(job)}%`; progress.append(bar); card.append(progress);
-      if (job.id) { const cancel=document.createElement('button'); cancel.className='text-button cancel-job'; cancel.textContent='Cancel'; cancel.dataset.jobId=job.id; status.append(cancel); }
+      if (job.id) { const cancel=document.createElement('button'); cancel.className='text-button cancel-job'; cancel.textContent='Cancel'; cancel.dataset.jobId=job.id; cancel.dataset.jobFocus=`${errorViewKey(job,compact)}:cancel`; status.append(cancel); }
     } else if (job.summary) {
       const chips=document.createElement('div'); chips.className='job-summary';
       for (const [key,label] of [['converted','converted'],['cached','already ready'],['pending','pending'],['planned','planned'],['inspected','inspected'],['failed','failed']]) if (Number(job.summary[key] || 0)) { const chip=document.createElement('span'); chip.textContent=`${job.summary[key]} ${label}`; chips.append(chip); }
       if (chips.childNodes.length) card.append(chips);
     }
-    const failures=[...(job.error?[job.error]:[]),...(job.notifications||[]).filter(item=>item.ok===false).map(item=>item.message),...(job.results||[]).filter(item=>item.ok===false).map(item=>item.message)].filter(Boolean);
-    if (failures.length) { const error=document.createElement('div'); error.className='job-error'; error.textContent=failures.join(' · '); card.append(error); }
+    const errors=renderErrors(job,compact);if(errors)card.append(errors);
     return card;
+  };
+  const updateJobList = (container,jobs,compact) => {
+    const signature=JSON.stringify(jobs);if(container.jobSignature===signature)return;
+    const focusKey=container.contains(document.activeElement)?document.activeElement.dataset.jobFocus:null;
+    for(const details of $$('.job-error',container))state.errorViews.set(details.dataset.errorKey,{open:details.open,scroll:$('.job-error-content',details).scrollTop});
+    container.jobSignature=signature;container.replaceChildren();for(const job of jobs)container.append(renderJobCard(job,compact));
+    if(!jobs.length){const empty=document.createElement('div');empty.className=`empty-state${compact?' compact':''}`;const icon=document.createElement('span');icon.className='empty-icon';icon.textContent='◷';const title=document.createElement('strong');title.textContent=compact?'No activity yet':'No jobs yet';const hint=document.createElement('span');hint.textContent=compact?'Start a scan to see progress here.':'Start a scan or extraction to see it here.';empty.append(icon,title,hint);container.append(empty);}
+    if(focusKey)$$('[data-job-focus]',container).find(node=>node.dataset.jobFocus===focusKey)?.focus({preventScroll:true});
+    for(const details of $$('.job-error',container))$('.job-error-content',details).scrollTop=state.errorViews.get(details.dataset.errorKey)?.scroll || 0;
   };
   const renderJobs = () => {
     const jobs=jobList(), running=state.status?.running;
-    const recent=$('#recent-activity'); recent.replaceChildren();
-    for (const job of jobs.slice(0,4)) recent.append(renderJobCard(job,true));
-    if (!jobs.length) { const empty=document.createElement('div'); empty.className='empty-state compact'; const icon=document.createElement('span'); icon.className='empty-icon'; icon.textContent='◷'; const title=document.createElement('strong'); title.textContent='No activity yet'; const hint=document.createElement('span'); hint.textContent='Start a scan to see progress here.'; empty.append(icon,title,hint); recent.append(empty); }
-    const list=$('#jobs-list'); list.replaceChildren();
-    for (const job of jobs) list.append(renderJobCard(job));
-    if (!jobs.length) { const empty=document.createElement('div'); empty.className='empty-state'; const icon=document.createElement('span'); icon.className='empty-icon'; icon.textContent='◷'; const title=document.createElement('strong'); title.textContent='No jobs yet'; const hint=document.createElement('span'); hint.textContent='Start a scan or extraction to see it here.'; empty.append(icon,title,hint); list.append(empty); }
+    updateJobList($('#recent-activity'),jobs.slice(0,4),true);updateJobList($('#jobs-list'),jobs,false);
+    const validKeys=new Set(jobs.flatMap(job=>[errorViewKey(job,true),errorViewKey(job,false)]));for(const key of state.errorViews.keys())if(!validKeys.has(key))state.errorViews.delete(key);
     setText($('#stat-running'),running ? 'Running' : 'Idle'); setText($('#stat-current'),currentLabel(running?.current) || (running ? 'Working through your library' : 'Nothing running right now'));
     const total=jobs.reduce((sum,job)=>sum+Number(job.summary?.converted || 0),0); setText($('#stat-converted'),total.toLocaleString());
     const queued=(state.status?.queue || []).length; const badge=$('#activity-badge'); badge.textContent=queued ? String(queued) : ''; badge.classList.toggle('hidden',!queued);
@@ -201,7 +245,7 @@
     $('.refresh-integration',card).addEventListener('click',()=>refreshIntegration(provider,card));
     $$('.load-libraries',card).forEach(button=>button.addEventListener('click',()=>loadLibraries(card)));
     $('.add-path-map',card).addEventListener('click',()=>{const entries=readMappings(card); entries.push({remote:'',local:''});renderMappings(card,entries);});
-    return card;
+    card.dataset.collapse=`integration-${provider}`;makePanelCollapsible(card);return card;
   };
   const populateLibraryOptions = (card,movies,series,selectedMovies=movies,selectedSeries=series) => {
     for (const [selector,values,selected] of [['.movie-libraries',movies,selectedMovies],['.series-libraries',series,selectedSeries]]) {
@@ -312,6 +356,8 @@
   const navigate = page => { if (!pageNames[page]) return; const fromMobileMenu=$('#sidebar').classList.contains('mobile-open'); state.currentPage=page; $$('.page').forEach(node=>node.classList.toggle('active',node.id===`page-${page}`)); $$('.nav-link[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page)); $$('.text-button[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page)); setText($('#page-crumb'),pageNames[page]); closeMobileMenu(); if(fromMobileMenu){const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} if(page==='settings'&&!state.settings)loadSettings(); };
   const cancelJob = async id => { try { const result=await api(`/api/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:'{}'}); notify(result.message || 'Cancellation requested.'); await pollStatus(); } catch(error) { notify(error.message,'error'); } };
   const bind = () => {
+    try{const saved=JSON.parse(localStorage.getItem('subforge.collapsed-panels')||'[]');if(Array.isArray(saved))state.collapsedPanels=new Set(saved.filter(key=>typeof key==='string'));}catch{}
+    $$('[data-collapse]').forEach(makePanelCollapsible);
     const mobileBackdrop=document.createElement('button'); mobileBackdrop.type='button'; mobileBackdrop.className='sidebar-backdrop'; mobileBackdrop.setAttribute('aria-label','Close navigation'); mobileBackdrop.setAttribute('aria-hidden','true'); document.body.append(mobileBackdrop);try{state.sidebarCollapsed=localStorage.getItem('subforge.sidebar-collapsed')==='true';}catch{}syncNavigation();
     $('.brand')?.addEventListener('click',event=>{event.preventDefault();navigate('overview');});
     $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>node.addEventListener('click',()=>navigate(node.dataset.page)));
