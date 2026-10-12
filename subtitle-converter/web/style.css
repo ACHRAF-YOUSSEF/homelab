@@ -2326,3 +2326,114 @@ html {
     padding-right:11px;
   }
 }
+
+/* Library search and paging share the root and media-type filters. */
+.inventory-toolbar .toolbar-filters {
+  display:grid;
+  grid-template-columns:minmax(220px,320px) repeat(2,150px);
+  gap:8px;
+}
+.inventory-search {
+  min-width:0;
+}
+.inventory-search svg {
+  width:16px;
+  height:16px;
+  flex:none;
+  fill:none;
+  stroke:currentColor;
+  stroke-width:1.8;
+  stroke-linecap:round;
+}
+.inventory-search input {
+  width:100%;
+}
+.inventory-pagination {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:16px;
+  padding:15px 19px;
+  border-top:1px solid var(--line);
+  color:var(--muted);
+  font-size:11px;
+}
+.inventory-page-info {
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:12px 24px;
+  min-width:0;
+}
+.inventory-page-size {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  white-space:nowrap;
+}
+.inventory-page-size .input {
+  min-width:0;
+  width:74px;
+}
+.inventory-page-nav {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-width:0;
+}
+.inventory-page-nav .input {
+  min-width:0;
+  width:148px;
+}
+.inventory-page-nav .button:disabled {
+  cursor:default;
+}
+.inventory-limit-note {
+  padding:0 19px 15px;
+  margin:0;
+  font-size:11px;
+}
+@media(max-width:1100px) {
+  .inventory-toolbar {
+    align-items:stretch;
+    flex-direction:column;
+  }
+  .inventory-toolbar .toolbar-filters {
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+  .inventory-search {
+    grid-column:1/-1;
+    min-width:0;
+    max-width:none;
+  }
+}
+@media(max-width:360px) {
+  .inventory-toolbar .toolbar-filters {
+    grid-template-columns:minmax(0,1fr);
+  }
+}
+@media(max-width:520px) {
+  .inventory-pagination {
+    padding:14px;
+  }
+  .inventory-page-info,.inventory-page-nav {
+    width:100%;
+  }
+  .inventory-page-nav {
+    display:grid;
+    grid-template-columns:minmax(0,1fr) minmax(0,1.5fr) minmax(0,1fr);
+  }
+  .inventory-page-nav .input {
+    width:100%;
+    padding-left:6px;
+    padding-right:3px;
+    font-size:12px;
+    min-height:44px;
+  }
+  .inventory-page-nav .button {
+    padding:9px 6px;
+    font-size:11px;
+    min-height:44px;
+  }
+}

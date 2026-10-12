@@ -11,6 +11,9 @@
   state.sidebarCollapsed=false;
   state.rootFolders={roots:[],mounts:[]};
   state.folderRequest=0;
+  state.inventoryPage=1;
+  state.inventoryPageSize=25;
+  state.inventoryTruncated=false;
   const integrationDefaults = () => ({enabled:false,url:'',api_key:'',api_key_set:false,path_mappings:[]});
   const setText = (el, value) => { if (el) el.textContent = value == null ? '' : String(value); };
   const escStatus = value => String(value || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
@@ -116,7 +119,7 @@
   const setConnection = good => { $('#connection-dot').classList.toggle('offline',!good); setText($('#connection-text'),good ? 'Service connected' : 'Service unavailable'); };
   const pollStatus = async () => {
     if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
-    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); const inspection=[...(state.status.history||[])].find(job=>job.kind==='inspect'&&Array.isArray(job.results)); if(inspection) { state.inventory=inspection.results; renderInventory(); } setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); }
+    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); const inspection=[...(state.status.history||[])].find(job=>job.kind==='inspect'&&Array.isArray(job.results)); if(inspection) { state.inventory=inspection.results; state.inventoryTruncated=!!inspection.truncated; } renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
@@ -126,14 +129,29 @@
   };
   const selectedRootIds = selector => { const value=$(selector).value; return value ? [value] : []; };
   const renderInventory = () => {
-    const body=$('#inventory-body'); body.replaceChildren();
-    const filter=$('#inventory-filter').value, root=$('#inventory-root').value;
+    const body=$('#inventory-body');
+    const filter=$('#inventory-filter').value, root=$('#inventory-root').value, query=$('#inventory-search').value.trim().toLowerCase();
     let rows=state.inventory.filter(row=>!root || row.root_id===root);
     if (filter==='video'||filter==='sidecar') rows=rows.filter(row=>row.type===filter);
     if (filter==='issues') rows=rows.filter(row=>row.error || row.type==='video' && !(row.tracks || []).length);
-    setText($('#inventory-meta'),`${rows.length} item${rows.length===1?'':'s'}${root?' in selected root':''}`);
-    if (!rows.length) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=5; td.className='table-empty'; td.textContent=state.inventory.length ? 'No files match this filter.' : 'No inventory yet. Choose Inspect library to list available subtitle tracks.'; tr.append(td); body.append(tr); return; }
-    for (const row of rows) {
+    if (query) rows=rows.filter(row=>`${row.name || ''}\n${row.path || ''}`.toLowerCase().includes(query));
+    const count=rows.length, pages=Math.max(1,Math.ceil(count/state.inventoryPageSize));
+    state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
+    const start=(state.inventoryPage-1)*state.inventoryPageSize, visibleRows=rows.slice(start,start+state.inventoryPageSize);
+    setText($('#inventory-meta'),`${count.toLocaleString()}${query||root||filter!=='all'?` of ${state.inventory.length.toLocaleString()}`:''} item${count===1?'':'s'}`);
+    const range=count?`${(start+1).toLocaleString()}–${(start+visibleRows.length).toLocaleString()} of ${count.toLocaleString()} items`:'0 items';
+    if ($('#inventory-range').textContent!==range) setText($('#inventory-range'),range);
+    const pageSelect=$('#inventory-page');
+    if (pageSelect.options.length!==pages) { pageSelect.replaceChildren();for(let page=1;page<=pages;page++)pageSelect.add(new Option(`Page ${page} of ${pages}`,String(page))); }
+    pageSelect.value=String(state.inventoryPage);pageSelect.disabled=!count;
+    $('#inventory-prev').disabled=state.inventoryPage===1;$('#inventory-next').disabled=state.inventoryPage===pages;
+    $('#inventory-limit-note').classList.toggle('hidden',!state.inventoryTruncated);
+    const emptyMessage=state.inventory.length?'No files match your search or filters.':'No inventory yet. Choose Refresh inventory to list available subtitle tracks.';
+    const viewKey=JSON.stringify([visibleRows,visibleRows.length?'':emptyMessage]);
+    if (viewKey===state.inventoryViewKey) return;
+    state.inventoryViewKey=viewKey;body.replaceChildren();
+    if (!count) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=5; td.className='table-empty'; td.textContent=emptyMessage; tr.append(td); body.append(tr); return; }
+    for (const row of visibleRows) {
       const tr=document.createElement('tr'); const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`; fileIcon.textContent=row.type==='sidecar'?'S':'▣'; const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; name.append(fileIcon,filename);
       const type=document.createElement('td'); const badge=document.createElement('span'); badge.className='type-badge'; badge.textContent=row.error?'Issue':row.type==='sidecar'?'Sidecar':'Video'; type.append(badge);
       const tracks=document.createElement('td'); tracks.textContent=row.error ? row.error : `${(row.tracks || []).length} track${(row.tracks || []).length===1?'':'s'}`;
@@ -142,7 +160,7 @@
       tr.append(name,type,tracks,lang,action); body.append(tr);
     }
   };
-  const inspect = async () => { const result=await startJob({kind:'inspect',rootIds:selectedRootIds('#inventory-root')}); if (!result) return; if (Array.isArray(result.results)) { state.inventory=result.results; renderInventory(); } };
+  const inspect = async () => { const result=await startJob({kind:'inspect',rootIds:selectedRootIds('#inventory-root')}); if (!result) return; if (Array.isArray(result.results)) { state.inventory=result.results; state.inventoryTruncated=!!result.truncated; renderInventory(); } };
   const renderLanguageList = () => {
     const list=$('#language-list'), term=$('#language-search').value.trim().toLowerCase(); list.replaceChildren();
     const allLabel=document.createElement('label'); allLabel.className='language-option all-option'; const all=document.createElement('input'); all.type='checkbox'; all.checked=isAll(state.draftLanguages); all.addEventListener('change',()=>{state.draftLanguages=all.checked?['*']:[];renderLanguageList();}); const allCopy=document.createElement('span'); const allTitle=document.createElement('strong'); allTitle.textContent='All languages'; const allHint=document.createElement('small'); allHint.textContent='Extract every supported subtitle track'; allCopy.append(allTitle,allHint); allLabel.append(all,allCopy); list.append(allLabel);
@@ -303,7 +321,10 @@
     $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>startJob({kind:'scan'})));
     $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{navigate('library');await inspect();}));
     $('#quick-form').addEventListener('submit',event=>{event.preventDefault();startJob({kind:'scan',rootIds:selectedRootIds('#quick-root')});});
-    $('#inventory-filter').addEventListener('change',renderInventory); $('#inventory-root').addEventListener('change',renderInventory);
+    const resetInventoryPage=()=>{state.inventoryPage=1;renderInventory();};
+    $('#inventory-filter').addEventListener('change',resetInventoryPage); $('#inventory-root').addEventListener('change',resetInventoryPage); $('#inventory-search').addEventListener('input',resetInventoryPage);
+    $('#inventory-page-size').addEventListener('change',()=>{state.inventoryPageSize=Number($('#inventory-page-size').value);resetInventoryPage();});
+    $('#inventory-prev').addEventListener('click',()=>{state.inventoryPage--;renderInventory();});$('#inventory-next').addEventListener('click',()=>{state.inventoryPage++;renderInventory();});$('#inventory-page').addEventListener('change',()=>{state.inventoryPage=Number($('#inventory-page').value);renderInventory();});
     $('#jobs-list').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);}); $('#recent-activity').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);});
     $('#save-settings').addEventListener('click',saveSettings); $('#language-search').addEventListener('input',renderLanguageList); $('#add-language').addEventListener('click',addCustomLanguage); $('#custom-language').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addCustomLanguage();}});
     $$('[data-open-languages]').forEach(button=>button.addEventListener('click',()=>openLanguageDialog(button.dataset.openLanguages)));
