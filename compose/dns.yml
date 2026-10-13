@@ -3,7 +3,7 @@ services:
   unbound:
     container_name: unbound
     image: mvance/unbound:latest
-    mem_limit: 128m
+    mem_limit: 64m
     restart: unless-stopped
     environment:
       - PUID=1000
@@ -20,7 +20,7 @@ services:
   adguardhome:
     image: adguard/adguardhome:latest
     container_name: adguardhome
-    mem_limit: 256m
+    mem_limit: 192m
     restart: unless-stopped
     environment:
       - PUID=1000

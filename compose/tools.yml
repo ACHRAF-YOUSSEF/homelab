@@ -3,7 +3,7 @@ services:
   it-tools:
     image: corentinth/it-tools:latest
     container_name: it-tools
-    mem_limit: 128m
+    mem_limit: 64m
     ports:
       - 8888:80
     restart: unless-stopped
@@ -14,7 +14,7 @@ services:
   stirling-pdf:
     image: stirlingtools/stirling-pdf:latest
     container_name: stirling-pdf
-    mem_limit: 2g
+    mem_limit: ${STIRLING_PDF_MEMORY_LIMIT:-1536m}
     ports:
       - "48537:8080"
     volumes:

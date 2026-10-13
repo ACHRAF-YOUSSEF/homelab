@@ -17,6 +17,7 @@ unavailable, assign the same scoped responsibility to an available agent.
 | `docs_maintainer` | `gpt-6-luna`, medium | Scoped Markdown edits, platform examples, link checks |
 | `validation_runner` | `gpt-6-luna`, medium | Scoped tests, workflow linting, privacy and config checks |
 | `security_reviewer` | `gpt-6.1-sol`, high | Docker access, CI trust boundaries, leak/security review |
+| `rust_specialist` | Personal profile | Safe Rust implementation and review; preserve `unsafe_code = "forbid"`, bounded resource use, and least privilege |
 
 The project default for subagents is the smaller model; the role definitions
 are personal global configuration rather than repository files. Assign a

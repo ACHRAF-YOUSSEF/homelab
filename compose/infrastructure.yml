@@ -3,7 +3,7 @@ services:
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
-    mem_limit: 128m
+    mem_limit: 96m
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     restart: unless-stopped
     networks:
@@ -34,7 +34,7 @@ services:
   docker-proxy:
     image: tecnativa/docker-socket-proxy:v0.5.0
     container_name: portracker-docker-proxy
-    mem_limit: 128m
+    mem_limit: 64m
     restart: unless-stopped
     environment:
       - CONTAINERS=1
@@ -51,7 +51,7 @@ services:
   portracker:
     image: mostafawahied/portracker:latest
     container_name: portracker
-    mem_limit: 256m
+    mem_limit: 192m
     restart: unless-stopped
     pid: "host"
     cap_add:
@@ -75,7 +75,7 @@ services:
   nginx-proxy-manager:
     image: jc21/nginx-proxy-manager:latest
     container_name: nginx-proxy-manager
-    mem_limit: 512m
+    mem_limit: 384m
     environment:
       - PUID=1000
       - PGID=1000
@@ -119,7 +119,7 @@ services:
   glance:
     container_name: glance
     image: glanceapp/glance:latest
-    mem_limit: 256m
+    mem_limit: 192m
     restart: unless-stopped
     volumes:
       - ../glance/config:/app/config:ro
@@ -200,7 +200,7 @@ services:
     build:
       context: ../glance/live
     container_name: glance-live
-    mem_limit: 128m
+    mem_limit: 96m
     restart: unless-stopped
     read_only: true
     user: "10001:10001"
@@ -237,7 +237,7 @@ services:
   uptime-kuma:
     image: louislam/uptime-kuma:2
     container_name: uptime-kuma
-    mem_limit: 512m
+    mem_limit: 384m
     volumes:
       - ../uptime-kuma:/app/data
     ports:

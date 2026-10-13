@@ -1,9 +1,22 @@
-FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS build
+WORKDIR /build
+ENV CARGO_BUILD_JOBS=1
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+COPY web/ ./web/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo test --lib --locked \
+    && cargo build --release --locked \
+    && cp target/release/subforge /build/subforge
+
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl ffmpeg libicu72 libfontconfig1 libgssapi-krb5-2 \
       fonts-dejavu-core iso-codes mkvtoolnix tesseract-ocr tesseract-ocr-all \
+      procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Official, self-contained Subtitle Edit CLI; verify each architecture's asset.
@@ -28,14 +41,23 @@ RUN groupadd --gid 1000 converter \
     && mkdir /data \
     && chown converter:converter /data
 WORKDIR /app
-COPY converter.py server.py integrations.py http_client.py ./
-COPY web/ ./web/
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
-    DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet \
-    OMP_THREAD_LIMIT=2
+COPY --from=build /build/subforge /usr/local/bin/subforge
+ENV DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet \
+    OMP_THREAD_LIMIT=1 \
+    CONVERTER_ENABLE_OCR=false
 USER 1000:1000
 EXPOSE 8100
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)" || exit 1
+    CMD ["/usr/local/bin/subforge", "healthcheck"]
 # Container listener; Compose publishes only the configured host interface.
-CMD ["python", "server.py", "--host", "0.0.0.0"]
+CMD ["/usr/local/bin/subforge", "--host", "0.0.0.0"]
+
+# Python is a test harness dependency only, excluded from the final app image.
+FROM runtime AS test
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY tests/ /tests/
+USER 1000:1000
+
+FROM runtime AS final

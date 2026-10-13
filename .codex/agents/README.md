@@ -10,6 +10,7 @@ Read [AGENTS.md](../../AGENTS.md) for homelab-specific privacy, Docker access, d
 | `docs_maintainer` | `gpt-6-luna`, medium | Maintain focused project documentation. |
 | `validation_runner` | `gpt-6-luna`, medium | Run requested validation and report results. |
 | `security_reviewer` | `gpt-6.1-sol`, high | Read-only security review of code and configuration. |
+| `rust_specialist` | Personal profile | Safe Rust implementation and review with bounded resource use and least privilege. The profile uses workspace-write access with network disabled and forbids `unsafe` code. The profile is installed in the maintainer's global Codex agents directory; it is not shipped by this repository. |
 
 Keep routine exploration, documentation, and validation on the smaller model. Reserve the stronger security profile for work that needs deeper security judgment. Each personal profile selects its own model and effort; it does not change the primary agent's model. The repository's [.codex/config.toml](../config.toml) still supplies a smaller default for other subagents and limits concurrent child agents to three while working in this project.
 

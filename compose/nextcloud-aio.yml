@@ -3,7 +3,7 @@ services:
   nextcloud-docker-proxy:
     build:
       context: ../docker-proxy/aio
-    mem_limit: 128m
+    mem_limit: 64m
     restart: unless-stopped
     network_mode: none
     # Match the real daemon socket's group without running the proxy as root.

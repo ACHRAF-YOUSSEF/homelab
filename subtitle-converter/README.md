@@ -1,6 +1,6 @@
 # Subforge — Automatic Subtitle Conversion
 
-**Subforge** is the name of the subtitle-conversion dashboard. The Compose service and folder remain `subtitle-converter`. It is an opt-in watcher and local web dashboard that creates UTF-8 SubRip (`.srt`) sidecars from embedded subtitle tracks and supported subtitle files, using the official [Subtitle Edit command-line converter](https://github.com/SubtitleEdit/subtitleedit/releases) and Tesseract for image tracks. The container is built locally from the pinned converter release.
+**Subforge** is the name of the subtitle-conversion dashboard. The Compose service and folder remain `subtitle-converter`. It is an opt-in Rust watcher and local web dashboard that creates UTF-8 SubRip (`.srt`) sidecars from embedded subtitle tracks and supported subtitle files. FFmpeg handles common text tracks; TTML and SBV sidecars use the official [Subtitle Edit command-line converter](https://github.com/SubtitleEdit/subtitleedit/releases) even when OCR is disabled. Image-based subtitle tracks use Subtitle Edit with Tesseract OCR only when OCR is explicitly enabled. The runtime image is built locally with a pinned Rust builder and a Debian Bookworm runtime; it does not include Python.
 
 ## Start the service
 
@@ -18,7 +18,7 @@ Open the responsive Subforge dashboard at `http://localhost:8100`. Routes are bo
 docker compose --profile subtitle-conversion exec subtitle-converter cat /data/ui-password
 ```
 
-Alternatively, set `CONVERTER_UI_PASSWORD` in the ignored root `.env` to a private password of at least 12 characters. The named `subtitle_converter_data` volume preserves the generated password, jobs, settings, and scan state across container rebuilds.
+Alternatively, set `CONVERTER_UI_PASSWORD` in the ignored root `.env` to a private password of at least 12 characters. The named `subtitle_converter_data` volume preserves the generated password, jobs, settings, preferences, and scan state across container rebuilds. The Rust runtime reads the existing JSON state/settings/preferences/history files and password, preserving compatible data when the image is upgraded; Jellyfin connection details remain managed through environment variables.
 
 ### Troubleshoot startup
 
@@ -34,9 +34,9 @@ Compose publishes container port `8100` on host port `8100`, bound to `127.0.0.1
 
 The breadcrumb and refresh button stay fixed at the top while scrolling. On desktop, the small chevron at the bottom of the sidebar collapses or expands navigation; the preference is remembered in that browser. On mobile, a separate hamburger button in the header opens and closes the navigation drawer.
 
-The build downloads Subtitle Edit's Linux `seconv` v5.2.0 release and checks its SHA-256 digest for `amd64` or `arm64`. Docker needs network access while building, and the running service uses the `homelab` network for its web UI and configured integrations. It has no GPU reservation or Docker socket. The process runs as UID/GID 1000 with a read-only container root, dropped capabilities, and `no-new-privileges`; it writes generated SRTs into the mounted libraries and private state into `/data`.
+Docker needs network access while building the pinned Rust application and OCR tool. The running service uses the `homelab` network for its web UI and configured integrations. It has no GPU reservation or Docker socket. The process runs as UID/GID 1000 with a read-only container root, dropped capabilities, and `no-new-privileges`; it writes generated SRTs into the mounted libraries and private state into `/data`. The runtime image contains the Rust executable and media tools, not Python. The bounded HTTP server has four request workers and a 16-connection queue; the job queue is limited to 32 and one conversion worker runs one media-tool child at a time.
 
-The dashboard's Overview shows conversion progress, queue, recent activity, and live logs. **Library → Refresh inventory** lists files and subtitle tracks without changing media; select an item to extract tracks with the selected languages. Search matches filenames and full paths case-insensitively and combines with the root and media-type filters. The inventory displays 25 rows per page by default; choose 25, 50, or 100 rows, then use Previous/Next or the page selector to navigate. Changing search, filters, or page size returns to page one; background status refreshes preserve the current page when possible. Inspections return at most 2,000 files, and the Library page identifies a capped result so you can inspect a smaller root. **Scan and extract** queues automatic conversion for the chosen roots. The Activity page shows queued, running, and completed jobs and lets you cancel queued or running work. Settings stores default languages in the data volume.
+The dashboard's Overview shows conversion progress, queue, recent activity, and live logs. **Library → Refresh inventory** lists files and subtitle tracks without changing media; select an item to extract tracks with the selected languages. Search matches filenames and full paths case-insensitively and combines with the root and media-type filters. The inventory displays 25 rows per page by default; choose 25, 50, or 100 rows, then use Previous/Next or the page selector to navigate. Changing search, filters, or page size returns to page one; background status refreshes preserve the current page when possible. Inspections return at most 2,000 files, and the Library page identifies a capped result so you can inspect a smaller root. **Scan and extract** queues automatic conversion for the chosen roots. The Activity page shows queued, running, and completed jobs and lets you cancel queued or running work. Settings stores default languages in the data volume; **Settings → General** shows whether OCR is enabled for the running service. OCR is controlled by environment configuration, not a dashboard toggle.
 
 Overview's Recent activity, Quick extraction, and Live log panels; the Library inventory; Activity's Jobs list; and the settings cards for languages, hooks, root folders, Sonarr, Radarr, Bazarr, and Jellyfin can be collapsed. The browser remembers each panel's open or collapsed state. Job failures, per-file conversion causes, integration notifications, and refresh results appear in a collapsed disclosure grouped by origin, provider, and repeated message, with a count and a preview; opening it shows bounded examples and, when a provider is identified, a shortcut to its settings. Jobs that finish processing files with failures are marked **Completed with errors**. The disclosure's open state and scroll position are preserved during status refreshes. Integration diagnostics give a safe HTTP or connection category without exposing API keys or raw server responses; they explain errors but do not repair an integration configuration.
 
@@ -58,7 +58,7 @@ After changing only either URL, recreate Glance. A `404` status means the widget
 
 The watcher scans movie and TV folders recursively for supported video files (`.mkv`, `.mks`, `.mp4`, `.m4v`, `.webm`, `.mov`, `.avi`, `.ts`, `.m2ts`) and sidecars (`.ass`, `.ssa`, `.vtt`, `.ttml`, `.smi`, `.sami`, `.sbv`, `.sup`, `.sub`, `.idx`). It exports each supported embedded subtitle track and converts sidecars to SRT beside the source. Existing SRT files are not inputs, and generated files never replace existing files. For example, an embedded English track may produce `Example.en.srt`; duplicate or unknown tracks receive track-number suffixes, and forced or hearing-impaired flags are retained in the name when available. Empty, correctly timed subtitle cues are removed from the converter's staged output before validation. A malformed SRT still fails validation and is not published. If a source later changes, an existing SRT is still left as-is; the converter does not refresh or overwrite it automatically.
 
-Text tracks keep their subtitle language. Image-based tracks use Tesseract OCR with the language inferred from embedded track metadata, a VobSub IDX language section, or a language suffix in a sidecar filename. The image OCR language packs are installed in the container. If the language cannot be identified, `CONVERTER_OCR_LANGUAGE` supplies the fallback and defaults to `eng`; OCR does not detect a language by recognizing the subtitle image itself. Use filenames such as `Example.fr.sup` when an image sidecar has no other language metadata. Language metadata and available OCR language packs affect image conversion; codecs or formats that Subtitle Edit cannot read can still fail.
+Common text tracks keep their subtitle language and are converted with FFmpeg. TTML and SBV sidecars use the Subtitle Edit fallback converter; this path runs with OCR disabled too, because it converts text formats. Image-based tracks use Tesseract OCR through Subtitle Edit only when `CONVERTER_ENABLE_OCR=true`; OCR is disabled by default and the **Settings → General** screen shows whether the running service has OCR permission. The OCR language is inferred from embedded track metadata, a VobSub IDX language section, or a language suffix in a sidecar filename. The image OCR language packs are installed in the container. If the language cannot be identified, `CONVERTER_OCR_LANGUAGE` supplies the fallback and defaults to `eng`; OCR does not detect a language by recognizing the subtitle image itself. Use filenames such as `Example.fr.sup` when an image sidecar has no other language metadata. Language metadata and available OCR language packs affect image conversion; codecs or formats that the tools cannot read can still fail.
 
 OCR takes longer than exporting text tracks and can misread names, punctuation, or stylized text. Review OCR output before relying on it. SRT cannot preserve ASS styling, positioning, or karaoke effects. Subtitle Edit warnings and conversion failures appear in the service logs; the watcher keeps source files and existing SRTs. It waits until an input's modification age reaches the configured minimum, retries failed inputs after the configured retry interval, and records successful fingerprints in its persistent state volume. If the state volume is removed, inputs are scanned and processed again; existing output SRTs remain protected.
 
@@ -78,6 +78,8 @@ The Compose service lets you change the four host-side library folders through `
 | `CONVERTER_MIN_AGE` | Minimum file modification age before conversion, in seconds | `120` |
 | `CONVERTER_TIMEOUT` | Maximum runtime for an individual conversion operation, in seconds | `7200` |
 | `CONVERTER_RETRY_INTERVAL` | Delay before retrying a failed unchanged input, in seconds | `3600` |
+| `CONVERTER_MEMORY_LIMIT` | Container memory ceiling; 512 MiB is a text-only option | `1536m` |
+| `CONVERTER_ENABLE_OCR` | Enable OCR for image subtitle tracks; requires a compatible memory ceiling | `false` |
 | `CONVERTER_OCR_LANGUAGE` | Tesseract fallback language for unknown image-subtitle language | `eng` |
 | `CONVERTER_BIND_ADDRESS` | Host interface for the dashboard publication | `127.0.0.1` |
 | `CONVERTER_ALLOWED_HOSTS` | Comma-separated `Host` header allowlist; preserve the defaults and add your browser hostname if needed | `localhost,127.0.0.1,::1,subtitle-converter` |
@@ -109,39 +111,58 @@ Jellyfin uses the existing `JELLYFIN_INTERNAL_URL` and `JELLYFIN_API_KEY` enviro
 
 If Jellyfin uses different paths, add mappings on its Settings tab. A native Windows path such as `D:\Media\Movies` can map to the converter's `/movies` mount; `C:\Media\TV` can map to `/tv-C`. This also translates the newly created SRT paths back into the paths Jellyfin sees.
 
-## Run once or preview
+### Safe integration diagnostic
 
-The container runs repeated scans by default. The standalone script supports `--once` to scan and convert once, or `--dry-run` to list inputs that would be processed without writing files. Repeat `--language CODE` to limit extraction languages; omitting it selects all supported tracks. For native use, install Python 3, Subtitle Edit's `seconv` v5.2.0, FFmpeg/`ffprobe`, MKVToolNix/`mkvmerge`, Tesseract with the needed trained data, and (for full language metadata mapping) the `iso-codes` data package. Then run the script with one or more `--root` options for actual library paths. The script itself uses only the Python standard library. See the [Subtitle Edit releases](https://github.com/SubtitleEdit/subtitleedit/releases), [Tesseract documentation](https://tesseract-ocr.github.io/), [FFmpeg downloads](https://ffmpeg.org/download.html), and [MKVToolNix downloads](https://mkvtoolnix.download/downloads.html) for platform-specific installers.
-
-The script's default state path is `/data/state.json`, which is writable in the container because `/data` is the persistent state volume. Native runs should pass `--state` with a writable state-file path.
-
-For example, PowerShell can preview and then process two explicit roots:
-
-```powershell
-$converterState = Join-Path $env:LOCALAPPDATA 'subtitle-converter\state.json'
-python .\subtitle-converter\converter.py --root 'D:\Media\Movies' --root 'D:\Media\TV' --state $converterState --dry-run
-python .\subtitle-converter\converter.py --root 'D:\Media\Movies' --root 'D:\Media\TV' --state $converterState --once
-```
-
-On macOS or Linux, use `python3` and absolute paths:
+The Rust executable includes a read-only connection check for configured media integrations. Run it from the repository root with the service running:
 
 ```shell
-converter_state="${XDG_STATE_HOME:-$HOME/.local/state}/subtitle-converter/state.json"
-python3 subtitle-converter/converter.py --root /srv/media/movies --root /srv/media/tv --state "$converter_state" --once
+docker compose --profile subtitle-conversion exec subtitle-converter subforge integration-check bazarr
 ```
 
-Without `--once` or `--dry-run`, the script repeats scans using `CONVERTER_SCAN_INTERVAL`.
+Replace `bazarr` with `sonarr`, `radarr`, or `jellyfin` to check another integration. The diagnostic uses the converter's configured credentials, prints only the provider, connection result, and—for Jellyfin—library/selection counts. It does not print server addresses, library names, API keys, or raw server responses. A nonzero exit status means the configured connection check failed; use the dashboard's safe diagnostic and service logs for next steps. This check verifies connectivity only and does not change server settings or queue scans.
 
-The native language map is limited if the operating system does not provide `/usr/share/iso-codes/json/iso_639-2.json`; install its `iso-codes` package or use `CONVERTER_OCR_LANGUAGE` for the fallback OCR language.
+## Memory use and OCR
+
+Compose and `.env.example` give Subforge a `1536m` memory ceiling by default while keeping image OCR disabled. To enable image-track extraction, set `CONVERTER_ENABLE_OCR=true` in the private `.env` and recreate the service; the default ceiling already matches the OCR configuration. When OCR remains disabled, a text-only deployment can set `CONVERTER_MEMORY_LIMIT=512m`, but TTML and SBV use Subtitle Edit even without OCR, so validate the limit against your subtitle formats. The General settings screen reports whether OCR is enabled; it does not change the environment-controlled permission. Subforge limits the OCR library to one OpenMP thread and runs one conversion child at a time. These are maximums for the container, not memory reserved on the host; Docker uses less when the workload needs less.
+
+See the repository's [memory budget guide](../docs/memory-budget.md) for the other example workload ceilings, Nextcloud AIO child limits, and a dry-run-first, reversible helper. Measure actual peak use under your own workload and leave room for the host, Docker Desktop or the Docker daemon, and host applications such as LM Studio.
+
+## Run the Rust application natively
+
+For native development, install Rust and Cargo, FFmpeg/`ffprobe`, and MKVToolNix/`mkvmerge`. Install Subtitle Edit `seconv` v5.2.0 and Tesseract with the needed trained data only if you enable OCR. The Docker image bundles the required Linux tools, but native installs are managed by the host operating system. See [FFmpeg downloads](https://ffmpeg.org/download.html), [MKVToolNix downloads](https://mkvtoolnix.download/downloads.html), the [Subtitle Edit releases](https://github.com/SubtitleEdit/subtitleedit/releases), and [Tesseract documentation](https://tesseract-ocr.github.io/).
+
+PowerShell example with two Windows media roots and persistent application data:
+
+```powershell
+$subforgeData = Join-Path $env:LOCALAPPDATA 'Subforge'
+New-Item -ItemType Directory -Force -Path $subforgeData | Out-Null
+cargo run --manifest-path .\subtitle-converter\Cargo.toml -- --host 127.0.0.1 --data $subforgeData --root 'D:\Media\Movies' --root 'D:\Media\TV'
+```
+
+On macOS/Linux, use native paths and a user state directory:
+
+```shell
+subforge_data="${XDG_STATE_HOME:-$HOME/.local/state}/subforge"
+mkdir -p "$subforge_data"
+cargo run --manifest-path subtitle-converter/Cargo.toml -- --host 127.0.0.1 --data "$subforge_data" --root /srv/media/movies --root /srv/media/tv
+```
+
+The native server scans periodically by default; pass `--no-auto-scan` to disable scheduled scans. Set environment variables such as `CONVERTER_ENABLE_OCR`, `CONVERTER_OCR_LANGUAGE`, and the media-server integration URLs/keys in the shell environment before running. Keep API keys private.
 
 ## Development checks
 
-Run the converter's Python fixture tests from the repository root:
+Run the Rust test suite from the repository root:
 
 ```shell
-python -m unittest discover -s subtitle-converter -p 'test_*.py'
+cargo test --locked --manifest-path subtitle-converter/Cargo.toml
 ```
 
-The security audit workflow also builds the pinned converter image and runs its integration fixtures with networking disabled and no host media mounted. Those fixtures cover text extraction and local OCR; they do not verify every media codec, language, or platform filesystem.
+Build the production binary without updating locked dependencies:
 
-Set `CONVERTER_SECONV`, `CONVERTER_FFPROBE`, and `CONVERTER_MKVMERGE` if the tools are not available on `PATH`. Native deployments should also set `CONVERTER_OCR_LANGUAGE` for unknown-language image subtitles. The native process must be able to create temporary files next to each input so completed SRTs can be published without overwriting existing files.
+```shell
+cargo build --locked --release --manifest-path subtitle-converter/Cargo.toml
+```
+
+OCR coverage and third-party media tools can vary by codec, language data, and filesystem; successful Rust tests do not establish behavior for every media file or deployment.
+
+The legacy Python implementation and its fixture tests remain in the repository as reference material while Rust parity checks continue; they are not part of the runtime image. Native Rust development requires the tools listed above and permission to create temporary files next to each input so completed SRTs can be published without overwriting existing files.

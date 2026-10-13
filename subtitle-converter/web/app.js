@@ -325,6 +325,9 @@
   const loadSettings = async () => {
     try {
       const data=await api('/api/settings'); state.settings=data; state.selectedLanguages=data.languages || ['*'];
+      const ocrEnabled=data.permissions?.ocr===true;
+      setText($('#ocr-permission-state'),ocrEnabled?'Enabled':'Locked');
+      setText($('#ocr-permission-note'),ocrEnabled?'Image subtitle extraction is enabled for this service.':'Text subtitles are enabled. To include image subtitles, enable CONVERTER_ENABLE_OCR and use a 1536 MiB memory limit.');
       for (const provider of ['sonarr','radarr','jellyfin','bazarr']) { const node=$(`#${provider}-settings`); node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})})); }
       updateLanguageLabels(); updateHookStates();
     } catch(error) { notify(`Could not load settings: ${error.message}`,'error'); }

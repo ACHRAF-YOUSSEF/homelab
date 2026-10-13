@@ -137,6 +137,43 @@ jobs:
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: pip-audit --strict --requirement glance/live/requirements.txt --progress-spinner off
 
+  subtitle-converter-rust:
+    name: Subforge Rust checks and dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up locked Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: 1.90.0
+          components: clippy, rustfmt
+          build-warnings: ''
+          cache: false
+
+      - name: Check Rust formatting
+        working-directory: subtitle-converter
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust lint and tests with warnings denied
+        working-directory: subtitle-converter
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+
+      - name: Install pinned RustSec audit tool
+        run: cargo install --locked cargo-audit --version 0.22.2
+
+      - name: Audit locked Rust dependencies
+        working-directory: subtitle-converter
+        run: cargo audit --file Cargo.lock --deny warnings
+
   subtitle-conversion:
     name: Subtitle conversion with isolated media and OCR fixtures
     runs-on: ubuntu-24.04
@@ -147,17 +184,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build pinned converter
-        run: docker build --tag subtitle-converter-test subtitle-converter
+      - name: Build isolated Rust runtime test stage
+        run: docker build --target test --tag subtitle-converter-test subtitle-converter
 
-      - name: Test text extraction and local OCR without network or host media
+      - name: Test text extraction with OCR disabled in a 512 MiB memory limit
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \
-            --security-opt no-new-privileges --memory 2g --cpus 2 --pids-limit 128 \
+            --security-opt no-new-privileges --memory 512m --cpus 2 --pids-limit 128 \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter,target=/tests,readonly" \
-            --workdir /tests --env CONVERTER_INTEGRATION=1 --entrypoint python \
-            subtitle-converter-test -m unittest discover -s . -p 'test_*.py'
+            --env OMP_THREAD_LIMIT=1 --entrypoint python3 \
+            subtitle-converter-test /tests/rust_smoke.py --text-only
+
+      - name: Test OCR extraction without network or host media
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 1536m --cpus 2 --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --env OMP_THREAD_LIMIT=1 --entrypoint python3 \
+            subtitle-converter-test /tests/rust_smoke.py
 
   frontend-dependencies:
     name: Frontend dependency audit including build tools
