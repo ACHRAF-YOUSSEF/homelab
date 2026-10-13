@@ -5,6 +5,10 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("Subforge {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("integration-check") {
         let provider = std::env::args().nth(2).unwrap_or_default();
         if !["sonarr", "radarr", "bazarr", "jellyfin"].contains(&provider.as_str())

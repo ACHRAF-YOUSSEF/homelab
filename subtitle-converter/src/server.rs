@@ -1,8 +1,9 @@
 //! A bounded HTTP/1.1 dashboard. Fixed worker counts and bounded headers/body
 //! prevent request traffic from allocating a thread or unbounded input buffer.
 
-use crate::converter::Converter;
+use crate::converter::{Converter, Workload};
 use crate::integrations::Integrations;
+use crate::tasks::Scheduler;
 use crate::util::{constant_equal, now, read_json, token, write_private};
 use base64::Engine;
 use serde_json::{Value, json};
@@ -75,8 +76,9 @@ pub struct App {
     webhook: String,
     widget: String,
     hosts: HashSet<String>,
-    interval: Duration,
-    auto_scan: bool,
+    scheduler: Mutex<Scheduler>,
+    started: Instant,
+    ocr_permission: bool,
     shutdown: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     wake: Condvar,
@@ -171,6 +173,7 @@ fn inventory_rows(value: &Value, mounts: &[PathBuf], roots: &[PathBuf]) -> Vec<V
         }).collect::<Vec<_>>();
         let root_id = roots.iter().filter(|root| Path::new(path).starts_with(root)).max_by_key(|root| root.components().count()).map(|root| root_info(root, mounts)["id"].clone()).unwrap_or(Value::Null);
         let mut result = json!({"path":path,"name":name,"root_id":root_id,"type":if row["type"]=="sidecar" {"sidecar"} else {"video"},"tracks":tracks});
+        if row["metadata_pending"] == true { result["metadata_pending"] = json!(true); }
         if let Some(error) = row["error"].as_str() { result["error"] = json!(error.chars().take(256).collect::<String>()); }
         Some(result)
     }).collect()
@@ -204,6 +207,13 @@ impl App {
             }
         }
         let converter = Converter::new(mounts.clone(), data.join("state.json"))?;
+        let ocr_permission = converter.ocr_allowed();
+        let schedule_path = data.join("tasks.json");
+        let new_schedule = !schedule_path.exists();
+        let mut scheduler = Scheduler::new(schedule_path, now(), auto_scan)?;
+        if new_schedule && interval.as_secs() >= 21600 {
+            scheduler.update(&json!({"tasks":[{"id":"discovery","enabled":true,"interval_seconds":interval.as_secs().min(2592000)}]}), now())?;
+        }
         let integrations = Integrations::new(data.join("settings.json"))?;
         let mut runtime = Runtime {
             roots: mounts.clone(),
@@ -332,8 +342,9 @@ impl App {
             webhook: std::env::var("CONVERTER_WEBHOOK_TOKEN").unwrap_or_default(),
             widget,
             hosts,
-            interval,
-            auto_scan,
+            scheduler: Mutex::new(scheduler),
+            started: Instant::now(),
+            ocr_permission,
             shutdown: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             wake: Condvar::new(),
@@ -354,6 +365,14 @@ impl App {
         }
     }
     fn settings(&self) -> Value {
+        let schedule = lock(&self.scheduler).public();
+        let scan_interval = schedule["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|task| task["id"] == "discovery")
+            .map(|task| task["interval_seconds"].clone())
+            .unwrap_or(json!(21600));
         let public = lock(&self.public_integrations).clone();
         let runtime = lock(&self.runtime);
         let mut connections = json!({});
@@ -363,7 +382,7 @@ impl App {
         for name in ["sonarr", "radarr"] {
             connections[name]["webhook_enabled"] = json!(!self.webhook.is_empty());
         }
-        json!({"languages":runtime.languages,"integrations":connections,"path_mappings":public["path_mappings"],"scan_interval":self.interval.as_secs(),"permissions":{"ocr":std::env::var("CONVERTER_ENABLE_OCR").is_ok_and(|value|value=="true" || value=="1")},"runtime":"rust"})
+        json!({"languages":runtime.languages,"integrations":connections,"path_mappings":public["path_mappings"],"scan_interval":scan_interval,"permissions":{"ocr":std::env::var("CONVERTER_ENABLE_OCR").is_ok_and(|value|value=="true" || value=="1")},"runtime":"rust","version":env!("CARGO_PKG_VERSION")})
     }
     fn status(&self) -> Value {
         let settings = self.settings();
@@ -374,7 +393,49 @@ impl App {
                 job["status"] = json!(completed_status(job));
             }
         }
-        json!({"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial},"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"settings":settings})
+        json!({"version":env!("CARGO_PKG_VERSION"),"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial},"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"settings":settings})
+    }
+    fn tasks(&self) -> Value {
+        let mut value = lock(&self.scheduler).public();
+        let runtime = lock(&self.runtime);
+        for task in value["tasks"].as_array_mut().into_iter().flatten() {
+            let active = runtime
+                .running
+                .iter()
+                .chain(runtime.queue.iter())
+                .find(|job| job["task_id"] == task["id"]);
+            task["job_id"] = active.map(|job| job["id"].clone()).unwrap_or(Value::Null);
+            if let Some(job) = active {
+                task["status"] = job["status"].clone();
+            }
+        }
+        value
+    }
+    fn system(&self) -> Value {
+        let schedule = lock(&self.scheduler).public();
+        let interval = schedule["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|task| task["id"] == "discovery")
+            .map(|task| task["interval_seconds"].clone())
+            .unwrap_or(json!(21600));
+        json!({"version":env!("CARGO_PKG_VERSION"),"runtime":"rust","os":std::env::consts::OS,"arch":std::env::consts::ARCH,"uptime_seconds":self.started.elapsed().as_secs(),"resource_policy":{"conversion_workers":1,"ocr_threads":1,"metadata_cache_max_bytes":33554432,"metadata_cache_max_entries":2000,"discovery_interval_seconds":interval,"ocr_permission":std::env::var("CONVERTER_ENABLE_OCR").is_ok_and(|value|value=="true" || value=="1"),"automatic_ocr_new_or_changed_only":true},"scheduler":{"paused":schedule["paused"]}})
+    }
+    fn enqueue_task(&self, id: &str, origin: &str, retry: bool) -> Result<Option<Value>, String> {
+        let kind = match id {
+            "discovery" => "scan",
+            "ocr" => "ocr",
+            "inventory" => "inspect",
+            "health" => "health",
+            "cleanup" => "cleanup",
+            "backup" => "backup",
+            _ => return Err("Unknown task".into()),
+        };
+        if id == "ocr" && !self.ocr_permission {
+            return Err("OCR is disabled by deployment permissions".into());
+        }
+        self.enqueue(&json!({"kind":kind,"task_id":id,"retry":retry}), origin)
     }
     fn inventory(&self) -> Value {
         let runtime = lock(&self.runtime);
@@ -387,7 +448,7 @@ impl App {
             .running
             .iter()
             .chain(runtime.history.iter().rev())
-            .find(|job| job["kind"] == "scan" || job["kind"] == "extract");
+            .find(|job| ["scan", "extract", "ocr"].contains(&job["kind"].as_str().unwrap_or("")));
         let failures = scan.map_or(0, |job| count(&job["summary"]["failed"]));
         json!({"converted_count":runtime.converted.len(),"current_run":current,"queued_count":runtime.queue.len(),"configured_root_count":runtime.roots.len(),"selected_languages":runtime.languages,"recent_failures_count":failures})
     }
@@ -492,7 +553,14 @@ impl App {
     }
     fn enqueue(&self, data: &Value, origin: &str) -> Result<Option<Value>, String> {
         let kind = data["kind"].as_str().unwrap_or("scan");
-        if !["scan", "inspect", "extract", "refresh"].contains(&kind) {
+        if kind == "ocr" && !self.ocr_permission {
+            return Err("OCR is disabled by deployment permissions".into());
+        }
+        if ![
+            "scan", "inspect", "extract", "refresh", "ocr", "health", "cleanup", "backup",
+        ]
+        .contains(&kind)
+        {
             return Err("Unknown job type".into());
         }
         let provider = data["provider"].as_str().unwrap_or("");
@@ -500,6 +568,20 @@ impl App {
             return Err("Unknown integration".into());
         }
         let mut runtime = lock(&self.runtime);
+        let task_id = if ["schedule", "task_manual"].contains(&origin) {
+            data["task_id"].as_str().unwrap_or("")
+        } else {
+            ""
+        };
+        if !task_id.is_empty()
+            && runtime
+                .running
+                .iter()
+                .chain(runtime.queue.iter())
+                .any(|job| job["task_id"] == task_id)
+        {
+            return Err("Task is already queued or running".into());
+        }
         if origin == "schedule" && (runtime.running.is_some() || !runtime.queue.is_empty()) {
             return Ok(None);
         }
@@ -549,7 +631,20 @@ impl App {
         if data.get("retry").is_some_and(|retry| !retry.is_boolean()) {
             return Err("Invalid retry option".into());
         }
-        let job = json!({"id":token(8),"kind":kind,"status":"queued","created":now(),"started":null,"finished":null,"current":null,"summary":{},"error":null,"results":[],"languages":languages,"root_ids":roots.iter().map(|root|root_info(root,&self.mounts)["id"].clone()).collect::<Vec<_>>(),"root_paths":roots,"paths":paths,"retry":data["retry"].as_bool().unwrap_or(false),"origin":origin,"provider":provider,"processed":0,"total":0});
+        if data
+            .get("include_ocr")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("Invalid OCR option".into());
+        }
+        if kind == "scan" && data["include_ocr"] == true {
+            return Err("Use selected-file extraction or the OCR task to run OCR".into());
+        }
+        let include_ocr = kind == "ocr"
+            || (kind == "extract"
+                && origin == "manual"
+                && data["include_ocr"].as_bool().unwrap_or(true));
+        let job = json!({"id":token(8),"task_id":task_id,"workload":if kind=="ocr" {"ocr"}else if include_ocr {"all"}else{"text"},"include_ocr":include_ocr,"kind":kind,"status":"queued","created":now(),"started":null,"finished":null,"current":null,"summary":{},"error":null,"results":[],"languages":languages,"root_ids":roots.iter().map(|root|root_info(root,&self.mounts)["id"].clone()).collect::<Vec<_>>(),"root_paths":roots,"paths":paths,"retry":data["retry"].as_bool().unwrap_or(false),"origin":origin,"provider":provider,"processed":0,"total":0});
         runtime.queue.push_back(job.clone());
         self.wake.notify_one();
         Ok(Some(job))
@@ -660,6 +755,27 @@ impl App {
         }
     }
     fn execute(&self, job: &Value, integrations: &mut Integrations) -> Result<(), String> {
+        if ["health", "cleanup", "backup"].contains(&job["kind"].as_str().unwrap_or("")) {
+            let result = match job["kind"].as_str().unwrap_or("") {
+                "cleanup" => lock(&self.converter).compact_cache()?,
+                "backup" => crate::maintenance::backup(&self.data, &self.cancel)?,
+                _ => {
+                    let unavailable = self
+                        .mounts
+                        .iter()
+                        .filter(|path| !path.is_dir() || symlink_component(path))
+                        .count();
+                    json!({"configured_mounts":self.mounts.len(),"unavailable_mounts":unavailable,"state_directory_available":self.data.is_dir() && !symlink_component(&self.data),"network_checks":0})
+                }
+            };
+            if let Some(running) = lock(&self.runtime).running.as_mut() {
+                running["results"] = json!([result]);
+                running["summary"] = json!({"processed":1});
+                running["processed"] = json!(1);
+                running["total"] = json!(1);
+            }
+            return Ok(());
+        }
         if job["kind"] == "refresh" {
             let result = integrations.refresh(
                 job["provider"].as_str().unwrap_or(""),
@@ -675,8 +791,10 @@ impl App {
             .iter()
             .map(|path| validate_root(Path::new(path), &self.mounts, false))
             .collect::<Result<Vec<_>, _>>()?;
-        let paths = if strings(&job["paths"]).is_empty() {
-            Converter::candidates(&roots)
+        let paths = if job["kind"] == "ocr" {
+            lock(&self.converter).ocr_candidates(&roots, job["retry"].as_bool().unwrap_or(false))
+        } else if strings(&job["paths"]).is_empty() {
+            Converter::candidates_with_stop(&roots, &self.cancel)
         } else {
             strings(&job["paths"])
                 .iter()
@@ -691,10 +809,18 @@ impl App {
                 .iter()
                 .map(|path| Converter::safe_path(&path.to_string_lossy(), &roots))
                 .collect::<Result<Vec<_>, _>>()?;
-            let summary = lock(&self.converter).scan(
+            let workload = match job["workload"].as_str().unwrap_or("text") {
+                "ocr" => Workload::Ocr,
+                "all" => Workload::All,
+                _ => Workload::Text,
+            };
+            let summary = lock(&self.converter).scan_workload(
                 &paths,
                 &strings(&job["languages"]),
                 job["retry"].as_bool().unwrap_or(false),
+                workload,
+                job["origin"] == "schedule"
+                    || ["sonarr", "radarr"].contains(&job["origin"].as_str().unwrap_or("")),
                 &self.cancel,
                 &mut |event| {
                     let outputs = strings(&event["new_outputs"]);
@@ -707,23 +833,43 @@ impl App {
             if let Some(running) = lock(&self.runtime).running.as_mut() {
                 running["summary"] = summary;
             }
-        } else {
+        }
+        if job["kind"] == "inspect" || job["task_id"] == "discovery" {
+            let previous_rows = lock(&self.runtime).inventory.iter().filter_map(|row|row["path"].as_str().map(|path|(path.to_owned(),row.clone()))).collect::<BTreeMap<_,_>>();
             let mut results = Vec::new();
             let mut inspected = 0_u64;
             let mut failed = 0_u64;
+            let mut metadata_pending = 0_u64;
             for path in paths.iter().take(INVENTORY_LIMIT) {
                 if self.cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 self.progress(json!({"status":"inspecting","path":path}));
-                let result = Converter::safe_path(&path.to_string_lossy(), &roots)
-                    .and_then(|_| lock(&self.converter).describe_with_stop(path, &self.cancel));
+                let cache_miss = job["task_id"] == "discovery" && lock(&self.converter).cached_description(path).is_none();
+                let result = Converter::safe_path(&path.to_string_lossy(), &roots).and_then(|_| {
+                    if job["task_id"] == "discovery" {
+                        lock(&self.converter)
+                            .cached_description(path)
+                            .ok_or_else(|| {
+                                "Metadata unavailable; inspect this file manually".into()
+                            })
+                    } else {
+                        lock(&self.converter).describe_with_stop(path, &self.cancel)
+                    }
+                });
                 let root_id = roots
                     .iter()
                     .find(|root| path.starts_with(root))
                     .map(|root| root_info(root, &self.mounts)["id"].clone())
                     .unwrap_or(Value::Null);
-                let result = match result {
+                let result = if cache_miss {
+                    metadata_pending += 1;
+                    let mut row = previous_rows.get(&*path.to_string_lossy()).cloned().unwrap_or_else(||json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"type":"video","tracks":[]}));
+                    row["root_id"] = root_id;
+                    row["metadata_pending"] = json!(true);
+                    if let Some(object) = row.as_object_mut() { object.remove("error"); }
+                    row
+                } else { match result {
                     Ok(tracks) => {
                         inspected += 1;
                         json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":if ["mkv","mks","mp4","m4v","webm","mov","avi","ts","m2ts"].contains(&path.extension().and_then(|value|value.to_str()).unwrap_or("")){"video"}else{"sidecar"},"tracks":tracks})
@@ -733,16 +879,23 @@ impl App {
                         self.progress(json!({"status":"failed","path":path,"error":error}));
                         json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":"video","tracks":[],"error":error})
                     }
-                };
+                }};
                 results.push(result);
                 if let Some(running) = lock(&self.runtime).running.as_mut() {
-                    running["processed"] = json!(inspected + failed);
-                    running["summary"] = json!({"inspected":inspected,"failed":failed});
+                    running["processed"] = json!(inspected + failed + metadata_pending);
+                    if job["kind"] == "inspect" {
+                        running["summary"] = json!({"inspected":inspected,"failed":failed});
+                    } else {
+                        running["summary"]["inspected"] = json!(inspected);
+                        running["summary"]["inspection_failed"] = json!(failed);
+                        running["summary"]["metadata_pending"] = json!(metadata_pending);
+                    }
                     running["truncated"] = json!(paths.len() > INVENTORY_LIMIT);
                 }
             }
-            let partial = self.cancel.load(Ordering::Relaxed);
-            let keep_previous = partial && !lock(&self.runtime).inventory.is_empty();
+            let cancelled = self.cancel.load(Ordering::Relaxed);
+            let partial = cancelled || metadata_pending > 0;
+            let keep_previous = cancelled && !lock(&self.runtime).inventory.is_empty();
             if !keep_previous {
                 let updated = now();
                 let truncated = paths.len() > INVENTORY_LIMIT;
@@ -757,17 +910,14 @@ impl App {
                 runtime.inventory_partial = partial;
             }
         }
+        lock(&self.converter).persist_metadata()?;
         Ok(())
     }
     fn worker(self: Arc<Self>) {
-        let mut next_scan = Instant::now();
         while !self.shutdown.load(Ordering::Relaxed) {
-            if self.auto_scan
-                && Instant::now() >= next_scan
-                && !lock(&self.runtime).roots.is_empty()
-            {
-                let _ = self.enqueue(&json!({"kind":"scan"}), "schedule");
-                next_scan = Instant::now() + self.interval;
+            let due = lock(&self.scheduler).due(now());
+            for id in due {
+                let _ = self.enqueue_task(&id, "schedule", false);
             }
             let job = {
                 let mut runtime = lock(&self.runtime);
@@ -786,15 +936,20 @@ impl App {
                 }
             };
             let Some(job) = job else { continue };
+            let task_start = job["task_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(|id| lock(&self.scheduler).start(id, now()))
+                .unwrap_or(Ok(()));
             let mut integrations = lock(&self.integrations).clone();
-            let result = self.execute(&job, &mut integrations);
+            let result = task_start.and_then(|_| self.execute(&job, &mut integrations));
             if let Err(message) = result {
                 if let Some(running) = lock(&self.runtime).running.as_mut() {
                     running["error"] = json!(message);
                 }
                 self.log("WARNING", "Dashboard job failed; see its safe diagnostic");
             }
-            if (job["kind"] == "scan" || job["kind"] == "extract")
+            if ["scan", "extract", "ocr"].contains(&job["kind"].as_str().unwrap_or(""))
                 && let Some(notification) =
                     integrations.flush_bazarr(&self.cancel, &mut |event| self.progress(event))
             {
@@ -808,6 +963,26 @@ impl App {
                     completed_status(&finished)
                 });
                 finished["finished"] = json!(now());
+                if let Some(id) = finished["task_id"].as_str().filter(|id| !id.is_empty()) {
+                    let status = finished["status"].as_str().unwrap_or("failed");
+                    let message = finished["error"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}; processed {}, failed {}",
+                                status,
+                                count(&finished["processed"]),
+                                count(&finished["summary"]["failed"])
+                            )
+                        });
+                    if lock(&self.scheduler)
+                        .finish(id, now(), status, &message)
+                        .is_err()
+                    {
+                        eprintln!("Task result could not be saved");
+                    }
+                }
                 if finished["kind"] == "inspect" {
                     finished["results"] = json!([]);
                     for prior in &mut runtime.history {
@@ -1080,6 +1255,8 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/health" => Reply::json(200, json!({"ok":true})),
             "/api/session" => Reply::json(200, json!({"csrf_token":app.csrf})),
             "/api/status" => Reply::json(200, app.status()),
+            "/api/tasks" => Reply::json(200, app.tasks()),
+            "/api/system" => Reply::json(200, app.system()),
             "/api/inventory" => Reply::json(200, app.inventory()),
             "/api/widget" => Reply::json(200, app.widget()),
             "/api/settings" => Reply::json(200, app.settings()),
@@ -1126,8 +1303,29 @@ fn handle(app: &App, request: &Request) -> Reply {
         match request.target.as_str() {
             "/api/settings" => app.update_settings(&data).map(|value| (200, value)),
             "/api/root-folders" => app.update_roots(&data).map(|value| (200, value)),
+            "/api/tasks" => lock(&app.scheduler)
+                .update(&data, now())
+                .map(|value| (200, value)),
             _ => return Reply::error(404, "Not found"),
         }
+    } else if request.target.starts_with("/api/tasks/") && request.target.ends_with("/run") {
+        let parts = request.target.split('/').collect::<Vec<_>>();
+        if parts.len() != 5 {
+            return Reply::error(404, "Not found");
+        }
+        if data
+            .as_object()
+            .is_none_or(|body| body.keys().any(|key| key != "retry"))
+            || data.get("retry").is_some_and(|retry| !retry.is_boolean())
+        {
+            return Reply::error(400, "Invalid task run options");
+        }
+        app.enqueue_task(
+            parts[3],
+            "task_manual",
+            data["retry"].as_bool().unwrap_or(false),
+        )
+        .map(|job| (202, json!({"job":job})))
     } else if request.target == "/api/jobs" {
         app.enqueue(&data, "manual")
             .map(|job| (202, json!({"job":job})))
@@ -1246,20 +1444,18 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
             .collect();
     }
     let interval = std::env::var("CONVERTER_SCAN_INTERVAL")
-        .unwrap_or_else(|_| "300".into())
+        .unwrap_or_else(|_| "21600".into())
         .parse::<u64>()
         .map_err(|_| "CONVERTER_SCAN_INTERVAL must be an integer of at least 1 second")?;
     if interval == 0 {
         return Err("CONVERTER_SCAN_INTERVAL must be at least 1 second".into());
     }
-    let app = App::new(roots, data, Duration::from_secs(interval), auto_scan)?;
-    let seed_inventory = {
-        let runtime = lock(&app.runtime);
-        auto_scan && runtime.inventory_updated == 0.0 && !runtime.roots.is_empty()
-    };
-    if seed_inventory {
-        app.enqueue(&json!({"kind":"inspect"}), "startup")?;
-    }
+    let app = App::new(
+        roots,
+        data,
+        Duration::from_secs(interval.max(21600)),
+        auto_scan,
+    )?;
     let listener = TcpListener::bind((host.as_str(), port))
         .map_err(|_| "Listener address or port is unavailable")?;
     listener

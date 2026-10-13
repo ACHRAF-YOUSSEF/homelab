@@ -208,6 +208,8 @@ fn configure_tool_environment(command: &mut Command, scratch: &Path) {
     command.env("LANG", "C.UTF-8").env("LC_ALL", "C.UTF-8");
     command
         .env("OMP_THREAD_LIMIT", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .env("DOTNET_PROCESSOR_COUNT", "1")
         .env("TMPDIR", scratch)
         .env("TEMP", scratch)
         .env("TMP", scratch);

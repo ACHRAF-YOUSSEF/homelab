@@ -14,6 +14,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 ARG TARGETARCH
+ARG SUBFORGE_VERSION=0.2.0
+LABEL org.opencontainers.image.title="Subforge" \
+      org.opencontainers.image.version="${SUBFORGE_VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl ffmpeg libicu72 libfontconfig1 libgssapi-krb5-2 \
       fonts-dejavu-core iso-codes mkvtoolnix tesseract-ocr tesseract-ocr-all \

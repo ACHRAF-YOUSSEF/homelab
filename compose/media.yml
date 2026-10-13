@@ -124,13 +124,14 @@ services:
 
   # Opt-in local conversion of embedded and sidecar subtitles, including OCR.
   subtitle-converter:
+    image: homelab-subtitle-converter:${CONVERTER_IMAGE_TAG:-0.2.0}
     build:
       context: ../subtitle-converter
     profiles: [subtitle-conversion]
     container_name: subtitle-converter
     init: true
     mem_limit: ${CONVERTER_MEMORY_LIMIT:-1536m}
-    cpus: 2
+    cpus: ${CONVERTER_CPU_LIMIT:-1}
     pids_limit: 128
     ports:
       - ${CONVERTER_BIND_ADDRESS:-127.0.0.1}:8100:8100
@@ -145,7 +146,7 @@ services:
       # Self-contained .NET extracts native libraries here for loading.
       - /tmp:rw,nosuid,nodev,size=512m
     environment:
-      - CONVERTER_SCAN_INTERVAL=${CONVERTER_SCAN_INTERVAL:-300}
+      - CONVERTER_SCAN_INTERVAL=${CONVERTER_SCAN_INTERVAL:-21600}
       - CONVERTER_MIN_AGE=${CONVERTER_MIN_AGE:-120}
       - CONVERTER_TIMEOUT=${CONVERTER_TIMEOUT:-7200}
       - CONVERTER_RETRY_INTERVAL=${CONVERTER_RETRY_INTERVAL:-3600}

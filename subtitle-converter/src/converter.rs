@@ -5,14 +5,15 @@
 //! outputs are staged beside their destination before no-clobber publication.
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::Builder;
 use walkdir::WalkDir;
@@ -32,8 +33,9 @@ const MAX_TRACK_LABEL: usize = 32;
 // Bump only when a converter fix or new diagnostics should retry cached
 // failures immediately. Successful fingerprint caches are independent.
 const ERROR_CACHE_REVISION: u64 = 1;
+const MAX_CANDIDATES: usize = 20_000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Track {
     number: Value,
     native_number: Option<String>,
@@ -42,6 +44,13 @@ struct Track {
     format: String,
     forced: bool,
     hi: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Workload {
+    All,
+    Text,
+    Ocr,
 }
 
 type ConversionJob = (
@@ -69,6 +78,7 @@ pub struct Converter {
     enable_ocr: bool,
     ocr_language: String,
     language_aliases: BTreeMap<String, String>,
+    metadata: Mutex<crate::metadata::MetadataCache>,
 }
 
 impl Converter {
@@ -87,7 +97,7 @@ impl Converter {
         Ok(Self {
             roots,
             state,
-            state_path,
+            state_path: state_path.clone(),
             ffprobe: env_tool("CONVERTER_FFPROBE", "ffprobe"),
             ffmpeg: env_tool("CONVERTER_FFMPEG", "ffmpeg"),
             mkvmerge: env_tool("CONVERTER_MKVMERGE", "mkvmerge"),
@@ -98,6 +108,9 @@ impl Converter {
             enable_ocr,
             ocr_language,
             language_aliases: language_aliases(),
+            metadata: Mutex::new(crate::metadata::MetadataCache::new(
+                state_path.with_file_name("metadata.json"),
+            )),
         })
     }
 
@@ -127,6 +140,10 @@ impl Converter {
     }
 
     pub fn candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
+        Self::candidates_with_stop(roots, &AtomicBool::new(false))
+    }
+
+    pub fn candidates_with_stop(roots: &[PathBuf], stop: &AtomicBool) -> Vec<PathBuf> {
         let mut found = BTreeSet::new();
         for root in roots {
             if root.is_symlink() || !root.is_dir() {
@@ -138,12 +155,16 @@ impl Converter {
             };
             for entry in WalkDir::new(root)
                 .follow_links(false)
+                .max_depth(64)
                 .into_iter()
                 .filter_entry(|entry| {
                     entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
                 })
                 .filter_map(Result::ok)
             {
+                if stop.load(Ordering::Relaxed) || found.len() >= MAX_CANDIDATES {
+                    return found.into_iter().collect();
+                }
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -259,6 +280,31 @@ impl Converter {
         stop: &AtomicBool,
         progress: &mut dyn FnMut(Value),
     ) -> Result<Value, String> {
+        self.scan_workload(
+            paths,
+            languages,
+            retry,
+            Workload::All,
+            false,
+            stop,
+            progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_workload(
+        &mut self,
+        paths: &[PathBuf],
+        languages: &[String],
+        retry: bool,
+        workload: Workload,
+        automatic: bool,
+        stop: &AtomicBool,
+        progress: &mut dyn FnMut(Value),
+    ) -> Result<Value, String> {
+        if workload == Workload::Ocr && !self.enable_ocr {
+            return Err("OCR is disabled by deployment permissions".into());
+        }
         let languages = if languages.is_empty() {
             vec!["*".to_owned()]
         } else {
@@ -311,28 +357,34 @@ impl Converter {
                 // Legacy state entries predate this flag and represent prior
                 // successful OCR runs. New OCR-disabled entries explicitly
                 // record false so enabling OCR schedules image tracks again.
-                let ocr_covered = ocr_coverage(&previous, self.enable_ocr);
+                let ocr_covered =
+                    workload == Workload::Text || ocr_coverage(&previous, self.enable_ocr);
+                let text_covered = workload == Workload::Ocr
+                    || previous["text_complete"].as_bool().unwrap_or(true);
                 let outputs_exist = previous_outputs
                     .iter()
                     .all(|name| path.parent().unwrap_or(Path::new("/")).join(name).is_file());
                 if previous.get("ok").and_then(Value::as_bool) == Some(true)
                     && coverage
                     && ocr_covered
+                    && text_covered
                     && outputs_exist
                 {
                     bump(&mut summary, "cached");
                     progress(json!({"status":"cached","path":path,"summary":summary}));
                     continue;
                 }
-                if failure_retry_delayed(&previous, retry, epoch_seconds(), self.retry_interval) {
+                if unchanged_failure_deferred(&previous, retry, workload, automatic)
+                    || failure_retry_delayed(&previous, retry, epoch_seconds(), self.retry_interval)
+                {
                     bump(&mut summary, "pending");
                     progress(json!({"status":"pending","path":path,"summary":summary}));
                     continue;
                 }
             }
             let existing = sibling_srt_names(&path);
-            match self.convert(&path, &languages, stop, progress) {
-                Ok(outputs) => {
+            match self.convert(&path, &languages, workload, stop, progress) {
+                Ok((outputs, ocr_pending)) => {
                     let after = match fingerprint(&path) {
                         Ok(v) => v,
                         Err(_) => {
@@ -347,9 +399,7 @@ impl Converter {
                     let mut output_names: BTreeSet<String> = outputs.into_iter().collect();
                     let mut completed_languages: BTreeSet<String> =
                         languages.iter().cloned().collect();
-                    if previous.get("fingerprint") == Some(&fingerprint_json(&before))
-                        && previous.get("ok").and_then(Value::as_bool) == Some(true)
-                    {
+                    if previous.get("fingerprint") == Some(&fingerprint_json(&before)) {
                         output_names.extend(previous_outputs);
                         completed_languages.extend(
                             previous
@@ -361,7 +411,16 @@ impl Converter {
                                 .map(str::to_owned),
                         );
                     }
-                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"outputs":output_names,"ok":true,"languages":completed_languages,"ocr":self.enable_ocr}));
+                    let unchanged = previous.get("fingerprint") == Some(&fingerprint_json(&before));
+                    let text_complete = workload != Workload::Ocr
+                        || (unchanged
+                            && previous["text_complete"]
+                                .as_bool()
+                                .unwrap_or(previous["ok"] == true));
+                    let ocr_complete = (workload != Workload::Text && self.enable_ocr)
+                        || (unchanged
+                            && previous["ocr"].as_bool().unwrap_or(previous["ok"] == true));
+                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"outputs":output_names,"ok":true,"languages":completed_languages,"ocr":ocr_complete,"ocr_pending":ocr_pending && !ocr_complete,"text_complete":text_complete}));
                     if crate::util::write_private(&self.state_path, &self.state).is_err() {
                         bump(&mut summary, "failed");
                         continue;
@@ -388,12 +447,70 @@ impl Converter {
                     bump(&mut summary, "failed");
                     let safe = bounded_message(&message);
                     progress(json!({"status":"failed","path":path,"error":safe,"summary":summary}));
-                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION}));
+                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION,"ocr_pending":workload==Workload::Ocr || previous["ocr_pending"]==true,"text_complete":previous["text_complete"].as_bool().unwrap_or(previous["ok"]==true),"outputs":previous_outputs}));
                     let _ = crate::util::write_private(&self.state_path, &self.state);
                 }
             }
         }
+        self.persist_metadata()?;
         Ok(summary)
+    }
+
+    pub fn persist_metadata(&self) -> Result<(), String> {
+        self.metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist()
+    }
+
+    pub fn cached_description(&self, path: &Path) -> Option<Value> {
+        if !is_video(path) {
+            return self.describe(path).ok();
+        }
+        let fingerprint = fingerprint_json(&fingerprint(path).ok()?);
+        let cached = self
+            .metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path.to_string_lossy(), &fingerprint)?;
+        let tracks: Vec<Track> = serde_json::from_value(cached).ok()?;
+        Some(Value::Array(tracks.into_iter().map(track_json).collect()))
+    }
+
+    pub fn ocr_allowed(&self) -> bool {
+        self.enable_ocr
+    }
+
+    pub fn ocr_candidates(&self, roots: &[PathBuf], retry: bool) -> Vec<PathBuf> {
+        self.state
+            .as_object()
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .filter(|(_, entry)| entry["ocr_pending"] == true && (entry["ok"] == true || retry))
+            .filter_map(|(path, _)| Self::safe_path(path, roots).ok())
+            .collect()
+    }
+
+    pub fn compact_cache(&mut self) -> Result<Value, String> {
+        let roots = self.roots.clone();
+        let mut removed = 0;
+        if let Some(entries) = self.state.as_object_mut() {
+            entries.retain(|path, _| {
+                let keep = Path::new(path).exists() && Self::safe_path(path, &roots).is_ok();
+                if !keep {
+                    removed += 1;
+                }
+                keep
+            });
+        }
+        let metadata_removed = self
+            .metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .compact(|path| Path::new(path).exists() && Self::safe_path(path, &roots).is_ok());
+        crate::util::write_private(&self.state_path, &self.state)?;
+        self.persist_metadata()?;
+        Ok(json!({"state_entries_removed":removed,"metadata_entries_removed":metadata_removed}))
     }
 
     fn set_state_entry(&mut self, key: &str, value: Value) {
@@ -403,6 +520,17 @@ impl Converter {
     }
 
     fn tracks(&self, path: &Path, stop: &AtomicBool) -> Result<Vec<Track>, String> {
+        let before = fingerprint_json(&fingerprint(path)?);
+        let key = path.to_string_lossy();
+        if let Some(cached) = self
+            .metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key, &before)
+            && let Ok(tracks) = serde_json::from_value(cached)
+        {
+            return Ok(tracks);
+        }
         let native_data = if matches!(extension(path).as_deref(), Some("mkv" | "mks" | "webm")) {
             let mut command = Command::new(&self.mkvmerge);
             command.args(["-J"]).arg(path);
@@ -516,6 +644,12 @@ impl Converter {
                     }),
             });
         }
+        if !stop.load(Ordering::Relaxed) && fingerprint_json(&fingerprint(path)?) == before {
+            self.metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(&key, before, json!(result));
+        }
         Ok(result)
     }
 
@@ -523,9 +657,10 @@ impl Converter {
         &self,
         path: &Path,
         languages: &[String],
+        workload: Workload,
         stop: &AtomicBool,
         progress: &mut dyn FnMut(Value),
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, bool), String> {
         let before = fingerprint(path)?;
         let parent = path.parent().ok_or("Media path has no parent directory")?;
         let staging = Builder::new()
@@ -548,6 +683,7 @@ impl Converter {
                 .or_default() += 1;
         }
         let mut jobs: Vec<ConversionJob> = Vec::new();
+        let mut ocr_pending = false;
         if is_video(path) {
             for track in tracks {
                 let lang = short_language(&track.language, &self.language_aliases);
@@ -585,7 +721,11 @@ impl Converter {
                 }
                 let image = is_image_format(&track.format);
                 let ocr_lang = self.ocr_for(&track.language);
-                if image && !self.enable_ocr {
+                if image && (workload == Workload::Text || !self.enable_ocr) {
+                    ocr_pending = true;
+                    continue;
+                }
+                if !image && workload == Workload::Ocr {
                     continue;
                 }
                 let stream_index = track
@@ -620,7 +760,11 @@ impl Converter {
                 let body_re = Regex::new(r"(?mi)^(id:.*index:)\s*\d+").unwrap();
                 for (n, c) in caps.iter().enumerate() {
                     let lang = bounded_track_language(&c[1]);
-                    if !wants(&lang, languages, &self.language_aliases) || !self.enable_ocr {
+                    if !wants(&lang, languages, &self.language_aliases) {
+                        continue;
+                    }
+                    if workload == Workload::Text || !self.enable_ocr {
+                        ocr_pending = true;
                         continue;
                     }
                     let label = short_language(&lang, &self.language_aliases);
@@ -674,7 +818,12 @@ impl Converter {
             let fmt = extension(path).unwrap_or_default();
             let image = matches!(fmt.as_str(), "sup" | "sub" | "idx");
             let seconv = matches!(fmt.as_str(), "ttml" | "sbv");
-            if !image || self.enable_ocr {
+            if image && (workload == Workload::Text || !self.enable_ocr) {
+                ocr_pending = true;
+            }
+            if (image && self.enable_ocr && workload != Workload::Text)
+                || (!image && workload != Workload::Ocr)
+            {
                 jobs.push((
                     path.to_path_buf(),
                     format!(
@@ -747,6 +896,8 @@ impl Converter {
                         "error",
                         "-protocol_whitelist",
                         "file,pipe",
+                        "-threads",
+                        "1",
                         "-i",
                     ])
                     .arg(&source);
@@ -755,7 +906,9 @@ impl Converter {
                 } else {
                     command.args(["-map", "0:s:0"]);
                 }
-                command.args(["-c:s", "srt", "-f", "srt"]).arg(&staged);
+                command
+                    .args(["-c:s", "srt", "-threads", "1", "-f", "srt"])
+                    .arg(&staged);
                 crate::util::bounded_process(
                     &mut command,
                     self.timeout,
@@ -781,7 +934,7 @@ impl Converter {
             let destination = parent.join(name);
             publish_noclobber(&staged, &destination)?;
         }
-        Ok(outputs)
+        Ok((outputs, ocr_pending))
     }
 
     fn ocr_for(&self, language: &str) -> String {
@@ -1137,6 +1290,15 @@ fn failure_retry_delayed(previous: &Value, retry: bool, now: f64, interval: Dura
             < interval.as_secs_f64()
 }
 
+fn unchanged_failure_deferred(
+    previous: &Value,
+    retry: bool,
+    workload: Workload,
+    automatic: bool,
+) -> bool {
+    !retry && previous["ok"] != true && (automatic || workload == Workload::Ocr)
+}
+
 fn conversion_error_context(
     message: &str,
     native_track: Option<&str>,
@@ -1479,6 +1641,164 @@ mod tests {
         assert_eq!(summary["cached"], 1);
         assert_eq!(summary["converted"], 0);
         assert_eq!(fs::read(output).unwrap(), b"existing subtitle must survive");
+    }
+
+    fn cache_image_track(converter: &Converter, media: &Path) {
+        let track = Track {
+            number: json!(4),
+            native_number: Some("4".into()),
+            stream_index: Some(3),
+            language: "eng".into(),
+            format: "HDMVPGS".into(),
+            forced: false,
+            hi: false,
+        };
+        converter.metadata.lock().unwrap().insert(
+            &media.to_string_lossy(),
+            fingerprint_json(&fingerprint(media).unwrap()),
+            json!([track]),
+        );
+    }
+
+    #[test]
+    fn text_discovery_defers_images_and_daily_ocr_excludes_unchanged_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("image.mkv");
+        fs::write(&media, b"fixture media").unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.enable_ocr = true;
+        converter.min_age = Duration::ZERO;
+        converter.seconv = dir.path().join("must-not-be-invoked");
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        cache_image_track(&converter, &media);
+        let summary = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                Workload::Text,
+                true,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary["converted"], 1);
+        assert_eq!(
+            converter.ocr_candidates(&converter.roots, false),
+            vec![media.clone()]
+        );
+        let summary = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                Workload::Text,
+                true,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary["cached"], 1);
+        let key = media.to_string_lossy();
+        converter.state[&*key]["ok"] = json!(false);
+        converter.state[&*key]["attempt"] = json!(0);
+        assert!(converter.ocr_candidates(&converter.roots, false).is_empty());
+        assert_eq!(
+            converter.ocr_candidates(&converter.roots, true),
+            vec![media.clone()]
+        );
+        let summary = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                Workload::Ocr,
+                true,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary["pending"], 1);
+        assert_eq!(summary["failed"], 0);
+        fs::write(&media, b"fixture media changed").unwrap();
+        cache_image_track(&converter, &media);
+        converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                Workload::Text,
+                true,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            converter.ocr_candidates(&converter.roots, false),
+            vec![media]
+        );
+    }
+
+    #[test]
+    fn metadata_survives_restart_and_unchanged_inspection_does_not_spawn_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("cached.mkv");
+        fs::write(&media, b"fixture").unwrap();
+        let converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        cache_image_track(&converter, &media);
+        converter.persist_metadata().unwrap();
+        let mut restarted = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        restarted.ffprobe = dir.path().join("must-not-be-invoked");
+        restarted.mkvmerge = dir.path().join("must-not-be-invoked");
+        assert_eq!(
+            restarted
+                .describe(&media)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::write(&media, b"changed fixture").unwrap();
+        assert!(restarted.describe(&media).is_err());
+    }
+
+    #[test]
+    fn ocr_workload_cannot_bypass_deployment_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.enable_ocr = false;
+        assert!(
+            converter
+                .scan_workload(
+                    &[],
+                    &["*".into()],
+                    true,
+                    Workload::Ocr,
+                    false,
+                    &AtomicBool::new(false),
+                    &mut |_| {}
+                )
+                .unwrap_err()
+                .contains("disabled by deployment permissions")
+        );
     }
 
     #[test]

@@ -225,6 +225,21 @@ impl Server {
         Ok(Response { status, body })
     }
 
+    fn json_request(&self, method: &str, path: &str, csrf: &str, body: &Value) -> Response {
+        let auth = self.auth_header();
+        self.request(
+            method,
+            path,
+            &[
+                ("Authorization", &auth),
+                ("X-CSRF-Token", csrf),
+                ("Content-Type", "application/json"),
+            ],
+            Some(&body.to_string()),
+        )
+        .expect("JSON API request")
+    }
+
     fn auth_header(&self) -> String {
         format!(
             "Basic {}",
@@ -526,6 +541,170 @@ fn inventory_api_is_separate_from_status_and_snapshot_survives_backend_restart()
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn task_and_system_endpoints_require_auth_and_report_ocr_permission() {
+    let server = Server::start();
+    for path in ["/api/tasks", "/api/system"] {
+        assert_eq!(server.request("GET", path, &[], None).unwrap().status, 401);
+    }
+
+    let auth = server.auth_header();
+    let tasks = server
+        .request("GET", "/api/tasks", &[("Authorization", &auth)], None)
+        .unwrap();
+    let system = server
+        .request("GET", "/api/system", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(tasks.status, 200);
+    assert_eq!(system.status, 200);
+    let ocr = tasks.body["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "ocr")
+        .unwrap();
+    assert_eq!(ocr["available"], false);
+    assert_eq!(ocr["enabled"], false);
+    assert_eq!(
+        ocr["blocked_reason"],
+        "OCR is disabled by deployment permissions"
+    );
+    assert_eq!(system.body["resource_policy"]["ocr_permission"], false);
+}
+
+#[test]
+fn task_updates_validate_and_persist_across_backend_restart() {
+    let mut server = Server::start();
+    let csrf = server.csrf();
+    let updated = server.json_request(
+        "PUT",
+        "/api/tasks",
+        &csrf,
+        &json!({
+            "paused": true,
+            "tasks": [{"id":"discovery", "enabled":false, "interval_seconds":43200}]
+        }),
+    );
+    assert_eq!(updated.status, 200);
+    assert_eq!(updated.body["paused"], true);
+    let discovery = updated.body["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "discovery")
+        .unwrap();
+    assert_eq!(discovery["enabled"], false);
+    assert_eq!(discovery["interval_seconds"], 43200);
+
+    for invalid in [
+        json!({"tasks":[{"id":"unknown", "enabled":true}]}),
+        json!({"tasks":[{"id":"..%2Fbackup", "enabled":true}]}),
+        json!({"tasks":[{"id":"discovery", "enabled":true, "command":"/bin/sh"}]}),
+        json!({"paused":"yes"}),
+        json!({"tasks":[{"id":"discovery", "interval_seconds":1}]}),
+    ] {
+        let response = server.json_request("PUT", "/api/tasks", &csrf, &invalid);
+        assert_eq!(response.status, 400, "invalid update unexpectedly accepted");
+    }
+
+    server.restart();
+    let auth = server.auth_header();
+    let tasks = server
+        .request("GET", "/api/tasks", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(tasks.status, 200);
+    assert_eq!(tasks.body["paused"], true);
+    let discovery = tasks.body["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "discovery")
+        .unwrap();
+    assert_eq!(discovery["enabled"], false);
+    assert_eq!(discovery["interval_seconds"], 43200);
+}
+
+#[test]
+fn task_run_requires_csrf_rejects_invalid_options_and_denies_disabled_ocr() {
+    let server = Server::start();
+    let body = "{}";
+    let auth = server.auth_header();
+    let no_auth = server
+        .request(
+            "POST",
+            "/api/tasks/inventory/run",
+            &[("Content-Type", "application/json")],
+            Some(body),
+        )
+        .unwrap();
+    assert_eq!(no_auth.status, 401);
+    let no_csrf = server
+        .request(
+            "POST",
+            "/api/tasks/inventory/run",
+            &[
+                ("Authorization", &auth),
+                ("Content-Type", "application/json"),
+            ],
+            Some(body),
+        )
+        .unwrap();
+    assert_eq!(no_csrf.status, 403);
+
+    let csrf = server.csrf();
+    for (path, invalid) in [
+        ("/api/tasks/not-a-task/run", json!({})),
+        ("/api/tasks/../../backup/run", json!({})),
+        ("/api/tasks/inventory/run", json!({"retry":"true"})),
+        (
+            "/api/tasks/inventory/run",
+            json!({"retry":false,"shell":"true"}),
+        ),
+    ] {
+        let response = server.json_request("POST", path, &csrf, &invalid);
+        assert!(response.status == 400 || response.status == 404);
+    }
+
+    let denied = server.json_request("POST", "/api/tasks/ocr/run", &csrf, &json!({}));
+    assert_eq!(denied.status, 400);
+    assert!(
+        denied.body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("OCR is disabled")
+    );
+
+    let accepted = server.json_request("POST", "/api/tasks/inventory/run", &csrf, &json!({}));
+    assert_eq!(accepted.status, 202);
+    let job_id = accepted.body["job"]["id"]
+        .as_str()
+        .expect("manual inventory task job id")
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let auth = server.auth_header();
+        let status = server
+            .request("GET", "/api/status", &[("Authorization", &auth)], None)
+            .expect("read manual task status");
+        if status.body["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|job| {
+                job["id"] == job_id
+                    && (job["status"] == "completed" || job["status"] == "completed_with_errors")
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "manual inventory task did not finish"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(unix)]
