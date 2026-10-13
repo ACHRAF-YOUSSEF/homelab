@@ -136,7 +136,7 @@ The gateway proxies Glance and emits sanitized JSON snapshots, keeping Jellyfin 
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
 | [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Sonarr and Radarr `/api/v3/calendar`; renders the next 14 days | `30s` |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
-| [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; converted count, queued jobs, configured roots, recent failures, current run/progress, and selected languages | `15s` |
+| [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; processed-file count, queued jobs, configured roots, recent failures, current run/progress, and selected languages | `15s` |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
 
 The Subforge widget is optional. The Compose service `subtitle-converter` uses

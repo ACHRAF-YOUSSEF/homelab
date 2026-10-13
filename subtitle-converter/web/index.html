@@ -23,7 +23,6 @@
         <button class="nav-link active" data-page="overview" aria-label="Overview" title="Overview"><span class="nav-icon" aria-hidden="true">◫</span><span class="nav-label">Overview</span></button>
         <button class="nav-link" data-page="library" aria-label="Library" title="Library"><span class="nav-icon" aria-hidden="true">▤</span><span class="nav-label">Library</span></button>
         <button class="nav-link" data-page="activity" aria-label="Activity" title="Activity"><span class="nav-icon" aria-hidden="true">◷</span><span class="nav-label">Activity</span><span id="activity-badge" class="nav-badge hidden">0</span></button>
-        <button class="nav-link" data-page="system" aria-label="System" title="System"><span class="nav-icon" aria-hidden="true">▣</span><span class="nav-label">System</span></button>
       </nav>
       <div class="sidebar-label library-label">SCAN ROOTS</div>
       <div id="root-list" class="root-list"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>
@@ -50,7 +49,7 @@
           <div class="heading-actions"><button class="button button-secondary" data-action="inspect">Inspect library</button><button class="button button-primary" data-action="scan"><span>＋</span> Scan library</button></div>
         </div>
         <div class="stat-grid">
-          <article class="stat-card"><div class="stat-top"><span class="stat-icon teal">⇄</span><span class="stat-caption">ALL TIME</span></div><div class="stat-value" id="stat-converted">—</div><div class="stat-label">Files converted</div><div class="stat-note">Valid SRT files created</div></article>
+          <article class="stat-card"><div class="stat-top"><span class="stat-icon teal">⇄</span><span class="stat-caption">ALL TIME</span></div><div class="stat-value" id="stat-converted">—</div><div class="stat-label">Files processed</div><div class="stat-note">Inputs with a completed conversion pass</div></article>
           <article class="stat-card"><div class="stat-top"><span class="stat-icon purple">◷</span><span class="stat-caption">CURRENT RUN</span></div><div class="stat-value" id="stat-running">Idle</div><div class="stat-label">Conversion status</div><div class="stat-note" id="stat-current">Nothing running right now</div></article>
           <article class="stat-card"><div class="stat-top"><span class="stat-icon amber">⌕</span><span class="stat-caption">LIBRARY</span></div><div class="stat-value" id="stat-roots">—</div><div class="stat-label">Scan roots</div><div class="stat-note">Configured media locations</div></article>
           <article class="stat-card"><div class="stat-top"><span class="stat-icon blue">文</span><span class="stat-caption">LANGUAGES</span></div><div class="stat-value" id="stat-languages">All</div><div class="stat-label">Selected languages</div><div class="stat-note">Applied to the next extraction</div></article>
@@ -67,7 +66,7 @@
               <div class="field-row"><span class="field-label">Languages</span><button class="text-button" type="button" data-open-languages="quick">Choose</button></div>
               <button class="language-summary" type="button" data-open-languages="quick"><span class="language-globe">◎</span><span id="quick-languages">All languages</span><span class="chevron">⌄</span></button>
               <button class="button button-primary full-button" type="submit"><span>▶</span> Extract subtitles</button>
-              <p class="form-hint">Existing SRT files are kept. The converter only adds missing tracks.</p>
+              <p class="form-hint">Text tracks convert now; image tracks wait for daily OCR in Settings → Tasks. Existing SRT files are kept.</p>
             </form>
           </article>
         </div>
@@ -92,28 +91,23 @@
         <article class="panel" data-collapse="activity-jobs"><div class="panel-heading"><div><h2>Jobs</h2><p>Running and recently completed work</p></div><span class="live-pill"><i></i> UPDATING</span></div><div id="jobs-list" class="jobs-list"><div class="empty-state"><span class="empty-icon">◷</span><strong>No jobs yet</strong><span>Start a scan or extraction to see it here.</span></div></div></article>
       </section>
 
-      <section class="page" id="page-system">
-        <div class="page-heading"><div><div class="eyebrow">SYSTEM & AUTOMATION</div><h1>System</h1><p class="lede">Schedule useful work while keeping your media server quiet.</p></div><button class="button button-secondary" id="refresh-system" type="button">Refresh</button></div>
-        <nav class="system-nav" aria-label="System sections"><button class="system-tab active" data-system-tab="tasks" type="button">Tasks</button><button class="system-tab" data-system-tab="status" type="button">Status</button></nav>
-        <section class="system-section active" id="system-tasks">
+      <section class="page" id="page-settings">
+        <div class="page-heading"><div><div class="eyebrow">PREFERENCES & CONNECTIONS</div><h1>Settings</h1><p class="lede">Manage languages, media connections, schedules, and application status.</p></div><div class="heading-actions"><button class="button button-secondary hidden" id="refresh-system" type="button">Refresh</button><button class="button button-primary" id="save-settings">Save changes</button></div></div>
+        <div class="settings-layout">
+          <nav class="settings-nav" aria-label="Settings sections"><button class="settings-tab active" data-setting-tab="general">General</button><button class="settings-tab" data-setting-tab="media">Media Management</button><button class="settings-tab" data-setting-tab="tasks">Tasks</button><button class="settings-tab" data-setting-tab="status">Status</button><button class="settings-tab" data-setting-tab="sonarr">Sonarr</button><button class="settings-tab" data-setting-tab="radarr">Radarr</button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin</button><button class="settings-tab" data-setting-tab="bazarr">Bazarr</button></nav>
+          <div class="settings-content">
+            <section class="settings-section" id="settings-tasks">
           <article class="panel" data-collapse="scheduled-tasks"><div class="panel-heading"><div><h2>Scheduled tasks</h2><p>Only new or changed files need conversion. OCR runs separately from text discovery.</p></div><span id="scheduler-state" class="status-pill">Loading</span></div>
             <div class="task-controls"><label class="check-row"><input id="pause-schedules" type="checkbox"><span>Pause automatic schedules</span></label><button class="button button-primary" id="save-task-schedules" type="button" disabled>Save schedules</button></div>
             <p id="task-schedule-note" class="form-hint task-note" role="status">Manual Run buttons remain available while schedules are paused. Pausing does not cancel a running job.</p>
             <div class="table-wrap"><table class="tasks-table"><thead><tr><th>NAME</th><th>SCHEDULE</th><th>NEXT EXECUTION</th><th>LAST RESULT</th><th>RUN</th></tr></thead><tbody id="tasks-body"><tr><td colspan="5" class="table-empty">Loading scheduled tasks…</td></tr></tbody></table></div>
             <div class="task-controls task-retry-controls"><label class="check-row"><input id="ocr-retry-failed" type="checkbox"><span>Include unchanged failed tracks in the next manual OCR run</span></label><p class="form-hint">Leave unchecked to avoid repeating costly OCR failures. Automatic OCR always skips them.</p></div>
           </article>
-        </section>
-        <section class="system-section" id="system-status">
+            </section>
+            <section class="settings-section" id="settings-status">
           <article class="panel" data-collapse="system-about"><div class="panel-heading"><div><h2>About Subforge</h2><p>Application version and the resource limits used by its worker.</p></div></div><dl id="system-about" class="system-about"><dt>Version</dt><dd>Loading…</dd></dl></article>
           <article class="panel" data-collapse="system-resource-policy"><div class="panel-heading"><div><h2>Resource policy</h2><p>One conversion worker, one OCR thread, and cached subtitle metadata.</p></div></div><p id="system-policy" class="system-policy"></p></article>
-        </section>
-      </section>
-
-      <section class="page" id="page-settings">
-        <div class="page-heading"><div><div class="eyebrow">PREFERENCES & CONNECTIONS</div><h1>Settings</h1><p class="lede">Choose extraction languages and connect your media servers.</p></div><button class="button button-primary" id="save-settings">Save changes</button></div>
-        <div class="settings-layout">
-          <nav class="settings-nav" aria-label="Settings sections"><button class="settings-tab active" data-setting-tab="general">General</button><button class="settings-tab" data-setting-tab="media">Media Management</button><button class="settings-tab" data-setting-tab="sonarr">Sonarr</button><button class="settings-tab" data-setting-tab="radarr">Radarr</button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin</button><button class="settings-tab" data-setting-tab="bazarr">Bazarr</button></nav>
-          <div class="settings-content">
+            </section>
             <section class="settings-section active" id="settings-general"><article class="panel settings-card" data-collapse="default-languages"><div class="panel-heading"><div><h2>Default languages</h2><p>Choose which subtitle tracks to export by default.</p></div></div><div class="settings-control"><div><strong>Extraction languages</strong><p>Used for scheduled scans and quick extraction.</p></div><button class="language-summary setting-language-button" type="button" data-open-languages="settings"><span class="language-globe">◎</span><span id="settings-languages">All languages</span><span class="chevron">⌄</span></button></div></article>
               <article class="panel settings-card" data-collapse="image-subtitles"><div class="panel-heading"><div><h2>Image subtitles</h2><p>OCR reads subtitle images and uses additional memory.</p></div></div><div class="hook-row"><div><strong>OCR permission</strong><p id="ocr-permission-note">Checking service configuration…</p></div><span id="ocr-permission-state" class="connection-state">Checking</span></div></article>
               <article class="panel settings-card" data-collapse="automation-hooks"><div class="panel-heading"><div><h2>Automation hooks</h2><p>Trigger an inspect or extraction when Sonarr or Radarr imports media.</p></div></div><div class="hook-row"><div><strong>Sonarr webhook</strong><p><code>/hooks/sonarr</code> · Configure the shared token in the service environment.</p></div><span id="sonarr-hook-state" class="connection-state">Checking</span></div><div class="hook-row"><div><strong>Radarr webhook</strong><p><code>/hooks/radarr</code> · Configure the shared token in the service environment.</p></div><span id="radarr-hook-state" class="connection-state">Checking</span></div></article></section>

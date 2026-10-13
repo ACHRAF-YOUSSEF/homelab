@@ -124,7 +124,7 @@ services:
 
   # Opt-in local conversion of embedded and sidecar subtitles, including OCR.
   subtitle-converter:
-    image: homelab-subtitle-converter:${CONVERTER_IMAGE_TAG:-0.2.0}
+    image: homelab-subtitle-converter:0.2.3
     build:
       context: ../subtitle-converter
     profiles: [subtitle-conversion]

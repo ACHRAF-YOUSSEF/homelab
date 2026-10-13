@@ -195,7 +195,7 @@
   };
   const pollStatus = async () => {
     if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
-    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateVersion(state.status.version); if(state.currentPage==='system'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
+    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateVersion(state.status.version); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
@@ -412,12 +412,12 @@
     for(const task of state.tasks.tasks || []) {
       const row=document.createElement('tr');row.dataset.taskId=task.id;
       const name=document.createElement('td'),copy=document.createElement('div');copy.className='task-name';const title=document.createElement('strong'),description=document.createElement('small');title.textContent=task.name;description.textContent=task.description;copy.append(title,description);name.append(copy);
-      const schedule=document.createElement('td'),controls=document.createElement('div');controls.className='task-schedule';const label=document.createElement('label');label.className='check-row';const enabled=document.createElement('input');enabled.type='checkbox';enabled.className='task-enabled';enabled.checked=!!task.enabled;enabled.disabled=task.available===false;enabled.setAttribute('aria-label',`Automatically run ${task.name}`);const labelText=document.createElement('span');labelText.textContent='Automatic';label.append(enabled,labelText);
+      const schedule=document.createElement('td'),controls=document.createElement('div');schedule.dataset.label='Schedule';controls.className='task-schedule';const label=document.createElement('label');label.className='check-row';const enabled=document.createElement('input');enabled.type='checkbox';enabled.className='task-enabled';enabled.checked=!!task.enabled;enabled.disabled=task.available===false;enabled.setAttribute('aria-label',`Automatically run ${task.name}`);const labelText=document.createElement('span');labelText.textContent='Automatic';label.append(enabled,labelText);
       const interval=document.createElement('select');interval.className='input compact-input task-interval';interval.setAttribute('aria-label',`${task.name} interval`);interval.disabled=task.available===false;
       const choices=[...new Set([3600,21600,43200,86400,172800,604800,1209600,2592000,task.interval_seconds])].filter(value=>value>=task.min_interval_seconds).sort((a,b)=>a-b);
       for(const value of choices)interval.add(new Option(intervalLabel(value),String(value)));interval.value=String(task.interval_seconds);enabled.addEventListener('change',markTasksDirty);interval.addEventListener('change',markTasksDirty);controls.append(label,interval);schedule.append(controls);
-      const next=document.createElement('td');next.className='task-next';next.textContent=task.available===false?'Permission disabled':paused?'Paused':task.enabled?fmtDate(task.next_run):'Manual only';
-      const last=document.createElement('td');last.className='task-last-result';const result=document.createElement('span');result.textContent=task.last_result||'Not run yet';last.append(result);if(task.last_run){const time=document.createElement('small');time.textContent=fmtDate(task.last_run);last.append(document.createElement('br'),time);}
+      const next=document.createElement('td');next.dataset.label='Next execution';next.className='task-next';next.textContent=task.available===false?'Permission disabled':paused?'Paused':task.enabled?fmtDate(task.next_run):'Manual only';
+      const last=document.createElement('td');last.dataset.label='Last result';last.className='task-last-result';const result=document.createElement('span');result.textContent=task.last_result||'Not run yet';last.append(result);if(task.last_run){const time=document.createElement('small');time.textContent=fmtDate(task.last_run);last.append(document.createElement('br'),time);}
       const action=document.createElement('td'),run=document.createElement('button');run.type='button';run.className='button button-secondary task-run';run.textContent=['running','queued'].includes(task.status)?'…':'▶';run.setAttribute('aria-label',`Run ${task.name}`);run.title=task.blocked_reason||`Run ${task.name} now`;run.disabled=task.available===false||['running','queued'].includes(task.status)||state.taskRequests.has(task.id);run.addEventListener('click',()=>runTask(task.id));action.append(run);row.append(name,schedule,next,last,action);body.append(row);
     }
     setText($('#task-schedule-note'),'Manual Run buttons remain available while schedules are paused. Pause does not cancel current work.');
@@ -445,22 +445,18 @@
     try{state.systemInfo=await api('/api/system');const info=state.systemInfo,policy=info.resource_policy||{};updateVersion(info.version);const uptime=Math.max(0,Math.floor(Number(info.uptime_seconds)||0)),rows=[['Subforge version',info.version?`v${info.version}`:'—'],['Runtime',info.runtime||'Rust'],['Operating system',[info.os,info.arch].filter(Boolean).join(' · ')],['Uptime',`${Math.floor(uptime/86400)}d ${Math.floor(uptime%86400/3600)}h ${Math.floor(uptime%3600/60)}m`],['Browser time zone',Intl.DateTimeFormat().resolvedOptions().timeZone],['Conversion workers',policy.conversion_workers??1],['OCR threads',policy.ocr_threads??1],['Track metadata cache',`${Math.round(Number(policy.metadata_cache_max_bytes||0)/1048576)} MiB · ${Number(policy.metadata_cache_max_entries||0).toLocaleString()} files maximum`]];const about=$('#system-about');about.replaceChildren();for(const[label,value]of rows){const term=document.createElement('dt'),detail=document.createElement('dd');term.textContent=label;detail.textContent=String(value);about.append(term,detail);}setText($('#system-policy'),`Discovery and import hooks convert text tracks and queue new or changed image tracks. Daily OCR handles that queue with one worker and one OCR thread${policy.ocr_permission?'':'; OCR is currently disabled by deployment permissions'}. Unchanged outputs and failures stay cached. Manual inventory refreshes reuse cached metadata. The container CPU and RAM ceilings are configured in Docker Compose.`);}
     catch(error){notify(`Could not load system status: ${error.message}`,'error');}
   };
-  const pageNames={overview:'Overview',library:'Library',activity:'Activity',system:'System',settings:'Settings'};
-  const settingsSections=['general','media','sonarr','radarr','jellyfin','bazarr'];
-  const systemSections=['tasks','status'];
+  const pageNames={overview:'Overview',library:'Library',activity:'Activity',settings:'Settings'};
+  const settingsSections=['general','media','tasks','status','sonarr','radarr','jellyfin','bazarr'];
   state.settingsSection='general';
-  state.systemSection='tasks';
-  const routeHash = (page,section) => `#/${page}${page==='settings'||page==='system'?`/${section}`:''}`;
+  const routeHash = (page,section) => `#/${page}${page==='settings'?`/${section}`:''}`;
   const readRoute = () => {
     const parts=location.hash.replace(/^#\/?/,'').replace(/\/+$/,'').split('/');
     const page=parts[0] || 'overview';
+    if(page==='system'&&parts.length<=2&&['tasks','status'].includes(parts[1]||'tasks'))return {page:'settings',section:parts[1]||'tasks'};
     if(!Object.hasOwn(pageNames,page))return {page:'overview',section:'general'};
     if(page==='settings') {
       const section=parts[1] || 'general';
       if(parts.length<=2&&settingsSections.includes(section))return {page,section};
-    } else if(page==='system') {
-      const section=parts[1] || 'tasks';
-      if(parts.length<=2&&systemSections.includes(section))return {page,section};
     } else if(parts.length===1)return {page,section:'general'};
     return {page:'overview',section:'general'};
   };
@@ -470,16 +466,13 @@
   const showRoute = ({page,section}) => {
     const fromMobileMenu=$('#sidebar').classList.contains('mobile-open');
     const previousPage=document.activeElement.closest('.page');
-    const changed=state.currentPage!==page||(page==='settings'&&state.settingsSection!==section)||(page==='system'&&state.systemSection!==section);
+    const changed=state.currentPage!==page||(page==='settings'&&state.settingsSection!==section);
     state.currentPage=page;
     if(page==='settings')state.settingsSection=section;
-    if(page==='system')state.systemSection=section;
     $$('.page').forEach(node=>node.classList.toggle('active',node.id===`page-${page}`));
     $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page));
     $$('.settings-tab').forEach(node=>node.classList.toggle('active',node.dataset.settingTab===state.settingsSection));
     $$('.settings-section').forEach(node=>node.classList.toggle('active',node.id===`settings-${state.settingsSection}`));
-    $$('.system-tab').forEach(node=>node.classList.toggle('active',node.dataset.systemTab===state.systemSection));
-    $$('.system-section').forEach(node=>node.classList.toggle('active',node.id===`system-${state.systemSection}`));
     setText($('#page-crumb'),pageNames[page]);closeMobileMenu();
     if(fromMobileMenu||(previousPage&&previousPage.id!==`page-${page}`)) {
       const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
@@ -488,15 +481,16 @@
       if(!state.settings)loadSettings();
       if(changed&&section==='media')loadRootFolders();
     }
-    if(page==='system'&&state.csrf&&changed){loadTasks();loadSystem();}
+    const administration=page==='settings'&&['tasks','status'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
+    if(administration&&state.csrf&&changed){loadTasks();loadSystem();}
   };
   const restoreRoute = () => {
     const route=readRoute(),hash=routeHash(route.page,route.section);
     if(location.hash!==hash)history.replaceState(null,'',hash);
     showRoute(route);
   };
-  const navigate = (page,section=page==='system'?state.systemSection:state.settingsSection) => {
-    if(!Object.hasOwn(pageNames,page)||(page==='settings'&&!settingsSections.includes(section))||(page==='system'&&!systemSections.includes(section)))return;
+  const navigate = (page,section=state.settingsSection) => {
+    if(!Object.hasOwn(pageNames,page)||(page==='settings'&&!settingsSections.includes(section)))return;
     const hash=routeHash(page,section);
     if(location.hash!==hash)history.pushState(null,'',hash);
     showRoute({page,section});
@@ -529,7 +523,6 @@
     $('#folder-mount').addEventListener('change',()=>browseRootFolder($('#folder-mount').value));$('#browse-root-folder').addEventListener('click',()=>browseRootFolder($('#folder-path').value.trim()));$('#folder-path').addEventListener('input',()=>{state.folderRequest++;state.currentFolder=null;$('#select-root-folder').disabled=true;setText($('#folder-browser-note'),'Browse to check this folder before adding it.');});$('#folder-path').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();browseRootFolder($('#folder-path').value.trim());}});
     $('#folder-parent-button').addEventListener('click',()=>{if(state.folderParent)browseRootFolder(state.folderParent);});$('#select-root-folder').addEventListener('click',()=>{if(state.currentFolder)saveRootFolders([...state.rootFolders.roots.map(root=>root.path),state.currentFolder]);});
     $$('.settings-tab').forEach(button=>button.addEventListener('click',()=>navigate('settings',button.dataset.settingTab)));
-    $$('.system-tab').forEach(button=>button.addEventListener('click',()=>navigate('system',button.dataset.systemTab)));
     $('#refresh-system').addEventListener('click',()=>{loadTasks();loadSystem();});
     $('#pause-schedules').addEventListener('change',markTasksDirty);
     $('#save-task-schedules').addEventListener('click',saveTasks);
@@ -543,6 +536,6 @@
     });
   };
   const scheduleStatusPoll = () => {clearTimeout(state.pollTimer);const busy=!!state.status?.running||!!state.status?.queue?.length;state.pollTimer=setTimeout(async()=>{await pollStatus();scheduleStatusPoll();},document.hidden?60000:busy?3000:15000);};
-  const initialize = async () => { bind();restoreRoute(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]);if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();if(state.currentPage==='system')await Promise.all([loadTasks(),loadSystem()]); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } scheduleStatusPoll();document.addEventListener('visibilitychange',async()=>{if(!document.hidden)await pollStatus();scheduleStatusPoll();}); };
+  const initialize = async () => { bind();restoreRoute(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]);if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();if(state.currentPage==='settings'&&['tasks','status'].includes(state.settingsSection))await Promise.all([loadTasks(),loadSystem()]); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } scheduleStatusPoll();document.addEventListener('visibilitychange',async()=>{if(!document.hidden)await pollStatus();scheduleStatusPoll();}); };
   initialize();
 })();

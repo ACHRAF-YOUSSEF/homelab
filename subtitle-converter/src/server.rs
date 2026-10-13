@@ -271,7 +271,18 @@ impl App {
             runtime.converted.extend(
                 state
                     .iter()
-                    .filter(|(_, item)| item["ok"] == true)
+                    .filter(|(_, item)| {
+                        item["ok"] == true
+                            || item["text_complete"] == true
+                            || item["outputs"].as_array().is_some_and(|outputs| {
+                                outputs.iter().any(|output| {
+                                    output.as_str().is_some_and(|name| {
+                                        Path::new(name).file_name().and_then(|value| value.to_str())
+                                            == Some(name)
+                                    })
+                                })
+                            })
+                    })
                     .map(|(path, _)| path.clone()),
             );
         }
@@ -835,7 +846,15 @@ impl App {
             }
         }
         if job["kind"] == "inspect" || job["task_id"] == "discovery" {
-            let previous_rows = lock(&self.runtime).inventory.iter().filter_map(|row|row["path"].as_str().map(|path|(path.to_owned(),row.clone()))).collect::<BTreeMap<_,_>>();
+            let previous_rows = lock(&self.runtime)
+                .inventory
+                .iter()
+                .filter_map(|row| {
+                    row["path"]
+                        .as_str()
+                        .map(|path| (path.to_owned(), row.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
             let mut results = Vec::new();
             let mut inspected = 0_u64;
             let mut failed = 0_u64;
@@ -845,7 +864,8 @@ impl App {
                     break;
                 }
                 self.progress(json!({"status":"inspecting","path":path}));
-                let cache_miss = job["task_id"] == "discovery" && lock(&self.converter).cached_description(path).is_none();
+                let cache_miss = job["task_id"] == "discovery"
+                    && lock(&self.converter).cached_description(path).is_none();
                 let result = Converter::safe_path(&path.to_string_lossy(), &roots).and_then(|_| {
                     if job["task_id"] == "discovery" {
                         lock(&self.converter)
@@ -867,19 +887,23 @@ impl App {
                     let mut row = previous_rows.get(&*path.to_string_lossy()).cloned().unwrap_or_else(||json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"type":"video","tracks":[]}));
                     row["root_id"] = root_id;
                     row["metadata_pending"] = json!(true);
-                    if let Some(object) = row.as_object_mut() { object.remove("error"); }
+                    if let Some(object) = row.as_object_mut() {
+                        object.remove("error");
+                    }
                     row
-                } else { match result {
-                    Ok(tracks) => {
-                        inspected += 1;
-                        json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":if ["mkv","mks","mp4","m4v","webm","mov","avi","ts","m2ts"].contains(&path.extension().and_then(|value|value.to_str()).unwrap_or("")){"video"}else{"sidecar"},"tracks":tracks})
+                } else {
+                    match result {
+                        Ok(tracks) => {
+                            inspected += 1;
+                            json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":if ["mkv","mks","mp4","m4v","webm","mov","avi","ts","m2ts"].contains(&path.extension().and_then(|value|value.to_str()).unwrap_or("")){"video"}else{"sidecar"},"tracks":tracks})
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            self.progress(json!({"status":"failed","path":path,"error":error}));
+                            json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":"video","tracks":[],"error":error})
+                        }
                     }
-                    Err(error) => {
-                        failed += 1;
-                        self.progress(json!({"status":"failed","path":path,"error":error}));
-                        json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":"video","tracks":[],"error":error})
-                    }
-                }};
+                };
                 results.push(result);
                 if let Some(running) = lock(&self.runtime).running.as_mut() {
                     running["processed"] = json!(inspected + failed + metadata_pending);
@@ -1586,5 +1610,62 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["tracks"].as_array().unwrap().len(), 64);
         assert!(rows[0]["tracks"][0]["language"].as_str().unwrap().len() <= 35);
+    }
+
+    #[test]
+    fn discovery_retains_legacy_inventory_when_track_metadata_is_not_cached() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let mount = temporary.path().join("media");
+        let data = temporary.path().join("data");
+        fs::create_dir(&mount).expect("fixture");
+        fs::create_dir(&data).expect("fixture");
+        let source = mount.join("legacy.mkv");
+        fs::write(&source, b"fresh fixture is deferred by minimum age").expect("fixture");
+        let tracks =
+            json!([{"number":3,"language":"en","format":"SubRip","forced":false,"hi":false}]);
+        write_private(&data.join("inventory.json"), &json!({"items":[{"path":source,"name":"legacy.mkv","type":"video","tracks":tracks}],"updated":10.0})).expect("fixture");
+        let app =
+            App::new(vec![mount], data.clone(), Duration::from_secs(21600), false).expect("app");
+        let job = app
+            .enqueue_task("discovery", "task_manual", false)
+            .expect("queue")
+            .expect("job");
+        lock(&app.runtime).running = Some(job.clone());
+        let mut integrations = Integrations::new(data.join("settings.json")).expect("fixture");
+        app.execute(&job, &mut integrations).expect("discovery");
+        let inventory = app.inventory();
+        assert_eq!(inventory["items"].as_array().unwrap().len(), 1);
+        assert_eq!(inventory["items"][0]["tracks"], tracks);
+        assert_eq!(inventory["items"][0]["metadata_pending"], true);
+        assert!(inventory["items"][0].get("error").is_none());
+        assert_eq!(app.status()["running"]["summary"]["inspection_failed"], 0);
+    }
+
+    #[test]
+    fn conversion_count_survives_later_ocr_failure_with_preserved_text_outputs() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let mount = temporary.path().join("media");
+        let data = temporary.path().join("data");
+        fs::create_dir(&mount).expect("fixture");
+        fs::create_dir(&data).expect("fixture");
+        let source = mount.join("processed.mkv").to_string_lossy().into_owned();
+        write_private(
+            &data.join("state.json"),
+            &json!({source.clone():{"ok":true,"outputs":["processed.en.srt"]}}),
+        )
+        .expect("fixture");
+        let app = App::new(
+            vec![mount.clone()],
+            data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .expect("app");
+        assert_eq!(app.status()["converted_count"], 1);
+        drop(app);
+        write_private(&data.join("state.json"), &json!({source:{"ok":false,"ocr_pending":true,"outputs":["processed.en.srt"]},"completed-text-pass":{"ok":false,"text_complete":true,"ocr_pending":true,"outputs":[]},"failed-without-output":{"ok":false,"outputs":[]},"invalid-output":{"ok":false,"outputs":["../outside.srt"]}})).expect("fixture");
+        let restarted =
+            App::new(vec![mount], data, Duration::from_secs(21600), false).expect("app");
+        assert_eq!(restarted.status()["converted_count"], 2);
     }
 }
