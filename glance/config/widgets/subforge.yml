@@ -18,7 +18,7 @@
         <div><div class="color-highlight size-h3">{{ .JSON.Int "converted_count" | formatNumber }}</div><div class="size-h6">CONVERTED</div></div>
         <div><div class="color-primary size-h3">{{ .JSON.Int "queued_count" }}</div><div class="size-h6">QUEUED</div></div>
         <div><div class="color-highlight size-h3">{{ .JSON.Int "configured_root_count" }}</div><div class="size-h6">ROOTS</div></div>
-        <div><div class="{{ if gt (.JSON.Int "recent_failures_count") 0 }}color-negative{{ else }}color-positive{{ end }} size-h3">{{ .JSON.Int "recent_failures_count" }}</div><div class="size-h6">RECENT FAILURES</div></div>
+        <div><div class="{{ if gt (.JSON.Int "recent_failures_count") 0 }}color-negative{{ else }}color-positive{{ end }} size-h3">{{ .JSON.Int "recent_failures_count" }}</div><div class="size-h6">LATEST SCAN FAILURES</div></div>
       </div>
       <div class="flex justify-between items-center gap-10 margin-top-15">
         <span class="size-h6">CURRENT RUN</span>

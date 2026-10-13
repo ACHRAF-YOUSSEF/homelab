@@ -58,6 +58,10 @@ struct Runtime {
     history: VecDeque<Value>,
     logs: VecDeque<Value>,
     converted: HashSet<String>,
+    inventory: Vec<Value>,
+    inventory_updated: f64,
+    inventory_truncated: bool,
+    inventory_partial: bool,
 }
 pub struct App {
     runtime: Mutex<Runtime>,
@@ -151,6 +155,27 @@ fn completed_status(job: &Value) -> &'static str {
     }
 }
 
+fn inventory_rows(value: &Value, mounts: &[PathBuf], roots: &[PathBuf]) -> Vec<Value> {
+    value.as_array().into_iter().flatten().take(INVENTORY_LIMIT).filter_map(|row| {
+        let path = row["path"].as_str()?;
+        if path.len() > 4096 || validate_root(Path::new(path), mounts, false).is_err() { return None; }
+        let name = Path::new(path).file_name()?.to_string_lossy().chars().take(256).collect::<String>();
+        let tracks = row["tracks"].as_array().into_iter().flatten().take(64).map(|track| {
+            let mut result = serde_json::Map::new();
+            for key in ["language", "format"] {
+                result.insert(key.into(), json!(track[key].as_str().unwrap_or("").chars().take(35).collect::<String>()));
+            }
+            for key in ["forced", "hi"] { result.insert(key.into(), json!(track[key].as_bool().unwrap_or(false))); }
+            result.insert("number".into(), json!(track["number"].as_u64().unwrap_or(0)));
+            Value::Object(result)
+        }).collect::<Vec<_>>();
+        let root_id = roots.iter().filter(|root| Path::new(path).starts_with(root)).max_by_key(|root| root.components().count()).map(|root| root_info(root, mounts)["id"].clone()).unwrap_or(Value::Null);
+        let mut result = json!({"path":path,"name":name,"root_id":root_id,"type":if row["type"]=="sidecar" {"sidecar"} else {"video"},"tracks":tracks});
+        if let Some(error) = row["error"].as_str() { result["error"] = json!(error.chars().take(256).collect::<String>()); }
+        Some(result)
+    }).collect()
+}
+
 impl App {
     pub fn new(
         mounts: Vec<PathBuf>,
@@ -219,6 +244,18 @@ impl App {
                     .filter(|entry| entry.is_object())
                     .cloned(),
             );
+        }
+        if let Ok(saved) = read_json(&data.join("inventory.json"), JSON_LIMIT) {
+            runtime.inventory = inventory_rows(&saved["items"], &mounts, &runtime.roots);
+            runtime.inventory_updated = saved["updated"].as_f64().unwrap_or(0.0);
+            runtime.inventory_truncated = saved["truncated"].as_bool().unwrap_or(false);
+            runtime.inventory_partial = saved["partial"].as_bool().unwrap_or(false);
+        }
+        // Inventory is stored once, independently of rotating job history.
+        for job in &mut runtime.history {
+            if job["kind"] == "inspect" {
+                job["results"] = json!([]);
+            }
         }
         if let Some(state) = converter.state.as_object() {
             runtime.converted.extend(
@@ -337,23 +374,21 @@ impl App {
                 job["status"] = json!(completed_status(job));
             }
         }
-        json!({"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"settings":settings})
+        json!({"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial},"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"settings":settings})
+    }
+    fn inventory(&self) -> Value {
+        let runtime = lock(&self.runtime);
+        json!({"items":runtime.inventory,"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial})
     }
     fn widget(&self) -> Value {
         let runtime = lock(&self.runtime);
         let current=runtime.running.as_ref().map(|job|{let total=count(&job["total"]);let processed=count(&job["processed"]);json!({"kind":job["kind"],"status":job["status"],"processed":processed,"total":total,"progress_percent":if total>0 {Some((processed.saturating_mul(100)/total).min(100))}else{None}})});
-        let failures: u64 = runtime
-            .history
+        let scan = runtime
+            .running
             .iter()
-            .map(|job| {
-                let failed = count(&job["summary"]["failed"]);
-                if failed == 0 && job["status"] == "failed" {
-                    1
-                } else {
-                    failed
-                }
-            })
-            .sum();
+            .chain(runtime.history.iter().rev())
+            .find(|job| job["kind"] == "scan" || job["kind"] == "extract");
+        let failures = scan.map_or(0, |job| count(&job["summary"]["failed"]));
         json!({"converted_count":runtime.converted.len(),"current_run":current,"queued_count":runtime.queue.len(),"configured_root_count":runtime.roots.len(),"selected_languages":runtime.languages,"recent_failures_count":failures})
     }
     fn mounts_value(&self) -> Value {
@@ -696,16 +731,30 @@ impl App {
                     Err(error) => {
                         failed += 1;
                         self.progress(json!({"status":"failed","path":path,"error":error}));
-                        json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"tracks":[],"error":"Inspection failed"})
+                        json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":"video","tracks":[],"error":error})
                     }
                 };
                 results.push(result);
                 if let Some(running) = lock(&self.runtime).running.as_mut() {
                     running["processed"] = json!(inspected + failed);
                     running["summary"] = json!({"inspected":inspected,"failed":failed});
-                    running["results"] = json!(results);
                     running["truncated"] = json!(paths.len() > INVENTORY_LIMIT);
                 }
+            }
+            let partial = self.cancel.load(Ordering::Relaxed);
+            let keep_previous = partial && !lock(&self.runtime).inventory.is_empty();
+            if !keep_previous {
+                let updated = now();
+                let truncated = paths.len() > INVENTORY_LIMIT;
+                write_private(
+                    &self.data.join("inventory.json"),
+                    &json!({"items":results,"updated":updated,"truncated":truncated,"partial":partial}),
+                )?;
+                let mut runtime = lock(&self.runtime);
+                runtime.inventory = results;
+                runtime.inventory_updated = updated;
+                runtime.inventory_truncated = truncated;
+                runtime.inventory_partial = partial;
             }
         }
         Ok(())
@@ -760,6 +809,7 @@ impl App {
                 });
                 finished["finished"] = json!(now());
                 if finished["kind"] == "inspect" {
+                    finished["results"] = json!([]);
                     for prior in &mut runtime.history {
                         if prior["kind"] == "inspect" {
                             prior["results"] = json!([]);
@@ -1030,6 +1080,7 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/health" => Reply::json(200, json!({"ok":true})),
             "/api/session" => Reply::json(200, json!({"csrf_token":app.csrf})),
             "/api/status" => Reply::json(200, app.status()),
+            "/api/inventory" => Reply::json(200, app.inventory()),
             "/api/widget" => Reply::json(200, app.widget()),
             "/api/settings" => Reply::json(200, app.settings()),
             "/api/root-folders" => Reply::json(200, app.root_folders()),
@@ -1202,6 +1253,13 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
         return Err("CONVERTER_SCAN_INTERVAL must be at least 1 second".into());
     }
     let app = App::new(roots, data, Duration::from_secs(interval), auto_scan)?;
+    let seed_inventory = {
+        let runtime = lock(&app.runtime);
+        auto_scan && runtime.inventory_updated == 0.0 && !runtime.roots.is_empty()
+    };
+    if seed_inventory {
+        app.enqueue(&json!({"kind":"inspect"}), "startup")?;
+    }
     let listener = TcpListener::bind((host.as_str(), port))
         .map_err(|_| "Listener address or port is unavailable")?;
     listener
@@ -1293,5 +1351,44 @@ mod tests {
         assert!(constant_equal(b"private", b"private"));
         assert!(!constant_equal(b"private", b"privat"));
         assert!(!constant_equal(b"private", b"prIvate"));
+    }
+    #[test]
+    fn inventory_survives_restart_separately_from_job_history() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let mount = temporary.path().join("media");
+        let data = temporary.path().join("data");
+        fs::create_dir(&mount).expect("fixture");
+        fs::create_dir(&data).expect("fixture");
+        let row = json!({"path":mount.join("example.mkv"),"type":"video","tracks":[{"number":3,"language":"en","format":"SubRip"}]});
+        write_private(
+            &data.join("inventory.json"),
+            &json!({"items":[row.clone()],"updated":10.0,"truncated":true}),
+        )
+        .expect("fixture");
+        write_private(
+            &data.join("jobs.json"),
+            &json!([{"kind":"inspect","results":[row],"status":"completed"}]),
+        )
+        .expect("fixture");
+        let app = App::new(vec![mount], data, Duration::from_secs(60), false).expect("app");
+        assert_eq!(app.inventory()["items"].as_array().unwrap().len(), 1);
+        assert_eq!(app.inventory()["updated"], 10.0);
+        assert_eq!(app.status()["history"][0]["results"], json!([]));
+        assert!(app.status()["inventory"].get("items").is_none());
+    }
+    #[test]
+    fn stored_inventory_is_bounded_and_stays_inside_mounts() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let mount = temporary.path().join("media");
+        fs::create_dir(&mount).expect("fixture");
+        let value = json!([{"path":temporary.path().join("outside.mkv"),"tracks":[]},{"path":mount.join("inside.mkv"),"tracks":vec![json!({"language":"x".repeat(4096),"format":"x".repeat(4096) });100]}]);
+        let rows = inventory_rows(
+            &value,
+            std::slice::from_ref(&mount),
+            std::slice::from_ref(&mount),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tracks"].as_array().unwrap().len(), 64);
+        assert!(rows[0]["tracks"][0]["language"].as_str().unwrap().len() <= 35);
     }
 }

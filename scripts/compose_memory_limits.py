@@ -121,7 +121,7 @@ def converter_ocr_enabled(container_id: str) -> bool:
     """Read only the OCR toggle from the converter's environment, never other envs."""
     output = run_docker([
         "docker", "inspect", "--format",
-        '{{range .Config.Env}}{{if eq . "CONVERTER_ENABLE_OCR=true"}}enabled{{end}}{{end}}',
+        '{{range .Config.Env}}{{if or (eq . "CONVERTER_ENABLE_OCR=true") (eq . "CONVERTER_ENABLE_OCR=1")}}enabled{{end}}{{end}}',
         container_id,
     ])
     return output.strip() == "enabled"

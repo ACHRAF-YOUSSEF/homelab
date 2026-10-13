@@ -11,6 +11,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::Builder;
@@ -28,6 +29,9 @@ const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SRT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRACKS: usize = 64;
 const MAX_TRACK_LABEL: usize = 32;
+// Bump only when a converter fix or new diagnostics should retry cached
+// failures immediately. Successful fingerprint caches are independent.
+const ERROR_CACHE_REVISION: u64 = 1;
 
 #[derive(Clone, Debug)]
 struct Track {
@@ -47,6 +51,7 @@ type ConversionJob = (
     Option<String>,
     bool,
     bool,
+    String,
     String,
 );
 
@@ -128,7 +133,7 @@ impl Converter {
                 continue;
             }
             let canonical_root = match root.canonicalize() {
-                Ok(p) => p,
+                Ok(p) => normalize_canonical_local_path(p),
                 Err(_) => continue,
             };
             for entry in WalkDir::new(root)
@@ -147,7 +152,7 @@ impl Converter {
                     continue;
                 }
                 let canonical = match path.canonicalize() {
-                    Ok(p) => p,
+                    Ok(p) => normalize_canonical_local_path(p),
                     Err(_) => continue,
                 };
                 if !canonical.starts_with(&canonical_root) {
@@ -181,9 +186,11 @@ impl Converter {
             let root = root
                 .canonicalize()
                 .map_err(|_| "Configured library is unavailable")?;
+            let root = normalize_canonical_local_path(root);
             let canonical = candidate
                 .canonicalize()
                 .map_err(|_| "Media path is unavailable")?;
+            let canonical = normalize_canonical_local_path(canonical);
             if canonical.starts_with(root) && !has_symlink_component(&candidate)? {
                 return Ok(canonical);
             }
@@ -317,14 +324,7 @@ impl Converter {
                     progress(json!({"status":"cached","path":path,"summary":summary}));
                     continue;
                 }
-                let attempt = previous
-                    .get("attempt")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                if !retry
-                    && previous.get("ok").and_then(Value::as_bool) != Some(true)
-                    && epoch_seconds() - attempt < self.retry_interval.as_secs_f64()
-                {
+                if failure_retry_delayed(&previous, retry, epoch_seconds(), self.retry_interval) {
                     bump(&mut summary, "pending");
                     progress(json!({"status":"pending","path":path,"summary":summary}));
                     continue;
@@ -388,7 +388,7 @@ impl Converter {
                     bump(&mut summary, "failed");
                     let safe = bounded_message(&message);
                     progress(json!({"status":"failed","path":path,"error":safe,"summary":summary}));
-                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe}));
+                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION}));
                     let _ = crate::util::write_private(&self.state_path, &self.state);
                 }
             }
@@ -406,16 +406,17 @@ impl Converter {
         let native_data = if matches!(extension(path).as_deref(), Some("mkv" | "mks" | "webm")) {
             let mut command = Command::new(&self.mkvmerge);
             command.args(["-J"]).arg(path);
-            let bytes = crate::util::bounded_process(
+            // mkvmerge uses exit status 1 when it emitted useful track JSON
+            // alongside warnings (for example a damaged subtitle track).
+            // Trust only parseable, structurally valid JSON; ffprobe remains
+            // the fallback if mkvmerge cannot provide it.
+            let (_success, bytes) = crate::util::bounded_process_allow_failure(
                 &mut command,
                 Duration::from_secs(120),
                 stop,
                 MAX_PROBE_BYTES,
             )?;
-            Some(
-                serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|_| "Matroska track metadata could not be parsed")?,
-            )
+            parse_mkvmerge_metadata(&bytes)
         } else {
             None
         };
@@ -452,15 +453,7 @@ impl Converter {
         if streams.len() > MAX_TRACKS {
             return Err("Media contains too many subtitle tracks to inspect safely".into());
         }
-        let native: Vec<Value> = native_data
-            .as_ref()
-            .and_then(|data| data.get("tracks"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|t| t.get("type").and_then(Value::as_str) == Some("subtitles"))
-            .cloned()
-            .collect();
+        let native = matching_native_tracks(native_data.as_ref(), streams.len());
         let mut result = Vec::new();
         for (ordinal, stream) in streams.iter().enumerate() {
             let tags = stream.get("tags").cloned().unwrap_or_else(|| json!({}));
@@ -522,9 +515,6 @@ impl Converter {
                             != 0
                     }),
             });
-        }
-        if !native.is_empty() && native.len() != result.len() {
-            return Err("Matroska subtitle track order could not be matched safely".into());
         }
         Ok(result)
     }
@@ -609,6 +599,7 @@ impl Converter {
                     image,
                     false,
                     ocr_lang,
+                    track.language,
                 ));
             }
         } else if matches!(extension(path).as_deref(), Some("idx" | "sub")) {
@@ -671,6 +662,7 @@ impl Converter {
                         true,
                         false,
                         self.ocr_for(&lang),
+                        lang,
                     ));
                 }
             }
@@ -696,12 +688,13 @@ impl Converter {
                     image,
                     seconv,
                     self.ocr_for(&filename_language(path, &self.language_aliases)),
+                    filename_language(path, &self.language_aliases),
                 ));
             }
         }
         let mut outputs = Vec::new();
         let mut destinations = HashSet::new();
-        for (source, name, stream, native_track, image, seconv, ocr_lang) in jobs {
+        for (source, name, stream, native_track, image, seconv, ocr_lang, language) in jobs {
             if !destinations.insert(name.clone()) {
                 continue;
             }
@@ -773,8 +766,11 @@ impl Converter {
             if staged.is_symlink() {
                 return Err("Converter created an unsafe symbolic-link output".into());
             }
-            remove_empty_cues(&staged)?;
-            validate_srt(&staged)?;
+            remove_empty_cues(&staged)
+                .and_then(|_| validate_srt(&staged))
+                .map_err(|message| {
+                    conversion_error_context(&message, native_track.as_deref(), stream, &language)
+                })?;
             outputs.push(name);
         }
         if fingerprint(path)? != before || stop.load(Ordering::Relaxed) {
@@ -826,6 +822,24 @@ fn absolute_lexical(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("/"))
             .join(path)
     }
+}
+
+/// Normalize only an internally canonicalized local drive path. User-supplied
+/// UNC and device paths are still rejected before canonicalization.
+pub fn normalize_canonical_local_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let mut components = path.components();
+        if let Some(Component::Prefix(prefix)) = components.next()
+            && let Prefix::VerbatimDisk(drive) = prefix.kind()
+            && components.next() == Some(Component::RootDir)
+        {
+            let mut normalized = PathBuf::from(format!("{}:\\", char::from(drive)));
+            normalized.push(components.as_path());
+            return normalized;
+        }
+    }
+    path
 }
 fn extension(path: &Path) -> Option<String> {
     path.extension()
@@ -922,6 +936,27 @@ fn bounded_track_language(value: &str) -> String {
         normalized
     } else {
         "und".into()
+    }
+}
+fn parse_mkvmerge_metadata(bytes: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .filter(|data| data.get("tracks").and_then(Value::as_array).is_some())
+}
+fn matching_native_tracks(native_data: Option<&Value>, stream_count: usize) -> Vec<Value> {
+    let native: Vec<Value> = native_data
+        .and_then(|data| data.get("tracks"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("subtitles"))
+        .take(MAX_TRACKS + 1)
+        .cloned()
+        .collect();
+    if native.len() == stream_count && native.len() <= MAX_TRACKS {
+        native
+    } else {
+        Vec::new()
     }
 }
 fn filename_language(path: &Path, aliases: &BTreeMap<String, String>) -> String {
@@ -1090,6 +1125,35 @@ fn bounded_message(s: &str) -> String {
     s.chars().take(240).collect()
 }
 
+fn failure_retry_delayed(previous: &Value, retry: bool, now: f64, interval: Duration) -> bool {
+    !retry
+        && previous.get("ok").and_then(Value::as_bool) != Some(true)
+        && previous.get("error_revision").and_then(Value::as_u64) == Some(ERROR_CACHE_REVISION)
+        && now
+            - previous
+                .get("attempt")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+            < interval.as_secs_f64()
+}
+
+fn conversion_error_context(
+    message: &str,
+    native_track: Option<&str>,
+    stream: Option<u64>,
+    language: &str,
+) -> String {
+    let track = native_track
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|number| format!("Track {number}"))
+        .or_else(|| stream.map(|number| format!("Stream {number}")))
+        .unwrap_or_else(|| "Sidecar".into());
+    bounded_message(&format!(
+        "{track}, language {}: {message}",
+        bounded_track_language(language)
+    ))
+}
+
 fn publish_noclobber(staged: &Path, destination: &Path) -> Result<bool, String> {
     if destination.exists() || destination.is_symlink() {
         return Ok(false);
@@ -1143,22 +1207,59 @@ fn validate_srt(path: &Path) -> Result<(), String> {
     }
     let timing = Regex::new(r"^\d{2,}:\d{2}:\d{2},\d{3} --> \d{2,}:\d{2}:\d{2},\d{3}(?: .*)?$")
         .map_err(|_| "Invalid subtitle validator")?;
-    for block in Regex::new(r"\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*")
+    for (ordinal, block) in Regex::new(r"\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*")
         .unwrap()
         .split(text)
+        .enumerate()
     {
-        let lines: Vec<_> = block.lines().collect();
-        if lines.len() < 3
-            || lines[0].trim().parse::<u64>().is_err()
-            || !timing.is_match(lines[1].trim())
-        {
-            return Err("Converter produced malformed SRT cues".into());
+        let cue = ordinal + 1;
+        let mut lines = block.lines();
+        if lines.next().unwrap_or("").trim().parse::<u64>().is_err() {
+            return Err(format!(
+                "Converter produced malformed SRT cue {cue}: invalid cue number"
+            ));
         }
-        if !lines[2..].iter().any(|l| !l.trim().is_empty()) {
-            return Err("Converter produced an empty SRT cue".into());
+        let timing_line = lines.next().ok_or_else(|| {
+            format!("Converter produced malformed SRT cue {cue}: missing timing line")
+        })?;
+        if !timing.is_match(timing_line.trim()) {
+            return Err(format!(
+                "Converter produced malformed SRT cue {cue}: invalid timing line"
+            ));
+        }
+        if !lines.any(|line| !line.trim().is_empty()) {
+            return Err(format!(
+                "Converter produced empty SRT cue {cue}: missing text"
+            ));
         }
     }
     Ok(())
+}
+fn canonical_srt_timing(value: &str) -> Option<String> {
+    static TIMING: OnceLock<Regex> = OnceLock::new();
+    let re = TIMING.get_or_init(|| {
+        Regex::new(r"^(\d{1,}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,}):(\d{2}):(\d{2})[,.](\d{3})(?:\s+(.*))?$")
+            .expect("static SRT timing expression is valid")
+    });
+    let captures = re.captures(value.trim())?;
+    let start_hour = captures[1].parse::<u64>().ok()?;
+    let start_minute = captures[2].parse::<u8>().ok()?;
+    let start_second = captures[3].parse::<u8>().ok()?;
+    let end_hour = captures[5].parse::<u64>().ok()?;
+    let end_minute = captures[6].parse::<u8>().ok()?;
+    let end_second = captures[7].parse::<u8>().ok()?;
+    if start_minute >= 60 || start_second >= 60 || end_minute >= 60 || end_second >= 60 {
+        return None;
+    }
+    let mut timing = format!(
+        "{start_hour:02}:{start_minute:02}:{start_second:02},{} --> {end_hour:02}:{end_minute:02}:{end_second:02},{}",
+        &captures[4], &captures[8]
+    );
+    if let Some(settings) = captures.get(9) {
+        timing.push(' ');
+        timing.push_str(settings.as_str().trim());
+    }
+    Some(timing)
 }
 fn remove_empty_cues(path: &Path) -> Result<usize, String> {
     if fs::metadata(path)
@@ -1180,18 +1281,26 @@ fn remove_empty_cues(path: &Path) -> Result<usize, String> {
     let blocks = Regex::new(r"\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*").unwrap();
     let mut kept = Vec::new();
     let mut removed = 0usize;
+    let mut modified = false;
     for block in blocks.split(text.trim_start_matches('\u{feff}').trim()) {
-        let lines: Vec<String> = block.lines().map(str::to_owned).collect();
+        let mut lines: Vec<String> = block.lines().map(str::to_owned).collect();
+        if let Some(timing) = lines.get_mut(1)
+            && let Some(canonical) = canonical_srt_timing(timing)
+        {
+            modified |= *timing != canonical;
+            *timing = canonical;
+        }
         let framed = lines.len() >= 2
             && lines[0].trim().parse::<u64>().is_ok()
             && timing.is_match(lines[1].trim());
         if framed && !lines[2..].iter().any(|l| !l.trim().is_empty()) {
             removed += 1;
+            modified = true;
             continue;
         }
         kept.push(lines)
     }
-    if removed > 0 {
+    if modified {
         let mut n = 1;
         for lines in &mut kept {
             if lines.len() >= 2
@@ -1262,6 +1371,117 @@ mod tests {
     }
 
     #[test]
+    fn srt_normalizes_period_milliseconds_and_single_digit_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("period.srt");
+        fs::write(&path, "1\n1:02:03.004-->1:02:04.005\nValid text\n").unwrap();
+        assert_eq!(remove_empty_cues(&path).unwrap(), 0);
+        assert!(validate_srt(&path).is_ok());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "1\n01:02:03,004 --> 01:02:04,005\nValid text\n"
+        );
+        assert!(canonical_srt_timing("00:61:00,000 --> 00:61:01,000").is_none());
+    }
+
+    #[test]
+    fn srt_cleanup_never_hides_broken_framing_after_valid_or_empty_cues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.srt");
+        for broken in [
+            "orphan text without a cue header",
+            "not-a-number\n00:00:03,000 --> 00:00:04,000\nText",
+            "3\nmissing timing\nText",
+        ] {
+            fs::write(
+                &path,
+                format!("1\n00:00:01,000 --> 00:00:02,000\nValid\n\n2\n00:00:02,000 --> 00:00:03,000\n \n\n{broken}\n"),
+            )
+            .unwrap();
+            remove_empty_cues(&path).unwrap();
+            assert!(validate_srt(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn srt_failures_identify_numeric_cue_and_reason_without_subtitle_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.srt");
+        fs::write(
+            &path,
+            "1\n00:00:01,000 --> 00:00:02,000\nPrivate fixture text\n\n2\ninvalid timing containing private fixture text\nPrivate fixture text\n",
+        )
+        .unwrap();
+        let error = validate_srt(&path).unwrap_err();
+        assert_eq!(
+            error,
+            "Converter produced malformed SRT cue 2: invalid timing line"
+        );
+        let context = conversion_error_context(&error, Some("4"), Some(3), "eng");
+        assert!(context.starts_with("Track 4, language eng:"));
+        assert!(!context.contains("Private fixture text"));
+        assert!(context.len() <= 240);
+        assert!(
+            conversion_error_context(&error, None, Some(3), "en")
+                .starts_with("Stream 3, language en:")
+        );
+        let hostile = conversion_error_context(
+            &"x".repeat(1000),
+            Some("untrusted track text"),
+            None,
+            &"x".repeat(1000),
+        );
+        assert!(hostile.starts_with("Sidecar, language und:"));
+        assert_eq!(hostile.len(), 240);
+    }
+
+    #[test]
+    fn legacy_failure_entries_retry_but_current_failures_keep_backoff() {
+        let interval = Duration::from_secs(3600);
+        let legacy = json!({"ok":false,"attempt":1000.0});
+        assert!(!failure_retry_delayed(&legacy, false, 1001.0, interval));
+        let current = json!({"ok":false,"attempt":1000.0,"error_revision":ERROR_CACHE_REVISION});
+        assert!(failure_retry_delayed(&current, false, 1001.0, interval));
+        assert!(!failure_retry_delayed(&current, true, 1001.0, interval));
+        assert!(!failure_retry_delayed(&current, false, 4601.0, interval));
+    }
+
+    #[test]
+    fn error_cache_revision_does_not_reprocess_successful_unchanged_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("movie.mkv");
+        let output = dir.path().join("movie.en.srt");
+        fs::write(&media, b"fixture source").unwrap();
+        fs::write(&output, b"existing subtitle must survive").unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.min_age = Duration::ZERO;
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        converter.set_state_entry(
+            &media.to_string_lossy(),
+            json!({
+                "ok":true,"fingerprint":fingerprint_json(&fingerprint(&media).unwrap()),
+                "languages":["*"],"outputs":["movie.en.srt"]
+            }),
+        );
+        let summary = converter
+            .scan(
+                &[media],
+                &["*".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary["cached"], 1);
+        assert_eq!(summary["converted"], 0);
+        assert_eq!(fs::read(output).unwrap(), b"existing subtitle must survive");
+    }
+
+    #[test]
     fn safe_path_rejects_parent_escape() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Converter::safe_path("../secret", &[dir.path().to_path_buf()]).is_err());
@@ -1274,7 +1494,7 @@ mod tests {
         fs::write(&media, b"fixture").unwrap();
         assert_eq!(
             Converter::safe_path(&media.to_string_lossy(), &[dir.path().to_path_buf()]).unwrap(),
-            media.canonicalize().unwrap()
+            normalize_canonical_local_path(media.canonicalize().unwrap())
         );
     }
 
@@ -1298,8 +1518,35 @@ mod tests {
         assert!(Path::new(&*drive_path).is_absolute());
         assert_eq!(
             Converter::safe_path(&drive_path, &[dir.path().to_path_buf()]).unwrap(),
-            media.canonicalize().unwrap()
+            normalize_canonical_local_path(media.canonicalize().unwrap())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn candidates_return_ordinary_drive_paths_and_preserve_user_device_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("film.mkv");
+        fs::write(&media, b"fixture").unwrap();
+        let canonical = media.canonicalize().unwrap();
+        let discovered = Converter::candidates(&[dir.path().to_path_buf()]);
+        assert_eq!(
+            discovered,
+            vec![normalize_canonical_local_path(canonical.clone())]
+        );
+        assert!(
+            Converter::safe_path(
+                &discovered[0].to_string_lossy(),
+                &[dir.path().to_path_buf()]
+            )
+            .is_ok()
+        );
+        assert!(
+            Converter::safe_path(&canonical.to_string_lossy(), &[dir.path().to_path_buf()])
+                .is_err()
+        );
+        let unc = PathBuf::from(r"\\?\UNC\server\share\film.mkv");
+        assert_eq!(normalize_canonical_local_path(unc.clone()), unc);
     }
 
     #[test]
@@ -1352,6 +1599,25 @@ mod tests {
     fn ffmpeg_hexadecimal_stream_ids_are_parsed_without_shell_interpolation() {
         assert_eq!(numeric_stream_id(&json!({"id":"0x2a"})), Some(42));
         assert_eq!(numeric_stream_id(&json!({"id":"not-an-id"})), None);
+    }
+
+    #[test]
+    fn mkvmerge_metadata_parser_accepts_valid_json_independent_of_exit_status() {
+        let metadata = br#"{"tracks":[{"type":"subtitles","properties":{"number":3}}]}"#;
+        assert!(parse_mkvmerge_metadata(metadata).is_some());
+        assert!(parse_mkvmerge_metadata(b"warning: invalid UTF-8 \xff").is_none());
+        assert!(parse_mkvmerge_metadata(br#"{"files":[]}"#).is_none());
+    }
+
+    #[test]
+    fn mkvmerge_track_count_mismatch_falls_back_to_ffprobe_ids() {
+        let native = json!({"tracks": [{"type":"video"}]});
+        assert!(matching_native_tracks(Some(&native), 25).is_empty());
+        let matching = json!({"tracks": [
+            {"type":"subtitles","properties":{"number":3}},
+            {"type":"subtitles","properties":{"number":4}}
+        ]});
+        assert_eq!(matching_native_tracks(Some(&matching), 2).len(), 2);
     }
 
     #[test]

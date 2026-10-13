@@ -79,7 +79,7 @@ class ComposeMemoryToolTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(
             command[3],
-            '{{range .Config.Env}}{{if eq . "CONVERTER_ENABLE_OCR=true"}}enabled{{end}}{{end}}',
+            '{{range .Config.Env}}{{if or (eq . "CONVERTER_ENABLE_OCR=true") (eq . "CONVERTER_ENABLE_OCR=1")}}enabled{{end}}{{end}}',
         )
 
 

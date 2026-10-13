@@ -748,6 +748,8 @@ For a read-only integration diagnostic, run `docker compose --profile subtitle-c
 
 Jellyfin's `JELLYFIN_INTERNAL_URL` and `JELLYFIN_API_KEY` remain environment-managed, and Subforge uses Jellyfin's current MediaBrowser authorization header. An HTTP 401/403 can reflect authorization format, a rejected key, or insufficient access; verify the safe connection diagnostic before changing the key. Recreate the converter after changing `JELLYFIN_API_KEY` in the private `.env`.
 
+Library inspection saves a bounded inventory snapshot separately from job history, preserving it across container restarts. The browser preserves its search, filters and page in the same tab and keeps the last snapshot visible while refreshing. The Glance widget reports failures from the latest scan. Integration settings explain each provider's triggers and latest recorded request; Sonarr/Radarr import hooks still need their Connect webhook configuration. Media tools use a scrubbed UTF-8 locale to keep non-ASCII metadata readable. Arr refreshes stream only IDs and paths from large library responses while enforcing byte and item ceilings.
+
 ### Jellyfin Plugins
 
 These optional Jellyfin plugins can be configured separately. Jellyfin is outside Compose, and this repository does not install or configure them:

@@ -2,6 +2,8 @@
 //! providers start disabled, URLs are explicitly validated, and this module
 //! only emits the small set of methods and endpoints used by the app.
 
+use serde::Deserialize;
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeSet,
@@ -16,6 +18,7 @@ use url::Url;
 
 const PROVIDERS: [&str; 4] = ["sonarr", "radarr", "bazarr", "jellyfin"];
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
+const MAX_ARR_RESPONSE: u64 = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 20_000;
 const SAFE_KEY_MAX: usize = 512;
 
@@ -23,6 +26,88 @@ const SAFE_KEY_MAX: usize = 512;
 struct HttpFailure {
     category: &'static str,
     status: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct ArrEntity {
+    id: Option<i64>,
+    path: Option<String>,
+}
+
+struct ArrEntitiesVisitor<'a> {
+    limit_exceeded: &'a mut bool,
+}
+
+impl<'de> Visitor<'de> for ArrEntitiesVisitor<'_> {
+    type Value = Vec<ArrEntity>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded Arr entity array")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        let mut records = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_ITEMS));
+        loop {
+            if records.len() == MAX_ITEMS {
+                // Detect another element without allocating its id/path or
+                // growing the record vector beyond the hard item ceiling.
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    *self.limit_exceeded = true;
+                    return Err(serde::de::Error::custom("Arr entity limit exceeded"));
+                }
+                return Ok(records);
+            }
+            match sequence.next_element::<ArrEntity>()? {
+                Some(record) => records.push(record),
+                None => return Ok(records),
+            }
+        }
+    }
+}
+
+fn arr_entities(base: &str, endpoint: &str, key: &str) -> Result<Vec<(i64, String)>, HttpFailure> {
+    let mut response = request_response(base, endpoint, "GET", key, Auth::ApiKey, None, None)?;
+    let reader = response.body_mut().as_reader();
+    parse_arr_entities(reader)
+}
+
+fn parse_arr_entities(reader: impl Read) -> Result<Vec<(i64, String)>, HttpFailure> {
+    let mut limited = reader.take(MAX_ARR_RESPONSE + 1);
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
+    let mut limit_exceeded = false;
+    let records = match serde::Deserializer::deserialize_seq(
+        &mut deserializer,
+        ArrEntitiesVisitor {
+            limit_exceeded: &mut limit_exceeded,
+        },
+    ) {
+        Ok(records) => records,
+        Err(_) => {
+            return Err(HttpFailure {
+                category: if limit_exceeded || limited.limit() == 0 {
+                    "response_limit"
+                } else {
+                    "invalid_json"
+                },
+                status: None,
+            });
+        }
+    };
+    let end_result = deserializer.end();
+    if limited.limit() == 0 {
+        return Err(HttpFailure {
+            category: "response_limit",
+            status: None,
+        });
+    }
+    end_result.map_err(|_| HttpFailure {
+        category: "invalid_json",
+        status: None,
+    })?;
+    Ok(records
+        .into_iter()
+        .filter_map(|record| Some((record.id?, record.path?)))
+        .collect())
 }
 
 impl HttpFailure {
@@ -165,6 +250,41 @@ fn request(
     body: Option<&Value>,
     form: Option<&[(&str, String)]>,
 ) -> Result<Value, HttpFailure> {
+    let mut response = request_response(base, path, method, key, auth, body, form)?;
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take((MAX_RESPONSE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| HttpFailure {
+            category: "unreachable",
+            status: None,
+        })?;
+    if bytes.len() > MAX_RESPONSE {
+        return Err(HttpFailure {
+            category: "response_limit",
+            status: None,
+        });
+    }
+    if bytes.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| HttpFailure {
+        category: "invalid_json",
+        status: None,
+    })
+}
+
+fn request_response(
+    base: &str,
+    path: &str,
+    method: &str,
+    key: &str,
+    auth: Auth,
+    body: Option<&Value>,
+    form: Option<&[(&str, String)]>,
+) -> Result<ureq::http::Response<ureq::Body>, HttpFailure> {
     if !matches!(method, "GET" | "POST" | "PATCH")
         || !path.starts_with('/')
         || path.starts_with("//")
@@ -224,36 +344,14 @@ fn request(
         status: None,
     })?;
     let result = http_agent().run(request);
-    let mut response = result.map_err(|e| safe_error(&e))?;
+    let response = result.map_err(|e| safe_error(&e))?;
     if !(200..300).contains(&response.status().as_u16()) {
         return Err(HttpFailure {
             category: "http_status",
             status: Some(response.status().as_u16()),
         });
     }
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take((MAX_RESPONSE + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| HttpFailure {
-            category: "unreachable",
-            status: None,
-        })?;
-    if bytes.len() > MAX_RESPONSE {
-        return Err(HttpFailure {
-            category: "response_limit",
-            status: None,
-        });
-    }
-    if bytes.is_empty() {
-        return Ok(json!({}));
-    }
-    serde_json::from_slice(&bytes).map_err(|_| HttpFailure {
-        category: "invalid_json",
-        status: None,
-    })
+    Ok(response)
 }
 
 #[derive(Clone, Copy)]
@@ -831,30 +929,27 @@ impl Integrations {
         } else {
             "/api/v3/movie"
         };
-        let data = self
-            .api(provider, endpoint, "GET", None, None)
-            .map_err(|e| e.message("Scan request failed"))?;
+        let entities = arr_entities(
+            get_str(self.conf(provider), "url"),
+            endpoint,
+            get_str(self.conf(provider), "api_key"),
+        )
+        .map_err(|e| e.message("Scan request failed"))?;
+        if entities.len() >= MAX_ITEMS {
+            return Err("Arr media list exceeds the configured scan limit".into());
+        }
+        let mapped_paths: Vec<_> = paths
+            .iter()
+            .filter_map(|path| self.remote_path(provider, path))
+            .filter_map(|path| norm_path(&path))
+            .collect();
         let mut ids = BTreeSet::new();
-        if let Some(entities) = data.as_array() {
-            for entity in entities {
-                let Some(id) = entity.get("id").and_then(Value::as_i64) else {
-                    continue;
-                };
-                let Some(root) = entity
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .and_then(norm_path)
-                else {
-                    continue;
-                };
-                if paths
-                    .iter()
-                    .filter_map(|p| self.remote_path(provider, p))
-                    .filter_map(|p| norm_path(&p))
-                    .any(|p| under(&p, &root))
-                {
-                    ids.insert(id);
-                }
+        for (id, entity_path) in entities {
+            let Some(root) = norm_path(&entity_path) else {
+                continue;
+            };
+            if mapped_paths.iter().any(|path| under(path, &root)) {
+                ids.insert(id);
             }
         }
         let cmd = if provider == "sonarr" {
@@ -1387,6 +1482,29 @@ mod tests {
         thread,
     };
 
+    #[test]
+    fn arr_array_limit_stops_before_reading_remaining_records() {
+        let tiny_records = std::iter::repeat_n("{}", MAX_ITEMS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(
+            "[{tiny_records},{{\"ignored\":\"{}\"}}]",
+            "x".repeat(64 * 1024)
+        );
+        let mut reader = std::io::Cursor::new(body.as_bytes());
+        let error = parse_arr_entities(&mut reader).unwrap_err();
+        assert_eq!(error.category, "response_limit");
+        assert!(reader.position() < body.len() as u64);
+
+        let at_limit = format!(
+            "[{}]",
+            std::iter::repeat_n("{}", MAX_ITEMS)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(parse_arr_entities(at_limit.as_bytes()).unwrap().is_empty());
+    }
+
     fn fixture(status: &str, body: &str, expected_auth: Option<&str>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1469,15 +1587,20 @@ mod tests {
                 let request = String::from_utf8_lossy(&bytes).to_string();
                 output.lock().unwrap().push(request.clone());
                 let body = if request.starts_with("GET /api/v3/series ") {
-                    r#"[{"id":12,"path":"/tv/Show"}]"#
+                    let records: Vec<_> = (1..=320)
+                        .map(|id| {
+                            json!({"id":if id == 320 { 12 } else { id },"path":if id == 320 { "/tv/Show" } else { "/tv/Other" },"largeIgnoredField":"x".repeat(7_000)})
+                        })
+                        .collect();
+                    serde_json::to_string(&records).unwrap()
                 } else if request.starts_with("GET /Library/VirtualFolders ") {
-                    r#"[{"ItemId":"movies","Name":"Movies","CollectionType":"movies","Locations":["/movies"]}]"#
+                    r#"[{"ItemId":"movies","Name":"Movies","CollectionType":"movies","Locations":["/movies"]}]"#.to_owned()
                 } else if request.starts_with("GET /api/series?") {
-                    r#"{"data":[{"sonarrSeriesId":12,"path":"/tv/Show"}],"total":1}"#
+                    r#"{"data":[{"sonarrSeriesId":12,"path":"/tv/Show"}],"total":1}"#.to_owned()
                 } else if request.starts_with("GET /api/movies?") {
-                    r#"{"data":[{"radarrId":34,"path":"/movies/Film.mkv"},{"radarrId":35,"path":"/movies/film.mkv"}],"total":2}"#
+                    r#"{"data":[{"radarrId":34,"path":"/movies/Film.mkv"},{"radarrId":35,"path":"/movies/film.mkv"}],"total":2}"#.to_owned()
                 } else {
-                    "{}"
+                    "{}".to_owned()
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

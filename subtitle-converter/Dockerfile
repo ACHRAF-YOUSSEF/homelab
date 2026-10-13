@@ -4,9 +4,10 @@ ENV CARGO_BUILD_JOBS=1
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 COPY web/ ./web/
+COPY tests/ ./tests/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo test --lib --locked \
+    cargo test --locked \
     && cargo build --release --locked \
     && cp target/release/subforge /build/subforge
 

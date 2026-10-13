@@ -126,26 +126,7 @@ pub fn bounded_process_allow_failure(
     let temporary = tempfile::tempdir().map_err(|_| "Cannot create tool scratch space")?;
     let mut stdout = tempfile::tempfile().map_err(|_| "Cannot create tool output buffer")?;
     let stderr = tempfile::tempfile().map_err(|_| "Cannot create tool error buffer")?;
-    command.env_clear();
-    for name in [
-        "PATH",
-        "SystemRoot",
-        "WINDIR",
-        "HOME",
-        "LANG",
-        "LC_ALL",
-        "DOTNET_BUNDLE_EXTRACT_BASE_DIR",
-        "FONTCONFIG_PATH",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    command
-        .env("OMP_THREAD_LIMIT", "1")
-        .env("TMPDIR", temporary.path())
-        .env("TEMP", temporary.path())
-        .env("TMP", temporary.path());
+    configure_tool_environment(command, temporary.path());
     command
         .stdin(Stdio::null())
         .stdout(
@@ -201,4 +182,65 @@ pub fn bounded_process_allow_failure(
         return Err("Tool output exceeded its limit".into());
     }
     Ok((success, bytes))
+}
+
+fn configure_tool_environment(command: &mut Command, scratch: &Path) {
+    command.env_clear();
+    for name in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "DOTNET_BUNDLE_EXTRACT_BASE_DIR",
+        "FONTCONFIG_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    // MKVToolNix serializes Unicode metadata through the process locale.
+    // Debian's default C locale can silently truncate valid JSON at a
+    // non-ASCII title even when the tool returns success. Use the built-in
+    // UTF-8 locale on Unix regardless of the service's display language.
+    #[cfg(unix)]
+    command.env("LANG", "C.UTF-8").env("LC_ALL", "C.UTF-8");
+    command
+        .env("OMP_THREAD_LIMIT", "1")
+        .env("TMPDIR", scratch)
+        .env("TEMP", scratch)
+        .env("TMP", scratch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_environment_drops_custom_values_and_uses_private_scratch() {
+        let mut command = Command::new("unused-test-executable");
+        command.env("SUBFORGE_TEST_SECRET", "fixture-value");
+        let scratch = Path::new("private-scratch");
+        configure_tool_environment(&mut command, scratch);
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert!(!environment.contains_key(std::ffi::OsStr::new("SUBFORGE_TEST_SECRET")));
+        assert_eq!(
+            environment
+                .get(std::ffi::OsStr::new("TMPDIR"))
+                .copied()
+                .flatten(),
+            Some(scratch.as_os_str())
+        );
+        #[cfg(unix)]
+        for name in ["LANG", "LC_ALL"] {
+            assert_eq!(
+                environment
+                    .get(std::ffi::OsStr::new(name))
+                    .copied()
+                    .flatten(),
+                Some(std::ffi::OsStr::new("C.UTF-8"))
+            );
+        }
+    }
 }

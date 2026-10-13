@@ -14,6 +14,10 @@
   state.inventoryPage=1;
   state.inventoryPageSize=25;
   state.inventoryTruncated=false;
+  state.inventoryUpdated=null;
+  state.inventoryLoaded=false;
+  state.inventoryBusy=false;
+  state.inventoryRestoreRoot=null;
   state.collapsedPanels=new Set();
   state.errorViews=new Map();
   const integrationDefaults = () => ({enabled:false,url:'',api_key:'',api_key_set:false,path_mappings:[]});
@@ -84,7 +88,7 @@
   const renderRootSelectors = roots => {
     const rootList = $('#root-list'); rootList.replaceChildren();
     const quick = $('#quick-root'), inventoryRoot = $('#inventory-root');
-    const keepQuick = quick.value, keepInventory = inventoryRoot.value;
+    const keepQuick = quick.value, keepInventory = state.inventoryRestoreRoot ?? inventoryRoot.value;
     quick.replaceChildren(new Option('All scan roots','')); inventoryRoot.replaceChildren(new Option('All roots',''));
     for (const root of roots || []) {
       const label = root.label || root.path || root.id;
@@ -97,6 +101,7 @@
     }
     if ([...quick.options].some(x=>x.value===keepQuick)) quick.value=keepQuick;
     if ([...inventoryRoot.options].some(x=>x.value===keepInventory)) inventoryRoot.value=keepInventory;
+    state.inventoryRestoreRoot=null;
     setText($('#stat-roots'),(roots || []).length);
   };
   const updateLanguageLabels = () => {
@@ -152,7 +157,7 @@
     updateJobList($('#recent-activity'),jobs.slice(0,4),true);updateJobList($('#jobs-list'),jobs,false);
     const validKeys=new Set(jobs.flatMap(job=>[errorViewKey(job,true),errorViewKey(job,false)]));for(const key of state.errorViews.keys())if(!validKeys.has(key))state.errorViews.delete(key);
     setText($('#stat-running'),running ? 'Running' : 'Idle'); setText($('#stat-current'),currentLabel(running?.current) || (running ? 'Working through your library' : 'Nothing running right now'));
-    const total=jobs.reduce((sum,job)=>sum+Number(job.summary?.converted || 0),0); setText($('#stat-converted'),total.toLocaleString());
+    const total=state.status?.converted_count ?? jobs.reduce((sum,job)=>sum+Number(job.summary?.converted || 0),0); setText($('#stat-converted'),total.toLocaleString());
     const queued=(state.status?.queue || []).length; const badge=$('#activity-badge'); badge.textContent=queued ? String(queued) : ''; badge.classList.toggle('hidden',!queued);
   };
   const renderLogs = logs => {
@@ -169,9 +174,22 @@
     box.scrollTop=box.scrollHeight;
   };
   const setConnection = good => { $('#connection-dot').classList.toggle('offline',!good); setText($('#connection-text'),good ? 'Service connected' : 'Service unavailable'); };
+  const loadInventory = async summary => {
+    if(state.inventoryBusy || state.inventoryLoaded && state.inventoryUpdated===summary?.updated)return;
+    state.inventoryBusy=true;
+    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;renderInventory();}
+    catch(error){notify(`Could not load library inventory: ${error.message}`,'error');}
+    finally{state.inventoryBusy=false;}
+  };
+  const saveInventoryView = () => {
+    try {sessionStorage.setItem('subforge.inventory-view',JSON.stringify({page:state.inventoryPage,pageSize:state.inventoryPageSize,search:$('#inventory-search').value,root:$('#inventory-root').value,filter:$('#inventory-filter').value}));}catch{}
+  };
+  const restoreInventoryView = () => {
+    try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:25;$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','video','sidecar','issues'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
+  };
   const pollStatus = async () => {
     if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
-    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); const inspection=[...(state.status.history||[])].find(job=>job.kind==='inspect'&&Array.isArray(job.results)); if(inspection) { state.inventory=inspection.results; state.inventoryTruncated=!!inspection.truncated; } renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); }
+    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
@@ -188,7 +206,7 @@
     if (filter==='issues') rows=rows.filter(row=>row.error || row.type==='video' && !(row.tracks || []).length);
     if (query) rows=rows.filter(row=>`${row.name || ''}\n${row.path || ''}`.toLowerCase().includes(query));
     const count=rows.length, pages=Math.max(1,Math.ceil(count/state.inventoryPageSize));
-    state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
+    if(state.inventoryLoaded)state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
     const start=(state.inventoryPage-1)*state.inventoryPageSize, visibleRows=rows.slice(start,start+state.inventoryPageSize);
     setText($('#inventory-meta'),`${count.toLocaleString()}${query||root||filter!=='all'?` of ${state.inventory.length.toLocaleString()}`:''} item${count===1?'':'s'}`);
     const range=count?`${(start+1).toLocaleString()}–${(start+visibleRows.length).toLocaleString()} of ${count.toLocaleString()} items`:'0 items';
@@ -198,6 +216,8 @@
     pageSelect.value=String(state.inventoryPage);pageSelect.disabled=!count;
     $('#inventory-prev').disabled=state.inventoryPage===1;$('#inventory-next').disabled=state.inventoryPage===pages;
     $('#inventory-limit-note').classList.toggle('hidden',!state.inventoryTruncated);
+    const refreshing=state.status?.running?.kind==='inspect'||(state.status?.queue||[]).some(job=>job.kind==='inspect');
+    setText($('#inventory-snapshot-note'),state.inventoryUpdated?`${refreshing?'Refreshing… Showing the saved inventory. ':''}Last inspection: ${fmtDate(state.inventoryUpdated)}${state.status?.inventory?.partial?' · Partial inventory':''}`:refreshing?'Building your first inventory…':'');
     const emptyMessage=state.inventory.length?'No files match your search or filters.':'No inventory yet. Choose Refresh inventory to list available subtitle tracks.';
     const viewKey=JSON.stringify([visibleRows,visibleRows.length?'':emptyMessage]);
     if (viewKey===state.inventoryViewKey) return;
@@ -231,6 +251,10 @@
     const card=$('#integration-template').content.firstElementChild.cloneNode(true); card.dataset.provider=provider;
     const title={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'}[provider]; const description={sonarr:'Trigger subtitle scans when episodes are imported, and notify Sonarr when sidecars are ready.',radarr:'Trigger subtitle scans when movies are imported, and notify Radarr when sidecars are ready.',jellyfin:'Refresh selected Jellyfin libraries after subtitle extraction.',bazarr:'Automatically sync and scan affected media after each extraction batch. Bazarr may download missing subtitles according to its own rules during sync.'}[provider];
     setText($('.integration-title',card),title); setText($('.integration-description',card),description);
+    const usage=document.createElement('div');usage.className='path-map-field';
+    const usageTitle=document.createElement('strong');usageTitle.textContent='How this integration is used';
+    const usageCopy=document.createElement('p');usageCopy.className='field-explainer';usageCopy.textContent={sonarr:'An optional Sonarr Connect webhook starts extraction when episodes are imported or renamed. New SRT files trigger a rescan of the matching series.',radarr:'An optional Radarr Connect webhook starts extraction when movies are imported or renamed. New SRT files trigger a rescan of the matching movie.',jellyfin:'New SRT files trigger metadata refreshes within your selected movie and series libraries. Refresh selected libraries runs a broader manual refresh.',bazarr:'Changed movies and episodes are synchronized and their subtitles indexed after the extraction batch. Sync and scan library runs the broader manual tasks.'}[provider];
+    const last=document.createElement('p');last.className='field-explainer integration-last-result';last.textContent='No extraction notification recorded yet.';usage.append(usageTitle,usageCopy,last);$('.integration-fields',card).append(usage);
     $('.integration-enabled',card).checked=!!config.enabled; $('.integration-url',card).value=config.url || '';
     $('.integration-key',card).value=config.api_key || ''; setText($('.api-key-hint',card),config.api_key_set?'A key is saved. Leave blank to keep it.':'');
     if (provider==='jellyfin') {
@@ -329,7 +353,7 @@
       setText($('#ocr-permission-state'),ocrEnabled?'Enabled':'Locked');
       setText($('#ocr-permission-note'),ocrEnabled?'Image subtitle extraction is enabled for this service.':'Text subtitles are enabled. To include image subtitles, enable CONVERTER_ENABLE_OCR and use a 1536 MiB memory limit.');
       for (const provider of ['sonarr','radarr','jellyfin','bazarr']) { const node=$(`#${provider}-settings`); node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})})); }
-      updateLanguageLabels(); updateHookStates();
+      updateLanguageLabels(); updateHookStates(); updateIntegrationUsage();
     } catch(error) { notify(`Could not load settings: ${error.message}`,'error'); }
   };
   const gatherSettings = () => {
@@ -361,6 +385,14 @@
   };
   const loadLibraries = async card => { try { const data=await api('/api/integrations/jellyfin/libraries'); state.jellyfinLibraries=data.libraries||[]; const config=state.settings?.integrations?.jellyfin || {}; populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]); notify('Jellyfin libraries loaded.','success'); } catch(error) { notify(error.message,'error'); } };
   const updateHookStates = () => { const integrations=state.status?.settings?.integrations || state.settings?.integrations || {}; for(const name of ['sonarr','radarr']) { const enabled=!!integrations[name]?.webhook_enabled; const node=$(`#${name}-hook-state`); if(node){node.className=`connection-state ${enabled?'is-on':''}`;setText(node,enabled?'READY':'TOKEN REQUIRED');} } };
+  const updateIntegrationUsage = () => {
+    for(const provider of ['sonarr','radarr','jellyfin','bazarr']) {
+      const node=$(`[data-provider="${provider}"] .integration-last-result`);if(!node)continue;
+      const jobs=jobList();let match=null;
+      for(const job of jobs){const result=[...(job.notifications||[]),...(job.results||[])].find(item=>item?.provider===provider&&typeof item.ok==='boolean');if(result){match={job,result};break;}}
+      setText(node,match?`Latest recorded request: ${match.result.ok?'Succeeded':'Failed'} · ${fmtDate(match.job.finished||match.job.started||match.job.created)}`:'No extraction notification recorded yet. Connection tests check access; they do not register import webhooks.');
+    }
+  };
   const pageNames={overview:'Overview',library:'Library',activity:'Activity',settings:'Settings'};
   const settingsSections=['general','media','sonarr','radarr','jellyfin','bazarr'];
   state.settingsSection='general';
@@ -421,10 +453,11 @@
     $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>startJob({kind:'scan'})));
     $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{navigate('library');await inspect();}));
     $('#quick-form').addEventListener('submit',event=>{event.preventDefault();startJob({kind:'scan',rootIds:selectedRootIds('#quick-root')});});
-    const resetInventoryPage=()=>{state.inventoryPage=1;renderInventory();};
+    restoreInventoryView();
+    const resetInventoryPage=()=>{state.inventoryPage=1;renderInventory();saveInventoryView();};
     $('#inventory-filter').addEventListener('change',resetInventoryPage); $('#inventory-root').addEventListener('change',resetInventoryPage); $('#inventory-search').addEventListener('input',resetInventoryPage);
     $('#inventory-page-size').addEventListener('change',()=>{state.inventoryPageSize=Number($('#inventory-page-size').value);resetInventoryPage();});
-    $('#inventory-prev').addEventListener('click',()=>{state.inventoryPage--;renderInventory();});$('#inventory-next').addEventListener('click',()=>{state.inventoryPage++;renderInventory();});$('#inventory-page').addEventListener('change',()=>{state.inventoryPage=Number($('#inventory-page').value);renderInventory();});
+    $('#inventory-prev').addEventListener('click',()=>{state.inventoryPage--;renderInventory();saveInventoryView();});$('#inventory-next').addEventListener('click',()=>{state.inventoryPage++;renderInventory();saveInventoryView();});$('#inventory-page').addEventListener('change',()=>{state.inventoryPage=Number($('#inventory-page').value);renderInventory();saveInventoryView();});
     $('#jobs-list').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);}); $('#recent-activity').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);});
     $('#save-settings').addEventListener('click',saveSettings); $('#language-search').addEventListener('input',renderLanguageList); $('#add-language').addEventListener('click',addCustomLanguage); $('#custom-language').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addCustomLanguage();}});
     $$('[data-open-languages]').forEach(button=>button.addEventListener('click',()=>openLanguageDialog(button.dataset.openLanguages)));
