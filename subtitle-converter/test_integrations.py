@@ -274,7 +274,7 @@ class IntegrationTest(unittest.TestCase):
         item_refreshes = [c for c in request_mock.call_args_list if "/Refresh?" in c.args[1]]
         self.assertEqual(len(item_refreshes), 1)
         self.assertIn("/Items/movie-item/Refresh?", item_refreshes[0].args[1])
-        self.assertEqual(item_refreshes[0].kwargs["api_key_header"], "X-Emby-Token")
+        self.assertEqual(item_refreshes[0].kwargs["api_key_header"], "Authorization")
 
     @patch("integrations.request", side_effect=HTTPError("sensitive-url-secret"))
     def test_notify_failure_is_safe_and_does_not_raise(self, _request):
@@ -282,6 +282,77 @@ class IntegrationTest(unittest.TestCase):
         result = self.integration.notify(["/tv/show/sub.en.srt"])
         self.assertFalse(result[0]["ok"])
         self.assertNotIn("secret", json.dumps(result))
+
+    def test_jellyfin_modern_auth_covers_connection_libraries_and_scoped_refresh(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+        from urllib.parse import quote
+
+        key = "fixture-jellyfin+/token="
+        expected = ('MediaBrowser Client="Subforge", Device="Subtitle converter", '
+                    'DeviceId="subforge", Version="1", Token="' + quote(key, safe="") + '"')
+        calls = []
+        class Handler(BaseHTTPRequestHandler):
+            def authenticated(self):
+                calls.append((self.command, self.path, self.headers.get("Authorization"),
+                              self.headers.get("X-Emby-Token")))
+                if self.headers.get("Authorization") != expected:
+                    self.send_response(401)
+                    self.end_headers()
+                    return False
+                return True
+            def do_GET(self):
+                if not self.authenticated(): return
+                if self.path == "/jellyfin/System/Info":
+                    value = {"Version": "12.2.0"}
+                elif self.path == "/jellyfin/Library/VirtualFolders":
+                    value = [{"ItemId": "movies-id", "Name": "Movies", "CollectionType": "movies",
+                              "Locations": ["/jf/movies"]}]
+                elif self.path.startswith("/jellyfin/Items?"):
+                    value = {"Items": [{"Id": "movie-id", "Name": "Film", "Path": "/jf/movies/Film/film.mkv"}]}
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                payload = json.dumps(value).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            def do_POST(self):
+                if not self.authenticated(): return
+                self.send_response(204)
+                self.end_headers()
+            def log_message(self, *_): pass
+        fixture = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=fixture.serve_forever, daemon=True)
+        thread.start()
+        def close_fixture():
+            fixture.shutdown()
+            thread.join(timeout=2)
+            fixture.server_close()
+        self.addCleanup(close_fixture)
+        url = f"http://127.0.0.1:{fixture.server_port}/jellyfin"
+        with self.assertRaises(HTTPError) as rejected:
+            request(url, "/System/Info", api_key=key, api_key_header="X-Emby-Token")
+        self.assertEqual(rejected.exception.status_code, 401)
+        with patch.dict(os.environ, {"JELLYFIN_INTERNAL_URL": url, "JELLYFIN_API_KEY": key}):
+            integration = Integrations(self.path)
+            integration.update({"jellyfin": {"enabled": True, "movie_libraries": ["movies-id"],
+                                                "refresh_movies": True}})
+            self.assertTrue(integration.test("jellyfin")["connected"])
+            self.assertEqual(integration.libraries()[0]["id"], "movies-id")
+            self.assertTrue(integration.refresh("jellyfin")["ok"])
+            notification = integration.notify(["/jf/movies/Film/film.en.srt"])[0]
+            self.assertTrue(notification["ok"])
+            self.assertEqual(notification["triggered"], 1)
+            self.assertNotIn(key, json.dumps(integration.public_settings()))
+            self.assertNotIn(key, self.path.read_text(encoding="utf-8"))
+        self.assertTrue(all(auth == expected and legacy is None for _, _, auth, legacy in calls[1:]))
+        posts = [path for method, path, _, _ in calls if method == "POST"]
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(all(path.startswith("/jellyfin/Items/movie-id/Refresh?") for path in posts))
 
     @patch("integrations.request")
     def test_manual_refresh_triggers_full_jellyfin_scan(self, request_mock):
@@ -351,6 +422,22 @@ class IntegrationTest(unittest.TestCase):
 
 
 class HTTPClientTest(unittest.TestCase):
+    def test_jellyfin_token_cannot_inject_authorization_fields_or_headers(self):
+        from urllib.parse import quote
+        from unittest.mock import MagicMock
+        key = 'fixture"\\\r\nInjected: value+/'
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{}'
+        with patch("urllib.request.OpenerDirector.open", return_value=response) as opened:
+            request("http://jellyfin:8096", "/System/Info", api_key=key, api_key_header="Authorization")
+        outgoing = opened.call_args.args[0]
+        auth = outgoing.get_header("Authorization")
+        self.assertIn('Token="' + quote(key, safe="") + '"', auth)
+        self.assertNotIn("\r", auth)
+        self.assertNotIn("\n", auth)
+        self.assertNotIn("Injected:", auth)
+        self.assertNotIn("?", outgoing.full_url)
+
     def test_rejects_redirects_without_following_them(self):
         from http.server import BaseHTTPRequestHandler, HTTPServer
         import threading

@@ -47,9 +47,19 @@ def request(base_url: str, path: str, *, method="GET", api_key="", body=None, fo
     url = base_url + path
     headers = {"Accept": "application/json", "User-Agent": "subtitle-converter/1"}
     if api_key:
-        if api_key_header not in {"X-Api-Key", "X-Emby-Token"}:
+        if api_key_header == "Authorization":
+            # Jellyfin 12 disables legacy X-Emby-* authentication by default.
+            # Match its official SDK: encode each value in the quoted scheme,
+            # never interpolate an arbitrary token as a raw Authorization header.
+            token = urllib.parse.quote(api_key, safe="")
+            headers["Authorization"] = (
+                'MediaBrowser Client="Subforge", Device="Subtitle converter", '
+                'DeviceId="subforge", Version="1", Token="' + token + '"'
+            )
+        elif api_key_header in {"X-Api-Key", "X-Emby-Token"}:
+            headers[api_key_header] = api_key
+        else:
             raise ValueError("Unsupported API key header")
-        headers[api_key_header] = api_key
     data = None
     if body is not None:
         if form is not None:

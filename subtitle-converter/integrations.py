@@ -294,7 +294,7 @@ class Integrations:
             conf = copy.deepcopy(self._settings[provider])
         args = {"method": method, "api_key": conf["api_key"], "body": body}
         if provider == "jellyfin":
-            args["api_key_header"] = "X-Emby-Token"
+            args["api_key_header"] = "Authorization"
         return request(conf["url"], path, **args)
 
     def _bazarr_tasks(self):

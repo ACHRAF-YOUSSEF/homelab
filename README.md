@@ -742,6 +742,8 @@ The optional `subtitle-converter` service (dashboard name **Subforge**) scans th
 
 Subforge can integrate with Sonarr, Radarr, Bazarr, and Jellyfin. For Bazarr, set `BAZARR_INTERNAL_URL` (default `http://bazarr:6767`) and the private `BAZARR_API_KEY` in `.env`, then enable and test the integration in **Settings → Bazarr**. At the end of each conversion job, it batches generated SRT paths and asks Bazarr to sync and scan only matching existing media items; the manual **Sync and scan library** action queues Bazarr's global library/index tasks. Bazarr may apply its own configured subtitle search and download rules during these sync operations. Configure path mappings when the apps use different container paths; Windows host paths and macOS/Linux host paths both map to the container paths seen by each service. Start only this service with `docker compose --profile subtitle-conversion up -d --build subtitle-converter`; Bazarr remains responsible for its own provider and subtitle-download settings. The [Subforge guide](subtitle-converter/README.md) documents path mapping, service credentials, and refresh behavior.
 
+Jellyfin's `JELLYFIN_INTERNAL_URL` and `JELLYFIN_API_KEY` remain environment-managed, and Subforge uses Jellyfin's current MediaBrowser authorization header. An HTTP 401/403 can reflect authorization format, a rejected key, or insufficient access; verify the safe connection diagnostic before changing the key. Recreate the converter after changing `JELLYFIN_API_KEY` in the private `.env`.
+
 ### Jellyfin Plugins
 
 These optional Jellyfin plugins can be configured separately. Jellyfin is outside Compose, and this repository does not install or configure them:
