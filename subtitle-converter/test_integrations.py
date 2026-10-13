@@ -16,7 +16,9 @@ class IntegrationTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self._env = patch.dict(os.environ, {"JELLYFIN_INTERNAL_URL": "http://jellyfin:8096",
-                                            "JELLYFIN_API_KEY": "jf-secret"})
+                                            "JELLYFIN_API_KEY": "jf-secret",
+                                            "BAZARR_INTERNAL_URL": "http://bazarr:6767",
+                                            "BAZARR_API_KEY": ""})
         self._env.start()
         self.addCleanup(self._env.stop)
         self.path = Path(self.tmp.name) / "integrations.json"
@@ -66,6 +68,98 @@ class IntegrationTest(unittest.TestCase):
             self.integration.update({"jellyfin": {"url": "http://elsewhere"}})
         with self.assertRaises(ValueError):
             self.integration.update({"jellyfin": {"api_key": "replacement"}})
+
+    def test_bazarr_uses_prefilled_url_and_keeps_key_private(self):
+        public = self.integration.update({"bazarr": {"enabled": True, "api_key": "bazarr-secret"}})
+        self.assertEqual(public["bazarr"]["url"], "http://bazarr:6767")
+        self.assertTrue(public["bazarr"]["enabled"])
+        self.assertTrue(public["bazarr"]["api_key_set"])
+        self.assertEqual(public["bazarr"]["api_key"], "")
+        self.assertNotIn("bazarr-secret", json.dumps(public))
+        self.assertIn("bazarr-secret", self.path.read_text(encoding="utf-8"))
+
+    @patch("integrations.request")
+    def test_bazarr_connection_uses_authenticated_status_endpoint(self, request_mock):
+        self.integration.update({"bazarr": {"url": "http://bazarr:6767", "api_key": "bazarr-secret"}})
+        request_mock.return_value = {"data": {"bazarr_version": "1.5.0"}}
+        result = self.integration.test("bazarr")
+        self.assertEqual(result, {"connected": True, "version": "1.5.0", "message": "Connected"})
+        request_mock.assert_called_once_with("http://bazarr:6767", "/api/system/status",
+                                             method="GET", api_key="bazarr-secret", body=None)
+
+    @patch("integrations.request")
+    def test_bazarr_manual_refresh_syncs_then_indexes_supported_tasks(self, request_mock):
+        self.integration.update({"bazarr": {"url": "http://bazarr:6767", "api_key": "bazarr-secret"}})
+        tasks = {"data": [{"job_id": task_id, "job_running": False, "name": task_id}
+                          for task_id in ("update_series", "update_movies", "series_full_scan_subtitles",
+                                          "movies_full_scan_subtitles")]}
+        request_mock.side_effect = lambda _url, _path, **_kwargs: tasks
+        result = self.integration.refresh("bazarr")
+        self.assertTrue(result["ok"])
+        posts = [call for call in request_mock.call_args_list if call.kwargs.get("method") == "POST"]
+        self.assertEqual([call.kwargs["form"]["taskid"] for call in posts], [
+            "update_series", "update_movies", "series_full_scan_subtitles", "movies_full_scan_subtitles"])
+        self.assertTrue(all(call.kwargs["api_key_header"] == "X-Api-Key" for call in posts))
+
+    @patch("integrations.request")
+    def test_bazarr_auto_flush_syncs_and_scans_only_affected_series_and_movie(self, request_mock):
+        self.integration.update({"bazarr": {"enabled": True, "url": "http://bazarr:6767",
+                                               "api_key": "bazarr-secret"},
+                                 "path_mappings": [{"provider": "bazarr", "remote": "/bazarr/tv",
+                                                    "local": "/tv"}]})
+        def respond(_url, path, **_kwargs):
+            if path.startswith("/api/series?"):
+                return {"data": [{"sonarrSeriesId": 12, "path": "/bazarr/tv/Show"}], "total": 1}
+            if path.startswith("/api/movies?"):
+                return {"data": [{"radarrId": 34, "path": "/movies/Film.mkv"}], "total": 1}
+            return {}
+        request_mock.side_effect = respond
+        self.integration.notify(["/tv/Show/S01/ep.en.srt", "/movies/Film.en.srt"])
+        result = self.integration.flush_bazarr()
+        self.assertEqual(result["triggered"], 2)
+        calls = [call for call in request_mock.call_args_list if call.kwargs.get("method") == "PATCH"]
+        self.assertEqual([(call.args[1], call.kwargs["form"]) for call in calls], [
+            ("/api/series", {"seriesid": "12", "action": "sync"}),
+            ("/api/series", {"seriesid": "12", "action": "scan-disk"}),
+            ("/api/movies", {"radarrid": "34", "action": "sync"}),
+            ("/api/movies", {"radarrid": "34", "action": "scan-disk"}),
+        ])
+        self.assertTrue(all(call.kwargs["api_key_header"] == "X-Api-Key" for call in calls))
+
+    @patch("integrations.request")
+    def test_bazarr_posix_path_matching_preserves_case(self, request_mock):
+        self.integration.update({"bazarr": {"enabled": True, "url": "http://bazarr:6767",
+                                               "api_key": "bazarr-secret"}})
+        def respond(_url, path, **_kwargs):
+            if path.startswith("/api/series?"):
+                return {"data": [], "total": 0}
+            if path.startswith("/api/movies?"):
+                return {"data": [
+                    {"radarrId": 34, "path": "/movies/Film.mkv"},
+                    {"radarrId": 35, "path": "/movies/film.mkv"},
+                ], "total": 2}
+            return {}
+        request_mock.side_effect = respond
+        self.integration.notify(["/movies/Film.en.srt"])
+        result = self.integration.flush_bazarr()
+        self.assertEqual(result["triggered"], 1)
+        patches = [call.kwargs["form"] for call in request_mock.call_args_list
+                   if call.kwargs.get("method") == "PATCH"]
+        self.assertEqual(patches, [{"radarrid": "34", "action": "sync"},
+                                   {"radarrid": "34", "action": "scan-disk"}])
+
+    @patch("integrations.request")
+    def test_bazarr_pending_paths_are_consumed_even_when_cancelled(self, request_mock):
+        import threading
+        self.integration.update({"bazarr": {"enabled": True, "url": "http://bazarr:6767",
+                                               "api_key": "bazarr-secret"}})
+        stop = threading.Event()
+        stop.set()
+        self.integration.notify(["/tv/Show/ep.en.srt"])
+        result = self.integration.flush_bazarr(stop=stop)
+        self.assertIn("cancelled", result["message"].lower())
+        self.assertIsNone(self.integration.flush_bazarr())
+        request_mock.assert_not_called()
 
     def test_map_path_uses_longest_boundary_match(self):
         self.integration.update({"path_mappings": [
@@ -281,6 +375,104 @@ class HTTPClientTest(unittest.TestCase):
         with self.assertRaises(HTTPError):
             request("http://127.0.0.1:%d" % server.server_port, "/test", timeout=2)
         self.assertEqual(hits, ["/test"])
+
+    def test_posts_form_encoded_data(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        seen = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                size = int(self.headers.get("Content-Length", "0"))
+                seen.append((self.path, self.headers.get("Content-Type"), self.headers.get("X-Api-Key"),
+                             self.rfile.read(size)))
+                self.send_response(204)
+                self.end_headers()
+            def log_message(self, *_args):
+                pass
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        def close_server():
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        self.addCleanup(close_server)
+        result = request("http://127.0.0.1:%d" % server.server_port, "/api/system/tasks",
+                         method="POST", api_key="fixture-key", api_key_header="X-Api-Key",
+                         form={"taskid": "update_series"})
+        self.assertEqual(result, {})
+        self.assertEqual(seen, [("/api/system/tasks", "application/x-www-form-urlencoded", "fixture-key",
+                                 b"taskid=update_series")])
+
+    def test_http_failures_have_safe_categories_and_status(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(401 if self.path == "/unauthorized" else 503)
+                self.end_headers()
+            def log_message(self, *_args):
+                pass
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        def close_server():
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        self.addCleanup(close_server)
+        base = "http://127.0.0.1:%d" % server.server_port
+        for path, category, status in (("/unauthorized", "authentication", 401),
+                                       ("/unavailable", "http_status", 503)):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                request(base, path, api_key="do-not-leak")
+            self.assertEqual(caught.exception.category, category)
+            self.assertEqual(caught.exception.status_code, status)
+            self.assertNotIn("do-not-leak", str(caught.exception))
+
+    def test_invalid_json_and_response_limit_are_categorized(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = b"nope" if self.path == "/bad-json" else b"12345"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            def log_message(self, *_args):
+                pass
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        def close_server():
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        self.addCleanup(close_server)
+        base = "http://127.0.0.1:%d" % server.server_port
+        for path, category in (("/bad-json", "invalid_json"), ("/large", "response_limit")):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                request(base, path, max_bytes=4)
+            self.assertEqual(caught.exception.category, category)
+
+    def test_transport_failures_are_categorized_without_exception_details(self):
+        import urllib.error
+        from unittest.mock import patch
+        cases = ((urllib.error.URLError(ConnectionRefusedError("secret URL")), "refused"),
+                 (TimeoutError("secret URL"), "timeout"),
+                 (urllib.error.URLError(OSError("network detail")), "unreachable"))
+        for failure, category in cases:
+            with self.subTest(category=category), \
+                    patch("urllib.request.OpenerDirector.open", side_effect=failure), \
+                    self.assertRaises(HTTPError) as caught:
+                request("http://service.example", "/status", api_key="secret")
+            self.assertEqual(caught.exception.category, category)
+            self.assertNotIn("secret", str(caught.exception))
+            self.assertNotIn("network detail", str(caught.exception))
 
 
 if __name__ == "__main__":

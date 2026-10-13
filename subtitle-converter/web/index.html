@@ -93,7 +93,7 @@
       <section class="page" id="page-settings">
         <div class="page-heading"><div><div class="eyebrow">PREFERENCES & CONNECTIONS</div><h1>Settings</h1><p class="lede">Choose extraction languages and connect your media servers.</p></div><button class="button button-primary" id="save-settings">Save changes</button></div>
         <div class="settings-layout">
-          <nav class="settings-nav" aria-label="Settings sections"><button class="settings-tab active" data-setting-tab="general">General</button><button class="settings-tab" data-setting-tab="media">Media Management</button><button class="settings-tab" data-setting-tab="sonarr">Sonarr</button><button class="settings-tab" data-setting-tab="radarr">Radarr</button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin</button></nav>
+          <nav class="settings-nav" aria-label="Settings sections"><button class="settings-tab active" data-setting-tab="general">General</button><button class="settings-tab" data-setting-tab="media">Media Management</button><button class="settings-tab" data-setting-tab="sonarr">Sonarr</button><button class="settings-tab" data-setting-tab="radarr">Radarr</button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin</button><button class="settings-tab" data-setting-tab="bazarr">Bazarr</button></nav>
           <div class="settings-content">
             <section class="settings-section active" id="settings-general"><article class="panel settings-card" data-collapse="default-languages"><div class="panel-heading"><div><h2>Default languages</h2><p>Choose which subtitle tracks to export by default.</p></div></div><div class="settings-control"><div><strong>Extraction languages</strong><p>Used for scheduled scans and quick extraction.</p></div><button class="language-summary setting-language-button" type="button" data-open-languages="settings"><span class="language-globe">◎</span><span id="settings-languages">All languages</span><span class="chevron">⌄</span></button></div></article>
               <article class="panel settings-card" data-collapse="automation-hooks"><div class="panel-heading"><div><h2>Automation hooks</h2><p>Trigger an inspect or extraction when Sonarr or Radarr imports media.</p></div></div><div class="hook-row"><div><strong>Sonarr webhook</strong><p><code>/hooks/sonarr</code> · Configure the shared token in the service environment.</p></div><span id="sonarr-hook-state" class="connection-state">Checking</span></div><div class="hook-row"><div><strong>Radarr webhook</strong><p><code>/hooks/radarr</code> · Configure the shared token in the service environment.</p></div><span id="radarr-hook-state" class="connection-state">Checking</span></div></article></section>
@@ -101,6 +101,7 @@
             <section class="settings-section" id="settings-sonarr"><div id="sonarr-settings"></div></section>
             <section class="settings-section" id="settings-radarr"><div id="radarr-settings"></div></section>
             <section class="settings-section" id="settings-jellyfin"><div id="jellyfin-settings"></div></section>
+            <section class="settings-section" id="settings-bazarr"><div id="bazarr-settings"></div></section>
             <div class="settings-save-note" id="settings-save-note"></div>
           </div>
         </div>

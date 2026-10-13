@@ -33,6 +33,7 @@ MAX_BODY = 65536
 MAX_INVENTORY = 2000
 MAX_ROOTS = 32
 MAX_FOLDERS = 200
+MAX_ERROR_GROUPS = 24
 
 
 class StartupError(ValueError):
@@ -312,7 +313,7 @@ class JobManager:
 
     def settings(self):
         public = self.integrations.public_settings()
-        providers = {name: public[name] for name in ("sonarr", "radarr", "jellyfin")}
+        providers = {name: public[name] for name in ("sonarr", "radarr", "jellyfin", "bazarr")}
         for name in ("sonarr", "radarr"):
             providers[name]["webhook_enabled"] = bool(os.environ.get("CONVERTER_WEBHOOK_TOKEN"))
         with self.lock:
@@ -355,9 +356,25 @@ class JobManager:
         settings = self.settings()
         with self.lock:
             # Round-trip snapshot: request threads never serialize live worker data.
-            return json.loads(json.dumps({"running": self.running, "queue": list(self.queue),
-                                          "history": list(reversed(self.history)), "logs": list(self.logs),
-                                          "roots": self.roots(), "settings": settings}))
+            snapshot = json.loads(json.dumps({"running": self.running, "queue": list(self.queue),
+                                             "history": list(reversed(self.history)), "logs": list(self.logs),
+                                             "roots": self.roots(), "settings": settings}))
+            # Correct older history written before partial failures had a status.
+            for job in snapshot["history"]:
+                if job.get("status") == "completed":
+                    job["status"] = self.finished_status(job)
+            return snapshot
+
+    @staticmethod
+    def finished_status(job):
+        if job.get("error") or (job.get("kind") == "refresh" and
+                                any(item.get("ok") is False for item in job.get("results", []) if isinstance(item, dict))):
+            return "failed"
+        summary = job.get("summary", {})
+        if (isinstance(summary, dict) and JobManager._widget_counter(summary.get("failed")) > 0) or any(
+                item.get("ok") is False for item in job.get("notifications", []) if isinstance(item, dict)):
+            return "completed_with_errors"
+        return "completed"
 
     def widget_status(self):
         """A path-free, read-only aggregate for small external status widgets."""
@@ -394,7 +411,7 @@ class JobManager:
         if kind not in {"scan", "inspect", "extract", "refresh"}:
             raise ValueError("Unknown job type")
         provider = data.get("provider")
-        if kind == "refresh" and provider not in {"sonarr", "radarr", "jellyfin"}:
+        if kind == "refresh" and provider not in {"sonarr", "radarr", "jellyfin", "bazarr"}:
             raise ValueError("Unknown integration")
         root_ids = data.get("root_ids", [])
         with self.lock:
@@ -468,18 +485,36 @@ class JobManager:
                 self.running["processed"] += 1
             if event.get("status") == "converted" and isinstance(event.get("path"), str):
                 self.converted_sources.add(event["path"])
+            if event.get("status") == "failed":
+                self._record_file_error(self.running, event.get("error", "Conversion failed"), event.get("path", ""))
         if event.get("new_outputs"):
             notifications = self.integrations.notify(event["new_outputs"])
             with self.lock:
                 self.running.setdefault("notifications", []).extend(notifications)
                 self.running["notifications"] = self.running["notifications"][-200:]
 
+    @staticmethod
+    def _record_file_error(job, message, path):
+        # Converter diagnostics are fixed, safe messages. Keep repeated failures
+        # useful without retaining a second unbounded catalogue of media paths.
+        message = str(message)[:240]
+        groups = job.setdefault("file_errors", [])
+        group = next((item for item in groups if item["message"] == message), None)
+        if group is None:
+            if len(groups) >= MAX_ERROR_GROUPS:
+                job["other_file_errors"] = job.get("other_file_errors", 0) + 1
+                return
+            group = {"message": message, "count": 0, "examples": []}
+            groups.append(group)
+        group["count"] += 1
+        name = Path(path).name[:240] if isinstance(path, str) and path else ""
+        if name and len(group["examples"]) < 3 and name not in group["examples"]:
+            group["examples"].append(name)
+
     def _execute(self, job):
         if job["kind"] == "refresh":
             job["results"] = [self.integrations.refresh(job["provider"], stop=self.cancel_event,
                                                          progress=self._progress)]
-            if not job["results"][0].get("ok"):
-                job["error"] = job["results"][0].get("message", "Refresh failed")
             return
         roots = [self._validate_root(str(root), require_exists=False)
                  for root in job.get("root_paths", [])]
@@ -514,6 +549,8 @@ class JobManager:
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 result = {"path": str(path), "name": path.name, "tracks": [], "error": type(error).__name__}
                 summary["failed"] += 1
+                with self.lock:
+                    self._record_file_error(job, type(error).__name__, str(path))
             if len(results) < MAX_INVENTORY:
                 results.append(result)
             with self.lock:
@@ -545,12 +582,21 @@ class JobManager:
                 continue
             try:
                 self._execute(job)
-                job["status"] = "cancelled" if self.cancel_event.is_set() else "failed" if job.get("error") else "completed"
             except Exception as error:
-                job.update(status="cancelled" if self.cancel_event.is_set() else "failed", error=type(error).__name__)
+                job["error"] = type(error).__name__
                 LOG.warning("Dashboard job failed (%s)", type(error).__name__)
             finally:
+                if job["kind"] in {"scan", "extract"}:
+                    try:
+                        notification = self.integrations.flush_bazarr(stop=self.cancel_event, progress=self._progress)
+                    except Exception as error:
+                        notification = {"provider": "bazarr", "ok": False,
+                                        "message": "Bazarr batch notification failed (" + type(error).__name__ + ")"}
+                    if notification is not None:
+                        with self.lock:
+                            job.setdefault("notifications", []).append(notification)
                 with self.lock:
+                    job["status"] = "cancelled" if self.cancel_event.is_set() else self.finished_status(job)
                     job["finished"] = time.time()
                     self.history.append(job)
                     self.running = None
@@ -765,7 +811,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, manager.cancel(identifier))
             elif self.path.startswith("/api/integrations/"):
                 parts = self.path.split("/")
-                if len(parts) != 5 or parts[3] not in {"sonarr", "radarr", "jellyfin"}:
+                if len(parts) != 5 or parts[3] not in {"sonarr", "radarr", "jellyfin", "bazarr"}:
                     raise ValueError("Unknown integration endpoint")
                 provider, action = parts[3:]
                 if action == "test":

@@ -55,9 +55,14 @@
   };
   const errorViewKey = (job,compact) => `${compact?'overview':'activity'}:${job.id || `${job.kind}:${job.created}`}`;
   const groupedErrors = job => {
-    const groups=new Map(),providers={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin'};
-    const add=(source,item)=>{const message=typeof item.message==='string'?item.message.trim():'';if(!message)return;const provider=typeof item.provider==='string'&&Object.hasOwn(providers,item.provider)?item.provider:null,key=JSON.stringify([source,provider,message]);const group=groups.get(key)||{source,provider,message,label:provider?providers[provider]:'Integration',count:0};group.count++;groups.set(key,group);};
-    if(job.error)add('job',{message:job.error});
+    const groups=new Map(),providers={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'};
+    const add=(source,item)=>{const message=typeof item.message==='string'?item.message.trim():'';if(!message)return;const provider=typeof item.provider==='string'&&Object.hasOwn(providers,item.provider)?item.provider:null,key=JSON.stringify([source,provider,message]);const group=groups.get(key)||{source,provider,message,label:provider?providers[provider]:'Integration',count:0,examples:[]};group.count+=Number.isSafeInteger(item.count)&&item.count>0?item.count:1;group.examples=(item.examples||[]).filter(name=>typeof name==='string').slice(0,3);groups.set(key,group);};
+    const duplicateRefresh=job.kind==='refresh'&&(job.results||[]).some(item=>item?.ok===false&&item.message===job.error);
+    if(job.error&&!duplicateRefresh)add('job',{message:job.error});
+    for(const item of Array.isArray(job.file_errors)?job.file_errors:[])add('conversion',item);
+    if(Number(job.other_file_errors)>0)add('conversion',{message:'Additional file failures',count:job.other_file_errors});
+    const reported=[...groups.values()].filter(group=>group.source==='conversion').reduce((sum,group)=>sum+group.count,0),missing=Number(job.summary?.failed||0)-reported;
+    if(missing>0)add('conversion',{message:'Detailed causes are unavailable for this older job. Run a new scan to collect file diagnostics.',count:missing});
     for(const item of Array.isArray(job.notifications)?job.notifications:[])if(item?.ok===false)add('notification',item);
     for(const item of Array.isArray(job.results)?job.results:[])if(item?.ok===false)add('result',item);
     return [...groups.values()];
@@ -67,10 +72,11 @@
     const key=errorViewKey(job,compact),saved=state.errorViews.get(key)||{open:false,scroll:0},count=groups.reduce((sum,group)=>sum+group.count,0);
     const details=document.createElement('details');details.className='job-error';details.dataset.errorKey=key;details.open=saved.open;
     const summary=document.createElement('summary');summary.dataset.jobFocus=`${key}:errors`;const copy=document.createElement('span');copy.className='job-error-summary-copy';const title=document.createElement('strong');title.textContent=`${count.toLocaleString()} reported error${count===1?'':'s'} · ${groups.length} group${groups.length===1?'':'s'}`;
-    const preview=document.createElement('span');preview.className='job-error-preview';preview.textContent=`${groups[0].source==='job'?'Job':groups[0].label}: ${groups[0].message}`;copy.append(title,preview);summary.append(copy,disclosureIcon());details.append(summary);
+    const preview=document.createElement('span');preview.className='job-error-preview';preview.textContent=`${groups[0].source==='job'?'Job':groups[0].source==='conversion'?'Media file':groups[0].label}: ${groups[0].message}`;copy.append(title,preview);summary.append(copy,disclosureIcon());details.append(summary);
     const content=document.createElement('div');content.className='job-error-content';const list=document.createElement('ul');
-    for(const group of groups){const row=document.createElement('li'),heading=document.createElement('div');heading.className='job-error-heading';const label=document.createElement('strong');label.textContent=group.source==='job'?'Job error':`${group.label} · ${group.source==='notification'?'Scan notification':'Refresh result'}`;const repeats=document.createElement('span');repeats.className='job-error-count';repeats.textContent=`${group.count.toLocaleString()}×`;heading.append(label,repeats);const message=document.createElement('p');message.textContent=group.message;row.append(heading,message);
-      if(group.provider){const settings=document.createElement('button');settings.type='button';settings.className='text-button';settings.textContent=`Review ${group.label} settings`;settings.dataset.jobFocus=`${key}:${group.source}:${group.provider}:${group.message}`;settings.addEventListener('click',()=>{navigate('settings');$(`[data-setting-tab="${group.provider}"]`).click();const card=$(`[data-provider="${group.provider}"]`);if(card?.classList.contains('is-collapsed'))$('.collapse-toggle',card).click();});row.append(settings);}
+    for(const group of groups){const row=document.createElement('li'),heading=document.createElement('div');heading.className='job-error-heading';const label=document.createElement('strong');label.textContent=group.source==='job'?'Job error':group.source==='conversion'?'Media file failures':`${group.label} · ${group.source==='notification'?'Scan notification':'Refresh result'}`;const repeats=document.createElement('span');repeats.className='job-error-count';repeats.textContent=`${group.count.toLocaleString()}×`;heading.append(label,repeats);const message=document.createElement('p');message.textContent=group.message;row.append(heading,message);
+      if(group.examples.length){const examples=document.createElement('p');examples.className='job-error-examples';examples.textContent=`Examples: ${group.examples.join(' · ')}`;row.append(examples);}
+      if(group.provider){const settings=document.createElement('button');settings.type='button';settings.className='text-button';settings.textContent=`Review ${group.label} settings`;settings.dataset.jobFocus=`${key}:${group.source}:${group.provider}:${group.message}`;settings.addEventListener('click',()=>{navigate('settings',group.provider);const card=$(`[data-provider="${group.provider}"]`);if(card?.classList.contains('is-collapsed'))$('.collapse-toggle',card).click();});row.append(settings);}
       list.append(row);
     }
     content.append(list);details.append(content);details.addEventListener('toggle',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});content.addEventListener('scroll',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});return details;
@@ -111,7 +117,7 @@
     const card = document.createElement('article'); card.className = `job-card${compact ? ' job-card-compact' : ''}`;
     const icon = document.createElement('div'); icon.className = `job-icon ${escStatus(job.status)}`; icon.textContent = job.kind === 'inspect' ? '⌕' : job.kind === 'extract' ? '▶' : '↻';
     const detail = document.createElement('div'); detail.className = 'job-detail';
-    const title = document.createElement('strong'); title.textContent = `${({scan:'Library scan',inspect:'Library inspection',extract:'Subtitle extraction'})[job.kind] || 'Converter job'}`;
+    const title = document.createElement('strong'); title.textContent = job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider] || 'Integration'} ${job.provider==='bazarr'?'sync and scan':'library refresh'}`:({scan:'Library scan',inspect:'Library inspection',extract:'Subtitle extraction'})[job.kind] || 'Converter job';
     const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = currentLabel(job.current) || (job.paths && job.paths.length ? shortPath(job.paths[0]) : job.root_label || 'All scan roots');
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
@@ -127,6 +133,8 @@
       for (const [key,label] of [['converted','converted'],['cached','already ready'],['pending','pending'],['planned','planned'],['inspected','inspected'],['failed','failed']]) if (Number(job.summary[key] || 0)) { const chip=document.createElement('span'); chip.textContent=`${job.summary[key]} ${label}`; chips.append(chip); }
       if (chips.childNodes.length) card.append(chips);
     }
+    const successfulResults=[...(job.kind==='refresh'&&Array.isArray(job.results)?job.results:[]),...(Array.isArray(job.notifications)?job.notifications.filter(item=>item?.provider==='bazarr'):[])].filter(item=>item?.ok===true&&typeof item.message==='string');
+    for(const item of successfulResults){const result=document.createElement('p');result.className='job-result';result.textContent=item.message;card.append(result);}
     const errors=renderErrors(job,compact);if(errors)card.append(errors);
     return card;
   };
@@ -153,7 +161,7 @@
     if (!entries.length) { const empty=document.createElement('div'); empty.className='log-empty'; empty.textContent='No recent converter events'; box.append(empty); return; }
     for (const entry of entries) {
       const row=document.createElement('div'); row.className='log-row';
-      const time=document.createElement('time'); time.textContent=entry.time ? new Date(entry.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
+      const time=document.createElement('time'); const timestamp=typeof entry.time==='number'&&entry.time<1e12?entry.time*1000:entry.time;time.textContent=timestamp ? new Date(timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
       const level=document.createElement('span'); level.className=`log-level ${escStatus(entry.level)}`; level.textContent=(entry.level || 'INFO').toUpperCase();
       const message=document.createElement('span'); message.className='log-message'; message.textContent=entry.message || '';
       row.append(time,level,message); box.append(row);
@@ -221,7 +229,7 @@
   const addCustomLanguage = () => { const input=$('#custom-language'), code=input.value.trim().toLowerCase(); if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/.test(code)) { notify('Enter a valid ISO language code, such as pl or pt-BR.','error'); return; } languages.push([code,code.toUpperCase()]); state.draftLanguages=isAll(state.draftLanguages)?[code]:[...new Set([...state.draftLanguages,code])]; input.value=''; renderLanguageList(); };
   const buildIntegrationCard = (provider, config={}) => {
     const card=$('#integration-template').content.firstElementChild.cloneNode(true); card.dataset.provider=provider;
-    const title={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin'}[provider]; const description={sonarr:'Trigger subtitle scans when episodes are imported, and notify Sonarr when sidecars are ready.',radarr:'Trigger subtitle scans when movies are imported, and notify Radarr when sidecars are ready.',jellyfin:'Refresh selected Jellyfin libraries after subtitle extraction.'}[provider];
+    const title={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'}[provider]; const description={sonarr:'Trigger subtitle scans when episodes are imported, and notify Sonarr when sidecars are ready.',radarr:'Trigger subtitle scans when movies are imported, and notify Radarr when sidecars are ready.',jellyfin:'Refresh selected Jellyfin libraries after subtitle extraction.',bazarr:'Automatically sync and scan affected media after each extraction batch. Bazarr may download missing subtitles according to its own rules during sync.'}[provider];
     setText($('.integration-title',card),title); setText($('.integration-description',card),description);
     $('.integration-enabled',card).checked=!!config.enabled; $('.integration-url',card).value=config.url || '';
     $('.integration-key',card).value=config.api_key || ''; setText($('.api-key-hint',card),config.api_key_set?'A key is saved. Leave blank to keep it.':'');
@@ -238,8 +246,9 @@
       $('.refresh-movies',card).checked=!!config.refresh_movies; $('.refresh-series',card).checked=!!config.refresh_series; $('.refresh-mode',card).value=config.refresh_mode || 'immediate';
       $('.refresh-integration',card).textContent='Refresh selected libraries';
     } else {
-      $('.integration-url',card).placeholder=provider==='sonarr'?'http://sonarr:8989':'http://radarr:7878';
+      $('.integration-url',card).placeholder={sonarr:'http://sonarr:8989',radarr:'http://radarr:7878',bazarr:'http://bazarr:6767'}[provider];
       $('.integration-key',card).placeholder='API key'; renderMappings(card,(state.settings?.path_mappings || []).filter(item=>!item.provider || item.provider===provider));
+      if(provider==='bazarr')$('.refresh-integration',card).textContent='Sync and scan library';
     }
     $('.test-integration',card).addEventListener('click',()=>testIntegration(provider,card));
     $('.refresh-integration',card).addEventListener('click',()=>refreshIntegration(provider,card));
@@ -316,13 +325,13 @@
   const loadSettings = async () => {
     try {
       const data=await api('/api/settings'); state.settings=data; state.selectedLanguages=data.languages || ['*'];
-      for (const provider of ['sonarr','radarr','jellyfin']) { const node=$(`#${provider}-settings`); node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})})); }
+      for (const provider of ['sonarr','radarr','jellyfin','bazarr']) { const node=$(`#${provider}-settings`); node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})})); }
       updateLanguageLabels(); updateHookStates();
     } catch(error) { notify(`Could not load settings: ${error.message}`,'error'); }
   };
   const gatherSettings = () => {
     const integrations={}; const path_mappings=[];
-    for (const provider of ['sonarr','radarr','jellyfin']) {
+    for (const provider of ['sonarr','radarr','jellyfin','bazarr']) {
       const card=$(`[data-provider="${provider}"]`); const old=state.settings?.integrations?.[provider] || {};
       integrations[provider]={enabled:$('.integration-enabled',card).checked,url:$('.integration-url',card).value.trim(),api_key:provider==='jellyfin'?'':$('.integration-key',card).value,
         api_key_set:!!old.api_key_set};
@@ -333,7 +342,7 @@
   };
   const saveSettings = async () => {
     const button=$('#save-settings'), note=$('#settings-save-note'); button.disabled=true; setText(note,'Saving…');
-    try { const data=await persistSettings(); for (const provider of ['sonarr','radarr','jellyfin']) {const node=$(`#${provider}-settings`);node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})}));} state.selectedLanguages=data.languages || state.selectedLanguages; updateLanguageLabels(); setText(note,'Changes saved'); notify('Settings saved.','success'); }
+    try { const data=await persistSettings(); for (const provider of ['sonarr','radarr','jellyfin','bazarr']) {const node=$(`#${provider}-settings`);node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})}));} state.selectedLanguages=data.languages || state.selectedLanguages; updateLanguageLabels(); setText(note,'Changes saved'); notify('Settings saved.','success'); }
     catch(error) { setText(note,error.message); notify(`Settings not saved: ${error.message}`,'error'); }
     finally { button.disabled=false; setTimeout(()=>setText(note,''),5000); }
   };
@@ -350,10 +359,52 @@
   const loadLibraries = async card => { try { const data=await api('/api/integrations/jellyfin/libraries'); state.jellyfinLibraries=data.libraries||[]; const config=state.settings?.integrations?.jellyfin || {}; populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]); notify('Jellyfin libraries loaded.','success'); } catch(error) { notify(error.message,'error'); } };
   const updateHookStates = () => { const integrations=state.status?.settings?.integrations || state.settings?.integrations || {}; for(const name of ['sonarr','radarr']) { const enabled=!!integrations[name]?.webhook_enabled; const node=$(`#${name}-hook-state`); if(node){node.className=`connection-state ${enabled?'is-on':''}`;setText(node,enabled?'READY':'TOKEN REQUIRED');} } };
   const pageNames={overview:'Overview',library:'Library',activity:'Activity',settings:'Settings'};
+  const settingsSections=['general','media','sonarr','radarr','jellyfin','bazarr'];
+  state.settingsSection='general';
+  const routeHash = (page,section) => `#/${page}${page==='settings'?`/${section}`:''}`;
+  const readRoute = () => {
+    const parts=location.hash.replace(/^#\/?/,'').replace(/\/+$/,'').split('/');
+    const page=parts[0] || 'overview';
+    if(!Object.hasOwn(pageNames,page))return {page:'overview',section:'general'};
+    if(page==='settings') {
+      const section=parts[1] || 'general';
+      if(parts.length<=2&&settingsSections.includes(section))return {page,section};
+    } else if(parts.length===1)return {page,section:'general'};
+    return {page:'overview',section:'general'};
+  };
   const syncNavigation = () => {const mobile=window.matchMedia('(max-width: 800px)').matches,open=$('#sidebar').classList.contains('mobile-open'),button=$('#mobile-menu'),collapse=$('#sidebar-collapse');$('.shell').classList.toggle('sidebar-collapsed',!mobile&&state.sidebarCollapsed);$('#sidebar').inert=mobile&&!open;const mobileLabel=open?'Close navigation':'Open navigation',desktopLabel=state.sidebarCollapsed?'Expand sidebar':'Collapse sidebar';button.setAttribute('aria-expanded',String(mobile&&open));button.setAttribute('aria-label',mobileLabel);button.title=mobileLabel;collapse.setAttribute('aria-expanded',String(!state.sidebarCollapsed));collapse.setAttribute('aria-label',desktopLabel);collapse.title=desktopLabel;};
   const closeMobileMenu = (restoreFocus=false) => { const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'); sidebar.classList.remove('mobile-open');backdrop.classList.remove('visible');backdrop.setAttribute('aria-hidden','true');syncNavigation();if(restoreFocus)button.focus(); };
   const toggleMobileMenu = () => {if(!window.matchMedia('(max-width: 800px)').matches){state.sidebarCollapsed=!state.sidebarCollapsed;try{localStorage.setItem('subforge.sidebar-collapsed',String(state.sidebarCollapsed));}catch{}syncNavigation();return;}const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'),open=!sidebar.classList.contains('mobile-open');sidebar.classList.toggle('mobile-open',open);backdrop.classList.toggle('visible',open);backdrop.setAttribute('aria-hidden',String(!open));syncNavigation();if(open)$('.nav-link[data-page]',sidebar)?.focus();else button.focus();};
-  const navigate = page => { if (!pageNames[page]) return; const fromMobileMenu=$('#sidebar').classList.contains('mobile-open'); state.currentPage=page; $$('.page').forEach(node=>node.classList.toggle('active',node.id===`page-${page}`)); $$('.nav-link[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page)); $$('.text-button[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page)); setText($('#page-crumb'),pageNames[page]); closeMobileMenu(); if(fromMobileMenu){const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} if(page==='settings'&&!state.settings)loadSettings(); };
+  const showRoute = ({page,section}) => {
+    const fromMobileMenu=$('#sidebar').classList.contains('mobile-open');
+    const previousPage=document.activeElement.closest('.page');
+    const changed=state.currentPage!==page||(page==='settings'&&state.settingsSection!==section);
+    state.currentPage=page;
+    if(page==='settings')state.settingsSection=section;
+    $$('.page').forEach(node=>node.classList.toggle('active',node.id===`page-${page}`));
+    $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page));
+    $$('.settings-tab').forEach(node=>node.classList.toggle('active',node.dataset.settingTab===state.settingsSection));
+    $$('.settings-section').forEach(node=>node.classList.toggle('active',node.id===`settings-${state.settingsSection}`));
+    setText($('#page-crumb'),pageNames[page]);closeMobileMenu();
+    if(fromMobileMenu||(previousPage&&previousPage.id!==`page-${page}`)) {
+      const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
+    }
+    if(page==='settings'&&state.csrf) {
+      if(!state.settings)loadSettings();
+      if(changed&&section==='media')loadRootFolders();
+    }
+  };
+  const restoreRoute = () => {
+    const route=readRoute(),hash=routeHash(route.page,route.section);
+    if(location.hash!==hash)history.replaceState(null,'',hash);
+    showRoute(route);
+  };
+  const navigate = (page,section=state.settingsSection) => {
+    if(!Object.hasOwn(pageNames,page)||(page==='settings'&&!settingsSections.includes(section)))return;
+    const hash=routeHash(page,section);
+    if(location.hash!==hash)history.pushState(null,'',hash);
+    showRoute({page,section});
+  };
   const cancelJob = async id => { try { const result=await api(`/api/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:'{}'}); notify(result.message || 'Cancellation requested.'); await pollStatus(); } catch(error) { notify(error.message,'error'); } };
   const bind = () => {
     try{const saved=JSON.parse(localStorage.getItem('subforge.collapsed-panels')||'[]');if(Array.isArray(saved))state.collapsedPanels=new Set(saved.filter(key=>typeof key==='string'));}catch{}
@@ -380,7 +431,8 @@
     $('#add-root-folder').addEventListener('click',()=>openRootFolderDialog());$('#refresh-root-folders').addEventListener('click',loadRootFolders);
     $('#folder-mount').addEventListener('change',()=>browseRootFolder($('#folder-mount').value));$('#browse-root-folder').addEventListener('click',()=>browseRootFolder($('#folder-path').value.trim()));$('#folder-path').addEventListener('input',()=>{state.folderRequest++;state.currentFolder=null;$('#select-root-folder').disabled=true;setText($('#folder-browser-note'),'Browse to check this folder before adding it.');});$('#folder-path').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();browseRootFolder($('#folder-path').value.trim());}});
     $('#folder-parent-button').addEventListener('click',()=>{if(state.folderParent)browseRootFolder(state.folderParent);});$('#select-root-folder').addEventListener('click',()=>{if(state.currentFolder)saveRootFolders([...state.rootFolders.roots.map(root=>root.path),state.currentFolder]);});
-    $$('.settings-tab').forEach(button=>button.addEventListener('click',()=>{const tab=button.dataset.settingTab;$$('.settings-tab').forEach(item=>item.classList.toggle('active',item===button));$$('.settings-section').forEach(item=>item.classList.toggle('active',item.id===`settings-${tab}`));if(tab==='media')loadRootFolders();}));
+    $$('.settings-tab').forEach(button=>button.addEventListener('click',()=>navigate('settings',button.dataset.settingTab)));
+    window.addEventListener('popstate',restoreRoute);window.addEventListener('hashchange',restoreRoute);
     document.addEventListener('keydown',event=>{
       const modal=$$('.modal-backdrop').find(item=>!item.classList.contains('hidden'));
       if(event.key==='Escape'){if(modal){event.preventDefault();closeDialog(modal);}else if($('#sidebar').classList.contains('mobile-open')){event.preventDefault();closeMobileMenu(true);}return;}
@@ -389,6 +441,6 @@
       if($('#sidebar').classList.contains('mobile-open')){const focusable=$$('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled)', $('#sidebar')).filter(node=>!node.closest('[inert]')&&node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}
     });
   };
-  const initialize = async () => { bind(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } setInterval(pollStatus,2000); };
+  const initialize = async () => { bind();restoreRoute(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]);if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders(); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } setInterval(pollStatus,2000); };
   initialize();
 })();

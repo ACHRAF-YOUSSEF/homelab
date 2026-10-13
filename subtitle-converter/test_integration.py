@@ -32,6 +32,23 @@ def make_text_variant(source, destination, fmt):
         assert destination.read_text(encoding="utf-8-sig").startswith("WEBVTT")
 
 
+def add_empty_ass_cue(path):
+    """Add a timed but textless dialogue event to exercise Subtitle Edit output."""
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    events = next(index for index, line in enumerate(lines) if line.strip().casefold() == "[events]")
+    format_index = next(index for index in range(events + 1, len(lines))
+                        if lines[index].casefold().startswith("format:"))
+    fields = [field.strip().casefold() for field in lines[format_index].split(":", 1)[1].split(",")]
+    values = {
+        "layer": "0", "marked": "0", "start": "0:00:00.00", "end": "0:00:00.53",
+        "style": "Default", "name": "", "marginl": "0", "marginr": "0", "marginv": "0",
+        "effect": "", "text": "",
+    }
+    entry = "Dialogue: " + ",".join(values.get(field, "") for field in fields)
+    lines.insert(format_index + 1, entry)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def make_image_subtitle(source, output_folder, fmt):
     output_folder.mkdir(parents=True)
     options = ["--overwrite", "--json", f"--output-folder:{output_folder}"]
@@ -90,6 +107,7 @@ class ConverterIntegrationTest(unittest.TestCase):
             ass = library / "sidecar.en.ass"
             vtt = library / "sidecar.fr.vtt"
             make_text_variant(english, ass, "ass")
+            add_empty_ass_cue(ass)
             make_text_variant(french, vtt, "vtt")
 
             movie = library / "Multi-language.mkv"
@@ -150,6 +168,14 @@ class ConverterIntegrationTest(unittest.TestCase):
                 output = library / name
                 self.assertTrue(output.is_file(), f"missing {name}; tracks={converter.tracks(movie)!r}; outputs={[path.name for path in library.glob('*.srt')]!r}")
                 self.assertTrue(valid_srt(output), f"invalid SRT {name}")
+            ass_output = library / "sidecar.en.srt"
+            ass_blocks = ass_output.read_text(encoding="utf-8-sig").strip().split("\n\n")
+            self.assertGreater(len(ass_blocks), 0)
+            self.assertTrue(all(len(block.splitlines()) >= 3 and
+                                any(line.strip() for line in block.splitlines()[2:])
+                                for block in ass_blocks))
+            self.assertFalse(any(block.splitlines()[0] == "2" and block.splitlines()[1] == "00:00:00,000 --> 00:00:00,530"
+                                 for block in ass_blocks))
             self.assertIn("Hello", (library / "vobsub.en.srt").read_text(encoding="utf-8-sig"))
             self.assertIn("Bonjour", (library / "vobsub.fr.srt").read_text(encoding="utf-8-sig"))
             self.assertEqual(

@@ -4,13 +4,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
-from converter import Converter, candidates, run_command
+from converter import Converter, candidates, remove_empty_srt_cues, run_command, valid_srt
 
 
 SRT = "1\n00:00:01,000 --> 00:00:02,000\nExample subtitle\n"
@@ -54,7 +55,7 @@ class ConverterTest(unittest.TestCase):
         calls = []
         progress = []
 
-        def run(command, timeout=None):
+        def run(command, timeout=None, *, check=True):
             name = command[command.index("--output-filename") + 1]
             staging = Path(command[command.index("--output-folder") + 1])
             calls.append(name)
@@ -123,7 +124,7 @@ class ConverterTest(unittest.TestCase):
         old = time.time() - 600
         os.utime(source, (old, old))
 
-        def mutate_source(command, timeout=None):
+        def mutate_source(command, timeout=None, *, check=True):
             source.write_text("changed while converting", encoding="utf-8")
             staging = Path(command[command.index("--output-folder") + 1])
             name = command[command.index("--output-filename") + 1]
@@ -222,9 +223,16 @@ class ConverterTest(unittest.TestCase):
                 run_command(["tool"], timeout=30, stop=stopped)
         kill_group.assert_called_once()
 
+    def test_run_command_can_return_structured_failure_json(self):
+        command = [sys.executable, "-c", "import sys; print('{\"success\": false}'); sys.exit(1)"]
+        result = run_command(command, timeout=5, check=False)
+        self.assertEqual(json.loads(result), {"success": False})
+        with self.assertRaisesRegex(RuntimeError, "Local conversion tool failed"):
+            run_command(command, timeout=5)
+
     def test_partial_or_invalid_seconv_output_publishes_nothing(self):
         calls = []
-        def seconv_result(command, timeout=None):
+        def seconv_result(command, timeout=None, *, check=True):
             staging = Path(command[command.index("--output-folder") + 1])
             name = command[command.index("--output-filename") + 1]
             calls.append(name)
@@ -244,17 +252,73 @@ class ConverterTest(unittest.TestCase):
         self.assertFalse((self.library / "Example.en.srt").exists())
         self.assertFalse((self.library / "Example.fr.srt").exists())
 
+    def test_removes_only_well_formed_empty_cues_from_staged_srt(self):
+        staged = self.base / "staged.srt"
+        staged.write_text(
+            "1\n00:00:00,000 --> 00:00:00,530\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nVisible line\n\n"
+            "7\n00:00:02,000 --> 00:00:03,000\n \t\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(valid_srt(staged))
+        self.assertEqual(remove_empty_srt_cues(staged), 2)
+        self.assertTrue(valid_srt(staged))
+        self.assertEqual(staged.read_text(encoding="utf-8"),
+                         "1\n00:00:01,000 --> 00:00:02,000\nVisible line\n")
+
+    def test_malformed_empty_cue_is_not_removed(self):
+        staged = self.base / "staged.srt"
+        malformed = "1\nnot a timestamp\n"
+        staged.write_text(malformed, encoding="utf-8")
+        self.assertEqual(remove_empty_srt_cues(staged), 0)
+        self.assertEqual(staged.read_text(encoding="utf-8"), malformed)
+        self.assertFalse(valid_srt(staged))
+
+    def test_cleanup_does_not_repair_a_malformed_kept_cue(self):
+        staged = self.base / "staged.srt"
+        staged.write_text(
+            "1\n00:00:00,000 --> 00:00:00,530\n\n"
+            "invalid-index\n00:00:01,000 --> 00:00:02,000\nVisible text\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(remove_empty_srt_cues(staged), 1)
+        self.assertIn("invalid-index\n00:00:01,000", staged.read_text(encoding="utf-8"))
+        self.assertFalse(valid_srt(staged))
+
     def test_failed_seconv_publishes_nothing(self):
         source = self.library / "captions.vtt"
         source.write_text("WEBVTT", encoding="utf-8")
-        def failed(command, timeout=None):
-            raise RuntimeError("mock tool failure")
+        def failed(command, timeout=None, *, check=True):
+            self.assertFalse(check)
+            return json.dumps({"success": False, "errors": [
+                "OCR failed to load /private/folder/tesseract.token=secret.traineddata"
+            ]}).encode()
 
         self.converter.run = failed
         with patch.object(self.converter, "tracks", return_value=[]):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(ValueError, "OCR failed. Check that the selected language data is installed and supported"):
                 self.converter.convert(source)
         self.assertFalse((self.library / "captions.srt").exists())
+
+    def test_safe_seconv_failure_is_reported_without_raw_tool_details(self):
+        events = []
+        self.converter.progress = events.append
+        self.converter.run = lambda command, timeout=None, *, check=True: json.dumps({
+            "success": False,
+            "errors": ["permission denied at C:\\Users\\private\\media\\movie.mkv token=secret"],
+        }).encode()
+        with patch.object(self.converter, "tracks", return_value=[
+            {"number": 2, "language": "eng", "forced": False, "hi": False},
+        ]):
+            result = self.converter.scan([self.video])
+        failed = [event for event in events if event.get("status") == "failed"]
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["error"],
+                         "Subtitle Edit could not write its staged output. Check folder permissions and free space.")
+        self.assertEqual(self.converter.state[str(self.video)]["error"], failed[0]["error"])
+        self.assertNotIn("private", failed[0]["error"])
+        self.assertNotIn("secret", failed[0]["error"])
 
     def test_retry_waits_after_failure_then_source_change_retries(self):
         calls = []

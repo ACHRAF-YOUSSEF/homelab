@@ -544,6 +544,10 @@ button {
   background:#3a2424;
   color:var(--red);
 }
+.job-icon.completed_with_errors {
+  background: rgba(232, 174, 72, .12);
+  color: #e8ae48;
+}
 .job-icon.queued {
   background:#302344;
   color:var(--purple);
@@ -590,6 +594,14 @@ button {
   background:#412727;
   color:#f09c9c;
 }
+.status-pill.completed_with_errors {
+  background: rgba(232, 174, 72, .12);
+  color: #e8ae48;
+}
+.job-error-examples {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
 .status-pill.completed,.status-pill.success {
   background:#193a30;
   color:#89d7ad;
@@ -627,6 +639,13 @@ button {
   border-radius:4px;
   padding:3px 6px;
   color:#8da09b;
+}
+.job-result {
+  grid-column: 2/4;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
 }
 .job-error {
   grid-column:1/4;

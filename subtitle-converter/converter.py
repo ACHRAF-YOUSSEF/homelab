@@ -27,7 +27,11 @@ SIDECARS = {".ass", ".ssa", ".vtt", ".ttml", ".smi", ".sami", ".sbv", ".sup", ".
 TIMING = re.compile(r"^\d{2,}:\d{2}:\d{2},\d{3} --> \d{2,}:\d{2}:\d{2},\d{3}(?: .*)?$")
 
 
-def run_command(command, *, timeout, stop=None):
+class ConversionError(ValueError):
+    """A short, safe diagnostic suitable for the dashboard activity feed."""
+
+
+def run_command(command, *, timeout, stop=None, check=True):
     """Bound runtime and captured output; stop OCR descendants with their parent."""
     with tempfile.TemporaryDirectory(prefix="subtitle-tool-") as temporary, \
             tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -64,7 +68,7 @@ def run_command(command, *, timeout, stop=None):
         result = stdout.read(8 * 1024 * 1024 + 1)
         if len(result) > 8 * 1024 * 1024:
             raise ValueError("Tool output exceeded limit")
-        if process.returncode:
+        if process.returncode and check:
             raise RuntimeError("Local conversion tool failed")
         return result
 
@@ -131,19 +135,84 @@ def candidates(roots: list[Path]):
 
 def valid_srt(path: Path) -> bool:
     """Reject empty, truncated, or non-UTF-8 exports before publishing."""
+    return srt_validation_error(path) is None
+
+
+def remove_empty_srt_cues(path: Path) -> int:
+    """Drop only correctly framed SRT cues with no visible subtitle text."""
+    try:
+        content = path.read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeError):
+        return 0
+    blocks = re.split(r"\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*", content)
+    kept = []
+    removed = 0
+    for block in blocks:
+        lines = block.splitlines()
+        framed = (len(lines) >= 2 and lines[0].strip().isdigit()
+                  and TIMING.fullmatch(lines[1].strip()))
+        if framed and not any(line.strip() for line in lines[2:]):
+            removed += 1
+            continue
+        kept.append(lines)
+    if removed:
+        # Removed cues leave gaps. Renumber only cues already validly framed;
+        # malformed blocks must remain malformed for strict validation below.
+        number = 1
+        for lines in kept:
+            if (len(lines) >= 2 and lines[0].strip().isdigit()
+                    and TIMING.fullmatch(lines[1].strip())):
+                lines[0] = str(number)
+                number += 1
+        path.write_text("\n\n".join("\n".join(lines) for lines in kept) + "\n", encoding="utf-8")
+    return removed
+
+
+def srt_validation_error(path: Path) -> str | None:
+    """Return a bounded, non-content-bearing reason when an export is invalid."""
     try:
         blocks = re.split(r"\n\s*\n", path.read_text(encoding="utf-8-sig").strip())
-    except (OSError, UnicodeError):
-        return False
+    except UnicodeError:
+        return "Subtitle Edit output is not valid UTF-8."
+    except OSError:
+        return "Subtitle Edit output could not be read from its staging folder."
     if not blocks or not blocks[0]:
-        return False
+        return "Subtitle Edit produced an empty subtitle file."
     for block in blocks:
         lines = block.splitlines()
         if len(lines) < 3 or not lines[0].strip().isdigit() or not TIMING.fullmatch(lines[1].strip()):
-            return False
+            return "Subtitle Edit output has malformed SRT cues."
         if not any(line.strip() for line in lines[2:]):
-            return False
-    return True
+            return "Subtitle Edit output contains an empty SRT cue."
+    return None
+
+
+def classify_seconv_failure(report) -> str:
+    """Map untrusted CLI diagnostics to short actionable messages without echoing them."""
+    messages = []
+    if isinstance(report, dict):
+        errors = report.get("errors", [])
+        if isinstance(errors, list):
+            messages.extend(item for item in errors if isinstance(item, str))
+        files = report.get("files", [])
+        if isinstance(files, list):
+            for item in files:
+                if isinstance(item, dict):
+                    error = item.get("error")
+                    if isinstance(error, str):
+                        messages.append(error)
+    detail = " ".join(messages).casefold()[:4096]
+    if any(word in detail for word in ("tesseract", "ocr", "traineddata", "language data")):
+        return "OCR failed. Check that the selected language data is installed and supported."
+    if "track" in detail and any(word in detail for word in ("not found", "invalid", "select", "number")):
+        return "Subtitle track selection failed. Check the source track metadata."
+    if any(word in detail for word in ("unsupported", "unknown format", "cannot open format")):
+        return "Subtitle format is unsupported or could not be identified."
+    if any(word in detail for word in ("permission", "access denied", "cannot write", "failed to write", "output folder")):
+        return "Subtitle Edit could not write its staged output. Check folder permissions and free space."
+    if any(word in detail for word in ("encoding", "decode", "invalid text")):
+        return "Subtitle text could not be decoded. Check the source encoding."
+    return "Subtitle Edit could not convert this track. Check its format and the converter logs."
 
 
 def publish(source: Path, destination: Path) -> bool:
@@ -186,8 +255,8 @@ class Converter:
         except (OSError, ValueError):
             LOG.warning("State could not be loaded; unchanged destinations will still be preserved")
 
-    def run(self, command, timeout=None):
-        return run_command(command, timeout=timeout or self.timeout, stop=self.stop)
+    def run(self, command, timeout=None, *, check=True):
+        return run_command(command, timeout=timeout or self.timeout, stop=self.stop, check=check)
 
     def ocr_for(self, language):
         if not isinstance(language, str) or not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language):
@@ -356,10 +425,21 @@ class Converter:
                            "--ocr-engine", "tesseract", "--ocr-language", language, "--json"]
                 if number is not None:
                     command.extend(["--track-number", str(number)])
-                report = json.loads(self.run(command))
+                try:
+                    report = json.loads(self.run(command, check=False))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise ConversionError("Subtitle Edit returned an unreadable conversion result.") from None
+                if not isinstance(report, dict):
+                    raise ConversionError("Subtitle Edit returned an unexpected conversion result.")
                 output = staging / name
-                if not report.get("success") or output.is_symlink() or not valid_srt(output):
-                    raise ValueError("Invalid or missing SRT output")
+                if not report.get("success"):
+                    raise ConversionError(classify_seconv_failure(report))
+                if output.is_symlink():
+                    raise ConversionError("Subtitle Edit created an unsafe symbolic-link output.")
+                remove_empty_srt_cues(output)
+                validation_error = srt_validation_error(output)
+                if validation_error:
+                    raise ConversionError(validation_error)
                 if report.get("warnings"):
                     LOG.warning("Subtitle Edit reported conversion warnings; check the resulting SRT")
                 outputs.append(output)
@@ -436,10 +516,12 @@ class Converter:
                     break
                 LOG.warning("Conversion failed for %s (%s); source and existing SRTs preserved", path.name, type(error).__name__)
                 summary["failed"] += 1
-                self.progress({"status": "failed", "path": str(path), "error": type(error).__name__,
+                diagnostic = str(error) if isinstance(error, ConversionError) else type(error).__name__
+                self.progress({"status": "failed", "path": str(path), "error": diagnostic[:240],
                                "summary": dict(summary)})
                 if not self.dry_run:
-                    self.state[key] = {"fingerprint": current, "ok": False, "attempt": time.time()}
+                    self.state[key] = {"fingerprint": current, "ok": False, "attempt": time.time(),
+                                       "error": diagnostic[:240]}
                     self.save()
         LOG.info("Scan: %s", ", ".join(f"{name}={count}" for name, count in summary.items()))
         return summary

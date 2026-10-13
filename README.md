@@ -67,7 +67,7 @@ This repository is an example to adapt to your own homelab. Service addresses, p
 Replace the example domain, LAN address, timezone, credentials, and media folders before using the stack. Choose the services you need; starting every definition is appropriate only after configuring its dependencies and hardware. Jellyfin and LM Studio are separate host applications in the example, and can be installed for your operating system or replaced with other reachable deployments.
 
 - **Public access** - Cloudflared uses `CLOUDFLARE_TUNNEL_TOKEN` for tunnel routes. Cloudflare DDNS uses the domain list in `CLOUDFLARE_DDNS_DOMAINS` and sets `PROXIED=false` for those records. Supply your own domain list; tunnel routes, DNS records, and certificates are configured separately.
-- **Direct HTTPS access** - Nginx Proxy Manager publishes HTTP on host port `80` and HTTPS on host port `4443`. A router serving standard HTTPS must forward WAN TCP `443` to host TCP `4443`.
+- **Direct HTTPS access** - Nginx Proxy Manager publishes HTTP on host port `80` and HTTPS on standard host port `443`, with host port `4443` retained as an alternate HTTPS port. Forward WAN TCP `443` to host TCP `443`; deployments retaining the alternate mapping can forward WAN TCP `443` to host TCP `4443`.
 - **Network-wide ad/tracker blocking** - [AdGuard Home](https://adguard.com/en/adguard-home/overview.html) backed by a recursive [Unbound](https://unbound.docs.nlnetlabs.nl/) DNS resolver and DNS blocklists.
 - **Automated media pipeline** - Sonarr, Radarr, Bazarr, Prowlarr, qBittorrent, Tdarr, and Seerr for media requests.
 - **YouTube archiving** - [TubeArchivist](https://github.com/tubearchivist/tubearchivist) for self-hosted YouTube download, indexing, and management, backed by Elasticsearch and Redis.
@@ -91,7 +91,7 @@ Internet
   |                         `-- AIO-managed Apache on host:11000
   |
   `-- DNS-only hostnames from CLOUDFLARE_DDNS_DOMAINS
-       `-- Router: WAN 80 -> host 80, WAN 443 -> host 4443
+       `-- Router: WAN 80 -> host 80, WAN 443 -> host 443 (or host 4443 for the alternate mapping)
             `-- Nginx Proxy Manager
                  +-- host Jellyfin:8096
                  `-- open-webui:8080 -> host LM Studio:1234
@@ -443,7 +443,7 @@ On a configured NVIDIA host, Subtitle Studio can be built and started independen
 4. Request and attach TLS certificates through Nginx Proxy Manager.
 5. For Jellyfin, use `host.docker.internal:8096` as the upstream and enable WebSockets.
 
-LAN HTTPS access uses `https://<your-server-ip>:4443`. Container-to-container HTTPS still uses `nginx-proxy-manager:443`. Open WebUI's upstream is `open-webui:8080`; its published host port is `3001`.
+LAN HTTPS access uses `https://<your-server-ip>` on standard host port `443`; host port `4443` remains available as an alternate. Container-to-container HTTPS still uses `nginx-proxy-manager:443`. Open WebUI's upstream is `open-webui:8080`; its published host port is `3001`.
 
 > Docs: [Nginx Proxy Manager Documentation](https://nginxproxymanager.com/guide/)
 
@@ -452,7 +452,7 @@ LAN HTTPS access uses `https://<your-server-ip>:4443`. Container-to-container HT
 Cloudflare DDNS updates the domains listed in `CLOUDFLARE_DDNS_DOMAINS` using `CLOUDFLARE_API_TOKEN`. `PROXIED=false` leaves those records DNS-only. Set only the records you intend to expose directly; leave the domain-list variable blank when not using DDNS.
 
 1. Configure your network so incoming traffic reaches the router serving the Docker host. If you have two routers, account for both forwarding layers.
-2. Forward WAN TCP `80` to host TCP `80`, and WAN TCP `443` to host TCP `4443`, on the machine running Nginx Proxy Manager.
+2. Forward WAN TCP `80` to host TCP `80`, and WAN TCP `443` to host TCP `443`, on the machine running Nginx Proxy Manager. If using the alternate host HTTPS port, forward WAN TCP `443` to host TCP `4443`.
 3. Create the Jellyfin proxy host in Nginx Proxy Manager, pointing at `host.docker.internal:8096`.
 4. Request and attach a valid TLS certificate in Nginx Proxy Manager.
 5. Keep `jellyfin.<your-domain>` gray-clouded in Cloudflare.
@@ -599,7 +599,7 @@ edits to deployment addresses in the dashboard YAML.
 | --- | --- |
 | Host and browser service addresses | `TZ=Etc/UTC` and `HOMELAB_URL=http://localhost` are generic defaults. `*_PUBLIC_URL` values are browser destinations that can point to a LAN address or reverse proxy; setting one does not publish a service or create DNS/tunnel routes. `TUBEARCHIVIST_PUBLIC_URL` also configures TubeArchivist's `TA_HOST`. `N8N_HOST` and `N8N_WEBHOOK_URL` configure n8n's advertised address. |
 | Glance LAN access and live updates | `GLANCE_BIND_ADDRESS` controls host publication of port `7575` and defaults to `127.0.0.1`; use the host's LAN interface address in private `.env` for LAN clients. Compose adds that address to the live gateway's host allowlist; add any LAN DNS hostname used in the browser to `GLANCE_LIVE_ALLOWED_HOSTS`. `GLANCE_LIVE_QBITTORRENT_INTERVAL` defaults to 2 seconds; `GLANCE_LIVE_JELLYFIN_INTERVAL` to 5 seconds; `GLANCE_LIVE_JELLYFIN_WS` enables Jellyfin WebSocket updates with REST reconciliation/fallback. Optional `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD` supply relay credentials; leave both blank when qBittorrent's network whitelist permits access. The relay accepts qBittorrent's HTTP 204 empty login response and the legacy HTTP 200 `Ok.` response. Recreate `glance-live` after changing its credentials. |
-| Private credentials | Cloudflare tokens and `CLOUDFLARE_DDNS_DOMAINS`; Jellyfin, Sonarr, Radarr, and Seerr API keys; optional qBittorrent username/password for the live relay; TubeArchivist username/password and its Elasticsearch password. Fill only the integrations you use. |
+| Private credentials | Cloudflare tokens and `CLOUDFLARE_DDNS_DOMAINS`; Jellyfin, Sonarr, Radarr, Bazarr, and Seerr API keys; optional qBittorrent username/password for the live relay; TubeArchivist username/password and its Elasticsearch password. Fill only the integrations you use. |
 | Subforge Glance widget | `CONVERTER_WIDGET_TOKEN` is an optional, dedicated read-only bearer token shared only with Glance and Subforge; blank disables the widget endpoint. Set a private random token of 32–256 characters in `.env` to enable the widget. |
 | Docker API proxies | `DOCKER_SOCKET_SOURCE` selects the daemon-side socket mounted only by the proxies. `DOCKER_SOCKET_GID` selects the socket's numeric group as seen inside the unprivileged AIO proxy (Docker Desktop commonly reports `0`). `GLANCE_DOCKER_HOST` selects the monitoring proxy. `AIO_PROXY_SOCKET_PATH` identifies the daemon-side Nextcloud proxy socket used by AIO-managed child containers. See [Docker API access](#docker-api-access). |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values are reachable from containers, with no trailing slash. They control dashboard checks, APIs, and the library-count helper independently of browser links. |
@@ -671,7 +671,8 @@ These are host ports unless explicitly marked AIO-managed. Compose mappings with
 | 853 | TCP/UDP | AdGuard Home encrypted DNS mapping |
 | 3000 | TCP | AdGuard Home first-run setup UI |
 | 3001 | TCP | Open WebUI |
-| 4443 | TCP | Nginx Proxy Manager HTTPS (container port 443) |
+| 443 | TCP | Nginx Proxy Manager HTTPS (container port 443) |
+| 4443 | TCP | Nginx Proxy Manager HTTPS alternate (container port 443) |
 | 4999 | TCP | Portracker |
 | 5053 | TCP/UDP | Unbound (DNS) |
 | 5055 | TCP | Seerr |
@@ -737,7 +738,9 @@ If Glance's Sonarr/Radarr calendar reports an HTTP `400`, check **Settings > Gen
 
 ### Automatic Subtitle Conversion
 
-The optional `subtitle-converter` service (dashboard name **Subforge**) scans the movie and TV folders configured for its four read/write library mounts and checks every five minutes by default. Its responsive, authenticated dashboard at `http://localhost:8100` lets you inspect tracks, select languages, queue or cancel extraction jobs, and view activity. **Library** includes a case-insensitive filename and full-path search, root and media-type filters, and pagination with 25, 50, or 100 rows per page. The inspection result is capped at 2,000 files; when that limit is reached, the page suggests inspecting a smaller root. Overview, Library, Activity, and Settings panels can be collapsed, with choices remembered in the browser. Repeated job and integration errors are summarized in expandable, grouped details; these details help identify failures but do not change integration connectivity. The breadcrumb and refresh control stay visible while scrolling. Desktop users can collapse the sidebar to an icon rail; the choice is remembered in that browser. On mobile, the header menu opens a slide-out drawer. Set the host-side library folders with the four `CONVERTER_*_DIR` variables in `.env`; in **Settings → Media Management**, choose the mounted roots or subfolders Subforge scans. The service's mount destinations remain `/movies`, `/movies-C`, `/tv`, and `/tv-C`. The Glance Media page also has an optional read-only Subforge status widget; configure a private `CONVERTER_WIDGET_TOKEN` to enable it. Enabling the token does not activate the `subtitle-conversion` Compose profile: start Subforge explicitly. If it exits during startup, check the sanitized service logs for the invalid setting; the [Subforge guide](subtitle-converter/README.md#troubleshoot-startup) covers the password fix and mount details, and the [Glance guide](glance/README.md#custom-widgets-and-refresh-behavior) explains widget setup. The Subforge guide also covers network binding, media-server integrations, and conversion limits. Start only this service with `docker compose --profile subtitle-conversion up -d --build subtitle-converter`; it remains separate from Bazarr's subtitle downloads.
+The optional `subtitle-converter` service (dashboard name **Subforge**) scans the movie and TV folders configured for its four read/write library mounts and checks every five minutes by default. Its responsive, authenticated dashboard at `http://localhost:8100` lets you inspect tracks, select languages, queue or cancel extraction jobs, and view activity. Dashboard routes are bookmarkable, so reloading or using browser back/forward preserves the selected page and Settings section. **Library** includes a case-insensitive filename and full-path search, root and media-type filters, and pagination with 25, 50, or 100 rows per page. The inspection result is capped at 2,000 files; when that limit is reached, the page suggests inspecting a smaller root. Overview, Library, Activity, and Settings panels can be collapsed, with choices remembered in the browser. Failed files are grouped by cause, and a job with conversion failures is marked **Completed with errors**; safe HTTP/category diagnostics help identify integration problems. Empty timed subtitle cues are removed from staged output, while malformed SRT remains a conversion failure. The breadcrumb and refresh control stay visible while scrolling. Desktop users can collapse the sidebar to an icon rail; the choice is remembered in that browser. On mobile, the header menu opens a slide-out drawer. Set the host-side library folders with the four `CONVERTER_*_DIR` variables in `.env`; in **Settings → Media Management**, choose the mounted roots or subfolders Subforge scans. The service's mount destinations remain `/movies`, `/movies-C`, `/tv`, and `/tv-C`. The Glance Media page also has an optional read-only Subforge status widget; configure a private `CONVERTER_WIDGET_TOKEN` to enable it. Enabling the token does not activate the `subtitle-conversion` Compose profile: start Subforge explicitly. If it exits during startup, check the sanitized service logs for the invalid setting; the [Subforge guide](subtitle-converter/README.md#troubleshoot-startup) covers the password fix and mount details, and the [Glance guide](glance/README.md#custom-widgets-and-refresh-behavior) explains widget setup.
+
+Subforge can integrate with Sonarr, Radarr, Bazarr, and Jellyfin. For Bazarr, set `BAZARR_INTERNAL_URL` (default `http://bazarr:6767`) and the private `BAZARR_API_KEY` in `.env`, then enable and test the integration in **Settings → Bazarr**. At the end of each conversion job, it batches generated SRT paths and asks Bazarr to sync and scan only matching existing media items; the manual **Sync and scan library** action queues Bazarr's global library/index tasks. Bazarr may apply its own configured subtitle search and download rules during these sync operations. Configure path mappings when the apps use different container paths; Windows host paths and macOS/Linux host paths both map to the container paths seen by each service. Start only this service with `docker compose --profile subtitle-conversion up -d --build subtitle-converter`; Bazarr remains responsible for its own provider and subtitle-download settings. The [Subforge guide](subtitle-converter/README.md) documents path mapping, service credentials, and refresh behavior.
 
 ### Jellyfin Plugins
 

@@ -158,6 +158,8 @@ services:
       - SONARR_API_KEY=${SONARR_API_KEY:-}
       - RADARR_INTERNAL_URL=${RADARR_INTERNAL_URL:-http://radarr:7878}
       - RADARR_API_KEY=${RADARR_API_KEY:-}
+      - BAZARR_INTERNAL_URL=${BAZARR_INTERNAL_URL:-http://bazarr:6767}
+      - BAZARR_API_KEY=${BAZARR_API_KEY:-}
       - JELLYFIN_INTERNAL_URL=${JELLYFIN_INTERNAL_URL:-http://host.docker.internal:8096}
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
     volumes:

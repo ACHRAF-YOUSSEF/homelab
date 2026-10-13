@@ -1,4 +1,4 @@
-"""Optional, server-side Sonarr, Radarr and Jellyfin integrations."""
+"""Optional, server-side Sonarr, Radarr, Bazarr and Jellyfin integrations."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ DEFAULTS = {
                "api_key": os.environ.get("SONARR_API_KEY", "")},
     "radarr": {"enabled": False, "url": os.environ.get("RADARR_INTERNAL_URL", ""),
                "api_key": os.environ.get("RADARR_API_KEY", "")},
+    "bazarr": {"enabled": False, "url": os.environ.get("BAZARR_INTERNAL_URL", "http://bazarr:6767"),
+               "api_key": os.environ.get("BAZARR_API_KEY", "")},
     "jellyfin": {"enabled": False,
                  "url": os.environ.get("JELLYFIN_INTERNAL_URL", "http://host.docker.internal:8096"),
                  "api_key": os.environ.get("JELLYFIN_API_KEY", ""), "movie_libraries": [],
@@ -27,6 +29,22 @@ DEFAULTS = {
     "path_mappings": [],
 }
 SAFE_KEY = re.compile(r"^[A-Za-z0-9._~+/=-]{1,512}$")
+
+
+def _http_failure(exc, *, prefix="Connection failed"):
+    """Turn a categorized HTTP failure into useful text without exposing details."""
+    category = getattr(exc, "category", "service_error")
+    status = getattr(exc, "status_code", None)
+    messages = {
+        "authentication": f"API key rejected (HTTP {status})" if status else "API key rejected (HTTP 401/403)",
+        "refused": "Connection refused; check the service URL and availability",
+        "unreachable": "Could not reach the configured service; check its URL and network",
+        "timeout": "Request timed out while waiting for the service",
+        "invalid_json": "Service returned an invalid JSON response; check its URL and proxy settings",
+        "response_limit": "Service response exceeded the safety limit",
+        "http_status": f"Service returned HTTP {status}" if status else "Service returned an HTTP error",
+    }
+    return f"{prefix}: {messages.get(category, 'check the URL, API key, and service logs')}"
 
 
 def _norm(path):
@@ -61,6 +79,7 @@ class Integrations:
         self.settings_path = Path(settings_path)
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._bazarr_pending_paths = set()
         self._settings = self._load()
 
     def _load(self):
@@ -69,10 +88,12 @@ class Integrations:
         values["sonarr"]["api_key"] = os.environ.get("SONARR_API_KEY", values["sonarr"]["api_key"])
         values["radarr"]["url"] = os.environ.get("RADARR_INTERNAL_URL", values["radarr"]["url"])
         values["radarr"]["api_key"] = os.environ.get("RADARR_API_KEY", values["radarr"]["api_key"])
+        values["bazarr"]["url"] = os.environ.get("BAZARR_INTERNAL_URL", values["bazarr"]["url"])
+        values["bazarr"]["api_key"] = os.environ.get("BAZARR_API_KEY", values["bazarr"]["api_key"])
         try:
             raw = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                for provider in ("sonarr", "radarr", "jellyfin"):
+                for provider in ("sonarr", "radarr", "bazarr", "jellyfin"):
                     if isinstance(raw.get(provider), dict):
                         values[provider].update({k: v for k, v in raw[provider].items()
                                                  if not (provider == "jellyfin" and k in {"url", "api_key"})})
@@ -86,7 +107,7 @@ class Integrations:
         values["jellyfin"]["url"] = os.environ.get(
             "JELLYFIN_INTERNAL_URL", "http://host.docker.internal:8096")
         values["jellyfin"]["api_key"] = os.environ.get("JELLYFIN_API_KEY", "")
-        for provider in ("sonarr", "radarr", "jellyfin"):
+        for provider in ("sonarr", "radarr", "bazarr", "jellyfin"):
             conf = values[provider]
             conf["enabled"] = bool(conf.get("enabled"))
             conf["url"] = str(conf.get("url") or "")
@@ -120,7 +141,7 @@ class Integrations:
     def public_settings(self):
         with self._lock:
             result = copy.deepcopy(self._settings)
-        for provider in ("sonarr", "radarr", "jellyfin"):
+        for provider in ("sonarr", "radarr", "bazarr", "jellyfin"):
             result[provider]["api_key_set"] = bool(result[provider].pop("api_key", ""))
             result[provider]["api_key"] = ""
         result["jellyfin"]["env_managed"] = True
@@ -131,7 +152,7 @@ class Integrations:
             raise ValueError("Settings must be an object")
         with self._lock:
             candidate = copy.deepcopy(self._settings)
-            for provider in ("sonarr", "radarr", "jellyfin"):
+            for provider in ("sonarr", "radarr", "bazarr", "jellyfin"):
                 incoming = settings.get(provider)
                 if incoming is None:
                     continue
@@ -189,8 +210,8 @@ class Integrations:
                     if not remote or not local:
                         raise ValueError("Path mappings must use absolute paths")
                     mapping_provider = mapping.get("provider")
-                    if mapping_provider not in {None, "sonarr", "radarr", "jellyfin"}:
-                        raise ValueError("Path mapping provider must be Sonarr, Radarr, or Jellyfin")
+                    if mapping_provider not in {None, "sonarr", "radarr", "bazarr", "jellyfin"}:
+                        raise ValueError("Path mapping provider must be Sonarr, Radarr, Bazarr, or Jellyfin")
                     safe.append({"remote": str(mapping["remote"]).rstrip("/\\"),
                                  "local": str(mapping["local"]).rstrip("/\\"),
                                  **({"provider": mapping_provider} if mapping_provider else {})})
@@ -200,7 +221,7 @@ class Integrations:
         return self.public_settings()
 
     def map_path(self, provider, remote):
-        if provider not in {"sonarr", "radarr", "jellyfin"}:
+        if provider not in {"sonarr", "radarr", "bazarr", "jellyfin"}:
             return None
         path, flavor = _norm(remote)
         if path is None:
@@ -220,7 +241,7 @@ class Integrations:
 
     def remote_path(self, provider, local):
         """Translate a converter path back into the application's configured path."""
-        if provider not in {"sonarr", "radarr", "jellyfin"}:
+        if provider not in {"sonarr", "radarr", "bazarr", "jellyfin"}:
             return None
         path, flavor = _norm(local)
         if path is None:
@@ -276,8 +297,138 @@ class Integrations:
             args["api_key_header"] = "X-Emby-Token"
         return request(conf["url"], path, **args)
 
+    def _bazarr_tasks(self):
+        response = self._api("bazarr", "/api/system/tasks")
+        tasks = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(tasks, list):
+            raise HTTPError("Bazarr returned an invalid task list", category="invalid_json")
+        return {item.get("job_id"): item for item in tasks
+                if isinstance(item, dict) and isinstance(item.get("job_id"), str)}
+
+    def _bazarr_run_task(self, task_id):
+        # Bazarr's API parser consumes application/x-www-form-urlencoded fields.
+        conf = self._settings["bazarr"]
+        return request(conf["url"], "/api/system/tasks", method="POST", api_key=conf["api_key"],
+                       api_key_header="X-Api-Key", form={"taskid": task_id})
+
+    def _bazarr_action(self, media_kind, media_id, action):
+        if media_kind == "series":
+            path, key = "/api/series", "seriesid"
+        elif media_kind == "movie":
+            path, key = "/api/movies", "radarrid"
+        else:
+            raise ValueError("Unknown Bazarr media type")
+        conf = self._settings["bazarr"]
+        return request(conf["url"], path, method="PATCH", api_key=conf["api_key"],
+                       api_key_header="X-Api-Key", form={key: str(media_id), "action": action})
+
+    def _bazarr_media(self, media_kind, *, stop=None, progress=None, max_items=20000):
+        """List Bazarr media with a strict cap; the API returns root/file paths."""
+        endpoint = "/api/series" if media_kind == "series" else "/api/movies"
+        records = []
+        start = 0
+        page_size = 200
+        while start < max_items:
+            if stop and stop.is_set():
+                break
+            query = urlencode({"start": start, "length": min(page_size, max_items - start)})
+            result = self._api("bazarr", endpoint + "?" + query)
+            page = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(page, list):
+                raise HTTPError("Bazarr returned invalid media data", category="invalid_json")
+            records.extend(item for item in page if isinstance(item, dict))
+            total = result.get("total", 0)
+            if not isinstance(total, int) or total < 0:
+                raise HTTPError("Bazarr returned invalid media count", category="invalid_json")
+            if len(records) >= total or len(page) < page_size:
+                break
+            start += len(page)
+        if len(records) >= max_items and total > max_items:
+            raise ValueError("Bazarr media list exceeds the configured scan limit")
+        return records
+
+    def _bazarr_ids_for_paths(self, paths, *, stop=None, progress=None):
+        series_records = self._bazarr_media("series", stop=stop)
+        movie_records = self._bazarr_media("movie", stop=stop)
+        series_roots = []
+        for item in series_records:
+            media_id = item.get("sonarrSeriesId")
+            root, flavor = _norm(item.get("path"))
+            if isinstance(media_id, int) and root:
+                series_roots.append((media_id, root, flavor))
+        movie_files = []
+        for item in movie_records:
+            media_id = item.get("radarrId")
+            movie_path, flavor = _norm(item.get("path"))
+            if isinstance(media_id, int) and movie_path:
+                movie_files.append((media_id, movie_path, flavor))
+
+        def path_key(value, flavor):
+            normalized = str(value).replace("\\", "/")
+            return normalized.casefold() if flavor == "windows" else normalized
+
+        matched_series, matched_movies = set(), set()
+        for path in paths:
+            remote = self.remote_path("bazarr", path)
+            normalized, flavor = _norm(remote)
+            stem = self._subtitle_stem(remote)
+            if not normalized or not stem:
+                continue
+            pure = PureWindowsPath(normalized) if flavor == "windows" else PurePosixPath(normalized)
+            parent = path_key(pure.parent, flavor)
+            for media_id, movie_path, movie_flavor in movie_files:
+                movie = PureWindowsPath(movie_path) if movie_flavor == "windows" else PurePosixPath(movie_path)
+                if movie_flavor == flavor and path_key(movie.parent, flavor) == parent and \
+                        path_key(movie.stem, flavor) == path_key(stem, flavor):
+                    matched_movies.add(media_id)
+            matching_roots = [(len(root), media_id) for media_id, root, root_flavor in series_roots
+                              if root_flavor == flavor and _under(normalized, root, flavor)]
+            if matching_roots:
+                matched_series.add(max(matching_roots)[1])
+        return sorted(matched_series), sorted(matched_movies)
+
+    def flush_bazarr(self, *, stop=None, progress=None):
+        """Scan only Bazarr entities touched by SRTs from the completed job."""
+        with self._lock:
+            paths = sorted(self._bazarr_pending_paths)
+            # Consume this batch before doing network work, so cancel/error can
+            # never leak paths into the next conversion job.
+            self._bazarr_pending_paths.clear()
+            conf = copy.deepcopy(self._settings["bazarr"])
+        if not paths:
+            return None
+        if not conf["enabled"] or not conf["url"] or not conf["api_key"]:
+            return {"provider": "bazarr", "ok": True, "triggered": 0, "message": "Bazarr integration is disabled"}
+        if stop and stop.is_set():
+            return {"provider": "bazarr", "ok": True, "triggered": 0, "message": "Bazarr scan cancelled"}
+        try:
+            series_ids, movie_ids = self._bazarr_ids_for_paths(paths, stop=stop, progress=progress)
+            actions = [("series", identifier) for identifier in series_ids]
+            actions.extend(("movie", identifier) for identifier in movie_ids)
+            done = 0
+            for media_kind, identifier in actions:
+                if stop and stop.is_set():
+                    return {"provider": "bazarr", "ok": True, "triggered": done,
+                            "message": "Bazarr scan cancelled"}
+                if progress:
+                    progress({"status": "refreshing", "path": f"Bazarr · {media_kind} {identifier}"})
+                self._bazarr_action(media_kind, identifier, "sync")
+                if stop and stop.is_set():
+                    return {"provider": "bazarr", "ok": True, "triggered": done,
+                            "message": "Bazarr scan cancelled"}
+                self._bazarr_action(media_kind, identifier, "scan-disk")
+                done += 1
+            return {"provider": "bazarr", "ok": True, "triggered": done,
+                    "message": f"Scanned {done} Bazarr item(s)" if done else "No matching Bazarr media item"}
+        except HTTPError as exc:
+            return {"provider": "bazarr", "ok": False, "triggered": 0,
+                    "message": _http_failure(exc, prefix="Bazarr scan failed")}
+        except (ValueError, TypeError, KeyError):
+            return {"provider": "bazarr", "ok": False, "triggered": 0,
+                    "message": "Bazarr scan failed; check media paths and integration settings"}
+
     def test(self, provider):
-        if provider not in {"sonarr", "radarr", "jellyfin"}:
+        if provider not in {"sonarr", "radarr", "bazarr", "jellyfin"}:
             return {"connected": False, "message": "Unknown integration"}
         conf = self._settings[provider]
         if not conf["url"] or not conf["api_key"]:
@@ -287,14 +438,44 @@ class Integrations:
                 data = self._api(provider, "/api/v3/system/status")
             elif provider == "radarr":
                 data = self._api(provider, "/api/v3/system/status")
+            elif provider == "bazarr":
+                data = self._api(provider, "/api/system/status")
+                data = data.get("data") if isinstance(data, dict) else None
             else:
                 data = self._api(provider, "/System/Info")
             if not isinstance(data, dict):
-                raise HTTPError("Invalid service status")
-            return {"connected": True, "version": str(data.get("version", data.get("Version", "")))[:64],
+                raise HTTPError("Invalid service status", category="invalid_json")
+            version = data.get("bazarr_version") if provider == "bazarr" else data.get("version", data.get("Version", ""))
+            return {"connected": True, "version": str(version or "")[:64],
                     "message": "Connected"}
-        except (HTTPError, ValueError):
+        except HTTPError as exc:
+            return {"connected": False, "message": _http_failure(exc)}
+        except ValueError:
             return {"connected": False, "message": "Connection failed; check the URL, API key, and service logs"}
+
+    def _bazarr_refresh(self, *, stop=None, progress=None):
+        tasks = self._bazarr_tasks()
+        sync_tasks = [task for task in ("update_series", "update_movies") if task in tasks]
+        scan_tasks = [task for task in ("series_full_scan_subtitles", "movies_full_scan_subtitles")
+                      if task in tasks]
+        if not scan_tasks:
+            return {"provider": "bazarr", "ok": False,
+                    "message": "Bazarr has no subtitle-index scan tasks; connect it to Sonarr or Radarr"}
+        queued = 0
+        for task_id in sync_tasks + scan_tasks:
+            if stop and stop.is_set():
+                return {"provider": "bazarr", "ok": True, "message": "Bazarr refresh cancelled before all tasks were queued"}
+            task = tasks[task_id]
+            if task.get("job_running"):
+                continue
+            if progress:
+                progress({"status": "refreshing", "path": f"Bazarr · {task.get('name', task_id)}"})
+            self._bazarr_run_task(task_id)
+            queued += 1
+        if not queued:
+            return {"provider": "bazarr", "ok": True, "message": "Bazarr sync and subtitle-index tasks are already running"}
+        return {"provider": "bazarr", "ok": True,
+                "message": f"Queued {queued} Bazarr sync and subtitle-index task(s)"}
 
     def libraries(self):
         conf = self._settings["jellyfin"]
@@ -444,29 +625,41 @@ class Integrations:
         """Trigger configured scans; return safe per-provider status objects."""
         results = []
         paths = [str(path) for path in paths if isinstance(path, (str, os.PathLike))]
+        with self._lock:
+            bazarr = self._settings["bazarr"]
+            if paths and bazarr["enabled"] and bazarr["url"] and bazarr["api_key"]:
+                self._bazarr_pending_paths.update(paths)
         for provider in ("sonarr", "radarr", "jellyfin"):
             conf = self._settings[provider]
             if not conf["enabled"] or not conf["url"] or not conf["api_key"]:
                 continue
             enabled_paths = paths
             try:
-                count = self._arr_refresh(provider, enabled_paths) if provider in {"sonarr", "radarr"} else self._jellyfin_refresh(enabled_paths)
+                if provider in {"sonarr", "radarr"}:
+                    count = self._arr_refresh(provider, enabled_paths)
+                else:
+                    count = self._jellyfin_refresh(enabled_paths)
                 results.append({"provider": provider, "ok": True, "triggered": count,
                                 "message": "Scan requested" if count else "No matching media item"})
-            except (HTTPError, ValueError, TypeError, KeyError):
+            except HTTPError as exc:
+                results.append({"provider": provider, "ok": False, "triggered": 0,
+                                "message": _http_failure(exc, prefix="Scan request failed")})
+            except (ValueError, TypeError, KeyError):
                 results.append({"provider": provider, "ok": False, "triggered": 0,
                                 "message": "Scan request failed; check integration settings"})
         return results
 
     def refresh(self, provider, *, stop=None, progress=None):
         """Manually request a complete library scan/refresh from one service."""
-        if provider not in {"sonarr", "radarr", "jellyfin"}:
+        if provider not in {"sonarr", "radarr", "bazarr", "jellyfin"}:
             return {"provider": str(provider), "ok": False, "message": "Unknown integration"}
         with self._lock:
             conf = copy.deepcopy(self._settings[provider])
         if not conf["url"] or not conf["api_key"]:
             return {"provider": provider, "ok": False, "message": "Configure the server URL and API key"}
         try:
+            if provider == "bazarr":
+                return self._bazarr_refresh(stop=stop, progress=progress)
             if provider == "jellyfin":
                 selected = []
                 for folder in self.libraries():
@@ -511,6 +704,9 @@ class Integrations:
                 self._api(provider, "/api/v3/command", method="POST",
                           body={"name": "RescanSeries" if provider == "sonarr" else "RescanMovie"})
             return {"provider": provider, "ok": True, "message": "Scan requested"}
-        except (HTTPError, ValueError, TypeError):
+        except HTTPError as exc:
+            return {"provider": provider, "ok": False,
+                    "message": _http_failure(exc, prefix="Scan request failed")}
+        except (ValueError, TypeError):
             return {"provider": provider, "ok": False,
                     "message": "Scan request failed; check integration settings"}

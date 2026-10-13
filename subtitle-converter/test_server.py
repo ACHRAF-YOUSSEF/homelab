@@ -29,16 +29,24 @@ class FakeIntegrations:
         self.mapped_path = mapped_path
         self.webhook_path = webhook_path
         self.webhook_payloads = []
+        self.flush_calls = []
+        self.notified_paths = []
+        self.flush_result = None
 
     def public_settings(self):
         return {name: {"enabled": False, "api_key": "", "api_key_set": False}
-                for name in ("sonarr", "radarr", "jellyfin")} | {"path_mappings": []}
+                for name in ("sonarr", "radarr", "jellyfin", "bazarr")} | {"path_mappings": []}
 
     def update(self, settings):
         return self.public_settings()
 
     def notify(self, paths):
+        self.notified_paths.extend(paths)
         return []
+
+    def flush_bazarr(self, **kwargs):
+        self.flush_calls.append({"cancelled": kwargs["stop"].is_set()})
+        return self.flush_result
 
     def libraries(self):
         return []
@@ -160,6 +168,86 @@ class DashboardServerTest(unittest.TestCase):
             self.assertTrue(headers["Content-Type"].startswith(content_type))
             self.assertEqual(self.request("GET", path, auth=False)[0], 401)
         self.assertEqual(self.request("GET", "/static/../converter.py")[0], 404)
+
+    def test_bazarr_settings_and_authenticated_refresh_routes(self):
+        status, body, _ = self.request("GET", "/api/settings")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["integrations"]["bazarr"]["api_key"], "")
+        route = "/api/integrations/bazarr/refresh"
+        self.assertEqual(self.request("POST", route, body={})[0], 403)
+        status, body, _ = self.request("POST", route, body={}, csrf=self.manager.csrf)
+        self.assertEqual(status, 202)
+        job = json.loads(body)["job"]
+        self.assertEqual((job["kind"], job["provider"]), ("refresh", "bazarr"))
+        self.assertEqual(self.request("POST", "/api/integrations/bazarr/test", body={}, csrf=self.manager.csrf)[0], 200)
+
+    def test_failure_status_classification_and_legacy_history_snapshot(self):
+        partial = {"kind": "scan", "status": "completed", "summary": {"converted": 2, "failed": 3}}
+        notification = {"kind": "extract", "notifications": [{"provider": "bazarr", "ok": False}]}
+        refresh = {"kind": "refresh", "results": [{"provider": "jellyfin", "ok": False}]}
+        self.assertEqual(JobManager.finished_status(partial), "completed_with_errors")
+        self.assertEqual(JobManager.finished_status(notification), "completed_with_errors")
+        self.assertEqual(JobManager.finished_status(refresh), "failed")
+        self.assertEqual(JobManager.finished_status({"error": "ValueError"}), "failed")
+        self.assertEqual(JobManager.finished_status({"summary": {"failed": 0}}), "completed")
+        self.manager.history.append(partial)
+        self.assertEqual(self.manager.status()["history"][0]["status"], "completed_with_errors")
+        self.assertEqual(partial["status"], "completed")
+
+    def test_file_failures_are_counted_and_bounded_in_activity(self):
+        self.manager.running = {"processed": 0}
+        for index in range(700):
+            self.manager._progress({"status": "failed", "error": "Converted SRT contains malformed cues",
+                                     "path": str(self.root / f"Film {index}.mkv")})
+        job = self.manager.running
+        self.assertEqual(job["processed"], 700)
+        self.assertEqual(len(job["file_errors"]), 1)
+        self.assertEqual(job["file_errors"][0]["count"], 700)
+        self.assertEqual(len(job["file_errors"][0]["examples"]), 3)
+        for index in range(40):
+            self.manager._progress({"status": "failed", "error": f"Fixture error {index}", "path": str(self.media)})
+        self.assertEqual(len(job["file_errors"]), server.MAX_ERROR_GROUPS)
+        self.assertEqual(job["other_file_errors"], 17)
+
+    def test_bazarr_flushes_once_after_partial_conversion_and_failed_jobs(self):
+        self.integrations.flush_result = {"provider": "bazarr", "ok": False, "message": "API key rejected (HTTP 401)"}
+        calls = []
+        def scan(paths=None, *, retry=False):
+            calls.append(True)
+            self.converter.progress({"status": "converted", "path": str(self.media),
+                                     "new_outputs": [str(self.media.with_suffix(".en.srt"))]})
+            if len(calls) == 2:
+                raise RuntimeError("private exception must not appear")
+            self.converter.progress({"status": "failed", "path": str(self.media), "error": "Malformed cues"})
+            return {"converted": 1, "failed": 1}
+        self.converter.scan = scan
+        self.manager.enqueue({"kind": "scan"})
+        self.manager.enqueue({"kind": "scan"})
+        self.manager.start()
+        deadline = time.monotonic() + 3
+        while len(self.manager.history) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(self.manager.history), 2)
+        self.assertEqual(len(self.integrations.flush_calls), 2)
+        first, second = self.manager.history
+        self.assertEqual(first["status"], "completed_with_errors")
+        self.assertEqual(first["file_errors"][0]["count"], 1)
+        self.assertEqual(first["notifications"][0]["provider"], "bazarr")
+        self.assertEqual(second["status"], "failed")
+        self.assertEqual(second["error"], "RuntimeError")
+
+    def test_refresh_failure_has_single_provider_result(self):
+        self.integrations.refresh = lambda provider, **kwargs: {"provider": provider, "ok": False, "message": "API key rejected (HTTP 401)"}
+        self.manager.enqueue({"kind": "refresh", "provider": "bazarr"})
+        self.manager.start()
+        deadline = time.monotonic() + 3
+        while not self.manager.history and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(self.manager.history)
+        job = self.manager.history[0]
+        self.assertEqual(job["status"], "failed")
+        self.assertIsNone(job["error"])
+        self.assertEqual(len(job["results"]), 1)
 
     def test_widget_bearer_auth_is_read_only_and_returns_only_safe_aggregates(self):
         self.assertEqual(self.request("GET", "/api/widget", auth=False)[0], 401)
@@ -510,6 +598,7 @@ class DashboardServerTest(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(state["maximum"], 1)
             self.assertEqual([job["status"] for job in manager.history], ["cancelled", "completed"])
+            self.assertEqual(self.integrations.flush_calls, [{"cancelled": True}, {"cancelled": False}])
         finally:
             release_first.set()
             self._close_manager(manager)
