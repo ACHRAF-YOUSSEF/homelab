@@ -6,6 +6,7 @@ mod gpu;
 pub mod integrations;
 pub mod maintenance;
 pub mod metadata;
+pub mod remote;
 mod resources;
 pub mod server;
 pub mod tasks;

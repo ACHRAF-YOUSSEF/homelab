@@ -12,7 +12,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo test --locked --features cuda \
     && cargo build --release --locked --features cuda \
-    && cp target/release/subforge /build/subforge
+    && cp target/release/subforge /build/subforge \
+    && cp target/release/subforge-worker /build/subforge-worker
 
 # Keep the heavy, locked OCR tools independent of the application revision.
 FROM python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 AS cuda-tools
@@ -51,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=cuda-tools /usr/local /usr/local
 COPY --from=cuda-tools /opt/paddle-models /opt/paddle-models
 COPY --from=cuda-build /build/subforge /usr/local/bin/subforge
+COPY --from=cuda-build /build/subforge-worker /usr/local/bin/subforge-worker
 LABEL org.opencontainers.image.version="0.4.0" \
       io.subforge.edition="cuda"
 USER 1000:1000

@@ -27,6 +27,81 @@ const INVENTORY_LIMIT: usize = 2000;
 const HISTORY_LIMIT: usize = 100;
 const JSON_LIMIT: usize = 32 * 1024 * 1024;
 const HTTP_WORKERS: usize = 4;
+const LOG_LIMIT: usize = 200;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+fn log_text(value: &str, limit: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(limit)
+        .collect()
+}
+
+/// Both sinks receive the same bounded JSON record. Only explicit operational
+/// fields enter logs; requests, headers, endpoints and subprocess output do not.
+fn progress_log(event: &Value) -> Value {
+    let status = log_text(event["status"].as_str().unwrap_or("progress"), 48);
+    let name = event["path"]
+        .as_str()
+        .and_then(|path| Path::new(path).file_name())
+        .map(|name| log_text(&name.to_string_lossy(), 240));
+    let error = event["error"].as_str().map(|error| log_text(error, 240));
+    let mut message = format!("File {status}");
+    if let Some(name) = &name {
+        message.push_str(&format!(": {name}"));
+    }
+    if let Some(track) = event["track"].as_u64() {
+        message.push_str(&format!("; track {track}"));
+    }
+    if let Some(backend) = event["backend"].as_str() {
+        message.push_str(&format!("; backend {}", log_text(backend, 32)));
+    }
+    if let Some(error) = &error {
+        message.push_str(&format!("; {error}"));
+    }
+    let mut entry = json!({"time":now(),"level":if status=="failed" {"ERROR"} else {"INFO"},"message":message,"status":status});
+    if let Some(name) = name {
+        entry["file"] = json!(name);
+    }
+    if let Some(error) = error {
+        entry["error"] = json!(error);
+    }
+    for key in [
+        "worker_id",
+        "track",
+        "processed",
+        "total",
+        "progress_percent",
+        "frames",
+        "frames_total",
+    ] {
+        if let Some(value) = event[key].as_u64() {
+            entry[key] = json!(value);
+        }
+    }
+    for key in ["backend", "resource", "language"] {
+        if let Some(value) = event[key].as_str() {
+            entry[key] = json!(log_text(value, 48));
+        }
+    }
+    entry
+}
+
+fn write_log(output: &mut impl Write, entry: &Value) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *output, entry)?;
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn record_log(runtime: &mut Runtime, entry: Value) {
+    // A failed/disconnected collector must not turn a completed file into a failure.
+    let _ = write_log(&mut std::io::stdout().lock(), &entry);
+    runtime.logs.push_back(entry);
+    while runtime.logs.len() > LOG_LIMIT {
+        runtime.logs.pop_front();
+    }
+}
 
 struct FileOutcome {
     state: Option<Value>,
@@ -113,6 +188,7 @@ pub struct App {
     metadata_usage: Arc<crate::metadata::CacheUsage>,
     resources: Mutex<crate::resources::Sampler>,
     workers: Mutex<Workers>,
+    remote: Mutex<crate::remote::Coordinator>,
     integrations: Mutex<Integrations>,
     public_integrations: Mutex<Value>,
     mounts: Vec<PathBuf>,
@@ -208,7 +284,7 @@ fn inventory_rows(value: &Value, mounts: &[PathBuf], roots: &[PathBuf]) -> Vec<V
         let path = row["path"].as_str()?;
         if path.len() > 4096 || validate_root(Path::new(path), mounts, false).is_err() { return None; }
         let name = Path::new(path).file_name()?.to_string_lossy().chars().take(256).collect::<String>();
-        let tracks = row["tracks"].as_array().into_iter().flatten().take(64).map(|track| {
+        let tracks = row["tracks"].as_array().into_iter().flatten().take(crate::metadata::MAX_TRACKS).map(|track| {
             let mut result = serde_json::Map::new();
             for key in ["language", "format"] {
                 result.insert(key.into(), json!(track[key].as_str().unwrap_or("").chars().take(35).collect::<String>()));
@@ -257,6 +333,10 @@ impl App {
         let ocr_permission = converter.ocr_allowed();
         let metadata_usage = converter.metadata_usage();
         let workers = Workers::new(data.join("workers.conf"), ocr_permission)?;
+        let remote = crate::remote::Coordinator::new(
+            std::env::var("CONVERTER_WORKER_TOKEN").unwrap_or_default(),
+            mounts.clone(),
+        )?;
         let schedule_path = data.join("tasks.json");
         let new_schedule = !schedule_path.exists();
         let mut scheduler = Scheduler::new(schedule_path, now(), auto_scan)?;
@@ -403,6 +483,7 @@ impl App {
             metadata_usage,
             resources: Mutex::new(crate::resources::Sampler::default()),
             workers: Mutex::new(workers),
+            remote: Mutex::new(remote),
             integrations: Mutex::new(integrations),
             mounts,
             data,
@@ -426,12 +507,10 @@ impl App {
     }
     fn log(&self, level: &str, message: &str) {
         let mut runtime = lock(&self.runtime);
-        runtime
-            .logs
-            .push_back(json!({"time":now(),"level":level,"message":message}));
-        while runtime.logs.len() > 200 {
-            runtime.logs.pop_front();
-        }
+        record_log(
+            &mut runtime,
+            json!({"time":now(),"level":log_text(level,16),"message":log_text(message,1024)}),
+        );
     }
     fn settings(&self) -> Value {
         let schedule = lock(&self.scheduler).public();
@@ -523,11 +602,24 @@ impl App {
 
     fn workers(&self) -> Value {
         let sample = lock(&self.resources).snapshot();
-        lock(&self.workers).public(&sample)
+        let mut value = lock(&self.workers).public(&sample);
+        value["remote"] = lock(&self.remote).public();
+        value
     }
 
     fn update_workers(&self, data: &Value) -> Result<Value, String> {
         lock(&self.workers).update(data)?;
+        let allocation = lock(&self.workers).allocation;
+        self.log(
+            "INFO",
+            &format!(
+                "Worker targets updated: CPU {}, CPU OCR {}, GPU {}; paused {}",
+                allocation.cpu_workers,
+                allocation.ocr_workers,
+                allocation.gpu_workers,
+                allocation.paused
+            ),
+        );
         self.wake.notify_all();
         Ok(self.workers())
     }
@@ -806,6 +898,10 @@ impl App {
             job["track_ids"] = json!(track_ids);
         }
         runtime.queue.push_back(job.clone());
+        record_log(
+            &mut runtime,
+            json!({"time":now(),"level":"INFO","message":format!("Job queued: {kind}"),"job_id":job["id"],"kind":kind,"status":"queued"}),
+        );
         self.wake.notify_one();
         Ok(Some(job))
     }
@@ -813,6 +909,10 @@ impl App {
         let mut runtime = lock(&self.runtime);
         if runtime.running.as_ref().is_some_and(|job| job["id"] == id) {
             self.cancel.store(true, Ordering::Relaxed);
+            record_log(
+                &mut runtime,
+                json!({"time":now(),"level":"INFO","message":"Job cancellation requested; waiting for active tools to stop","job_id":id,"status":"cancelling"}),
+            );
             return Ok(json!({"status":"cancelling"}));
         }
         if let Some(index) = runtime.queue.iter().position(|job| job["id"] == id)
@@ -820,6 +920,10 @@ impl App {
         {
             job["status"] = json!("cancelled");
             job["finished"] = json!(now());
+            record_log(
+                &mut runtime,
+                json!({"time":now(),"level":"INFO","message":"Queued job cancelled","job_id":id,"status":"cancelled"}),
+            );
             runtime.history.push_back(job);
             while runtime.history.len() > HISTORY_LIMIT {
                 runtime.history.pop_front();
@@ -847,6 +951,12 @@ impl App {
     }
     fn progress(&self, event: Value) {
         let mut runtime = lock(&self.runtime);
+        let mut entry = progress_log(&event);
+        if let Some(job) = &runtime.running {
+            entry["job_id"] = job["id"].clone();
+            entry["kind"] = job["kind"].clone();
+        }
+        record_log(&mut runtime, entry);
         if event["status"] == "converted"
             && let Some(path) = event["path"].as_str()
         {
@@ -988,6 +1098,46 @@ impl App {
             || ["sonarr", "radarr"].contains(&job["origin"].as_str().unwrap_or(""));
         let ocr = matches!(mode, FileMode::Convert(workload) if workload != Workload::Text)
             && self.ocr_permission;
+        // Cached track metadata lets text-only selections use CPU text slots
+        // even when extraction's default mode also permits OCR. Unknown video
+        // metadata keeps the conservative OCR reservation.
+        let ocr_paths = if ocr {
+            let converter = lock(&self.converter);
+            paths
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| {
+                    let needs_ocr = if matches!(mode, FileMode::Convert(Workload::Ocr)) {
+                        true
+                    } else if path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            ["srt", "ass", "ssa", "vtt", "ttml"]
+                                .iter()
+                                .any(|text| extension.eq_ignore_ascii_case(text))
+                        })
+                    {
+                        false
+                    } else {
+                        converter.cached_description(path).is_none_or(|tracks| {
+                            tracks.as_array().is_none_or(|tracks| {
+                                tracks.iter().any(|track| {
+                                    track_ids.as_ref().is_none_or(|ids| {
+                                        track["number"].as_u64().is_some_and(|id| ids.contains(&id))
+                                    }) && crate::converter::is_image_format(
+                                        track["format"].as_str().unwrap_or(""),
+                                    )
+                                })
+                            })
+                        })
+                    };
+                    needs_ocr.then_some(index)
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
         let mut seen = HashSet::new();
         let mut pending: VecDeque<_> = paths
             .iter()
@@ -1007,13 +1157,22 @@ impl App {
         };
         let mut descriptions = BTreeMap::new();
         let mut failure = None;
+        let mut last_heartbeat = Instant::now();
+        let mut last_wait_reason = None;
         std::thread::scope(|scope| {
             let (sender, receiver) = mpsc::sync_channel::<FileEvent>(16);
             let mut handles = BTreeMap::new();
-            while !pending.is_empty() || !handles.is_empty() {
+            let mut remote_jobs: BTreeMap<usize, (usize, PathBuf, String)> = BTreeMap::new();
+            let mut remote_retries: BTreeMap<usize, u8> = BTreeMap::new();
+            while !pending.is_empty() || !handles.is_empty() || !remote_jobs.is_empty() {
                 if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed) {
                     self.cancel.store(true, Ordering::Relaxed);
                     pending.clear();
+                    let mut remote = lock(&self.remote);
+                    for (_, _, ticket) in remote_jobs.values() {
+                        remote.cancel(ticket);
+                    }
+                    remote_jobs.clear();
                 }
                 loop {
                     if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed)
@@ -1025,28 +1184,128 @@ impl App {
                     if pending.is_empty() || failure.is_some() {
                         break;
                     }
+                    if let FileMode::Convert(workload) = mode {
+                        let candidate = {
+                            let remote = lock(&self.remote);
+                            let workers = lock(&self.workers);
+                            pending.iter().enumerate().find_map(|(position, index)| {
+                                if workers.allocation.paused {
+                                    return None;
+                                }
+                                if remote_retries
+                                    .get(index)
+                                    .is_some_and(|attempts| *attempts >= 2)
+                                {
+                                    return None;
+                                }
+                                let path = paths.get(*index)?;
+                                if workers
+                                    .active
+                                    .iter()
+                                    .any(|active| crate::workers::conflicts(&active.path, path))
+                                    || remote_jobs.values().any(|(_, active, _)| {
+                                        crate::workers::conflicts(active, path)
+                                    })
+                                {
+                                    return None;
+                                }
+                                let needs_ocr = ocr_paths.contains(index);
+                                let resource = if needs_ocr && remote.has_capacity("gpu") {
+                                    "gpu"
+                                } else if remote.has_capacity(if needs_ocr {
+                                    "cpu_ocr"
+                                } else {
+                                    "cpu"
+                                }) {
+                                    if needs_ocr { "cpu_ocr" } else { "cpu" }
+                                } else {
+                                    return None;
+                                };
+                                let id = (crate::workers::HARD_TOTAL_LIMIT
+                                    ..crate::workers::HARD_TOTAL_LIMIT + crate::remote::MAX_LEASES)
+                                    .find(|id| !remote_jobs.contains_key(id))?;
+                                Some((position, *index, path.clone(), resource, id))
+                            })
+                        };
+                        if let Some((position, index, path, resource, id)) = candidate {
+                            let state_result = {
+                                let converter = lock(&self.converter);
+                                converter
+                                    .state
+                                    .get(path.to_string_lossy().as_ref())
+                                    .map(|state| crate::util::bounded_json_clone(state, 48 * 1024))
+                                    .transpose()
+                            };
+                            let state = match state_result {
+                                Ok(state) => state,
+                                Err(error) => {
+                                    failure = Some(error);
+                                    pending.clear();
+                                    break;
+                                }
+                            };
+                            let offered = match lock(&self.remote).offer(
+                                &path,
+                                &languages,
+                                retry,
+                                automatic,
+                                // A CPU text reservation never grants OCR,
+                                // even if that worker enables OCR locally.
+                                if resource == "cpu" || !self.ocr_permission {
+                                    Workload::Text
+                                } else {
+                                    workload
+                                },
+                                track_ids.as_deref(),
+                                resource,
+                                state,
+                            ) {
+                                Ok(offered) => offered,
+                                Err(error) => {
+                                    failure = Some(error);
+                                    pending.clear();
+                                    break;
+                                }
+                            };
+                            if let Some(ticket) = offered {
+                                pending.remove(position);
+                                remote_jobs.insert(id, (index, path.clone(), ticket));
+                                self.progress(json!({"status":"remote_queued","path":path,"worker_id":id,"resource":resource}));
+                                continue;
+                            }
+                        }
+                    }
                     let sample = lock(&self.resources).snapshot();
                     let admission = {
                         let mut workers = lock(&self.workers);
-                        let resource = if ocr && workers.can_start_resource(&sample, "gpu") {
-                            Some("gpu")
-                        } else if workers
-                            .can_start_resource(&sample, if ocr { "cpu_ocr" } else { "cpu" })
-                        {
-                            Some(if ocr { "cpu_ocr" } else { "cpu" })
-                        } else {
-                            None
-                        };
-                        if let Some(resource) = resource {
-                            let next = pending.iter().position(|index| {
-                                paths.get(*index).is_some_and(|path| {
+                        let next = pending.iter().enumerate().find_map(|(position, index)| {
+                            let needs_ocr = ocr_paths.contains(index);
+                            let resource =
+                                if needs_ocr && workers.can_start_resource(&sample, "gpu") {
+                                    "gpu"
+                                } else if workers.can_start_resource(
+                                    &sample,
+                                    if needs_ocr { "cpu_ocr" } else { "cpu" },
+                                ) {
+                                    if needs_ocr { "cpu_ocr" } else { "cpu" }
+                                } else {
+                                    return None;
+                                };
+                            paths
+                                .get(*index)
+                                .filter(|path| {
                                     workers.active.iter().all(|active| {
                                         matches!(mode, FileMode::Inspect { .. })
                                             || !crate::workers::conflicts(&active.path, path)
+                                    }) && remote_jobs.values().all(|(_, active, _)| {
+                                        !crate::workers::conflicts(active, path)
                                     })
                                 })
-                            });
-                            next.and_then(|next| pending.remove(next))
+                                .map(|_| (position, resource))
+                        });
+                        if let Some((next, resource)) = next {
+                            pending
+                                .remove(next)
                                 .and_then(|index| paths.get(index))
                                 .and_then(|path| {
                                     let id = (0..crate::workers::HARD_TOTAL_LIMIT)
@@ -1107,6 +1366,7 @@ impl App {
                     if resource == "gpu" {
                         worker.enable_gpu_ocr(lock(&self.workers).gpu_min_free_mib());
                     }
+                    self.progress(json!({"status":"dispatched","path":path,"worker_id":id,"resource":resource}));
                     let worker_path = path.clone();
                     let worker_sender = sender.clone();
                     let worker_languages = &languages;
@@ -1179,10 +1439,51 @@ impl App {
                         }
                     }
                 }
-                if pending.is_empty() && handles.is_empty() {
+                if pending.is_empty() && handles.is_empty() && remote_jobs.is_empty() {
                     break;
                 }
-                match receiver.recv_timeout(Duration::from_millis(100)) {
+                let remote_event = {
+                    let mut completed = None;
+                    let mut remote = lock(&self.remote);
+                    let ready =
+                        remote_jobs.iter().find_map(|(id, (_, path, ticket))| {
+                            match remote.take(ticket, &self.cancel) {
+                                crate::remote::RemotePoll::Pending => None,
+                                crate::remote::RemotePoll::Retry => Some((*id, path.clone(), None)),
+                                crate::remote::RemotePoll::Finished(outcome) => {
+                                    Some((*id, path.clone(), Some(outcome)))
+                                }
+                            }
+                        });
+                    if let Some((id, path, outcome)) = ready {
+                        let entry = remote_jobs.remove(&id);
+                        if let Some(outcome) = outcome {
+                            completed = Some(FileEvent::Finished {
+                                id,
+                                path,
+                                outcome: Ok(FileOutcome {
+                                    state: outcome.state,
+                                    summary: outcome.summary,
+                                    terminal: outcome.terminal,
+                                    gpu_health: None,
+                                    description: None,
+                                }),
+                            });
+                        } else if !self.cancel.load(Ordering::Relaxed)
+                            && let Some((index, _, _)) = entry
+                        {
+                            let attempts = remote_retries.entry(index).or_default();
+                            *attempts = attempts.saturating_add(1);
+                            pending.push_back(index);
+                            self.log("WARNING", &format!("Remote lease expired or result was rejected; file requeued (attempt {attempts}, local fallback after two attempts)"));
+                        }
+                    }
+                    completed
+                };
+                match remote_event
+                    .map(Ok)
+                    .unwrap_or_else(|| receiver.recv_timeout(Duration::from_millis(100)))
+                {
                     Ok(FileEvent::Progress { id, mut event }) => {
                         if let Some(worker) = lock(&self.workers)
                             .active
@@ -1193,11 +1494,15 @@ impl App {
                                 Some("extracting") => "extracting",
                                 Some("inspecting") => "inspecting",
                                 Some("checking_gpu") => "checking_gpu",
+                                Some("ocr") => "ocr",
+                                Some("validating") => "validating",
+                                Some("track_complete") => "track_complete",
                                 _ => "processing",
                             };
                         }
                         if let Some(object) = event.as_object_mut() {
                             object.remove("summary");
+                            object.insert("worker_id".into(), json!(id));
                         }
                         self.progress(event);
                     }
@@ -1267,6 +1572,75 @@ impl App {
                         self.cancel.store(true, Ordering::Relaxed);
                         pending.clear();
                     }
+                }
+                if !pending.is_empty()
+                    && handles.is_empty()
+                    && remote_jobs.is_empty()
+                    && failure.is_none()
+                {
+                    let sample = lock(&self.resources).snapshot();
+                    let workers = lock(&self.workers);
+                    let ocr = pending
+                        .front()
+                        .is_some_and(|index| ocr_paths.contains(index));
+                    let resource = if ocr { "cpu_ocr" } else { "cpu" };
+                    let reason = workers.admission_reason(&sample, resource);
+                    let gpu_reason = ocr
+                        .then(|| workers.admission_reason(&sample, "gpu"))
+                        .flatten();
+                    let wait_reason = format!(
+                        "Dispatch waiting: {}; pending files {}{}",
+                        reason.unwrap_or("output family is active"),
+                        pending.len(),
+                        gpu_reason
+                            .map(|reason| format!("; GPU: {reason}"))
+                            .unwrap_or_default()
+                    );
+                    let limits = workers.limits(&sample);
+                    let impossible = !workers.allocation.paused
+                        && if ocr {
+                            limits.ocr_workers == 0 && limits.gpu_workers == 0
+                        } else {
+                            limits.cpu_workers == 0
+                        };
+                    drop(workers);
+                    if impossible {
+                        failure = Some(wait_reason.clone());
+                        pending.clear();
+                        self.log("ERROR", &wait_reason);
+                    } else if last_wait_reason.as_ref() != Some(&wait_reason) {
+                        self.log("INFO", &wait_reason);
+                        last_wait_reason = Some(wait_reason);
+                    }
+                } else {
+                    last_wait_reason = None;
+                }
+                if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                    let workers = lock(&self.workers);
+                    let active = workers.active.len() + remote_jobs.len();
+                    let details = workers
+                        .active
+                        .iter()
+                        .map(|worker| {
+                            format!(
+                                "worker {} {} {} ({}s)",
+                                worker.id,
+                                worker.resource,
+                                worker.status,
+                                (now() - worker.started).max(0.0) as u64
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    drop(workers);
+                    self.log(
+                        "INFO",
+                        &format!(
+                            "Job progress: {active} active files, {} pending; {details}",
+                            pending.len()
+                        ),
+                    );
+                    last_heartbeat = Instant::now();
                 }
             }
         });
@@ -1466,6 +1840,14 @@ impl App {
                 }
             };
             let Some(job) = job else { continue };
+            self.log(
+                "INFO",
+                &format!(
+                    "Job started: {} ({})",
+                    job["kind"].as_str().unwrap_or("job"),
+                    job["id"].as_str().unwrap_or("")
+                ),
+            );
             let task_start = job["task_id"]
                 .as_str()
                 .filter(|id| !id.is_empty())
@@ -1477,7 +1859,7 @@ impl App {
                 if let Some(running) = lock(&self.runtime).running.as_mut() {
                     running["error"] = json!(message);
                 }
-                self.log("WARNING", "Dashboard job failed; see its safe diagnostic");
+                self.log("ERROR", &format!("Job failed: {}", log_text(&message, 512)));
             }
             if ["scan", "extract", "ocr"].contains(&job["kind"].as_str().unwrap_or(""))
                 && let Some(notification) =
@@ -1493,6 +1875,10 @@ impl App {
                     completed_status(&finished)
                 });
                 finished["finished"] = json!(now());
+                record_log(
+                    &mut runtime,
+                    json!({"time":now(),"level":if finished["status"]=="failed" {"ERROR"} else {"INFO"},"message":format!("Job {}: {}; processed {}, failed {}", finished["status"].as_str().unwrap_or("finished"),finished["kind"].as_str().unwrap_or("job"), count(&finished["processed"]),count(&finished["summary"]["failed"])),"job_id":finished["id"],"status":finished["status"]}),
+                );
                 if let Some(id) = finished["task_id"].as_str().filter(|id| !id.is_empty()) {
                     let status = finished["status"].as_str().unwrap_or("failed");
                     let message = finished["error"]
@@ -1686,6 +2072,34 @@ fn guard(app: &App, request: &Request) -> Option<Reply> {
     }) {
         return Some(Reply::error(403, "Cross-origin requests are not allowed"));
     }
+    if request.target.starts_with("/api/remote/") {
+        if ![
+            "/api/remote/register",
+            "/api/remote/heartbeat",
+            "/api/remote/lease",
+            "/api/remote/complete",
+        ]
+        .contains(&request.target.as_str())
+        {
+            return Some(Reply::error(404, "Not found"));
+        }
+        if request.method != "POST" {
+            return Some(Reply::error(405, "Method is not allowed"));
+        }
+        let supplied = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        let remote = lock(&app.remote);
+        if !remote.enabled() {
+            return Some(Reply::error(404, "Remote workers are disabled"));
+        }
+        if !remote.authenticated(supplied) {
+            return Some(Reply::error(401, "Worker token is missing or invalid"));
+        }
+        return None;
+    }
     if request.target.starts_with("/hooks/") {
         if !["/hooks/sonarr", "/hooks/radarr"].contains(&request.target.as_str()) {
             return Some(Reply::error(404, "Not found"));
@@ -1788,6 +2202,7 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/api/tasks" => Reply::json(200, app.tasks()),
             "/api/system" => Reply::json(200, app.system()),
             "/api/workers" => Reply::json(200, app.workers()),
+            "/api/nodes" => Reply::json(200, lock(&app.remote).public()),
             "/api/inventory" => Reply::json(200, app.inventory()),
             "/api/widget" => Reply::json(200, app.widget()),
             "/api/settings" => Reply::json(200, app.settings()),
@@ -1840,6 +2255,10 @@ fn handle(app: &App, request: &Request) -> Reply {
                 .map(|value| (200, value)),
             _ => return Reply::error(404, "Not found"),
         }
+    } else if request.target.starts_with("/api/remote/") {
+        lock(&app.remote)
+            .handle(&request.target, &data)
+            .map(|value| (200, value))
     } else if request.target.starts_with("/api/tasks/") && request.target.ends_with("/run") {
         let parts = request.target.split('/').collect::<Vec<_>>();
         if parts.len() != 5 {
@@ -1906,9 +2325,31 @@ fn handle(app: &App, request: &Request) -> Reply {
     } else {
         return Reply::error(404, "Not found");
     };
+    let operation = match request.target.as_str() {
+        "/api/settings" => Some("Settings update"),
+        "/api/root-folders" => Some("Media folder update"),
+        "/api/tasks" => Some("Schedule update"),
+        "/api/remote/register" => Some("Remote worker registration"),
+        "/api/remote/complete" => Some("Remote completion report"),
+        "/api/integrations/sonarr/test"
+        | "/api/integrations/radarr/test"
+        | "/api/integrations/jellyfin/test"
+        | "/api/integrations/bazarr/test" => Some("Integration connection test"),
+        _ => None,
+    };
     match result {
-        Ok((status, value)) => Reply::json(status, value),
-        Err(error) => Reply::error(400, &error),
+        Ok((status, value)) => {
+            if let Some(operation) = operation {
+                app.log("INFO", &format!("{operation} processed"));
+            }
+            Reply::json(status, value)
+        }
+        Err(error) => {
+            if let Some(operation) = operation {
+                app.log("WARNING", &format!("{operation} rejected"));
+            }
+            Reply::error(400, &error)
+        }
     }
 }
 fn send(socket: &mut TcpStream, reply: Reply) -> std::io::Result<()> {
@@ -2056,6 +2497,39 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn operational_logs_are_bounded_single_line_records_with_explicit_fields() {
+        let event = json!({"status":"extracting", "path":"/media/private-root/movie\n.ass", "track":7,"backend":"ffmpeg","password":"omit-this-field","stdout":"omit-subtitle-text"});
+        let entry = progress_log(&event);
+        assert_eq!(entry["file"], "movie.ass");
+        assert_eq!(entry["track"], 7);
+        assert!(entry["message"].as_str().unwrap().contains("track 7"));
+        let mut output = Vec::new();
+        write_log(&mut output, &entry).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(!output.contains("private-root"));
+        assert!(!output.contains("omit-this-field"));
+        assert!(!output.contains("omit-subtitle-text"));
+        let failure = progress_log(&json!({"status":"failed","error":"x".repeat(10000)}));
+        assert_eq!(failure["level"], "ERROR");
+        assert_eq!(failure["error"].as_str().unwrap().len(), 240);
+    }
+
+    #[test]
+    fn progress_populates_dashboard_logs_during_a_running_job() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        app.progress(
+            json!({"status":"ocr","path":"/media/movie.sup","track":2,"backend":"paddle"}),
+        );
+        let status = app.status();
+        let latest = status["logs"].as_array().unwrap().last().unwrap();
+        assert_eq!(latest["status"], "ocr");
+        assert_eq!(latest["backend"], "paddle");
+        assert_eq!(status["running"]["current"]["track"], 2);
+        assert!(status["logs"].as_array().unwrap().len() <= LOG_LIMIT);
+    }
+
     fn gated_workers_fixture() -> (
         tempfile::TempDir,
         Arc<App>,
@@ -2148,6 +2622,158 @@ mod tests {
         );
         assert_eq!(app.status()["running"]["processed"], 3);
         assert!(lock(&app.workers).active.is_empty());
+    }
+
+    #[test]
+    fn all_mode_text_sidecars_use_text_slots_when_cpu_ocr_is_zero() {
+        let (_temporary, mut app, paths, gate) = gated_workers_fixture();
+        Arc::get_mut(&mut app).unwrap().ocr_permission = true;
+        app.update_workers(
+            &json!({"cpu_workers":2,"ocr_workers":0,"gpu_workers":0,"paused":false}),
+        )
+        .unwrap();
+        let runner = Arc::clone(&app);
+        let thread = std::thread::spawn(move || {
+            let mut integrations = Integrations::new(runner.data.join("settings.json")).unwrap();
+            runner.convert_files(
+                &paths,
+                &json!({"languages":["*"]}),
+                Workload::All,
+                &mut integrations,
+            )
+        });
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 2);
+        assert_eq!(app.workers()["active"]["ocr_workers"], 0);
+        gate.released.store(true, Ordering::Relaxed);
+        assert_eq!(thread.join().unwrap().unwrap()["converted"], 3);
+    }
+
+    #[test]
+    fn remote_routes_require_dedicated_bearer_and_preserve_host_and_origin_guards() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let token = "r".repeat(48);
+        *lock(&app.remote) =
+            crate::remote::Coordinator::new(token.clone(), app.mounts.clone()).unwrap();
+        let mut request = Request {
+            method: "POST".into(),
+            target: "/api/remote/register".into(),
+            headers: BTreeMap::from([("host".into(), "localhost".into())]),
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(guard(&app, &request).unwrap().status, 401);
+        request
+            .headers
+            .insert("authorization".into(), format!("Bearer {token}"));
+        assert!(
+            guard(&app, &request).is_none(),
+            "worker token authorizes its fixed routes without dashboard CSRF"
+        );
+        request
+            .headers
+            .insert("origin".into(), "https://unexpected.invalid".into());
+        assert_eq!(guard(&app, &request).unwrap().status, 403);
+        request.headers.remove("origin");
+        request
+            .headers
+            .insert("host".into(), "unexpected.invalid".into());
+        assert_eq!(guard(&app, &request).unwrap().status, 403);
+        request.headers.insert("host".into(), "localhost".into());
+        request.target = "/api/settings".into();
+        assert_eq!(
+            guard(&app, &request).unwrap().status,
+            401,
+            "worker token cannot access dashboard settings"
+        );
+        request.target = "/api/remote/arbitrary".into();
+        assert_eq!(guard(&app, &request).unwrap().status, 404);
+        request.target = "/api/remote/register".into();
+        request.method = "GET".into();
+        assert_eq!(guard(&app, &request).unwrap().status, 405);
+        *lock(&app.remote) =
+            crate::remote::Coordinator::new(String::new(), app.mounts.clone()).unwrap();
+        request.method = "POST".into();
+        assert_eq!(guard(&app, &request).unwrap().status, 404);
+    }
+
+    #[test]
+    fn remote_all_mode_respects_coordinator_ocr_permission_and_merges_outputs() {
+        let (_temporary, mut app, paths, gate) = gated_workers_fixture();
+        Arc::get_mut(&mut app).unwrap().ocr_permission = false;
+        *lock(&app.remote) =
+            crate::remote::Coordinator::new("r".repeat(48), app.mounts.clone()).unwrap();
+        let node = lock(&app.remote)
+            .handle(
+                "/api/remote/register",
+                &json!({"name":"fixture-node","resource":"cpu","roots":app.mounts}),
+            )
+            .unwrap()["node"]
+            .clone();
+        lock(&app.remote)
+            .handle("/api/remote/lease", &json!({"node":node}))
+            .unwrap();
+        let path = paths[0].clone();
+        let runner = Arc::clone(&app);
+        let thread = std::thread::spawn(move || {
+            let mut integrations = Integrations::new(runner.data.join("settings.json")).unwrap();
+            runner.convert_files(
+                &[path],
+                &json!({"languages":["*"]}),
+                Workload::All,
+                &mut integrations,
+            )
+        });
+        wait_for_fixture(|| lock(&app.remote).public()["active"] == 1);
+        let assignment = lock(&app.remote)
+            .handle("/api/remote/lease", &json!({"node":node}))
+            .unwrap();
+        assert_eq!(assignment["resource"], "cpu");
+        assert_eq!(
+            assignment["workload"], "text",
+            "remote workers may not enable OCR for a text-only coordinator reservation"
+        );
+        let staging = app.mounts[0].join(assignment["staging"].as_str().unwrap());
+        let output = "show.S01E01.en.srt";
+        fs::write(
+            staging.join(output),
+            b"1\n00:00:01,000 --> 00:00:02,000\nFixture\n",
+        )
+        .unwrap();
+        assert!(
+            !paths[0].parent().unwrap().join(output).exists(),
+            "remote staging is unpublished"
+        );
+        let metadata = fs::metadata(&paths[0]).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        lock(&app.remote).handle("/api/remote/complete",&json!({"node":node,"lease":assignment["lease"],"fingerprint":[[metadata.len(),modified]],"state":{"ok":true,"outputs":[output],"fingerprint":[[metadata.len(),modified]]},"summary":{"converted":1,"cached":0,"pending":0,"failed":0,"planned":0},"terminal":{"status":"converted"},"outputs":[output]})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let finished = thread.is_finished();
+        if !finished {
+            app.cancel.store(true, Ordering::Relaxed);
+            gate.released.store(true, Ordering::Relaxed);
+        }
+        let result = thread.join().unwrap();
+        assert!(
+            finished,
+            "valid remote completion must reach the coordinator promptly"
+        );
+        assert_eq!(result.unwrap()["converted"], 1);
+        assert!(paths[0].parent().unwrap().join(output).is_file());
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 0);
+        assert_eq!(app.workers()["remote"]["active"], 0);
+        assert!(lock(&app.workers).active.is_empty());
+        assert_eq!(
+            read_json(&app.data.join("state.json"), JSON_LIMIT).unwrap()
+                [paths[0].to_string_lossy().as_ref()]["ok"],
+            true
+        );
     }
 
     #[test]
@@ -2270,14 +2896,17 @@ mod tests {
         let temporary = tempfile::tempdir().expect("fixture");
         let mount = temporary.path().join("media");
         fs::create_dir(&mount).expect("fixture");
-        let value = json!([{"path":temporary.path().join("outside.mkv"),"tracks":[]},{"path":mount.join("inside.mkv"),"tracks":vec![json!({"language":"x".repeat(4096),"format":"x".repeat(4096) });100]}]);
+        let value = json!([{"path":temporary.path().join("outside.mkv"),"tracks":[]},{"path":mount.join("inside.mkv"),"tracks":vec![json!({"language":"x".repeat(4096),"format":"x".repeat(4096) });crate::metadata::MAX_TRACKS + 20]}]);
         let rows = inventory_rows(
             &value,
             std::slice::from_ref(&mount),
             std::slice::from_ref(&mount),
         );
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["tracks"].as_array().unwrap().len(), 64);
+        assert_eq!(
+            rows[0]["tracks"].as_array().unwrap().len(),
+            crate::metadata::MAX_TRACKS
+        );
         assert!(rows[0]["tracks"][0]["language"].as_str().unwrap().len() <= 35);
     }
 

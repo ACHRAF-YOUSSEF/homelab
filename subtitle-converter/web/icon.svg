@@ -1,14 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
   <title>Subforge</title>
   <defs>
-    <linearGradient id="ember" x1="9" y1="52" x2="56" y2="8" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FF7A2F"/>
-      <stop offset="1" stop-color="#FFB547"/>
+    <linearGradient id="signal" x1="9" y1="52" x2="56" y2="8" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#79A6FF"/>
+      <stop offset="1" stop-color="#A9C7FF"/>
     </linearGradient>
   </defs>
-  <rect x="1" y="1" width="62" height="62" rx="17" fill="#1F1B18"/>
-  <rect x="1.5" y="1.5" width="61" height="61" rx="16.5" stroke="#FF7A2F" stroke-opacity=".2"/>
-  <path d="M37 18H18a8 8 0 0 0-8 8v15a8 8 0 0 0 8 8h3v7l10-7h10a8 8 0 0 0 8-8v-7" stroke="url(#ember)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M19 29h15M19 38h21" stroke="url(#ember)" stroke-width="4" stroke-linecap="round"/>
-  <path d="m49 5 3.2 8.8L61 17l-8.8 3.2L49 29l-3.2-8.8L37 17l8.8-3.2L49 5Z" fill="url(#ember)"/>
+  <rect x="1" y="1" width="62" height="62" rx="17" fill="#202E42"/>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="16.5" stroke="#79A6FF" stroke-opacity=".2"/>
+  <path d="M37 18H18a8 8 0 0 0-8 8v15a8 8 0 0 0 8 8h3v7l10-7h10a8 8 0 0 0 8-8v-7" stroke="url(#signal)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M19 29h15M19 38h21" stroke="url(#signal)" stroke-width="4" stroke-linecap="round"/>
+  <path d="m49 5 3.2 8.8L61 17l-8.8 3.2L49 29l-3.2-8.8L37 17l8.8-3.2L49 5Z" fill="url(#signal)"/>
 </svg>

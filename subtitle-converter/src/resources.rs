@@ -82,6 +82,16 @@ impl Snapshot {
     pub fn memory_limit(&self) -> Option<u64> {
         self.memory.cgroup_limit_bytes
     }
+
+    pub fn memory_current(&self) -> Option<u64> {
+        self.memory.cgroup_current_bytes
+    }
+
+    #[cfg(test)]
+    pub fn with_memory_current(mut self, bytes: u64) -> Self {
+        self.memory.cgroup_current_bytes = Some(bytes);
+        self
+    }
 }
 
 #[derive(Default)]

@@ -9,7 +9,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo test --locked \
     && cargo build --release --locked \
-    && cp target/release/subforge /build/subforge
+    && cp target/release/subforge /build/subforge \
+    && cp target/release/subforge-worker /build/subforge-worker
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
@@ -43,6 +44,7 @@ RUN groupadd --gid 1000 converter \
     && chown converter:converter /data
 WORKDIR /app
 COPY --from=build /build/subforge /usr/local/bin/subforge
+COPY --from=build /build/subforge-worker /usr/local/bin/subforge-worker
 ENV DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet \
     OMP_THREAD_LIMIT=1 \
     CONVERTER_ENABLE_OCR=false

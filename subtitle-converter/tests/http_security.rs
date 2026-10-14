@@ -711,7 +711,7 @@ fn api_edition_is_compiled_and_ignores_deployment_labels() {
 
 #[cfg(not(feature = "cuda"))]
 #[test]
-fn cpu_edition_rejects_gpu_allocation_even_when_deployment_grants_it() {
+fn cpu_edition_retains_gpu_target_without_granting_execution() {
     let server = Server::start_with_environment(
         None,
         &[
@@ -732,16 +732,19 @@ fn cpu_edition_rejects_gpu_allocation_even_when_deployment_grants_it() {
         "GPU OCR requires the CUDA image edition"
     );
     let configuration_path = server.data.join("workers.conf");
-    let original = fs::read(&configuration_path).unwrap();
     let csrf = server.csrf();
-    let denied = server.json_request(
+    let response = server.json_request(
         "PUT",
         "/api/workers",
         &csrf,
         &json!({"cpu_workers":1,"ocr_workers":1,"gpu_workers":1,"paused":false}),
     );
-    assert_eq!(denied.status, 400);
-    assert_eq!(fs::read(&configuration_path).unwrap(), original);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body["allocation"]["gpu_workers"], 1);
+    assert_eq!(response.body["effective"]["gpu_workers"], 0);
+    assert_eq!(response.body["detected"]["gpu_available"], false);
+    let saved: Value = serde_json::from_slice(&fs::read(configuration_path).unwrap()).unwrap();
+    assert_eq!(saved["gpu_workers"], 1);
 }
 
 #[test]
@@ -889,8 +892,8 @@ fn worker_configuration_is_created_private_validated_and_preserved() {
     assert_eq!(configuration["cpu_workers"], 1);
     assert_eq!(configuration["ocr_workers"], 1);
     assert_eq!(configuration["gpu_workers"], 0);
-    assert_eq!(configuration["max_cpu_workers"], 4);
-    assert_eq!(configuration["max_gpu_workers"], 1);
+    assert_eq!(configuration["max_cpu_workers"], 32);
+    assert_eq!(configuration["max_gpu_workers"], 4);
     assert_eq!(configuration["gpu_min_free_mib"], 2048);
     assert!(fs::read_to_string(&path).unwrap().contains('\n'));
     #[cfg(unix)]
@@ -936,7 +939,7 @@ fn worker_configuration_is_created_private_validated_and_preserved() {
     let written = fs::read(&path).unwrap();
     for invalid in [
         json!({"cpu_workers":0,"ocr_workers":1,"gpu_workers":0,"paused":false}),
-        json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":1,"paused":false}),
+        json!({"cpu_workers":1_000_001,"ocr_workers":1,"gpu_workers":0,"paused":false}),
         json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":false,"max_cpu_workers":8}),
     ] {
         assert_eq!(
@@ -953,7 +956,7 @@ fn worker_configuration_is_created_private_validated_and_preserved() {
         .unwrap();
     assert_eq!(workers.body["allocation"], update);
     assert_eq!(workers.body["configuration_path"], "/data/workers.conf");
-    assert_eq!(workers.body["configuration"]["max_cpu_workers"], 4);
+    assert_eq!(workers.body["configuration"]["max_cpu_workers"], 32);
 }
 
 #[test]
@@ -970,6 +973,26 @@ fn legacy_worker_allocation_migrates_without_configuration_environment() {
     assert_eq!(workers.body["allocation"], allocation);
     assert!(server.data.join("workers.conf").is_file());
     assert!(server.data.join("workers.json").is_file());
+}
+
+#[test]
+fn settings_changes_appear_in_operation_logs_without_request_contents() {
+    let server = Server::start();
+    let csrf = server.csrf();
+    let changed = server.json_request("PUT", "/api/settings", &csrf, &json!({"languages":["fr"]}));
+    assert_eq!(changed.status, 200);
+    let auth = server.auth_header();
+    let status = server
+        .request("GET", "/api/status", &[("Authorization", &auth)], None)
+        .unwrap();
+    let logs = status.body["logs"].as_array().unwrap();
+    assert!(
+        logs.iter()
+            .any(|entry| entry["message"] == "Settings update processed")
+    );
+    let serialized = serde_json::to_string(logs).unwrap();
+    assert!(!serialized.contains(PASSWORD));
+    assert!(!serialized.contains(&csrf));
 }
 
 #[cfg(unix)]

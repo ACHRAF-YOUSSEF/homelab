@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0F0D0C">
+  <meta name="theme-color" content="#0D1420">
   <meta name="description" content="Subforge turns your media subtitles into SRT files, with language selection and library automation.">
   <title>Subforge · Subtitle automation</title>
   <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
@@ -16,27 +16,29 @@
       <div class="sidebar-content">
       <a class="brand" href="#overview" aria-label="Subforge home">
         <span class="brand-mark" aria-hidden="true"><img src="/static/icon.svg" width="40" height="40" alt=""></span>
-        <span class="brand-copy"><strong>Sub<span class="brand-light">forge</span></strong><small>SUBTITLE AUTOMATION</small></span>
+        <span class="brand-copy"><strong>Sub<span class="brand-light">forge</span></strong><small>Subtitle workspace</small></span>
       </a>
-      <div class="sidebar-label">WORKSPACE</div>
+      <div class="sidebar-label">Workspace</div>
       <nav class="nav" aria-label="Main navigation">
         <button class="nav-link active" data-page="overview" aria-label="Overview" title="Overview"><span class="nav-icon" aria-hidden="true">◫</span><span class="nav-label">Overview</span></button>
         <button class="nav-link" data-page="library" aria-label="Library" title="Library"><span class="nav-icon" aria-hidden="true">▤</span><span class="nav-label">Library</span></button>
         <button class="nav-link" data-page="activity" aria-label="Activity" title="Activity"><span class="nav-icon" aria-hidden="true">◷</span><span class="nav-label">Activity</span><span id="activity-badge" class="nav-badge hidden">0</span></button>
+        <button class="nav-link settings-link" data-page="settings" aria-label="Settings" title="Settings"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></button>
       </nav>
-      <div class="sidebar-label library-label">SCAN ROOTS</div>
+      <div class="sidebar-label library-label">Media folders</div>
       <div id="root-list" class="root-list"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>
       </div>
       <div class="sidebar-bottom">
         <div class="connection"><span class="status-dot" id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
-        <button class="nav-link settings-link" data-page="settings" aria-label="Settings" title="Settings"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></button>
-        <div class="sidebar-controls"><button class="sidebar-toggle" id="sidebar-collapse" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="sidebar-chevron" d="m15 6-6 6 6 6"/></svg></button></div>
+
+
         <div class="sidebar-footer">Subforge <div class="sidebar-release"><span id="version-label">—</span><span id="edition-label" class="edition-chip">—</span></div></div>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
+        <button class="sidebar-toggle" id="sidebar-collapse" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="sidebar-chevron" d="m15 6-6 6 6 6"/></svg></button>
         <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open navigation" title="Open navigation" aria-controls="sidebar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
         <div class="crumb"><span>Subforge</span><span class="crumb-slash">/</span><strong id="page-crumb">Overview</strong></div>
         <div class="top-actions"><span id="header-edition" class="edition-chip" hidden></span><span id="last-updated" class="updated-label">Waiting for service</span><button class="icon-button" id="refresh-button" title="Refresh status" aria-label="Refresh status">↻</button></div>
@@ -45,53 +47,58 @@
       <div id="toast" class="toast hidden" role="status"></div>
       <section class="page active" id="page-overview">
         <div class="page-heading">
-          <div><h1>Subtitle workspace</h1><p class="lede">Find media, inspect its tracks, and write SRT sidecars.</p></div>
-          <div class="heading-actions"><button class="button button-secondary" data-action="inspect">Inspect library</button><button class="button button-secondary" data-action="scan">Scan library</button></div>
+          <div><h1>Overview</h1><p class="lede">Your subtitle jobs, library coverage, and next steps.</p></div>
+          <div class="heading-actions"><button class="button button-secondary" data-action="inspect">Inspect media</button><button class="button button-secondary" data-action="scan">Convert subtitles</button></div>
         </div>
-        <article class="panel pipeline-panel" aria-label="Library pipeline">
-          <div class="pipeline-heading"><h2>Library pipeline</h2><span id="pipeline-status" class="muted" role="status">Waiting for service</span></div>
-          <div class="pipeline-strip" role="group" aria-label="Pipeline stages">
-            <button class="pipeline-stage" type="button" data-pipeline-stage="scan"><span class="stage-name">Scan</span><strong id="pipeline-roots">—</strong><span class="stage-unit">roots</span></button>
-            <button class="pipeline-stage" type="button" data-pipeline-stage="inspect"><span class="stage-name">Inspect</span><strong id="pipeline-inspected">—</strong><span class="stage-unit">files</span></button>
-            <button class="pipeline-stage" type="button" data-pipeline-stage="convert"><span class="stage-name">Convert</span><strong id="pipeline-convert">—</strong><span class="stage-unit">queued</span></button>
-            <button class="pipeline-stage" type="button" data-pipeline-stage="ready"><span class="stage-name">Ready</span><strong id="pipeline-ready">—</strong><span class="stage-unit">SRT files</span></button>
-          </div>
-          <progress id="pipeline-progress" class="pipeline-progress" min="0" max="100" value="0" aria-label="Pipeline progress"></progress>
+        <article class="panel current-work" aria-labelledby="current-work-title">
+          <div class="panel-heading"><div><h2 id="current-work-title">Current work</h2><p id="current-work-summary" role="status">Connecting to the service…</p></div><button class="text-button" data-page="activity">Open activity</button></div>
+          <div id="current-work-content" class="current-work-content"></div>
+          <progress id="pipeline-progress" class="pipeline-progress" min="0" max="100" value="0" aria-label="Current job progress" hidden></progress>
         </article>
         <article class="panel attention-panel" aria-labelledby="attention-title">
           <div class="panel-heading"><div><h2 id="attention-title">Needs attention</h2><p id="attention-summary">Items that may need a closer look</p></div></div>
           <div class="attention-list">
             <button type="button" data-attention="pending"><strong id="attention-pending">—</strong><span>Pending OCR</span></button>
-            <button type="button" data-attention="failed"><strong id="attention-failed">—</strong><span>Failed</span></button>
-            <button type="button" data-attention="paths"><strong id="attention-unreachable">—</strong><span>Unreachable paths</span></button>
+            <button type="button" data-attention="failed"><strong id="attention-failed">—</strong><span>Failed files</span></button>
+            <button type="button" data-attention="paths"><strong id="attention-unreachable">—</strong><span>Unavailable folders</span></button>
           </div>
         </article>
         <div class="content-grid">
           <article class="panel activity-panel" data-collapse="recent-activity">
-            <div class="panel-heading"><div><h2>Recent activity</h2><p>Latest scans and conversions</p></div><button class="text-button" data-page="activity">View activity <span>→</span></button></div>
+            <div class="panel-heading"><div><h2>Recent activity</h2><p>Latest subtitle jobs; maintenance is in Activity</p></div><button class="text-button" data-page="activity">View activity</button></div>
             <div id="recent-activity" class="activity-list"><div class="empty-state compact"><span class="empty-icon">◷</span><strong>Loading activity</strong></div></div>
           </article>
-          <article class="panel quick-panel" data-collapse="quick-extraction">
-            <div class="panel-heading"><div><h2>Quick conversion</h2><p>Choose a folder and languages</p></div><span class="panel-glyph">✳</span></div>
+          <article class="panel quick-panel">
+            <div class="panel-heading"><div><h2>Quick conversion</h2><p>Choose a folder and languages</p></div></div>
             <form id="quick-form" class="quick-form">
-              <label class="field-label" for="quick-root">Scan location</label><select id="quick-root" class="input"><option value="">All scan roots</option></select>
+              <label class="field-label" for="quick-root">Media folder</label><select id="quick-root" class="input"><option value="">All scan roots</option></select>
               <div class="field-row"><span class="field-label">Languages</span><button class="text-button" type="button" data-open-languages="quick">Choose</button></div>
               <button class="language-summary" type="button" data-open-languages="quick"><span class="language-globe">◎</span><span id="quick-languages">All languages</span><span class="chevron">⌄</span></button>
-              <button class="button button-primary full-button" type="submit"><span>▶</span> Convert subtitles</button>
-              <p class="form-hint">Text tracks convert now; image tracks wait for daily OCR in Settings → Tasks. Existing SRT files are kept.</p>
+              <button class="button button-primary full-button" type="submit">Review conversion</button>
+              <p class="form-hint">Text tracks convert immediately. Image tracks wait for the OCR schedule. Existing SRT files are kept.</p>
             </form>
           </article>
         </div>
+        <article class="panel pipeline-panel" aria-label="Library snapshot">
+          <div class="pipeline-heading"><h2>Library snapshot</h2><span id="pipeline-status" class="muted" role="status">Waiting for service</span></div>
+          <div class="pipeline-strip" role="group" aria-label="Saved library measures">
+            <button class="pipeline-stage" type="button" data-pipeline-stage="scan"><span class="stage-name">Media folders</span><strong id="pipeline-roots">—</strong><span class="stage-unit">roots</span></button>
+            <button class="pipeline-stage" type="button" data-pipeline-stage="inspect"><span class="stage-name">Inventory snapshot</span><strong id="pipeline-inspected">—</strong><span class="stage-unit">files</span></button>
+            <button class="pipeline-stage" type="button" data-pipeline-stage="convert"><span class="stage-name">Awaiting OCR</span><strong id="pipeline-convert">—</strong><span class="stage-unit">queued</span></button>
+            <button class="pipeline-stage" type="button" data-pipeline-stage="ready"><span class="stage-name">Generated subtitles</span><strong id="pipeline-ready">—</strong><span class="stage-unit">SRT files</span></button>
+          </div>
+          <p class="snapshot-note" id="snapshot-note"></p>
+        </article>
         <article class="panel log-panel" data-collapse="live-log">
-          <div class="panel-heading"><div><h2>Live log</h2><p>Recent converter events</p></div><span class="live-pill"><i></i> LIVE</span></div>
+          <div class="panel-heading"><div><h2>Operation log</h2><p>Job, file, worker, and conversion events</p></div><span class="live-pill"><i></i> LIVE</span></div>
           <div class="log-window" id="live-logs"><div class="log-empty">Waiting for converter events…</div></div>
         </article>
       </section>
 
       <section class="page" id="page-library">
-        <div class="page-heading"><div><h1>Library</h1><p class="lede">Review tracks and convert selected media into sidecar SRT files.</p></div><div class="heading-actions"><button class="button button-secondary" data-action="inspect">Inspect library</button><button class="button button-primary" data-action="scan">Convert all</button></div></div>
-        <article class="panel inventory-panel" data-collapse="library-inventory"><div class="inventory-toolbar"><div><h2>Subtitle inventory</h2><p id="inventory-meta">Inspect a scan root to list its media and tracks.</p></div><div class="toolbar-filters"><label class="search-box inventory-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input id="inventory-search" type="search" placeholder="Search filenames or paths…" aria-label="Search library files" maxlength="256" autocomplete="off" spellcheck="false"></label><select id="inventory-root" class="input compact-input" aria-label="Filter by scan root"><option value="">All roots</option></select><select id="inventory-filter" class="input compact-input" aria-label="Filter by media type"><option value="all">All media</option><option value="video">Video files</option><option value="sidecar">Subtitle files</option><option value="issues">Needs attention</option><option value="has_tracks">Has tracks</option><option value="pending">Pending OCR</option><option value="failed">Failed</option><option value="ready">Ready</option><option value="metadata">Metadata</option></select></div></div>
-          <div class="table-wrap"><table><thead><tr><th>MEDIA FILE</th><th>TYPE</th><th>SUBTITLE TRACKS</th><th>TRACK FORMATS</th><th></th></tr></thead><tbody id="inventory-body"><tr><td colspan="5" class="table-empty">Run an inspection to load your library.</td></tr></tbody></table></div>
+        <div class="page-heading"><div><h1>Library</h1><p class="lede">Review tracks and convert selected media into sidecar SRT files.</p></div><div class="heading-actions"><button class="button button-secondary" data-action="inspect">Inspect media</button><button class="button button-primary" data-action="scan">Convert subtitles</button></div></div>
+        <article class="panel inventory-panel" data-collapse="library-inventory"><div class="inventory-toolbar"><div><h2>Subtitle inventory</h2><p id="inventory-meta">Inspect a scan root to list its media and tracks.</p></div><div class="toolbar-filters"><label class="search-box inventory-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input id="inventory-search" type="search" placeholder="Search filenames or paths…" aria-label="Search library files" maxlength="256" autocomplete="off" spellcheck="false"></label><select id="inventory-root" class="input compact-input" aria-label="Filter by scan root"><option value="">All roots</option></select><select id="inventory-filter" class="input compact-input" aria-label="Filter by status or media type"><option value="all">All media</option><option value="video">Video files</option><option value="sidecar">Subtitle files</option><option value="issues">Needs attention</option><option value="has_tracks">Has tracks</option><option value="pending">Pending OCR</option><option value="failed">Failed</option><option value="ready">Ready</option><option value="metadata">Metadata</option></select></div></div>
+          <p id="inventory-scope-note" class="inventory-scope-note" role="status"></p><div class="table-wrap"><table class="inventory-table"><thead><tr><th>Media file</th><th>Status</th><th>Subtitle tracks</th><th>Languages and formats</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="inventory-body"><tr><td colspan="5" class="table-empty">Run an inspection to load your library.</td></tr></tbody></table></div>
           <div class="inventory-pagination"><div class="inventory-page-info"><span id="inventory-range" role="status" aria-live="polite">0 items</span><label class="inventory-page-size">Rows per page<select id="inventory-page-size" class="input compact-input"><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label></div><nav class="inventory-page-nav" aria-label="Library pages"><button id="inventory-prev" class="button button-secondary" type="button" aria-controls="inventory-body" disabled>Previous</button><select id="inventory-page" class="input compact-input" aria-label="Go to library page" aria-controls="inventory-body" disabled><option value="1">Page 1 of 1</option></select><button id="inventory-next" class="button button-secondary" type="button" aria-controls="inventory-body" disabled>Next</button></nav></div>
           <p id="inventory-limit-note" class="form-hint inventory-limit-note hidden">This inspection shows the first 2,000 files. Inspect a smaller scan root to see other files.</p>
           <p id="inventory-snapshot-note" class="form-hint inventory-limit-note" role="status"></p>
@@ -100,17 +107,18 @@
 
       <section class="page" id="page-activity">
         <div class="page-heading"><div><h1>Activity</h1><p class="lede">Follow scans and conversion jobs from start to finish.</p></div><button class="button button-secondary duplicate-refresh" id="clear-view-button" type="button" tabindex="-1" aria-hidden="true">Refresh</button></div>
+        <div class="activity-filters" role="group" aria-label="Filter activity"><label>Status<select id="activity-status" class="input"><option value="all">All statuses</option><option value="running">Running</option><option value="queued">Queued</option><option value="issues">Failed or with errors</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select></label><label>Work type<select id="activity-kind" class="input"><option value="subtitle">Subtitle work</option><option value="all">All operations</option><option value="maintenance">Maintenance</option></select></label><span id="activity-count" class="muted" role="status"></span></div>
         <article class="panel" data-collapse="activity-jobs"><div class="panel-heading"><div><h2>Jobs</h2><p>Running and recently completed work</p></div><span class="live-pill"><i></i> UPDATING</span></div><div id="jobs-list" class="jobs-list"><div class="empty-state"><span class="empty-icon">◷</span><strong>No jobs yet</strong><span>Start a scan or conversion to see it here.</span></div></div></article>
       </section>
 
       <section class="page" id="page-settings">
         <div class="page-heading"><div><h1>Settings</h1><p class="lede">Manage languages, media connections, schedules, and application status.</p></div><div class="heading-actions"><button class="button button-secondary hidden duplicate-refresh" id="refresh-system" type="button" tabindex="-1" aria-hidden="true">Refresh</button><button class="button button-primary" id="save-settings">Save changes</button></div></div>
         <div class="settings-layout">
-          <nav class="settings-nav" aria-label="Settings sections"><div class="settings-group-label">Application</div><button class="settings-tab active" data-setting-tab="general">General</button><button class="settings-tab" data-setting-tab="media">Media Management</button><button class="settings-tab" data-setting-tab="tasks">Tasks</button><button class="settings-tab" data-setting-tab="workers">Workers</button><button class="settings-tab" data-setting-tab="status">Status</button><div class="settings-group-label">Integrations</div><button class="settings-tab" data-setting-tab="sonarr">Sonarr<span class="integration-dot" data-integration-dot="sonarr" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button><button class="settings-tab" data-setting-tab="radarr">Radarr<span class="integration-dot" data-integration-dot="radarr" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin<span class="integration-dot" data-integration-dot="jellyfin" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button><button class="settings-tab" data-setting-tab="bazarr">Bazarr<span class="integration-dot" data-integration-dot="bazarr" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button></nav>
+          <nav class="settings-nav" aria-label="Settings sections"><span class="settings-group-label">Workspace</span><button class="settings-tab active" data-setting-tab="general">Preferences</button><button class="settings-tab" data-setting-tab="media">Media folders</button><button class="settings-tab" data-setting-tab="tasks">Tasks</button><button class="settings-tab" data-setting-tab="workers">Workers</button><button class="settings-tab" data-setting-tab="status">System</button><span class="settings-group-label">Connections</span><button class="settings-tab" data-setting-tab="sonarr">Sonarr<span class="integration-dot" data-integration-dot="sonarr" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button><button class="settings-tab" data-setting-tab="radarr">Radarr<span class="integration-dot" data-integration-dot="radarr" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button><button class="settings-tab" data-setting-tab="jellyfin">Jellyfin<span class="integration-dot" data-integration-dot="jellyfin" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button><button class="settings-tab" data-setting-tab="bazarr">Bazarr<span class="integration-dot" data-integration-dot="bazarr" role="img" aria-label="Connection status unknown" title="Connection status unknown"></span></button></nav>
           <div class="settings-content">
             <section class="settings-section" id="settings-tasks">
           <article class="panel" data-collapse="scheduled-tasks"><div class="panel-heading"><div><h2>Scheduled tasks</h2><p>Only new or changed files need conversion. OCR runs separately from text discovery.</p></div><span id="scheduler-state" class="status-pill">Loading</span></div>
-            <div class="task-controls"><label class="check-row"><input id="pause-schedules" type="checkbox"><span>Pause automatic schedules</span></label><button class="button button-primary" id="save-task-schedules" type="button" disabled>Save schedules</button></div>
+            <div class="task-controls"><label class="check-row"><input id="pause-schedules" type="checkbox"><span>Pause schedules</span></label><button class="button button-primary" id="save-task-schedules" type="button" disabled>Save schedules</button></div>
             <p id="task-schedule-note" class="form-hint task-note" role="status">Manual Run buttons remain available while schedules are paused. Pausing does not cancel a running job.</p>
             <div class="table-wrap"><table class="tasks-table"><thead><tr><th>NAME</th><th>SCHEDULE</th><th>NEXT EXECUTION</th><th>LAST RESULT</th><th>RUN</th></tr></thead><tbody id="tasks-body"><tr><td colspan="5" class="table-empty">Loading scheduled tasks…</td></tr></tbody></table></div>
             <div class="task-controls task-retry-controls"><label class="check-row"><input id="ocr-retry-failed" type="checkbox"><span>Include unchanged failed tracks in the next manual OCR run</span></label><p class="form-hint">Leave unchecked to avoid repeating costly OCR failures. Automatic OCR always skips them.</p></div>
@@ -118,22 +126,24 @@
             </section>
             <section class="settings-section" id="settings-workers">
               <article class="panel" data-collapse="worker-allocation">
-                <div class="panel-heading"><div><h2>Local worker pool</h2><p>Allocate parallel file workers within your container's resource limits. Settings are saved in workers.conf.</p></div><span id="worker-pool-state" class="status-pill">Loading</span></div>
+                <div class="panel-heading"><div><h2>Local worker pool</h2><p>Choose requested CPU and GPU slots. Admission adapts to available memory and execution limits.</p></div><span id="worker-pool-state" class="status-pill">Loading</span></div>
                 <div class="worker-resources" aria-label="Available resources">
                   <div><span>CPU allowance</span><strong id="worker-cpu-allowance">—</strong><small id="worker-cpu-usage">Loading measurements</small></div>
                   <div><span>Container RAM</span><strong id="worker-ram">—</strong><meter id="worker-memory-meter" min="0" max="1" value="0" aria-label="Container memory usage"></meter></div>
                   <div><span>GPU OCR</span><strong id="worker-gpu-availability">Checking</strong><small id="worker-gpu-reason">GPU access is opt-in.</small></div>
                 </div>
                 <form id="worker-allocation-form" class="worker-allocation-form">
-                  <label class="check-row"><input id="worker-paused" type="checkbox"><span>Pause new file work</span></label>
+                  <label class="check-row"><input id="worker-paused" type="checkbox"><span>Pause local workers</span></label>
                   <p class="form-hint">Running files finish safely. Paused work stays queued until you resume.</p>
-                  <div class="worker-allocation-row"><div><label for="worker-cpu-count">CPU workers</label><p>Text conversion and inspection; independent files can run in parallel.</p><small id="worker-cpu-capacity">Loading capacity</small></div><div class="worker-stepper"><button type="button" class="icon-button" data-worker-step="cpu_workers" data-delta="-1" aria-label="Decrease CPU workers">−</button><input id="worker-cpu-count" class="input" type="number" min="1" max="1" step="1" value="1" inputmode="numeric"><button type="button" class="icon-button" data-worker-step="cpu_workers" data-delta="1" aria-label="Increase CPU workers">+</button></div></div>
-                  <div class="worker-allocation-row"><div><label for="worker-ocr-count">CPU OCR slots</label><p>Image subtitle recognition with Tesseract. These share the CPU worker pool.</p><small id="worker-ocr-capacity">Loading capacity</small></div><div class="worker-stepper"><button type="button" class="icon-button" data-worker-step="ocr_workers" data-delta="-1" aria-label="Decrease CPU OCR slots">−</button><input id="worker-ocr-count" class="input" type="number" min="0" max="1" step="1" value="1" inputmode="numeric"><button type="button" class="icon-button" data-worker-step="ocr_workers" data-delta="1" aria-label="Increase CPU OCR slots">+</button></div></div>
+                  <div class="worker-allocation-row"><div><label for="worker-cpu-count">CPU workers</label><p>Text conversion and inspection; independent files can run in parallel.</p><small id="worker-cpu-capacity">Loading capacity</small></div><div class="worker-stepper"><button type="button" class="icon-button" data-worker-step="cpu_workers" data-delta="-1" aria-label="Decrease CPU workers">−</button><input id="worker-cpu-count" class="input" type="number" min="1" max="1000000" step="1" value="1" inputmode="numeric"><button type="button" class="icon-button" data-worker-step="cpu_workers" data-delta="1" aria-label="Increase CPU workers">+</button></div></div>
+                  <div class="worker-allocation-row"><div><label for="worker-ocr-count">CPU OCR slots</label><p>Image subtitle recognition with Tesseract. These share the CPU worker pool.</p><small id="worker-ocr-capacity">Loading capacity</small></div><div class="worker-stepper"><button type="button" class="icon-button" data-worker-step="ocr_workers" data-delta="-1" aria-label="Decrease CPU OCR slots">−</button><input id="worker-ocr-count" class="input" type="number" min="0" max="1000000" step="1" value="1" inputmode="numeric"><button type="button" class="icon-button" data-worker-step="ocr_workers" data-delta="1" aria-label="Increase CPU OCR slots">+</button></div></div>
                   <div class="worker-allocation-row"><div><label for="worker-gpu-count">GPU OCR slots</label><p>Accelerated image recognition with an explicitly enabled GPU backend.</p><small id="worker-gpu-capacity">Loading capacity</small></div><div class="worker-stepper"><button type="button" class="icon-button" data-worker-step="gpu_workers" data-delta="-1" aria-label="Decrease GPU OCR slots">−</button><input id="worker-gpu-count" class="input" type="number" min="0" max="0" step="1" value="0" inputmode="numeric" disabled><button type="button" class="icon-button" data-worker-step="gpu_workers" data-delta="1" aria-label="Increase GPU OCR slots" disabled>+</button></div></div>
                   <div class="worker-allocation-footer"><p id="worker-allocation-note" class="form-hint" role="status">More workers use more RAM. Keep OCR allocations low to leave headroom for other apps.</p><button id="save-worker-allocation" class="button button-primary" type="submit" disabled>Save allocation</button></div>
                 </form>
               </article>
               <article class="panel" data-collapse="active-workers"><div class="panel-heading"><div><h2>Active file workers</h2><p>Each row follows one file. Resource changes apply when the next file starts.</p></div><span id="worker-live-state" class="live-pill">Loading</span></div><div class="table-wrap"><table class="workers-table"><thead><tr><th>WORKER</th><th>PROCESSOR</th><th>MEDIA FILE</th><th>STATUS</th><th>ELAPSED</th></tr></thead><tbody id="workers-body"><tr><td colspan="5" class="table-empty">No file workers running.</td></tr></tbody></table></div></article>
+
+              <article class="panel" id="remote-workers-panel"><div class="panel-heading"><div><h2>Worker nodes</h2><p>Local capacity and connected remote machines</p></div><button class="text-button" type="button" id="refresh-worker-nodes">Refresh nodes</button></div><div id="worker-nodes" class="worker-nodes"><p class="muted">Loading worker nodes…</p></div><details class="remote-setup"><summary>Connect a remote worker</summary><p>Remote workers use a dedicated worker token and explicitly mapped shared media folders. On the other machine, set the coordinator origin in <code>CONVERTER_COORDINATOR_URL</code>, configure the dedicated <code>CONVERTER_WORKER_TOKEN</code>, and map shared media with <code>CONVERTER_WORKER_MAPPINGS</code>. Start <code>subforge-worker</code> from the CPU or CUDA image. Both machines must see the same media and staging directories. Keep the dashboard password separate from worker credentials.</p></details></article>
             </section>
             <section class="settings-section" id="settings-status">
           <article class="panel" data-collapse="system-about"><div class="panel-heading"><div><h2>About Subforge</h2><p>Application version and live uptime.</p></div></div><dl id="system-about" class="system-about"><dt>Version</dt><dd>Loading…</dd></dl></article>
@@ -143,7 +153,7 @@
             <section class="settings-section active" id="settings-general"><article class="panel settings-card"><div class="panel-heading"><div><h2>Default languages</h2><p>Choose which subtitle tracks to export by default.</p></div></div><div class="settings-control"><div><strong>Conversion languages</strong><p>Used for scheduled scans and quick conversion.</p></div><button class="language-summary setting-language-button" type="button" data-open-languages="settings"><span class="language-globe">◎</span><span id="settings-languages">All languages</span><span class="chevron">⌄</span></button></div></article>
               <article class="panel settings-card"><div class="panel-heading"><div><h2>Image subtitles</h2><p>OCR reads subtitle images and uses additional memory.</p></div></div><div class="hook-row"><div><strong>OCR permission</strong><p id="ocr-permission-note">Checking service configuration…</p></div><span id="ocr-permission-state" class="connection-state">Checking</span></div></article>
               <article class="panel settings-card"><div class="panel-heading"><div><h2>Automation hooks</h2><p>Trigger an inspection or conversion when Sonarr or Radarr imports media.</p></div></div><div class="hook-row"><div><strong>Sonarr webhook</strong><p><code>/hooks/sonarr</code> · Configure the shared token in the service environment.</p></div><span id="sonarr-hook-state" class="connection-state">Checking</span></div><div class="hook-row"><div><strong>Radarr webhook</strong><p><code>/hooks/radarr</code> · Configure the shared token in the service environment.</p></div><span id="radarr-hook-state" class="connection-state">Checking</span></div></article></section>
-            <section class="settings-section" id="settings-media"><article class="panel settings-card root-folders-card" data-collapse="root-folders"><div class="panel-heading"><div><h2>Root folders</h2><p>Choose which media folders Subforge scans.</p></div><button class="icon-button duplicate-refresh" id="refresh-root-folders" type="button" aria-label="Refresh root folders" title="Refresh root folders" tabindex="-1" aria-hidden="true">↻</button></div><div class="table-wrap"><table class="root-folders-table"><thead><tr><th>PATH</th><th>FREE SPACE</th><th>STATUS</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="root-folder-body"><tr><td colspan="4" class="table-empty">Loading folders…</td></tr></tbody></table></div><div class="root-folders-footer"><button class="button button-secondary" type="button" id="add-root-folder"><span>＋</span> Add Root Folder</button><p class="form-hint">Select mounted folders or their subfolders. Folder changes apply to future scans.</p></div></article></section>
+            <section class="settings-section" id="settings-media"><article class="panel settings-card root-folders-card" data-collapse="root-folders"><div class="panel-heading"><div><h2>Root folders</h2><p>Choose which media folders Subforge scans.</p></div><button class="icon-button duplicate-refresh" id="refresh-root-folders" type="button" aria-label="Refresh root folders" title="Refresh root folders" tabindex="-1" aria-hidden="true">↻</button></div><div class="table-wrap"><table class="root-folders-table"><thead><tr><th>PATH</th><th>FREE SPACE</th><th>STATUS</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="root-folder-body"><tr><td colspan="4" class="table-empty">Loading folders…</td></tr></tbody></table></div><div class="root-folders-footer"><button class="button button-secondary" type="button" id="add-root-folder"><span>＋</span> Add media folder</button><p class="form-hint">Select mounted folders or their subfolders. Folder changes apply to future scans.</p></div></article></section>
             <section class="settings-section" id="settings-sonarr"><div id="sonarr-settings"></div></section>
             <section class="settings-section" id="settings-radarr"><div id="radarr-settings"></div></section>
             <section class="settings-section" id="settings-jellyfin"><div id="jellyfin-settings"></div></section>
@@ -158,6 +168,7 @@
   <div id="track-drawer-backdrop" class="modal-backdrop hidden" role="presentation">
     <section class="modal track-drawer" role="dialog" aria-modal="true" aria-labelledby="track-drawer-title">
       <div class="modal-heading"><div><h2 id="track-drawer-title">Subtitle tracks</h2><p id="track-drawer-path" class="drawer-path"></p></div><button class="icon-button modal-close" type="button" aria-label="Close track details">×</button></div>
+      <div id="track-drawer-failure" class="drawer-failure hidden" role="status"></div>
       <div id="track-drawer-hint" class="drawer-hint muted" role="status"></div>
       <div id="track-drawer-list" class="track-list"></div>
       <div class="drawer-tools"><button id="inspect-drawer-file" class="button button-secondary" type="button">Inspect this file</button><button id="select-all-tracks" class="button button-secondary" type="button">Select all</button><button id="select-no-tracks" class="button button-secondary" type="button">Clear selection</button></div>
@@ -167,7 +178,7 @@
 
   <div id="language-modal" class="modal-backdrop hidden" role="presentation">
     <section class="modal" role="dialog" aria-modal="true" aria-labelledby="language-title">
-      <div class="modal-heading"><div><div class="eyebrow">SUBTITLE PREFERENCES</div><h2 id="language-title">Choose languages</h2></div><button class="icon-button modal-close" aria-label="Close">×</button></div>
+      <div class="modal-heading"><div><h2 id="language-title">Choose languages</h2></div><button class="icon-button modal-close" aria-label="Close">×</button></div>
       <div class="language-modal-body">
       <p class="modal-copy">Select the languages to convert. “All languages” includes every detected subtitle track.</p>
       <label class="search-box"><span>⌕</span><input id="language-search" type="search" placeholder="Search or enter a language code" autocomplete="off"></label>
@@ -180,7 +191,7 @@
 
   <div id="root-folder-modal" class="modal-backdrop hidden" role="presentation">
     <section class="modal folder-modal" role="dialog" aria-modal="true" aria-labelledby="root-folder-title">
-      <div class="modal-heading"><div><div class="eyebrow">MEDIA MANAGEMENT</div><h2 id="root-folder-title">Add Root Folder</h2></div><button class="icon-button modal-close" aria-label="Close">×</button></div>
+      <div class="modal-heading"><div><h2 id="root-folder-title">Add media folder</h2></div><button class="icon-button modal-close" aria-label="Close">×</button></div>
       <div class="folder-modal-body">
       <p class="modal-copy">Choose a folder from the media locations available to Subforge.</p>
       <label class="form-field"><span>Media location</span><select id="folder-mount" class="input"></select></label>
@@ -192,6 +203,9 @@
       <div class="modal-footer"><button class="button button-secondary modal-close">Cancel</button><button class="button button-primary" type="button" id="select-root-folder">Add this folder</button></div>
     </section>
   </div>
+
+
+  <div id="conversion-modal" class="modal-backdrop hidden" role="presentation"><section class="modal conversion-modal" role="dialog" aria-modal="true" aria-labelledby="conversion-title"><div class="modal-heading"><div><h2 id="conversion-title">Review conversion</h2><p>Check the scope before adding this job.</p></div><button class="icon-button modal-close" type="button" aria-label="Close conversion review">×</button></div><dl class="conversion-scope" id="conversion-scope"></dl><p class="modal-copy">Text tracks convert now. Image tracks are queued for scheduled OCR. Existing SRT files are kept.</p><div class="modal-footer"><button class="button button-secondary modal-close" type="button">Cancel</button><button class="button button-primary" type="button" id="confirm-conversion">Convert subtitles</button></div></section></div>
 
   <template id="integration-template"><article class="panel settings-card"><div class="panel-heading"><div><h2 class="integration-title"></h2><p class="integration-description"></p></div><label class="switch"><input class="integration-enabled" type="checkbox"><span></span><b>Enabled</b></label></div><div class="integration-fields"><label class="form-field"><span>Server URL</span><input class="input integration-url" type="url" placeholder="http://sonarr:8989" autocomplete="url"></label><label class="form-field api-key-field"><span>API key <small class="api-key-hint"></small></span><input class="input integration-key" type="password" placeholder="Enter API key" autocomplete="new-password"></label><div class="integration-status-row"><button class="button button-secondary test-integration">Test connection</button><button class="button button-secondary refresh-integration">Refresh library</button><span class="test-result muted"></span></div><div class="path-map-field"><label class="form-field"><span>Path mapping</span><span class="field-explainer">Translate paths reported by this server into paths visible to the converter.</span></label><div class="path-map-list"></div><button class="text-button add-path-map" type="button">＋ Add path mapping</button></div><div class="jellyfin-fields hidden"><div class="library-picker"><div class="picker-heading"><strong>Movie libraries</strong><button type="button" class="text-button load-libraries">Load libraries</button></div><div class="movie-libraries library-options"><span class="muted">Test connection to load libraries.</span></div><label class="check-row"><input class="refresh-movies" type="checkbox"><span>Refresh movie metadata after conversion</span></label></div><div class="library-picker"><div class="picker-heading"><strong>Series libraries</strong><button type="button" class="text-button load-libraries">Load libraries</button></div><div class="series-libraries library-options"><span class="muted">Test connection to load libraries.</span></div><label class="check-row"><input class="refresh-series" type="checkbox"><span>Refresh series metadata after conversion</span></label></div><label class="form-field"><span>Refresh timing</span><select class="input refresh-mode"><option value="immediate">Immediately after conversion</option><option value="async">Notify library scan</option></select></label></div></div></article></template>
 </body>

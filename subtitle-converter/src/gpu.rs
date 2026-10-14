@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub const ADAPTER: &str = "/usr/local/bin/paddleocr";
-pub const HARD_GPU_LIMIT: usize = 1;
+pub const HARD_GPU_LIMIT: usize = 4;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

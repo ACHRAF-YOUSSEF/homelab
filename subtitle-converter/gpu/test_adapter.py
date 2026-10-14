@@ -237,19 +237,16 @@ class AdapterTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 module.calls.append(kwargs)
 
-            def predict(self, source):
-                module.events.append(("predict", source))
-
-                def one_result():
+            def predict_iter(self, sources):
+                module.events.append(("predict_iter", sources))
+                for source in sources:
                     module.events.append(("yield", source))
                     yield Result(source)
-
-                return one_result()
 
         module.PaddleOCR = PaddleOCR
         return module
 
-    def test_run_skips_symlinked_images_streams_one_image_and_forces_gpu_batch_one(self):
+    def test_run_skips_symlinked_images_streams_results_and_batches_recognition(self):
         self.install_models("en")
         paddle, _ = fake_paddle()
         fake_ocr = self.fake_paddleocr()
@@ -264,12 +261,15 @@ class AdapterTests(unittest.TestCase):
         calls = fake_ocr.calls
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["device"], "gpu:0")
-        self.assertEqual(calls[0]["text_recognition_batch_size"], 1)
+        self.assertEqual(calls[0]["text_recognition_batch_size"], 8)
         self.assertEqual(calls[0]["cpu_threads"], 1)
         self.assertEqual(calls[0]["text_detection_model_name"], "PP-OCRv6_small_det")
         events = fake_ocr.events
-        self.assertEqual([Path(event[1]).name for event in events if event[0] == "predict"], ["a.PNG", "b.png"])
+        predictions = [event[1] for event in events if event[0] == "predict_iter"]
+        self.assertEqual(len(predictions), 1)
+        self.assertEqual([Path(source).name for source in predictions[0]], ["a.PNG", "b.png"])
         self.assertEqual([Path(event[1]).name for event in events if event[0] == "yield"], ["a.PNG", "b.png"])
+        self.assertEqual([event[0] for event in events], ["predict_iter", "yield", "save", "yield", "save"])
         for name in ("a.json", "b.json"):
             saved = json.loads((self.output_dir / name).read_text(encoding="utf-8"))
             self.assertEqual(saved["res"]["rec_texts"], ["fixture"])
@@ -297,6 +297,20 @@ class AdapterTests(unittest.TestCase):
 
         with self.assertRaises(adapter.AdapterError):
             adapter.run(self.input_dir, self.input_dir / "nested-output", "en")
+
+    def test_stream_rejects_missing_or_extra_results(self):
+        self.install_models("en")
+        paddle, _ = fake_paddle()
+        (self.input_dir / "one.png").write_bytes(tiny_png())
+        for count in (0, 2):
+            fake_ocr = types.ModuleType("paddleocr")
+            result = types.SimpleNamespace(save_to_json=mock.Mock())
+            instance = types.SimpleNamespace(predict_iter=lambda sources: iter([result] * count))
+            fake_ocr.PaddleOCR = mock.Mock(return_value=instance)
+            with self.subTest(count=count), self.modules(paddle, fake_ocr):
+                with self.assertRaisesRegex(adapter.AdapterError, "results|every input image"):
+                    adapter.run(self.input_dir, self.output_dir, "en")
+            self.assertLessEqual(result.save_to_json.call_count, 1)
 
     def test_symlinked_tmpdir_ancestry_is_rejected(self):
         target = self.root / "tmp-target"

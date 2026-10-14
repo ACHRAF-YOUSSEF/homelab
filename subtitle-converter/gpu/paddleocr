@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 MAX_IMAGES = 10_000
+RECOGNITION_BATCH_SIZE = 8
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 MODEL_ROOT = Path("/opt/paddle-models")
 
@@ -177,17 +178,23 @@ def run(input_dir: Path, output_dir: Path, lang: str):
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        text_recognition_batch_size=1,
+        text_recognition_batch_size=RECOGNITION_BATCH_SIZE,
         cpu_threads=1,
         device="gpu:0",
     )
-    for image in images:
-        results = iter(ocr.predict(str(image)))
-        result = next(results, None)
-        if result is None:
-            # PaddleOCR may return no result for unreadable images; preserve an empty schema.
-            raise AdapterError(f"OCR returned no result for input image {image.name}")
+    # predict() materializes its entire result list in PaddleOCR 3.7. Use the
+    # streaming API once for the bounded list of paths: decoded images and OCR
+    # tensors remain in the pipeline's bounded batches, rather than retaining
+    # results for a whole subtitle track. Recognition batches use GPU memory;
+    # CPU decoding and thread counts remain bounded independently.
+    processed = 0
+    for result in ocr.predict_iter([str(image) for image in images]):
+        if processed >= len(images):
+            raise AdapterError("OCR returned more results than input images")
         result.save_to_json(str(output_dir))
+        processed += 1
+    if processed != len(images):
+        raise AdapterError("OCR did not return one result for every input image")
     return 0
 
 

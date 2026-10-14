@@ -28,11 +28,12 @@ const MAX_PROBE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONVERTER_OUTPUT: usize = 8 * 1024 * 1024;
 const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SRT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TRACKS: usize = 64;
+const MAX_TRACKS: usize = crate::metadata::MAX_TRACKS;
+const MAX_SELECTED_TRACKS: usize = 64;
 const MAX_TRACK_LABEL: usize = 32;
 // Bump only when a converter fix or new diagnostics should retry cached
 // failures immediately. Successful fingerprint caches are independent.
-const ERROR_CACHE_REVISION: u64 = 1;
+const ERROR_CACHE_REVISION: u64 = 2;
 const MAX_CANDIDATES: usize = 20_000;
 const MAX_TRACKED_OUTPUTS: usize = 20_000;
 
@@ -93,6 +94,8 @@ pub struct Converter {
     gpu_ocr: Option<u32>,
     gpu_health: Mutex<Option<crate::gpu::Health>>,
     gpu_failure: Mutex<Option<&'static str>>,
+    remote_staging: Option<PathBuf>,
+    staged_outputs: Mutex<Vec<String>>,
     #[cfg(test)]
     file_gate: Option<Arc<FileGate>>,
     #[cfg(test)]
@@ -135,6 +138,8 @@ impl Converter {
             gpu_ocr: None,
             gpu_health: Mutex::new(None),
             gpu_failure: Mutex::new(None),
+            remote_staging: None,
+            staged_outputs: Mutex::new(Vec::new()),
             #[cfg(test)]
             file_gate: None,
             #[cfg(test)]
@@ -584,7 +589,7 @@ impl Converter {
     /// IDs identify existing embedded tracks, never command arguments.
     pub fn select_tracks(&mut self, ids: Vec<u64>) -> Result<(), String> {
         if ids.is_empty()
-            || ids.len() > MAX_TRACKS
+            || ids.len() > MAX_SELECTED_TRACKS
             || ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len()
         {
             return Err("Choose 1–64 unique subtitle track IDs".into());
@@ -620,7 +625,7 @@ impl Converter {
                     selection.get("fingerprint") == current_fingerprint.as_ref()
                 });
                 // One file remains bounded even after many different manual selections.
-                if selections.len() >= MAX_TRACKS
+                if selections.len() >= MAX_SELECTED_TRACKS
                     && !selections.contains_key(scope)
                     && let Some(oldest) = selections.keys().next().cloned()
                 {
@@ -714,7 +719,7 @@ impl Converter {
 
     pub fn file_processing(&self, path: &str) -> Value {
         let Some(entry) = self.state.get(path) else {
-            return json!({"pending_ocr":false,"failed":false,"generated_srt_count":0});
+            return json!({"pending_ocr":false,"failed":false,"generated_srt_count":0,"last_error":null});
         };
         let mut outputs = BTreeSet::new();
         let mut available = true;
@@ -736,11 +741,33 @@ impl Converter {
         }
         let mut pending = false;
         let mut failed = false;
+        let mut latest_error: Option<(f64, String)> = None;
         for item in current_processing_entries(entry) {
             pending |= item["ocr_pending"] == true;
             failed |= failed_state(item);
+            if failed_state(item)
+                && let Some(error) = item["error"].as_str()
+            {
+                let attempt = item["attempt"]
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(0.0);
+                if latest_error
+                    .as_ref()
+                    .is_none_or(|(previous, _)| attempt >= *previous)
+                {
+                    latest_error = Some((
+                        attempt,
+                        error
+                            .chars()
+                            .filter(|character| !character.is_control())
+                            .take(240)
+                            .collect(),
+                    ));
+                }
+            }
         }
-        json!({"pending_ocr":pending,"failed":failed,"generated_srt_count":if available {Some(outputs.len())}else{None}})
+        json!({"pending_ocr":pending,"failed":failed,"generated_srt_count":if available {Some(outputs.len())}else{None},"last_error":latest_error.map(|(_, error)|error)})
     }
 
     fn worker_with_state(&self, state: Value) -> Self {
@@ -765,6 +792,8 @@ impl Converter {
             gpu_ocr: None,
             gpu_health: Mutex::new(None),
             gpu_failure: Mutex::new(None),
+            remote_staging: None,
+            staged_outputs: Mutex::new(Vec::new()),
             #[cfg(test)]
             file_gate: self.file_gate.clone(),
             #[cfg(test)]
@@ -776,6 +805,31 @@ impl Converter {
         if crate::edition::CUDA_ENABLED {
             self.gpu_ocr = Some(minimum_free_mib.min(65536));
         }
+    }
+
+    pub(crate) fn enable_remote_staging(&mut self, directory: PathBuf) -> Result<(), String> {
+        if !directory.is_dir()
+            || has_symlink_component(&directory)?
+            || !directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".subforge-remote-") && name.len() <= 100)
+        {
+            return Err("Remote staging directory is unavailable or unsafe".into());
+        }
+        self.remote_staging = Some(normalize_canonical_local_path(
+            directory
+                .canonicalize()
+                .map_err(|_| "Remote staging directory is unavailable")?,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn staged_outputs(&self) -> Vec<String> {
+        self.staged_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn gpu_status(&self) -> (Option<crate::gpu::Health>, Option<&'static str>) {
@@ -934,6 +988,8 @@ impl Converter {
                 "-select_streams",
                 "s",
                 "-show_streams",
+                "-show_entries",
+                "stream=index,id,codec_name:stream_tags=language:stream_disposition=forced,hearing_impaired",
                 "-of",
                 "json",
             ])
@@ -1036,6 +1092,17 @@ impl Converter {
     ) -> Result<(Vec<String>, bool, Vec<String>), String> {
         let before = fingerprint(path)?;
         let parent = path.parent().ok_or("Media path has no parent directory")?;
+        if let Some(directory) = &self.remote_staging
+            && (directory.parent() != Some(parent)
+                || has_symlink_component(directory)?
+                || !directory.is_dir())
+        {
+            return Err("Remote staging must be a safe direct sibling of the media file".into());
+        }
+        self.staged_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let staging = Builder::new()
             .prefix(".subforge-")
             .tempdir_in(parent)
@@ -1252,8 +1319,18 @@ impl Converter {
             if destination.exists() || destination.is_symlink() {
                 continue;
             }
+            let backend = if image && self.gpu_ocr.is_some() {
+                "paddle"
+            } else if image {
+                "tesseract"
+            } else if seconv {
+                "seconv"
+            } else {
+                "ffmpeg"
+            };
             progress(
-                json!({"status":"extracting","path":path,"output":name,"track":stream,"language":ocr_lang}),
+                json!({"status":if image {"ocr"} else {"extracting"},"path":path,
+                "output":name,"track":stream,"language":ocr_lang,"backend":backend}),
             );
             let staged = staging.path().join(&name);
             if image || seconv {
@@ -1309,7 +1386,7 @@ impl Converter {
                 if let Some(track_number) = native_track.as_deref() {
                     command.args(["--track-number", track_number]);
                 }
-                let (_exit_success, report) = if gpu {
+                let (exit_success, report) = if gpu {
                     crate::util::bounded_gpu_process(
                         &mut command,
                         self.timeout,
@@ -1324,11 +1401,20 @@ impl Converter {
                         stop,
                         MAX_CONVERTER_OUTPUT,
                     )
-                }?;
-                let report: Value = serde_json::from_slice(&report)
-                    .map_err(|_| "OCR converter returned an unreadable report")?;
-                if report.get("success").and_then(Value::as_bool) != Some(true) {
-                    return Err(classify_ocr_failure(&report));
+                }
+                .map_err(|message| {
+                    conversion_error_context(&message, native_track.as_deref(), stream, &language)
+                })?;
+                let report = parse_conversion_report(&report).map_err(|message| {
+                    conversion_error_context(message, native_track.as_deref(), stream, &language)
+                })?;
+                if !exit_success || report.get("success").and_then(Value::as_bool) != Some(true) {
+                    return Err(conversion_error_context(
+                        &classify_ocr_failure(&report),
+                        native_track.as_deref(),
+                        stream,
+                        &language,
+                    ));
                 }
             } else {
                 let mut command = Command::new(&self.ffmpeg);
@@ -1352,16 +1438,28 @@ impl Converter {
                 command
                     .args(["-c:s", "srt", "-threads", "1", "-f", "srt"])
                     .arg(&staged);
-                self.extract_text(&mut command, &staged, stop)?;
+                self.extract_text(&mut command, &staged, stop)
+                    .map_err(|message| {
+                        conversion_error_context(
+                            &message,
+                            native_track.as_deref(),
+                            stream,
+                            &language,
+                        )
+                    })?;
             }
             if staged.is_symlink() {
                 return Err("Converter created an unsafe symbolic-link output".into());
             }
+            progress(json!({"status":"validating","path":path,"output":name,
+                "track":stream,"language":language,"backend":backend}));
             remove_empty_cues(&staged)
                 .and_then(|_| validate_srt(&staged))
                 .map_err(|message| {
                     conversion_error_context(&message, native_track.as_deref(), stream, &language)
                 })?;
+            progress(json!({"status":"track_complete","path":path,"output":name,
+                "track":stream,"language":language,"backend":backend}));
             outputs.push(name);
         }
         if fingerprint(path)? != before || stop.load(Ordering::Relaxed) {
@@ -1370,9 +1468,15 @@ impl Converter {
         let mut published = Vec::new();
         for name in &outputs {
             let staged = staging.path().join(name);
-            let destination = parent.join(name);
+            let destination = self.remote_staging.as_deref().unwrap_or(parent).join(name);
             if publish_noclobber(&staged, &destination)? {
                 published.push(name.clone());
+                if self.remote_staging.is_some() {
+                    self.staged_outputs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(name.clone());
+                }
             }
         }
         Ok((outputs, ocr_pending, published))
@@ -1381,14 +1485,16 @@ impl Converter {
     fn extract_text(
         &self,
         command: &mut Command,
-        _staged: &Path,
+        staged: &Path,
         stop: &AtomicBool,
     ) -> Result<(), String> {
         #[cfg(test)]
         if let Some(bytes) = self.text_fixture {
-            return fs::write(_staged, bytes).map_err(|_| "Cannot write fixture subtitle".into());
+            fs::write(staged, bytes).map_err(|_| "Cannot write fixture subtitle")?;
+            return normalize_ffmpeg_srt(staged);
         }
-        crate::util::bounded_process(command, self.timeout, stop, MAX_CONVERTER_OUTPUT).map(|_| ())
+        crate::util::bounded_process(command, self.timeout, stop, MAX_CONVERTER_OUTPUT)?;
+        normalize_ffmpeg_srt(staged)
     }
 
     fn ocr_for(&self, language: &str) -> String {
@@ -1593,7 +1699,7 @@ fn wants(language: &str, selected: &[String], aliases: &BTreeMap<String, String>
                 && short_language(language, aliases).split('-').next() == Some(v.as_str()))
     })
 }
-fn is_image_format(format: &str) -> bool {
+pub(crate) fn is_image_format(format: &str) -> bool {
     let f = format.to_ascii_lowercase();
     [
         "pgs",
@@ -1628,7 +1734,7 @@ fn validate_selected_tracks(tracks: &[Track], ids: &[u64]) -> Result<(), String>
 
 pub fn validate_track_ids(description: &Value, ids: &[u64]) -> Result<(), String> {
     if ids.is_empty()
-        || ids.len() > MAX_TRACKS
+        || ids.len() > MAX_SELECTED_TRACKS
         || ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len()
     {
         return Err("Choose 1–64 unique subtitle track IDs".into());
@@ -1863,6 +1969,43 @@ fn publish_noclobber(staged: &Path, destination: &Path) -> Result<bool, String> 
         Err(_) => Err("Could not publish SRT without replacing an existing file".into()),
     }
 }
+fn parse_conversion_report(bytes: &[u8]) -> Result<Value, &'static str> {
+    // SeConv 5.2's container loaders can print diagnostic lines even under
+    // --json. Accept only the final, complete report envelope, never a nested
+    // success property or truncated JSON. Diagnostic text remains private.
+    let valid = |value: &Value| {
+        value["success"].is_boolean()
+            && value["totalFiles"].is_u64()
+            && value["files"].is_array()
+            && value["errors"].is_array()
+    };
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes)
+        && valid(&value)
+    {
+        return Ok(value);
+    }
+    // Only a top-level object at column zero can start a SeConv report.
+    // Limit parser retries as well as the subprocess's overall byte limit.
+    for (offset, _) in bytes
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(offset, byte)| {
+            **byte == b'{' && (*offset == 0 || bytes.get(offset - 1) == Some(&b'\n'))
+        })
+        .take(32)
+    {
+        if let Ok(value) = serde_json::from_slice::<Value>(&bytes[offset..])
+            && valid(&value)
+        {
+            return Ok(value);
+        }
+    }
+    Err(
+        "OCR converter returned no complete conversion report; check runtime memory and converter availability",
+    )
+}
+
 fn classify_ocr_failure(report: &Value) -> String {
     let mut messages = report
         .get("errors")
@@ -1880,14 +2023,101 @@ fn classify_ocr_failure(report: &Value) -> String {
         );
     }
     let text = messages.join(" ").to_ascii_lowercase();
-    if text.contains("tesseract") || text.contains("traineddata") || text.contains("ocr") {
+    if text.contains("out of memory")
+        || text.contains("cannot allocate")
+        || text.contains("memory limit")
+    {
+        "OCR exceeded available memory. Increase the worker memory limit or reduce concurrent OCR workers.".into()
+    } else if text.contains("cuda")
+        || text.contains("cudnn")
+        || text.contains("paddle")
+        || text.contains("gpu")
+    {
+        "GPU OCR failed. Check the granted CUDA runtime, available GPU memory, and packaged OCR models.".into()
+    } else if text.contains("tesseract")
+        || text.contains("traineddata")
+        || text.contains("language")
+    {
         "OCR failed. Check that the selected language data is installed and supported.".into()
     } else {
         "OCR converter could not convert this track. Check the image subtitle format and logs."
             .into()
     }
 }
-fn validate_srt(path: &Path) -> Result<(), String> {
+
+fn normalize_ffmpeg_srt(path: &Path) -> Result<(), String> {
+    if fs::metadata(path)
+        .map_err(|_| "Subtitle output could not be read")?
+        .len()
+        > MAX_SRT_BYTES
+    {
+        return Err("Subtitle output exceeds the safe size limit".into());
+    }
+    let bytes = fs::read(path).map_err(|_| "Subtitle output could not be read")?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "Subtitle output is not valid UTF-8")?;
+    let mut lines = text
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .lines()
+        .peekable();
+    let mut output = String::with_capacity(text.len());
+    let mut ordinal = 0u64;
+    while let Some(number) = lines.next() {
+        ordinal += 1;
+        if number.trim().parse::<u64>().ok() != Some(ordinal) {
+            return Err(format!(
+                "FFmpeg produced malformed SRT cue {ordinal}: invalid cue number"
+            ));
+        }
+        let timing = lines.next().and_then(canonical_srt_timing).ok_or_else(|| {
+            format!("FFmpeg produced malformed SRT cue {ordinal}: invalid timing line")
+        })?;
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!("{ordinal}\n{timing}\n"));
+        let mut gap = false;
+        while let Some(line) = lines.peek().copied() {
+            if line.trim().is_empty() {
+                lines.next();
+                gap = true;
+                continue;
+            }
+            if gap
+                && line.trim().parse::<u64>().is_ok()
+                && lines
+                    .clone()
+                    .nth(1)
+                    .and_then(canonical_srt_timing)
+                    .is_some()
+            {
+                break;
+            }
+            if canonical_srt_timing(line).is_some() {
+                return Err(format!(
+                    "FFmpeg produced malformed SRT cue {ordinal}: missing cue number"
+                ));
+            }
+            // FFmpeg's ASS/SubRip encoder preserves repeated ASS line breaks
+            // inside a cue. Blank body lines are illegal SRT separators; fold
+            // those gaps while retaining every nonblank text line. This repair
+            // applies only to fresh FFmpeg output, never arbitrary OCR files.
+            output.push_str(line);
+            output.push('\n');
+            lines.next();
+            gap = false;
+        }
+    }
+    if output.len() as u64 > MAX_SRT_BYTES {
+        return Err("Subtitle output exceeds the safe size limit".into());
+    }
+    if output.as_bytes() != bytes {
+        fs::write(path, output).map_err(|_| "Could not normalize staged subtitle cues")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_srt(path: &Path) -> Result<(), String> {
     if fs::metadata(path)
         .map_err(|_| "Subtitle output could not be read")?
         .len()
@@ -2078,6 +2308,142 @@ mod tests {
             "1\n01:02:03,004 --> 01:02:04,005\nValid text\n"
         );
         assert!(canonical_srt_timing("00:61:00,000 --> 00:61:01,000").is_none());
+    }
+
+    #[test]
+    fn ffmpeg_srt_body_gaps_preserve_text_and_strict_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ass.srt");
+        fs::write(&path, "1\n00:00:00,000 --> 00:00:01,000\nFirst line\n\nSecond line\n\n2026\n\n2\n00:00:01,000 --> 00:00:02,000\nNext cue\n").unwrap();
+        assert!(validate_srt(&path).is_err());
+        normalize_ffmpeg_srt(&path).unwrap();
+        assert!(validate_srt(&path).is_ok());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "1\n00:00:00,000 --> 00:00:01,000\nFirst line\nSecond line\n2026\n\n2\n00:00:01,000 --> 00:00:02,000\nNext cue\n"
+        );
+        for broken in [
+            "bad\n00:00:00,000 --> 00:00:01,000\nText\n",
+            "1\n00:00:00,000 --> 00:00:01,000\nText\n\nwrong\n00:00:01,000 --> 00:00:02,000\nText\n",
+            "1\n00:00:00,000 --> 00:00:01,000\nText\n\n3\n00:00:01,000 --> 00:00:02,000\nText\n",
+        ] {
+            fs::write(&path, broken).unwrap();
+            assert!(normalize_ffmpeg_srt(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn ffmpeg_ass_repeated_line_breaks_are_repaired_after_real_conversion() {
+        // Local, disposable text fixture; no deployment media or OCR required.
+        let Ok(available) = Command::new("ffmpeg").arg("-version").output() else {
+            return;
+        };
+        if !available.status.success() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("fixture.ass");
+        let output = dir.path().join("fixture.srt");
+        fs::write(&source, "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,First\\N\\NSecond\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Next\n").unwrap();
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(&source)
+            .args(["-c:s", "srt", "-f", "srt"])
+            .arg(&output);
+        crate::util::bounded_process(
+            &mut command,
+            Duration::from_secs(15),
+            &AtomicBool::new(false),
+            4096,
+        )
+        .unwrap();
+        assert!(validate_srt(&output).is_err());
+        normalize_ffmpeg_srt(&output).unwrap();
+        validate_srt(&output).unwrap();
+        let repaired = fs::read_to_string(output).unwrap();
+        assert!(repaired.contains("First") && repaired.contains("Second"));
+        assert!(repaired.contains("\n\n2\n"));
+        assert!(!repaired.contains("\n\nSecond"));
+    }
+
+    #[test]
+    fn converter_report_accepts_diagnostic_prefix_but_not_partial_or_nested_success() {
+        let report = br#"{"success":true,"totalFiles":1,"files":[{"success":true}],"errors":[]}"#;
+        assert_eq!(parse_conversion_report(report).unwrap()["success"], true);
+        let mut prefixed = b"Warning: VobSub OCR diagnostic\n".to_vec();
+        prefixed.extend_from_slice(report);
+        assert_eq!(parse_conversion_report(&prefixed).unwrap()["totalFiles"], 1);
+        for invalid in [
+            br#"{"success":true}"#.as_slice(),
+            br#"{"success":false,"totalFiles":1,"files":[{"success":true}],"errors":[]"#,
+            br#"{"unrelated":{"success":true,"totalFiles":1,"files":[],"errors":[]}}"#,
+            br#"{"success":true,"totalFiles":1,"files":[],"errors":[]} trailing diagnostics"#,
+            b"Killed",
+        ] {
+            assert!(parse_conversion_report(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_worker_stages_without_publishing_beside_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("fixture.en.ass");
+        fs::write(&source, b"disposable fixture source").unwrap();
+        let remote = dir.path().join(".subforge-remote-fixture");
+        fs::create_dir(&remote).unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.text_fixture = Some(b"1\n00:00:00,000 --> 00:00:01,000\nFixture\n");
+        converter.enable_remote_staging(remote.clone()).unwrap();
+        let source = Converter::safe_path(&source.to_string_lossy(), &converter.roots).unwrap();
+        converter
+            .convert(
+                &source,
+                &["*".into()],
+                Workload::Text,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!dir.path().join("fixture.en.srt").exists());
+        assert_eq!(converter.staged_outputs(), vec!["fixture.en.srt"]);
+        validate_srt(&remote.join("fixture.en.srt")).unwrap();
+        let nested = remote.join(".subforge-remote-nested");
+        fs::create_dir(&nested).unwrap();
+        converter.enable_remote_staging(nested).unwrap();
+        assert!(
+            converter
+                .convert(
+                    &source,
+                    &["*".into()],
+                    Workload::Text,
+                    &AtomicBool::new(false),
+                    &mut |_| {}
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn processing_exposes_latest_current_failure_with_bounded_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.state = json!({"fixture": {"fingerprint":[1],"ok":false,"error":"Old failure","attempt":1,
+            "track_selections":{"2":{"fingerprint":[1],"ok":false,"error":"Latest failure","attempt":3},
+                "3":{"fingerprint":[0],"ok":false,"error":"Stale failure","attempt":10}}}});
+        assert_eq!(
+            converter.file_processing("fixture")["last_error"],
+            "Latest failure"
+        );
+        assert!(converter.file_processing("missing")["last_error"].is_null());
     }
 
     #[test]
@@ -2273,7 +2639,7 @@ mod tests {
         );
         let extracting: Vec<_> = events
             .iter()
-            .filter(|event| event["status"] == "extracting")
+            .filter(|event| event["status"] == "ocr")
             .collect();
         assert_eq!(extracting.len(), 1);
         assert_eq!(extracting[0]["output"], "selected.track7.en.srt");
@@ -2946,5 +3312,21 @@ mod tests {
         .unwrap();
         let stop = AtomicBool::new(false);
         assert!(converter.describe_with_stop(&idx, &stop).is_err());
+        fs::write(
+            &idx,
+            (0..100)
+                .map(|index| format!("id: en, index: {index}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        assert_eq!(
+            converter
+                .describe_with_stop(&idx, &stop)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            100
+        );
     }
 }

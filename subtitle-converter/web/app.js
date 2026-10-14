@@ -7,6 +7,10 @@
     ['af','Afrikaans'],['sq','Albanian'],['am','Amharic'],['hy','Armenian'],['az','Azerbaijani'],['eu','Basque'],['bn','Bengali'],['bs','Bosnian'],['bg','Bulgarian'],['my','Burmese'],['ca','Catalan'],['hr','Croatian'],['cs','Czech'],['da','Danish'],['et','Estonian'],['fi','Finnish'],['el','Greek'],['he','Hebrew'],['hi','Hindi'],['hu','Hungarian'],['id','Indonesian'],['ga','Irish'],['is','Icelandic'],['kk','Kazakh'],['km','Khmer'],['lo','Lao'],['lv','Latvian'],['lt','Lithuanian'],['mk','Macedonian'],['ms','Malay'],['no','Norwegian'],['fa','Persian'],['pl','Polish'],['ro','Romanian'],['sr','Serbian'],['sk','Slovak'],['sl','Slovenian'],['sw','Swahili'],['sv','Swedish'],['th','Thai'],['uk','Ukrainian'],['ur','Urdu'],['vi','Vietnamese']
   ];
   const state = { csrf: '', status: null, settings: null, selectedLanguages: ['*'], draftLanguages: ['*'], languageTarget: 'quick', inventory: [], selectedFile: null, currentPage: 'overview', lastToast: 0, pollBusy: false };
+  state.defaultLanguages=['*'];
+  state.quickLanguagesChanged=false;
+  state.settingsDirty=false;
+  state.pendingConversion=null;
   state.jellyfinLibraries=[];
   state.sidebarCollapsed=false;
   state.rootFolders={roots:[],mounts:[]};
@@ -40,7 +44,12 @@
   const setText = (el, value) => { if (el) el.textContent = value == null ? '' : String(value); };
   const escStatus = value => String(value || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
   const fmtDate = value => { if (!value) return '—'; const parsed=typeof value==='number'?(value<1e12?value*1000:value):value; const date = new Date(parsed); return Number.isNaN(date.valueOf()) ? String(value) : new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}).format(date); };
-  const currentLabel = current => { if (!current) return ''; if (typeof current!=='object') return String(current); const detail=shortPath(current.path || current.output || ''); return [current.status || 'Processing',detail].filter(Boolean).join(' · '); };
+  const currentLabel = current => {
+    if(!current)return '';if(typeof current!=='object')return String(current);
+    const phase=({checking_gpu:'Checking GPU runtime',extracting:'Extracting text',ocr:'Recognizing images',validating:'Validating SRT',track_complete:'Track complete',processing:'Processing file',cached:'Already converted',pending:'Awaiting OCR',failed:'Failed'})[current.status]||current.status||'Processing';
+    const backend=({ffmpeg:'FFmpeg / CPU',tesseract:'Tesseract / CPU',paddle:'PaddleOCR / GPU',seconv:'Subtitle Edit'})[current.backend];
+    return [phase,backend,current.track!=null?`track ${current.track}`:'',shortPath(current.path||current.output||'')].filter(Boolean).join(' · ');
+  };
   const shortPath = value => { const path = String(value || ''); return path.length > 80 ? `…${path.slice(-77)}` : path; };
   const notify = (message, kind = 'info') => { const toast = $('#toast'); setText(toast, message); toast.className = `toast ${kind}`; clearTimeout(state.lastToast); state.lastToast = setTimeout(() => toast.classList.add('hidden'), 4200); };
   const api = async (path, options = {}) => {
@@ -60,30 +69,37 @@
   const isAll = list => !Array.isArray(list) || list.includes('*');
   const languageDescription = list => isAll(list) ? 'All languages' : `${list.length} ${list.length === 1 ? 'language' : 'languages'} · ${list.slice(0,3).map(langLabel).join(', ')}${list.length > 3 ? ` +${list.length - 3}` : ''}`;
   const iconSvg = type => {
-    const paths={scan:'M4 4h6M4 4v6m16-6h-6m6 0v6M4 20h6m-6 0v-6m16 6h-6m6 0v-6',inspect:'m21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',convert:'M4 7h15m-4-4 4 4-4 4M20 17H5m4-4-4 4 4 4',ocr:'M3 5h18v14H3zM6 15l4-5 4 5 3-3 3 4M16 8h.01',backup:'M5 3h14v18H5zM8 3v6h8V3M8 21v-7h8v7',health:'M3 12h4l3-8 4 16 3-8h4',cleanup:'M5 6h14M9 6V3h6v3M7 6l1 15h8l1-15',refresh:'M20 8a8 8 0 1 0 0 8M20 3v5h-5',file:'M6 3h8l4 4v14H6zM14 3v5h4'};
+    const paths={overview:'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',library:'M4 4h16v16H4zM8 8h8M8 12h8M8 16h5',activity:'M12 3a9 9 0 1 1-9 9 9 9 0 0 1 9-9M12 7v5l3 2',settings:'M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2',scan:'M4 4h6M4 4v6m16-6h-6m6 0v6M4 20h6m-6 0v-6m16 6h-6m6 0v-6',inspect:'m21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',convert:'M4 7h15m-4-4 4 4-4 4M20 17H5m4-4-4 4 4 4',ocr:'M3 5h18v14H3zM6 15l4-5 4 5 3-3 3 4M16 8h.01',backup:'M5 3h14v18H5zM8 3v6h8V3M8 21v-7h8v7',health:'M3 12h4l3-8 4 16 3-8h4',cleanup:'M5 6h14M9 6V3h6v3M7 6l1 15h8l1-15',refresh:'M20 8a8 8 0 1 0 0 8M20 3v5h-5',file:'M6 3h8l4 4v14H6zM14 3v5h4'};
     const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');
     const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d',paths[type]||paths.file);svg.append(path);return svg;
   };
   const trackFormat = track => {
     const codec=String(track.codec||track.codec_id||track.format||'').toLowerCase();
     if(/pgs|hdmv|sup|vobsub|dvd|dvb/.test(codec)||track.image===true||track.kind==='image')return {label:/pgs|hdmv|sup/.test(codec)?'PGS (img)':'VobSub (img)',style:'image',image:true};
-    if(/ass|ssa/.test(codec))return {label:'ASS',style:'ass',image:false};
+    if(/ass|ssa|substation/.test(codec))return {label:'ASS',style:'ass',image:false};
     if(/srt|subrip|utf8/.test(codec))return {label:'SRT',style:'srt',image:false};
     return {label:/vtt|webvtt/.test(codec)?'VTT':codec?codec.replace(/^s_text\//,'').toUpperCase().slice(0,16):'Text',style:'text',image:false};
   };
   const trackBadge = track => {const format=trackFormat(track),pill=document.createElement('span');pill.className=`format-badge format-${format.style}`;pill.textContent=`${languageCode(track.language).toUpperCase()} · ${format.label}`;pill.title=`${langLabel(track.language||'und')} · ${track.codec||track.codec_id||track.format||format.label}`;return pill;};
   const filterLibrary = filter => {$('#inventory-filter').value=filter;$('#inventory-root').value='';$('#inventory-search').value='';state.inventoryPage=1;renderInventory();saveInventoryView();navigate('library');};
   const renderPipeline = () => {
-    const data=state.status?.pipeline||{},available=data.available||{},running=state.status?.running;
-    const count=(key)=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
-    setText($('#pipeline-roots'),count('root_count'));setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));
-    setText($('#pipeline-convert'),count('pending_ocr_files'));const queued=(state.status?.queue||[]).length;setText($('[data-pipeline-stage="convert"] .stage-unit'),`pending OCR${queued?` · ${queued} job${queued===1?'':'s'} queued`:''}`);
-    setText($('#pipeline-status'),running?`${({scan:'Scan',inspect:'Inspect',extract:'Convert',ocr:'OCR'})[running.kind]||'Task'} · ${jobPercent(running)}%`:'Idle · saved library data');
-    $('#pipeline-progress').value=running?jobPercent(running):0;
-    $('#pipeline-ready').title='SRT outputs recorded by Subforge; existing external SRT files are not included.';
+    const data=state.status?.pipeline||{},available=data.available||{},running=state.status?.running,queued=(state.status?.queue||[]).length;
+    const count=key=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
+    setText($('#pipeline-roots'),count('root_count'));setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));setText($('#pipeline-convert'),count('pending_ocr_files'));
+    setText($('[data-pipeline-stage="convert"] .stage-unit'),'files in conversion state');
+    setText($('#pipeline-status'),state.inventoryUpdated?`Inspected ${fmtDate(state.inventoryUpdated)}`:'No inventory yet');
+    setText($('#snapshot-note'),`${state.inventoryTruncated?'Partial inventory: first 2,000 media items. Inspect a smaller folder for more coverage.':'Saved inventory; inspect media to refresh it.'} Generated subtitles count tracked SRT outputs across conversion state, excluding external SRT files.`);
     setText($('#attention-pending'),count('pending_ocr_files'));setText($('#attention-failed'),count('failed_files'));setText($('#attention-unreachable'),count('unreachable_roots'));
-    setText($('#attention-summary'),`${data.inventory_truncated?'Counts use the saved inventory; some files are outside this snapshot.':'Pending OCR and failures use saved conversion state.'} Path health is checked during startup or health checks.`);
-    $('[data-attention="pending"]').title='Show image subtitle files waiting for scheduled OCR';
+    setText($('#attention-summary'),'Failures and OCR counts cover saved conversion state. Library results cover the saved inventory snapshot.');
+    for(const [key,value] of [['pending',data.pending_ocr_files],['failed',data.failed_files],['paths',data.unreachable_roots]]){const button=$(`[data-attention="${key}"]`);button.classList.toggle('has-issues',Number(value)>0);button.classList.toggle('is-clear',value===0);}
+    $('#current-work-title').closest('article').classList.toggle('is-idle',!running&&!queued);const progress=$('#pipeline-progress');progress.hidden=!running;
+    if(running&&Number(running.total)>0){progress.value=jobPercent(running);progress.setAttribute('aria-label',`${running.processed||0} of ${running.total} files processed`);}else progress.removeAttribute('value');
+    const content=$('#current-work-content');content.replaceChildren();
+    setText($('#current-work-summary'),running?`${queued} queued job${queued===1?'':'s'} · ${running.total?`${running.processed||0} / ${running.total} files`: 'Discovering work'}`:queued?`${queued} queued job${queued===1?'':'s'} · waiting for a worker`:'No jobs running');
+    const title=document.createElement('strong'),detail=document.createElement('span');detail.className='muted';
+    title.textContent=running?({scan:'Converting text subtitles',inspect:'Inspecting media',extract:'Converting selected tracks',ocr:'Recognizing image subtitles'})[running.kind]||'Running maintenance':queued?'Work is queued':'Ready for your next conversion';
+    detail.textContent=running?currentLabel(running.current)||'Preparing files':queued?'Open Activity to review the queue and Workers to check admission limits.':'Choose a media folder and languages, or inspect your library first.';
+    content.append(title,detail);
   };
   const disclosureIcon = () => {
     const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');
@@ -97,7 +113,7 @@
     const button=document.createElement('button');button.type='button';button.className='icon-button collapse-toggle';button.setAttribute('aria-controls',content.id);button.append(disclosureIcon());
     const sync=()=>{const collapsed=state.collapsedPanels.has(key);content.hidden=collapsed;card.classList.toggle('is-collapsed',collapsed);button.setAttribute('aria-expanded',String(!collapsed));button.setAttribute('aria-label',`${collapsed?'Expand':'Collapse'} ${title}`);button.title=`${collapsed?'Expand':'Collapse'} ${title}`;};
     button.addEventListener('click',()=>{if(state.collapsedPanels.has(key))state.collapsedPanels.delete(key);else state.collapsedPanels.add(key);sync();try{localStorage.setItem('subforge.collapsed-panels',JSON.stringify([...state.collapsedPanels]));}catch{}});
-    if(header.classList.contains('inventory-toolbar')){const heading=header.firstElementChild;heading.classList.add('inventory-heading-title');heading.append(button);}
+    if(header.classList.contains('inventory-toolbar')){header.firstElementChild.classList.add('inventory-heading-title');const actions=document.createElement('div');actions.className='panel-heading-actions';actions.append(button);header.insertBefore(actions,$('.toolbar-filters',header));}
     else{const actions=document.createElement('div');actions.className='panel-heading-actions';while(header.children.length>1)actions.append(header.children[1]);actions.append(button);header.append(actions);}
     sync();
   };
@@ -141,7 +157,7 @@
       const item = document.createElement('div'); item.className = 'root-item';
       const dot = document.createElement('span'); dot.className = 'root-dot';
       const text = document.createElement('span'); text.className = 'root-item-text'; text.title = root.path || label; text.textContent = label;
-      const count = document.createElement('span'); count.className = 'root-count'; count.textContent = '•';
+      const count = document.createElement('span'); count.className = 'root-count'; count.textContent = '';dot.title='Configured folder; health is shown in Media folders';
       item.append(dot,text,count); rootList.append(item);
       quick.add(new Option(label,root.id)); inventoryRoot.add(new Option(label,root.id));
     }
@@ -151,9 +167,9 @@
     setText($('#stat-roots'),(roots || []).length);
   };
   const updateLanguageLabels = () => {
-    const label = languageDescription(state.selectedLanguages);
-    setText($('#quick-languages'),label); setText($('#settings-languages'),label);
-    setText($('#stat-languages'),isAll(state.selectedLanguages) ? 'All' : state.selectedLanguages.length);
+    setText($('#quick-languages'),languageDescription(state.selectedLanguages));
+    setText($('#settings-languages'),languageDescription(state.defaultLanguages));
+    setText($('#stat-languages'),isAll(state.selectedLanguages)?'All':state.selectedLanguages.length);
   };
   const jobPercent = job => {
     const total=Number(job.total || 0), processed=Number(job.processed || 0);
@@ -172,7 +188,7 @@
     const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = currentLabel(job.current) || (job.paths && job.paths.length ? shortPath(job.paths[0]) : job.root_label || 'All scan roots');
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
-    const pill = document.createElement('span'); pill.className=`status-pill ${escStatus(job.status)}`; pill.textContent=(job.status || 'queued').replaceAll('_',' ');
+    const pill = document.createElement('span'); pill.className=`status-pill ${escStatus(job.status)}`; pill.textContent=({completed_with_errors:'Completed with errors',running:'Running',queued:'Queued',completed:'Completed',failed:'Failed',cancelled:'Cancelled'})[job.status]||job.status||'Queued';
     const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.started || job.created);
     status.append(pill,time);
     card.append(icon,detail,status);
@@ -199,15 +215,17 @@
     for(const details of $$('.job-error',container))$('.job-error-content',details).scrollTop=state.errorViews.get(details.dataset.errorKey)?.scroll || 0;
   };
   const renderJobs = () => {
-    const jobs=jobList(), running=state.status?.running;
-    updateJobList($('#recent-activity'),jobs.slice(0,4),true);updateJobList($('#jobs-list'),jobs,false);
+    const jobs=jobList(),running=state.status?.running,maintenance=job=>['health','backup','cleanup'].includes(job.kind);
+    const status=$('#activity-status').value,kind=$('#activity-kind').value;
+    const filtered=jobs.filter(job=>(kind==='all'||(kind==='maintenance')===maintenance(job))&&(status==='all'||status==='issues'&&['failed','completed_with_errors'].includes(job.status)||status===job.status));
+    updateJobList($('#recent-activity'),jobs.filter(job=>!maintenance(job)).slice(0,4),true);updateJobList($('#jobs-list'),filtered,false);
+    setText($('#activity-count'),`${filtered.length} of ${jobs.length} jobs`);
     const validKeys=new Set(jobs.flatMap(job=>[errorViewKey(job,true),errorViewKey(job,false)]));for(const key of state.errorViews.keys())if(!validKeys.has(key))state.errorViews.delete(key);
-    setText($('#stat-running'),running ? 'Running' : 'Idle'); setText($('#stat-current'),currentLabel(running?.current) || (running ? 'Working through your library' : 'Nothing running right now'));
-    const total=state.status?.converted_count ?? jobs.reduce((sum,job)=>sum+Number(job.summary?.converted || 0),0); setText($('#stat-converted'),total.toLocaleString());
-    const queued=(state.status?.queue || []).length; const badge=$('#activity-badge'); badge.textContent=queued ? String(queued) : ''; badge.classList.toggle('hidden',!queued);
+    const queued=(state.status?.queue||[]).length,badge=$('#activity-badge');badge.textContent=queued?String(queued):'';badge.classList.toggle('hidden',!queued);
+    setText($('#stat-running'),running?'Running':'Idle');
   };
   const renderLogs = logs => {
-    const box=$('#live-logs'); box.replaceChildren();
+    const box=$('#live-logs'),signature=JSON.stringify(logs||[]);if(box.logSignature===signature)return;box.logSignature=signature;const atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-20;box.replaceChildren();
     const entries=(logs || []).slice(-50);
     if (!entries.length) { const empty=document.createElement('div'); empty.className='log-empty'; empty.textContent='No recent converter events'; box.append(empty); return; }
     for (const entry of entries) {
@@ -217,7 +235,7 @@
       const message=document.createElement('span'); message.className='log-message'; message.textContent=entry.message || '';
       row.append(time,level,message); box.append(row);
     }
-    box.scrollTop=box.scrollHeight;
+    if(atEnd)box.scrollTop=box.scrollHeight;
   };
   const setConnection = good => { $('#connection-dot').classList.toggle('offline',!good); setText($('#connection-text'),good ? 'Service connected' : 'Service unavailable'); };
   const loadInventory = async summary => {
@@ -260,7 +278,9 @@
     const count=rows.length, pages=Math.max(1,Math.ceil(count/state.inventoryPageSize));
     if(state.inventoryLoaded)state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
     const start=(state.inventoryPage-1)*state.inventoryPageSize, visibleRows=rows.slice(start,start+state.inventoryPageSize);
-    setText($('#inventory-meta'),`${count.toLocaleString()}${query||root||filter!=='all'?` of ${state.inventory.length.toLocaleString()}`:''} item${count===1?'':'s'}`);
+    setText($('#inventory-meta'),`${count.toLocaleString()} ${count===1?'match':'matches'} in ${state.inventory.length.toLocaleString()} inspected items`);
+    const globalCount=filter==='failed'?state.status?.pipeline?.failed_files:filter==='pending'?state.status?.pipeline?.pending_ocr_files:null;
+    setText($('#inventory-scope-note'),[state.inventoryTruncated?'Partial inventory: first 2,000 items. Inspect a smaller media folder to see other files.':'',Number.isFinite(globalCount)?`${count.toLocaleString()} ${count===1?'match':'matches'} in this snapshot; ${globalCount.toLocaleString()} ${filter==='failed'?'failed':'awaiting OCR'} files across saved conversion state.`:'',state.inventoryUpdated?`Last inspection: ${fmtDate(state.inventoryUpdated)}.`:''].filter(Boolean).join(' '));
     const range=count?`${(start+1).toLocaleString()}–${(start+visibleRows.length).toLocaleString()} of ${count.toLocaleString()} items`:'0 items';
     if ($('#inventory-range').textContent!==range) setText($('#inventory-range'),range);
     const pageSelect=$('#inventory-page');
@@ -276,22 +296,31 @@
     state.inventoryViewKey=viewKey;body.replaceChildren();
     if (!count) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=5; td.className='table-empty'; td.textContent=emptyMessage; tr.append(td); body.append(tr); return; }
     for (const row of visibleRows) {
-      const tr=document.createElement('tr');tr.tabIndex=0;tr.classList.toggle('inventory-row-empty',!row.tracks?.length&&!row.error);tr.setAttribute('aria-label',`Subtitle details: ${row.name||row.path}`);tr.addEventListener('click',()=>openTrackDrawer(row));tr.addEventListener('keydown',event=>{if(event.target===tr&&['Enter',' '].includes(event.key)){event.preventDefault();openTrackDrawer(row);}});const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`;fileIcon.append(iconSvg('file')); const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; name.append(fileIcon,filename);
-      const type=document.createElement('td'); const badge=document.createElement('span'); badge.className='type-badge'; badge.textContent=row.error?'Issue':row.type==='sidecar'?'Sidecar':'Video'; type.append(badge);
-      const tracks=document.createElement('td'); tracks.textContent=row.error ? row.error : `${(row.tracks || []).length} track${(row.tracks || []).length===1?'':'s'}`;
+      const tr=document.createElement('tr');tr.tabIndex=0;tr.classList.toggle('inventory-row-empty',!row.tracks?.length&&!row.error);tr.setAttribute('aria-label',`Subtitle details: ${row.name||row.path}`);tr.addEventListener('click',()=>openTrackDrawer(row));tr.addEventListener('keydown',event=>{if(event.target===tr&&['Enter',' '].includes(event.key)){event.preventDefault();openTrackDrawer(row);}});const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`;fileIcon.append(iconSvg('file')); const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; const copy=document.createElement('span');copy.className='file-cell-copy';copy.append(filename);const context=document.createElement('small');context.textContent=(row.path||'').replace(/[/\\][^/\\]+$/,'');copy.append(context);const fileContent=document.createElement('div');fileContent.className='file-cell-content';fileContent.append(fileIcon,copy);name.append(fileContent);
+      const type=document.createElement('td');type.className='processing-cell';const badge=document.createElement('span'),processing=row.processing||{},failed=!!row.error||!!processing.failed;badge.className=`status-pill ${failed?'failed':processing.pending_ocr?'queued':processing.generated_srt_count>0?'completed':'cancelled'}`;badge.textContent=failed?'Failed':processing.pending_ocr?'Awaiting OCR':processing.generated_srt_count>0?'Ready':row.metadata_pending?'Needs inspection':'Inspected';type.append(badge);const problem=failureMessage(row);if(failed&&problem){const hint=document.createElement('small');hint.textContent=problem.length>140?`${problem.slice(0,137)}…`:problem;hint.title=problem;type.append(hint);}
+      const tracks=document.createElement('td');tracks.className='track-count';tracks.textContent=row.error ? row.error : `${(row.tracks || []).length} track${(row.tracks || []).length===1?'':'s'}`;
       const lang=document.createElement('td'); lang.className='language-tags';for(const track of (row.tracks||[]).slice(0,3))lang.append(trackBadge(track));if(row.tracks?.length>3){const more=document.createElement('span');more.className='muted';more.textContent=`+${row.tracks.length-3}`;lang.append(more);}if(!lang.childNodes.length)lang.textContent='—';
-      const action=document.createElement('td'),button=document.createElement('button');button.type='button';button.className='row-action';button.textContent='Details';button.title='Review tracks and choose which to convert';button.addEventListener('click',event=>{event.stopPropagation();openTrackDrawer(row);});action.append(button);
+      const action=document.createElement('td'),button=document.createElement('button');action.className='file-action';button.type='button';button.className='row-action';button.textContent='Details';button.title='Review tracks and choose which to convert';button.addEventListener('click',event=>{event.stopPropagation();openTrackDrawer(row);});action.append(button);
       tr.append(name,type,tracks,lang,action); body.append(tr);
     }
   };
-  const syncDrawerSelection = () => {$('#convert-selected-tracks').disabled=!state.drawerSelection.size||state.drawerSelection.size>64;setText($('#track-drawer-hint'),state.selectedFile?.error||(state.drawerSelection.size>64?'Choose up to 64 tracks per conversion.':`${state.drawerSelection.size} selected · Image tracks use OCR when deployment permissions allow it.`));};
+  const failureMessage = row => {
+    const value=row.error||row.processing?.last_error||row.processing?.error||row.processing?.error_detail;
+    return typeof value==='string'?value:row.processing?.failed?'A conversion failed. Open Activity to review the recorded track errors.':'';
+  };
+  const syncDrawerSelection = () => {
+    const count=state.drawerSelection.size;$('#convert-selected-tracks').disabled=!count||count>64;
+    setText($('#convert-selected-tracks'),`Convert ${count} track${count===1?'':'s'}`);
+    const selected=$$('#track-drawer-list input:checked'),image=selected.some(input=>input.dataset.image==='true');
+    setText($('#track-drawer-hint'),count>64?'Select up to 64 tracks per conversion.':`${count} selected · ${image?'Image tracks use the configured OCR backend; text tracks use CPU extraction.':'Text tracks use CPU extraction.'}`);
+  };
   const openTrackDrawer = row => {
     state.selectedFile=row;state.modalTrigger=document.activeElement;state.drawerSelection=new Set();const list=$('#track-drawer-list');list.replaceChildren();
-    setText($('#track-drawer-title'),row.name||'Subtitle tracks');setText($('#track-drawer-path'),row.path);
+    setText($('#track-drawer-title'),row.name||'Subtitle tracks');setText($('#track-drawer-path'),row.path);const failure=$('#track-drawer-failure'),message=failureMessage(row);failure.replaceChildren();failure.classList.toggle('hidden',!message);if(message){const text=document.createElement('p');text.textContent=message;const activity=document.createElement('button');activity.className='text-button';activity.type='button';activity.textContent='Review errors in Activity';activity.addEventListener('click',()=>{closeDialog($('#track-drawer-backdrop'));$('#activity-status').value='issues';$('#activity-kind').value='subtitle';renderJobs();navigate('activity');});failure.append(text,activity);}
     const tracks=row.tracks||[],counts=new Map();for(const track of tracks){const id=track.id??track.number;if(Number.isSafeInteger(id))counts.set(id,(counts.get(id)||0)+1);}
     tracks.forEach((track,index)=>{const id=track.id??track.number,format=trackFormat(track),single=tracks.length===1&&row.type==='sidecar'&&id==null,key=single?'source':id;
       const supported=single||Number.isSafeInteger(id)&&counts.get(id)===1,permitted=!format.image||state.settings?.permissions?.ocr===true;
-      const label=document.createElement('label');label.className='track-choice';const input=document.createElement('input');input.type='checkbox';input.disabled=!supported||!permitted||!!row.error;input.checked=!input.disabled;if(input.checked)state.drawerSelection.add(key);input.dataset.trackKey=String(key);input.setAttribute('aria-label',`Convert track ${id??index+1}, ${langLabel(track.language||'und')}, ${format.label}`);input.addEventListener('change',()=>{if(input.checked)state.drawerSelection.add(key);else state.drawerSelection.delete(key);syncDrawerSelection();});
+      const label=document.createElement('label');label.className='track-choice';const input=document.createElement('input');input.type='checkbox';input.disabled=!supported||!permitted||!!row.error;input.dataset.image=String(format.image);input.checked=!input.disabled&&(isAll(state.selectedLanguages)||state.selectedLanguages.some(code=>languageCode(code)===languageCode(track.language)||languageCode(code)===languageCode(track.language).split('-')[0]));if(input.checked)state.drawerSelection.add(key);input.dataset.trackKey=String(key);input.setAttribute('aria-label',`Convert track ${id??index+1}, ${langLabel(track.language||'und')}, ${format.label}`);input.addEventListener('change',()=>{if(input.checked)state.drawerSelection.add(key);else state.drawerSelection.delete(key);syncDrawerSelection();});
       const copy=document.createElement('span'),title=document.createElement('strong'),source=document.createElement('small');title.textContent=`Track ${id??index+1} · ${langLabel(track.language||'und')}`;source.className='track-source';source.textContent=`${track.codec||track.codec_id||track.format||format.label} · ${row.type==='sidecar'?'Sidecar':'Embedded'}${!supported?' · Inspect again to obtain an unambiguous track ID':!permitted?' · OCR permission locked':''}`;copy.append(title,source);
       const flags=document.createElement('span');flags.className='track-flags';flags.append(trackBadge(track));for(const [key,text] of [['forced','Forced'],['hi','SDH'],['sdh','SDH'],['hearing_impaired','SDH']])if(track[key]&&!(text==='SDH'&&flags.textContent.includes('SDH'))){const flag=document.createElement('span');flag.className='type-badge';flag.textContent=text;flags.append(flag);}label.append(input,copy,flags);list.append(label);
     });
@@ -310,13 +339,13 @@
     const codes=new Set(languages.map(x=>x[0].toLowerCase())); for (const code of state.draftLanguages) if (code!=='*' && !codes.has(code.toLowerCase())) languages.push([code,`${langLabel(code)} · ${code.toUpperCase()}`]);
     for (const [code,name] of languages) {
       if (term && !`${name} ${code}`.toLowerCase().includes(term)) continue;
-      const label=document.createElement('label'); label.className='language-option'; const input=document.createElement('input'); input.type='checkbox'; input.value=code; input.checked=!isAll(state.draftLanguages) && state.draftLanguages.some(item=>item.toLowerCase()===code.toLowerCase()); input.addEventListener('change',()=>{if(isAll(state.draftLanguages))state.draftLanguages=[];state.draftLanguages=input.checked?[...new Set([...state.draftLanguages,code])]:state.draftLanguages.filter(item=>item!==code);updateLanguageCount();}); const copy=document.createElement('span'); const title=document.createElement('strong'); title.textContent=name; const detail=document.createElement('small'); detail.textContent=code.toUpperCase(); copy.append(title,detail); label.append(input,copy); list.append(label);
+      const label=document.createElement('label'); label.className='language-option'; const input=document.createElement('input'); input.type='checkbox'; input.value=code; input.checked=!isAll(state.draftLanguages) && state.draftLanguages.some(item=>item.toLowerCase()===code.toLowerCase()); input.addEventListener('change',()=>{if(isAll(state.draftLanguages)){state.draftLanguages=[];$('.all-option input',list).checked=false;}state.draftLanguages=input.checked?[...new Set([...state.draftLanguages,code])]:state.draftLanguages.filter(item=>item!==code);updateLanguageCount();}); const copy=document.createElement('span'); const title=document.createElement('strong'); title.textContent=name; const detail=document.createElement('small'); detail.textContent=code.toUpperCase(); copy.append(title,detail); label.append(input,copy); list.append(label);
     }
     updateLanguageCount();
   };
-  const updateLanguageCount = () => setText($('#language-count'),isAll(state.draftLanguages)?'All languages selected':`${state.draftLanguages.length} language${state.draftLanguages.length===1?'':'s'} selected`);
+  const updateLanguageCount = () => {setText($('#language-count'),isAll(state.draftLanguages)?'All languages selected':`${state.draftLanguages.length} language${state.draftLanguages.length===1?'':'s'} selected`);$('#apply-languages').disabled=!state.draftLanguages.length;};
   const showDialog = backdrop => {backdrop.classList.remove('hidden');$('.shell').inert=true;document.body.classList.add('modal-open');};
-  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...state.selectedLanguages]; $('#language-search').value='';showDialog($('#language-modal')); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
+  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...(target==='settings'?state.defaultLanguages:state.selectedLanguages)];setText($('#apply-languages'),target==='settings'?'Apply default languages':'Use for this conversion'); $('#language-search').value='';showDialog($('#language-modal')); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
   const closeDialog = backdrop => { if (!backdrop || backdrop.classList.contains('hidden')) return; backdrop.classList.add('hidden');$('.shell').inert=false;document.body.classList.remove('modal-open'); if (state.modalTrigger?.isConnected) state.modalTrigger.focus();else{const heading=$(`#page-${state.currentPage} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} };
   const addCustomLanguage = () => { const input=$('#custom-language'), code=input.value.trim().toLowerCase(); if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/.test(code)) { notify('Enter a valid ISO language code, such as pl or pt-BR.','error'); return; } languages.push([code,code.toUpperCase()]); state.draftLanguages=isAll(state.draftLanguages)?[code]:[...new Set([...state.draftLanguages,code])]; input.value=''; renderLanguageList(); };
   const buildIntegrationCard = (provider, config={}) => {
@@ -420,7 +449,7 @@
   const persistSettings = async () => { const data=await api('/api/settings',{method:'PUT',body:JSON.stringify(gatherSettings())}); state.settings=data; return data; };
   const loadSettings = async () => {
     try {
-      const data=await api('/api/settings'); state.settings=data; state.selectedLanguages=data.languages || ['*'];
+      const data=await api('/api/settings'); state.settings=data;state.defaultLanguages=data.languages||['*'];if(!state.quickLanguagesChanged)state.selectedLanguages=[...state.defaultLanguages];
       const ocrEnabled=data.permissions?.ocr===true;
       setText($('#ocr-permission-state'),ocrEnabled?'Enabled':'Locked');
       setText($('#ocr-permission-note'),ocrEnabled?'Image subtitle conversion is enabled for this service.':'Text subtitles are enabled. To include image subtitles, enable CONVERTER_ENABLE_OCR and use a 1536 MiB memory limit.');
@@ -437,11 +466,11 @@
       path_mappings.push(...readMappings(card).map(item=>({...item,provider})));
       if(provider==='jellyfin') { delete integrations[provider].url; delete integrations[provider].api_key; Object.assign(integrations[provider],{movie_libraries:readSelectedLibraries(card,'.movie-libraries'),series_libraries:readSelectedLibraries(card,'.series-libraries'),refresh_movies:$('.refresh-movies',card).checked,refresh_series:$('.refresh-series',card).checked,refresh_mode:$('.refresh-mode',card).value}); }
     }
-    return {languages:state.selectedLanguages,integrations,path_mappings};
+    return {languages:state.defaultLanguages,integrations,path_mappings};
   };
   const saveSettings = async () => {
     const button=$('#save-settings'), note=$('#settings-save-note'); button.disabled=true; setText(note,'Saving…');
-    try { const data=await persistSettings(); for (const provider of ['sonarr','radarr','jellyfin','bazarr']) {const node=$(`#${provider}-settings`);node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})}));} state.selectedLanguages=data.languages || state.selectedLanguages; updateLanguageLabels(); setText(note,'Changes saved'); notify('Settings saved.','success'); }
+    try { const data=await persistSettings(); for (const provider of ['sonarr','radarr','jellyfin','bazarr']) {const node=$(`#${provider}-settings`);node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})}));} state.defaultLanguages=data.languages||state.defaultLanguages;state.settingsDirty=false;$('#save-settings').textContent='Save changes';updateLanguageLabels();setText(note,'Changes saved'); notify('Settings saved.','success'); }
     catch(error) { setText(note,error.message); notify(`Settings not saved: ${error.message}`,'error'); }
     finally { button.disabled=false; setTimeout(()=>setText(note,''),5000); }
   };
@@ -520,15 +549,32 @@
     catch(error){notify(error.message,'error');}
     finally{state.taskRequests.delete(id);renderTasks();}
   };
+  const renderWorkerNodes = remote => {
+    const target=$('#worker-nodes');target.replaceChildren();
+    const add=(name,description,status)=>{const row=document.createElement('div');row.className='worker-node';const copy=document.createElement('div'),title=document.createElement('strong'),detail=document.createElement('small'),pill=document.createElement('span');title.textContent=name;detail.textContent=description;pill.className=`status-pill ${status==='online'?'completed':status==='busy'?'running':'cancelled'}`;pill.textContent=status;copy.append(title,detail);row.append(copy,pill);target.append(row);};
+    const data=state.workersInfo||{},allocation=data.allocation||{};add('This node',`${allocation.cpu_workers||0} CPU slots requested · ${allocation.gpu_workers||0} GPU slots requested`,'online');
+    if(!remote){const hint=document.createElement('p');hint.className='muted';hint.textContent='Remote-node status is not available from this server.';target.append(hint);return;}
+    if(!remote.enabled){const hint=document.createElement('p');hint.className='muted';hint.textContent='Remote workers are disabled. Configure a dedicated worker token on the coordinator and each worker to enable registration.';target.append(hint);return;}
+    for(const node of remote.nodes||[]){const status=({working:'busy',idle:'online'})[node.status]||node.status||'online';add(node.name||node.id,`${node.resource||'CPU'} · ${Number(node.active||0)} active · last seen ${node.last_seen_seconds??'—'}s ago`,status);}
+    if(!remote.nodes?.length){const hint=document.createElement('p');hint.className='muted';hint.textContent='No remote workers connected yet. Start a worker with the coordinator URL and mapped shared folders.';target.append(hint);}
+  };
+  const loadWorkerNodes = async () => {try{renderWorkerNodes(await api('/api/nodes'));}catch(error){notify(`Could not load worker nodes: ${error.message}`,'error');}};
+  const reviewConversion = rootIds => {
+    state.pendingConversion={kind:'scan',rootIds,languages:[...state.selectedLanguages]};state.modalTrigger=document.activeElement;
+    const scope=$('#conversion-scope');scope.replaceChildren();
+    const roots=(state.status?.roots||[]).filter(root=>!rootIds.length||rootIds.includes(root.id));
+    for(const [key,value] of [['Folders',roots.map(root=>root.label||root.path||root.id).join(', ')||'All configured media folders'],['Languages',languageDescription(state.selectedLanguages)],['Operation','Discover media and convert supported text tracks']]){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=key;dd.textContent=value;scope.append(dt,dd);}
+    showDialog($('#conversion-modal'));$('#confirm-conversion').focus();
+  };
   const workersVisible = () => state.currentPage==='settings'&&state.settingsSection==='workers'&&!document.hidden;
   const workerFields={cpu_workers:'#worker-cpu-count',ocr_workers:'#worker-ocr-count',gpu_workers:'#worker-gpu-count'};
   const workerDirty = () => {state.workersDirty=true;$('#save-worker-allocation').disabled=state.workersSaving;setText($('#worker-allocation-note'),'Unsaved allocation. Save to apply it to the next files; running files keep their current resources.');renderWorkerSteppers();};
   const renderWorkerSteppers = () => {
     const data=state.workersInfo;if(!data)return;
     for(const [kind,selector] of Object.entries(workerFields)){
-      const input=$(selector),ceiling=Number(data.deployment?.[`max_${kind}`]??0);
-      input.max=String(kind==='ocr_workers'?Math.min(ceiling,Number($('#worker-cpu-count').value)||1):ceiling);
-      input.disabled=ceiling===0||state.workersSaving;
+      const input=$(selector),ceiling=Number(data.max_requested??data.deployment?.[`max_${kind}`]??0);
+      input.max=String(ceiling);
+      input.disabled=ceiling===0||state.workersSaving||kind==='gpu_workers'&&data.edition==='cpu';
       $$(`[data-worker-step="${kind}"]`).forEach(button=>{const next=Number(input.value)+Number(button.dataset.delta);button.disabled=input.disabled||next<Number(input.min)||next>Number(input.max);});
     }
   };
@@ -545,13 +591,13 @@
     setText($('#worker-cpu-usage'),measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% of allowance in use`:'Waiting for a CPU sample');
     setText($('#worker-ram'),measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
     const meter=$('#worker-memory-meter');meter.value=memory.cgroup_limit_bytes>0?Math.min(1,(memory.cgroup_current_bytes||0)/memory.cgroup_limit_bytes):0;meter.hidden=measuredNumber(memory.cgroup_current_bytes)===null||!(memory.cgroup_limit_bytes>0);
-    setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA checked':'Runtime enabled'):'Unavailable');setText($('#worker-gpu-reason'),detected.gpu_reason||'GPU OCR requires the CUDA edition, an enabled runtime and a granted device.');
-    setText($('#worker-cpu-capacity'),`${active.cpu_workers||0} active · ${effective.cpu_workers??0} effective slots${data.cpu_limit_reason?` · ${data.cpu_limit_reason}`:''}`);
-    setText($('#worker-ocr-capacity'),`${active.ocr_workers||0} active · ${effective.ocr_workers??0} effective slots${data.ocr_limit_reason?` · ${data.ocr_limit_reason}`:''}`);
-    setText($('#worker-gpu-capacity'),`${active.gpu_workers||0} active · ${effective.gpu_workers??0} effective slots`);
-    if(!state.workersDirty&&!state.workersSaving)setText($('#worker-allocation-note'),paused?'New file work is paused. Resume and save to continue; running files finish safely.':'Allocation is saved in workers.conf. Each tool uses one CPU thread; CPU and RAM limits keep parallel work bounded. GPU slots stay off until you enable them.');
+    setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA runtime checked':'Runtime enabled'):'Unavailable');setText($('#worker-gpu-reason'),detected.gpu_reason||'GPU OCR requires the CUDA edition, an enabled runtime and a granted device.');
+    setText($('#worker-cpu-capacity'),`${allocation.cpu_workers||0} requested · ${active.cpu_workers||0} active · ${effective.cpu_workers??0} execution slots${data.cpu_limit_reason?` · ${data.cpu_limit_reason}`:''}${data.admission?.cpu?.reason?` · ${data.admission.cpu.reason}`:''}`);
+    setText($('#worker-ocr-capacity'),`${allocation.ocr_workers||0} requested · ${active.ocr_workers||0} active · ${effective.ocr_workers??0} execution slots${data.ocr_limit_reason?` · ${data.ocr_limit_reason}`:''}${data.admission?.cpu_ocr?.reason?` · ${data.admission.cpu_ocr.reason}`:''}`);
+    setText($('#worker-gpu-capacity'),`${allocation.gpu_workers||0} requested · ${active.gpu_workers||0} active · ${effective.gpu_workers??0} execution slots${data.gpu_limit_reason?` · ${data.gpu_limit_reason}`:''}${data.admission?.gpu?.reason?` · ${data.admission.gpu.reason}`:''}`);
+    if(!state.workersDirty&&!state.workersSaving)setText($('#worker-allocation-note'),paused?'New file work is paused. Resume and save to continue; running files finish safely.':'Requested slots are saved. Active execution follows admission and memory headroom. Higher counts do not add physical CPUs or GPU memory; text extraction always uses CPU.');
     const body=$('#workers-body');body.replaceChildren();
-    for(const worker of (data.workers||[]).slice(0,9)){
+    for(const worker of (data.workers||[])){
       const row=document.createElement('tr');const elapsed=Math.max(0,Math.floor(Date.now()/1000-Number(worker.started||Date.now()/1000)));
       for(const [label,value] of [['Worker',`#${worker.id}`],['Processor',worker.resource==='gpu'?'GPU OCR':worker.resource==='cpu_ocr'?'CPU OCR':'CPU'],['Media file',shortPath(worker.path||'')],['Status',worker.status||'Processing'],['Elapsed',`${Math.floor(elapsed/60)}m ${elapsed%60}s`]]){const cell=document.createElement('td');cell.dataset.label=label;cell.textContent=value;if(label==='Media file'){cell.className='worker-file';cell.title=worker.path||'';}row.append(cell);}body.append(row);
     }
@@ -560,16 +606,16 @@
   };
   const loadWorkers = async (quiet=false) => {
     if(!state.csrf||state.workersBusy||state.workersSaving)return;state.workersBusy=true;
-    try{state.workersInfo=await api('/api/workers');renderWorkers();}
+    try{state.workersInfo=await api('/api/workers');renderWorkers();renderWorkerNodes(state.workersInfo.remote);}
     catch(error){setText($('#worker-live-state'),'Disconnected · retrying');if(!quiet)notify(`Could not load workers: ${error.message}`,'error');}
     finally{state.workersBusy=false;}
   };
   const saveWorkers = async event => {
     event.preventDefault();if(state.workersSaving||!state.workersInfo)return;
     const allocation={paused:$('#worker-paused').checked};
-    for(const [kind,selector] of Object.entries(workerFields)){const input=$(selector),value=Number(input.value);if(!Number.isInteger(value)||value<Number(input.min)||value>Number(input.max)){notify('Choose whole worker counts within the available limits.','error');input.focus();return;}allocation[kind]=value;}
+    for(const [kind,selector] of Object.entries(workerFields)){const input=$(selector),value=Number(input.value);if(!Number.isInteger(value)||value<Number(input.min)||value>Number(input.max)){notify('Enter a whole requested worker count within the supported range.','error');input.focus();return;}allocation[kind]=value;}
     state.workersSaving=true;$('#save-worker-allocation').disabled=true;renderWorkerSteppers();
-    try{state.workersInfo=await api('/api/workers',{method:'PUT',body:JSON.stringify(allocation)});state.workersDirty=false;notify('Worker allocation saved. It applies to new files.','success');}
+    try{state.workersInfo=await api('/api/workers',{method:'PUT',body:JSON.stringify(allocation)});state.workersDirty=false;renderWorkerNodes(state.workersInfo.remote);notify('Worker allocation saved. It applies to new files.','success');}
     catch(error){notify(error.message,'error');}
     finally{state.workersSaving=false;$('#save-worker-allocation').disabled=!state.workersDirty;renderWorkers();if(systemVisible())loadSystem(true);}
   };
@@ -664,13 +710,14 @@
     state.currentPage=page;
     if(page==='settings')state.settingsSection=section;
     $$('.page').forEach(node=>node.classList.toggle('active',node.id===`page-${page}`));
-    $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>node.classList.toggle('active',node.dataset.page===page));
-    $$('.settings-tab').forEach(node=>node.classList.toggle('active',node.dataset.settingTab===state.settingsSection));
+    $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>{const active=node.dataset.page===page;node.classList.toggle('active',active);if(active)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
+    $$('.settings-tab').forEach(node=>{const active=node.dataset.settingTab===state.settingsSection;node.classList.toggle('active',active);if(active)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
     $$('.settings-section').forEach(node=>node.classList.toggle('active',node.id===`settings-${state.settingsSection}`));
-    setText($('#page-crumb'),pageNames[page]);closeMobileMenu();
+    setText($('#page-crumb'),page==='settings'?`Settings / ${$('.settings-tab.active')?.textContent||'Preferences'}`:pageNames[page]);closeMobileMenu();if(changed)window.scrollTo({top:0,behavior:'instant'});
     if(fromMobileMenu||(previousPage&&previousPage.id!==`page-${page}`)) {
       const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
     }
+    if(changed)state.pendingConversion=null;
     if(page==='settings'&&state.csrf) {
       if(!state.settings)loadSettings();
       if(changed&&section==='media')loadRootFolders();
@@ -692,6 +739,7 @@
   };
   const cancelJob = async id => { try { const result=await api(`/api/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:'{}'}); notify(result.message || 'Cancellation requested.'); await pollStatus(); } catch(error) { notify(error.message,'error'); } };
   const bind = () => {
+    $$('.nav-link[data-page]').forEach(button=>$('.nav-icon',button)?.replaceChildren(iconSvg(button.dataset.page)));
     $$('button[aria-label]').forEach(button=>{if(!button.title)button.title=button.getAttribute('aria-label');});
     try{const libraries=JSON.parse(sessionStorage.getItem('subforge.jellyfin-libraries')||'[]');if(Array.isArray(libraries))rememberLibraries(libraries);}catch{}
     try{const saved=JSON.parse(localStorage.getItem('subforge.collapsed-panels')||'[]');if(Array.isArray(saved))state.collapsedPanels=new Set(saved.filter(key=>typeof key==='string'));}catch{}
@@ -702,14 +750,16 @@
     $('#mobile-menu').addEventListener('click',toggleMobileMenu); $('#sidebar-collapse').addEventListener('click',toggleMobileMenu); mobileBackdrop.addEventListener('click',()=>closeMobileMenu(true));
     window.addEventListener('resize',()=>{if(!window.matchMedia('(max-width: 800px)').matches)closeMobileMenu();else syncNavigation();});
     $('#refresh-button').addEventListener('click',()=>{pollStatus();if(systemVisible())loadSystem();if(workersVisible())loadWorkers();if(state.currentPage==='settings'&&state.settingsSection==='tasks')loadTasks();if(state.currentPage==='settings'&&state.settingsSection==='media')loadRootFolders();}); $('#clear-view-button').addEventListener('click',()=>pollStatus());
-    $$('[data-pipeline-stage]').forEach(button=>button.addEventListener('click',()=>filterLibrary(({scan:'all',inspect:'has_tracks',convert:'pending',ready:'ready'})[button.dataset.pipelineStage])));
+    $$('[data-pipeline-stage]').forEach(button=>{button.title=button.dataset.pipelineStage==='scan'?'View configured media folders':'View matching files in the saved inventory';button.addEventListener('click',()=>button.dataset.pipelineStage==='scan'?navigate('settings','media'):filterLibrary(({inspect:'all',convert:'pending',ready:'ready'})[button.dataset.pipelineStage]));});
     $$('[data-attention]').forEach(button=>button.addEventListener('click',()=>button.dataset.attention==='paths'?navigate('settings','media'):filterLibrary(button.dataset.attention)));
     $('#convert-selected-tracks').addEventListener('click',convertDrawerSelection);
     for(const [selector,checked] of [['#select-all-tracks',true],['#select-no-tracks',false]])$(selector).addEventListener('click',()=>{$$('#track-drawer-list input:not(:disabled)').forEach(input=>{if(input.checked!==checked){input.checked=checked;input.dispatchEvent(new Event('change'));}});});
     $('#inspect-drawer-file').addEventListener('click',async()=>{const row=state.selectedFile;if(!row)return;const result=await startJob({kind:'inspect',paths:[row.path],rootIds:row.root_id?[row.root_id]:[]});if(result)closeDialog($('#track-drawer-backdrop'));});
-    $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>startJob({kind:'scan'})));
-    $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{navigate('library');await inspect();}));
-    $('#quick-form').addEventListener('submit',event=>{event.preventDefault();startJob({kind:'scan',rootIds:selectedRootIds('#quick-root')});});
+    $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>reviewConversion(selectedRootIds(state.currentPage==='library'?'#inventory-root':'#quick-root'))));
+    $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{const root=state.currentPage==='library'?$('#inventory-root').value:$('#quick-root').value;navigate('library');$('#inventory-root').value=root;await inspect();}));
+    $('#quick-form').addEventListener('submit',event=>{event.preventDefault();reviewConversion(selectedRootIds('#quick-root'));});
+    $('#confirm-conversion').addEventListener('click',async()=>{if(!state.pendingConversion)return;const button=$('#confirm-conversion');button.disabled=true;try{const result=await startJob(state.pendingConversion);if(result){state.pendingConversion=null;closeDialog($('#conversion-modal'));}}finally{button.disabled=false;}});
+    $('#activity-status').addEventListener('change',renderJobs);$('#activity-kind').addEventListener('change',renderJobs);$('#refresh-worker-nodes').addEventListener('click',loadWorkerNodes);
     restoreInventoryView();
     const resetInventoryPage=()=>{state.inventoryPage=1;renderInventory();saveInventoryView();};
     $('#inventory-filter').addEventListener('change',resetInventoryPage); $('#inventory-root').addEventListener('change',resetInventoryPage); $('#inventory-search').addEventListener('input',resetInventoryPage);
@@ -718,7 +768,7 @@
     $('#jobs-list').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);}); $('#recent-activity').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);});
     $('#save-settings').addEventListener('click',saveSettings); $('#language-search').addEventListener('input',renderLanguageList); $('#add-language').addEventListener('click',addCustomLanguage); $('#custom-language').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addCustomLanguage();}});
     $$('[data-open-languages]').forEach(button=>button.addEventListener('click',()=>openLanguageDialog(button.dataset.openLanguages)));
-    $('#apply-languages').addEventListener('click',()=>{if(!state.draftLanguages.length){notify('Select at least one language or choose All languages.','error');return;}state.selectedLanguages=[...state.draftLanguages];updateLanguageLabels();const backdrop=$('#language-modal');closeDialog(backdrop);if(state.languageTarget==='settings')setText($('#settings-save-note'),'Save changes to keep this default.');});
+    $('#apply-languages').addEventListener('click',()=>{if(!state.draftLanguages.length){notify('Select at least one language or choose All languages.','error');return;}if(state.languageTarget==='settings'){state.defaultLanguages=[...state.draftLanguages];state.settingsDirty=true;$('#save-settings').textContent='Save changes •';setText($('#settings-save-note'),'Default languages have unsaved changes. Save changes to persist them.');}else{state.selectedLanguages=[...state.draftLanguages];state.quickLanguagesChanged=true;}updateLanguageLabels();closeDialog($('#language-modal'));});
     $$('.modal-close').forEach(button=>button.addEventListener('click',()=>closeDialog(button.closest('.modal-backdrop'))));
     $$('.modal-backdrop').forEach(backdrop=>backdrop.addEventListener('click',event=>{if(event.target===backdrop)closeDialog(backdrop);}));
     $('#add-root-folder').addEventListener('click',()=>openRootFolderDialog());$('#refresh-root-folders').addEventListener('click',loadRootFolders);
@@ -733,6 +783,7 @@
     $('#pause-schedules').addEventListener('change',markTasksDirty);
     $('#save-task-schedules').addEventListener('click',saveTasks);
     window.addEventListener('popstate',restoreRoute);window.addEventListener('hashchange',restoreRoute);
+    window.addEventListener('beforeunload',event=>{if(state.settingsDirty||state.workersDirty||state.tasksDirty){event.preventDefault();event.returnValue='';}});
     document.addEventListener('keydown',event=>{
       const modal=$$('.modal-backdrop').find(item=>!item.classList.contains('hidden'));
       if(event.key==='Escape'){if(modal){event.preventDefault();closeDialog(modal);}else if($('#sidebar').classList.contains('mobile-open')){event.preventDefault();closeMobileMenu(true);}return;}

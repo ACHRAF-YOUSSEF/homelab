@@ -8,8 +8,8 @@ use std::sync::{
 
 pub const LIMIT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 5_000;
-const MAX_ENTRY_BYTES: usize = 64 * 1024;
-const MAX_TRACKS: usize = 64;
+const MAX_ENTRY_BYTES: usize = 128 * 1024;
+pub const MAX_TRACKS: usize = 256;
 const MAX_LABEL: usize = 32;
 const REVISION: u64 = 1;
 
@@ -271,6 +271,28 @@ mod tests {
         let cache = MetadataCache::new(path);
         assert_eq!(cache.get("/safe/movie.mkv", &fingerprint), Some(tracks()));
         assert!(cache.get("/safe/movie.mkv", &json!({"size":43})).is_none());
+    }
+
+    #[test]
+    fn more_than_sixty_four_tracks_survive_cache_persistence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let many = json!(
+            (0..100)
+                .map(|number| {
+                    let mut track = tracks()[0].clone();
+                    track["number"] = json!(number);
+                    track
+                })
+                .collect::<Vec<_>>()
+        );
+        let mut cache = MetadataCache::new(path.clone());
+        cache.insert("fixture.mkv", json!(1), many.clone());
+        cache.persist().unwrap();
+        assert_eq!(
+            MetadataCache::new(path).get("fixture.mkv", &json!(1)),
+            Some(many)
+        );
     }
 
     #[test]

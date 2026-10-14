@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-pub const HARD_CPU_LIMIT: usize = 8;
+pub const HARD_CPU_LIMIT: usize = 32;
 pub const HARD_TOTAL_LIMIT: usize = HARD_CPU_LIMIT + crate::gpu::HARD_GPU_LIMIT;
-const HARD_OCR_LIMIT: usize = 2;
+const HARD_OCR_LIMIT: usize = 16;
+/// A persisted target is a scalar, never a thread or buffer allocation size.
+pub const MAX_REQUESTED: usize = 1_000_000;
 const SERVER_RESERVE: u64 = 128 * 1024 * 1024;
 const CPU_RESERVE: u64 = 256 * 1024 * 1024;
 const OCR_RESERVE: u64 = 1024 * 1024 * 1024;
@@ -56,9 +58,9 @@ impl Default for Configuration {
             ocr_workers: 1,
             gpu_workers: 0,
             paused: false,
-            max_cpu_workers: 4,
-            max_ocr_workers: 1,
-            max_gpu_workers: 1,
+            max_cpu_workers: HARD_CPU_LIMIT,
+            max_ocr_workers: HARD_OCR_LIMIT,
+            max_gpu_workers: crate::gpu::HARD_GPU_LIMIT,
             gpu_min_free_mib: 2048,
         }
     }
@@ -122,7 +124,7 @@ pub struct Workers {
 impl Workers {
     pub fn new(path: PathBuf, ocr_allowed: bool) -> Result<Self, String> {
         let existed = path.exists();
-        let mut configuration = if existed {
+        let configuration = if existed {
             serde_json::from_value::<Configuration>(read_json(&path, 4096)?)
                 .map_err(|_| "workers.conf contains invalid configuration")?
                 .validate()?
@@ -134,19 +136,11 @@ impl Workers {
             }
             configuration
         };
-        let stored = configuration.allocation();
         let gpu = crate::gpu::Capability::detect(ocr_allowed, configuration.max_gpu_workers);
-        let allocation = Allocation {
-            cpu_workers: stored.cpu_workers.min(configuration.max_cpu_workers),
-            ocr_workers: stored
-                .ocr_workers
-                .min(configuration.max_ocr_workers)
-                .min(stored.cpu_workers.min(configuration.max_cpu_workers)),
-            gpu_workers: stored.gpu_workers.min(gpu.max_workers),
-            paused: stored.paused,
-        };
-        configuration.set_allocation(allocation);
-        if !existed || allocation != stored {
+        // Retain intent across resource pressure, image changes and restarts.
+        // Capability and deployment limits apply only at admission time.
+        let allocation = configuration.allocation();
+        if !existed {
             write_private_pretty(&path, &json!(configuration))?;
         }
         let workers = Self {
@@ -162,24 +156,8 @@ impl Workers {
         Ok(workers)
     }
 
-    fn validate(&self, value: &Value) -> Result<Allocation, String> {
-        let allocation = parse_allocation(value)?;
-        if allocation.cpu_workers == 0
-            || allocation.cpu_workers > self.max_cpu
-            || allocation.ocr_workers > self.max_ocr
-            || allocation.ocr_workers > allocation.cpu_workers
-            || allocation.gpu_workers > self.gpu.max_workers
-            || (allocation.gpu_workers > 0 && !self.gpu.eligible)
-        {
-            return Err(
-                "Worker allocation exceeds deployment limits; GPU OCR is unavailable".into(),
-            );
-        }
-        Ok(allocation)
-    }
-
     pub fn update(&mut self, value: &Value) -> Result<(), String> {
-        let allocation = self.validate(value)?;
+        let allocation = parse_allocation(value)?;
         let mut configuration = self.configuration;
         configuration.set_allocation(allocation);
         write_private_pretty(&self.path, &json!(configuration))?;
@@ -193,12 +171,8 @@ impl Workers {
     }
 
     pub fn limits(&self, sample: &Snapshot) -> Limits {
-        let detected = sample
-            .cpu_allowance()
-            .map(|cores| cores.floor().max(1.0) as usize)
-            .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
-            .unwrap_or(1)
-            .min(HARD_CPU_LIMIT);
+        // CPU quotas limit runtime throughput, not how many single-threaded
+        // jobs may wait for I/O. Explicit targets may oversubscribe that quota.
         let cpu_memory = memory_slots(sample.memory_limit(), CPU_RESERVE);
         let ocr_memory = sample.memory_limit().map_or(HARD_OCR_LIMIT, |limit| {
             usize::try_from(limit.saturating_sub(SERVER_RESERVE) / OCR_RESERVE)
@@ -209,7 +183,6 @@ impl Workers {
             .allocation
             .cpu_workers
             .min(self.max_cpu)
-            .min(detected)
             .min(cpu_memory);
         Limits {
             cpu_workers,
@@ -239,8 +212,18 @@ impl Workers {
     }
 
     pub fn can_start_resource(&self, sample: &Snapshot, resource: &str) -> bool {
+        self.admission_reason(sample, resource).is_none()
+    }
+
+    pub fn admission_reason(&self, sample: &Snapshot, resource: &str) -> Option<&'static str> {
         if self.allocation.paused {
-            return false;
+            return Some("Worker dispatch is paused; active files finish normally");
+        }
+        if resource == "gpu" && !self.gpu.eligible {
+            return Some(self.gpu.reason);
+        }
+        if resource == "cpu_ocr" && !self.ocr_allowed {
+            return Some("OCR is disabled by deployment permissions");
         }
         let limits = self.limits(sample);
         let active_ocr = self
@@ -261,8 +244,20 @@ impl Workers {
             _ => true,
         };
         if blocked || self.active.len() >= HARD_TOTAL_LIMIT {
-            return false;
+            return Some(match resource {
+                "gpu" if self.allocation.gpu_workers == 0 => "No GPU workers requested",
+                "cpu_ocr" if self.allocation.ocr_workers == 0 => "No CPU OCR workers requested",
+                "cpu" | "cpu_ocr" | "gpu" => {
+                    "Effective worker slots are occupied or limited by deployment and memory reservations"
+                }
+                _ => "Unsupported worker resource",
+            });
         }
+        let reserve = match resource {
+            "gpu" => GPU_RESERVE,
+            "cpu_ocr" => OCR_RESERVE,
+            _ => CPU_RESERVE,
+        };
         let budget = self
             .active
             .iter()
@@ -275,14 +270,18 @@ impl Workers {
                     CPU_RESERVE
                 })
             })
-            .saturating_add(match resource {
-                "gpu" => GPU_RESERVE,
-                "cpu_ocr" => OCR_RESERVE,
-                _ => CPU_RESERVE,
-            });
-        sample
-            .memory_limit()
-            .is_none_or(|limit| budget <= limit || (resource == "cpu" && self.active.is_empty()))
+            .saturating_add(reserve);
+        if sample.memory_limit().is_some_and(|limit| budget > limit) {
+            return Some("Memory reservations leave insufficient space for another worker");
+        }
+        if let (Some(limit), Some(current)) = (sample.memory_limit(), sample.memory_current())
+            && reserve > limit.saturating_sub(current)
+        {
+            return Some(
+                "Current cgroup memory pressure leaves insufficient headroom for another worker",
+            );
+        }
+        None
     }
 
     pub fn public(&self, sample: &Snapshot) -> Value {
@@ -297,14 +296,21 @@ impl Workers {
             .iter()
             .filter(|worker| worker.resource == "gpu")
             .count();
-        json!({"edition":crate::edition::NAME,"allocation":self.allocation,"effective":effective,
+        let admission = |resource| {
+            let reason = self.admission_reason(sample, resource);
+            json!({"allowed":reason.is_none(),"reason":reason.unwrap_or("Ready for another worker; runtime checks still apply")})
+        };
+        json!({"edition":crate::edition::NAME,"allocation":self.allocation,"requested":self.allocation,"effective":effective,
+            "max_requested":MAX_REQUESTED,
+            "admission":{"cpu":admission("cpu"),"cpu_ocr":admission("cpu_ocr"),"gpu":admission("gpu")},
             "configuration_path":"/data/workers.conf",
             "configuration":self.configuration,
             "deployment":{"max_cpu_workers":self.max_cpu,"max_ocr_workers":self.max_ocr,"max_gpu_workers":self.gpu.max_workers},
             "detected":{"cpu_allowance_cores":sample.cpu_allowance(),"gpu_available":self.gpu.eligible,"gpu_reason":self.gpu.reason,
                 "gpu_verification":if self.gpu.verified.is_some() {"verified"} else if self.gpu.eligible {"pending"} else {"unavailable"},"gpu_health":self.gpu.verified},
-            "cpu_limit_reason":if effective.cpu_workers < self.allocation.cpu_workers {"Kernel CPU or memory allowance limits active workers"} else {"Allocation is within deployment and kernel allowances"},
+            "cpu_limit_reason":if effective.cpu_workers < self.allocation.cpu_workers {"Deployment safety ceiling or memory reservations limit active workers; requested target is retained"} else {"Requested concurrency admitted; CPU quota controls throughput and may be oversubscribed"},
             "ocr_limit_reason":if !self.ocr_allowed {"OCR is disabled by deployment permissions"} else if effective.ocr_workers < self.allocation.ocr_workers {"OCR memory or CPU allowance limits active workers"} else {"OCR slots are a subset of CPU slots"},
+            "gpu_limit_reason":if !self.gpu.eligible {self.gpu.reason} else if effective.gpu_workers < self.allocation.gpu_workers {"Deployment GPU safety ceiling or host memory reservations limit active workers; requested target is retained"} else {"GPU workers still require per-file CUDA, VRAM and offline-model verification"},
             "active":{"cpu_workers":self.active.len().saturating_sub(active_gpu),"ocr_workers":active_ocr,"gpu_workers":active_gpu},
             "threads_per_worker":1,"workers":self.active,
             "memory_reservations":{"kind":"soft_estimate","server_bytes":SERVER_RESERVE,"cpu_worker_bytes":CPU_RESERVE,"ocr_worker_bytes":OCR_RESERVE,"gpu_worker_bytes":GPU_RESERVE}})
@@ -315,12 +321,12 @@ fn parse_allocation(value: &Value) -> Result<Allocation, String> {
     let allocation: Allocation = serde_json::from_value(value.clone())
         .map_err(|_| "Invalid worker allocation; supply CPU, OCR, GPU counts and paused")?;
     if allocation.cpu_workers == 0
-        || allocation.cpu_workers > HARD_CPU_LIMIT
-        || allocation.ocr_workers > HARD_OCR_LIMIT
+        || allocation.cpu_workers > MAX_REQUESTED
+        || allocation.ocr_workers > MAX_REQUESTED
         || allocation.ocr_workers > allocation.cpu_workers
-        || allocation.gpu_workers > crate::gpu::HARD_GPU_LIMIT
+        || allocation.gpu_workers > MAX_REQUESTED
     {
-        return Err("Worker allocation exceeds hard safety limits".into());
+        return Err("Worker targets must be between zero and 1000000; CPU must be positive and OCR cannot exceed CPU".into());
     }
     Ok(allocation)
 }
@@ -329,7 +335,7 @@ fn memory_slots(limit: Option<u64>, reserve: u64) -> usize {
     limit.map_or(HARD_CPU_LIMIT, |limit| {
         usize::try_from(limit.saturating_sub(SERVER_RESERVE) / reserve)
             .unwrap_or(HARD_CPU_LIMIT)
-            .clamp(1, HARD_CPU_LIMIT)
+            .min(HARD_CPU_LIMIT)
     })
 }
 
@@ -364,7 +370,7 @@ mod tests {
         let original = read_json(&path, 4096).unwrap();
         for value in [
             json!({"cpu_workers":0,"ocr_workers":1,"gpu_workers":0,"paused":false}),
-            json!({"cpu_workers":1,"ocr_workers":1,"gpu_workers":1,"paused":false}),
+            json!({"cpu_workers":1,"ocr_workers":1,"gpu_workers":1000001,"paused":false}),
             json!({"cpu_workers":1,"ocr_workers":1,"gpu_workers":0,"paused":false,"command":"anything"}),
             json!({"cpu_workers":1,"ocr_workers":1,"gpu_workers":0,"paused":"true"}),
         ] {
@@ -390,11 +396,11 @@ mod tests {
         };
         write_private_pretty(&path, &json!(configuration)).unwrap();
         let mut workers = Workers::new(path.clone(), true).unwrap();
-        assert!(
-            workers
-                .update(&json!({"cpu_workers":3,"ocr_workers":1,"gpu_workers":0,"paused":false}))
-                .is_err()
-        );
+        workers
+            .update(&json!({"cpu_workers":3,"ocr_workers":1,"gpu_workers":0,"paused":false}))
+            .unwrap();
+        assert_eq!(workers.allocation.cpu_workers, 3);
+        assert_eq!(workers.limits(&Snapshot::fixture(1.0, None)).cpu_workers, 2);
         workers
             .update(&json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":false}))
             .unwrap();
@@ -405,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_allocation_normalizes_when_deployment_permissions_are_reduced() {
+    fn saved_targets_survive_reduced_deployment_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workers.conf");
         write_private(
@@ -414,11 +420,12 @@ mod tests {
         )
         .unwrap();
         let workers = Workers::new(path.clone(), false).unwrap();
-        assert_eq!(workers.allocation.cpu_workers, workers.max_cpu.min(8));
-        assert_eq!(workers.allocation.ocr_workers, 1);
-        assert_eq!(workers.allocation.gpu_workers, 0);
+        assert_eq!(workers.allocation.cpu_workers, 8);
+        assert_eq!(workers.allocation.ocr_workers, 2);
+        assert_eq!(workers.allocation.gpu_workers, 1);
+        assert_eq!(workers.limits(&Snapshot::fixture(4.0, None)).gpu_workers, 0);
         assert!(workers.allocation.paused);
-        assert_eq!(read_json(&path, 4096).unwrap()["gpu_workers"], 0);
+        assert_eq!(read_json(&path, 4096).unwrap()["gpu_workers"], 1);
     }
 
     #[test]
@@ -504,12 +511,58 @@ mod tests {
         workers.allocation.paused = true;
         assert!(!workers.can_start(&sample, false));
         workers.allocation.paused = false;
-        assert_eq!(workers.limits(&Snapshot::fixture(0.5, None)).cpu_workers, 1);
+        assert_eq!(workers.limits(&Snapshot::fixture(0.5, None)).cpu_workers, 4);
         assert_eq!(
             workers
                 .limits(&Snapshot::fixture(4.0, Some(512 * 1024 * 1024)))
                 .ocr_workers,
             0
         );
+    }
+
+    #[test]
+    fn large_targets_are_preserved_without_large_execution_allocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.conf");
+        let mut workers = Workers::new(path.clone(), false).unwrap();
+        workers.update(&json!({"cpu_workers":MAX_REQUESTED,"ocr_workers":MAX_REQUESTED,"gpu_workers":MAX_REQUESTED,"paused":false})).unwrap();
+        let sample = Snapshot::fixture(0.5, Some(1536 * 1024 * 1024));
+        let public = workers.public(&sample);
+        assert_eq!(public["requested"]["gpu_workers"], MAX_REQUESTED);
+        assert_eq!(public["effective"]["cpu_workers"], 5);
+        assert_eq!(public["effective"]["ocr_workers"], 0);
+        assert_eq!(public["effective"]["gpu_workers"], 0);
+        assert_eq!(public["admission"]["gpu"]["allowed"], false);
+        assert!(workers.active.capacity() <= HARD_TOTAL_LIMIT);
+        assert_eq!(
+            Workers::new(path, false).unwrap().allocation.cpu_workers,
+            MAX_REQUESTED
+        );
+    }
+
+    #[test]
+    fn live_memory_pressure_blocks_new_files_with_an_explicit_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workers = Workers::new(dir.path().join("workers.conf"), true).unwrap();
+        workers.gpu.eligible = true;
+        workers.gpu.max_workers = 1;
+        workers.allocation.gpu_workers = 1;
+        let sample = Snapshot::fixture(4.0, Some(1536 * 1024 * 1024))
+            .with_memory_current(1400 * 1024 * 1024);
+        for resource in ["cpu", "cpu_ocr", "gpu"] {
+            assert!(!workers.can_start_resource(&sample, resource));
+            assert!(
+                workers
+                    .admission_reason(&sample, resource)
+                    .unwrap()
+                    .contains("memory pressure")
+            );
+        }
+        assert_eq!(
+            workers.public(&sample)["admission"]["gpu"]["allowed"],
+            false
+        );
+        let recovered = sample.with_memory_current(128 * 1024 * 1024);
+        assert!(workers.can_start_resource(&recovered, "gpu"));
     }
 }
