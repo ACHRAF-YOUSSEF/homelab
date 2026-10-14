@@ -1,5 +1,14 @@
 # Subforge revisions
 
+## 0.4.0
+
+- Refresh the dashboard with an ember-accented dark palette, compact pipeline summary, and clickable stage filters.
+- Keep inventory search, filter, and pagination state per browser tab, and add a per-track drawer for embedded and sidecar subtitle selection.
+- Report tracked SRT output counts separately from tracked processed-input totals; show totals as unavailable when bounded tracking cannot provide an exact answer.
+- Add bounded retries for recorded failed paths, observed-request integration indicators, Jellyfin library names with IDs, and live resource bars.
+- Scope selected-track failure records to the current source fingerprint and clear only failures resolved by a successful whole-file pass.
+- Publish fixed local CPU and CUDA image tags for `0.4.0`; Compose uses the prebuilt selected edition.
+
 ## 0.3.1
 
 - Split Subforge into fixed local tags `homelab-subtitle-converter:0.3.1-cpu` and `homelab-subtitle-converter:0.3.1-cuda`; Compose starts prebuilt images and never builds or pulls them.

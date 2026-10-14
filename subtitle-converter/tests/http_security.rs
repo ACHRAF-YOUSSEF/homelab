@@ -520,6 +520,91 @@ fn manual_extraction_rejects_traversal_and_symlinks_without_touching_targets() {
 }
 
 #[test]
+fn track_selection_api_validates_scope_types_and_known_ids() {
+    let mut server = Server::start();
+    let source = server.root.join("Selected fixture.mkv");
+    fs::write(&source, b"disposable media fixture").unwrap();
+    fs::write(server.data.join("inventory.json"), json!({"updated":10.0,"items":[{"path":source,"type":"video","tracks":[{"number":3,"language":"en","format":"SubRip"},{"number":4,"language":"en","format":"SubRip"}]}]}).to_string()).unwrap();
+    server.restart();
+    let csrf = server.csrf();
+    for selection in [
+        json!([]),
+        json!([3, 3]),
+        json!([99]),
+        json!(["3"]),
+        json!([-1]),
+        json!([3.0]),
+        json!(null),
+        json!(vec![3; 65]),
+    ] {
+        let response = server.json_request(
+            "POST",
+            "/api/jobs",
+            &csrf,
+            &json!({"kind":"extract","paths":[source],"track_ids":selection}),
+        );
+        assert_eq!(response.status, 400, "invalid selection must fail closed");
+    }
+    let wrong_kind = server.json_request(
+        "POST",
+        "/api/jobs",
+        &csrf,
+        &json!({"kind":"scan","paths":[source],"track_ids":[3]}),
+    );
+    assert_eq!(wrong_kind.status, 400);
+    let too_many_files = server.json_request(
+        "POST",
+        "/api/jobs",
+        &csrf,
+        &json!({"kind":"extract","paths":[source,source],"track_ids":[3]}),
+    );
+    assert_eq!(too_many_files.status, 400);
+    let accepted = server.json_request(
+        "POST",
+        "/api/jobs",
+        &csrf,
+        &json!({"kind":"extract","paths":[source],"track_ids":[4],"include_ocr":false}),
+    );
+    assert_eq!(accepted.status, 202);
+    assert_eq!(accepted.body["job"]["track_ids"], json!([4]));
+    let legacy = server.job_request(&csrf, &[utf8_path(&source)]);
+    assert_eq!(legacy.status, 202);
+    assert!(legacy.body["job"].get("track_ids").is_none());
+    let status = server
+        .request(
+            "GET",
+            "/api/status",
+            &[("Authorization", &server.auth_header())],
+            None,
+        )
+        .unwrap();
+    assert_eq!(status.body["pipeline"]["generated_srt_count"], 0);
+    assert_eq!(status.body["pipeline"]["files_inspected"], 1);
+    for secret in [PASSWORD, WIDGET_TOKEN, WEBHOOK_TOKEN] {
+        assert!(!status.body.to_string().contains(secret));
+    }
+    for key in [
+        "password",
+        "api_key",
+        "csrf_token",
+        "widget_token",
+        "webhook_token",
+    ] {
+        assert!(
+            !status.body["pipeline"]
+                .to_string()
+                .contains(&format!("\"{key}\":"))
+        );
+    }
+    for provider in ["sonarr", "radarr", "jellyfin", "bazarr"] {
+        assert_eq!(
+            status.body["settings"]["integrations"][provider]["api_key"],
+            ""
+        );
+    }
+}
+
+#[test]
 fn inventory_api_is_separate_from_status_and_snapshot_survives_backend_restart() {
     let mut server = Server::start();
     let media = server.root.join("Inventory fixture.mkv");

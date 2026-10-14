@@ -34,6 +34,7 @@ const MAX_TRACK_LABEL: usize = 32;
 // failures immediately. Successful fingerprint caches are independent.
 const ERROR_CACHE_REVISION: u64 = 1;
 const MAX_CANDIDATES: usize = 20_000;
+const MAX_TRACKED_OUTPUTS: usize = 20_000;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -88,11 +89,14 @@ pub struct Converter {
     metadata: Arc<Mutex<crate::metadata::MetadataCache>>,
     persist_state: bool,
     state_dirty: bool,
+    selected_tracks: Option<Vec<u64>>,
     gpu_ocr: Option<u32>,
     gpu_health: Mutex<Option<crate::gpu::Health>>,
     gpu_failure: Mutex<Option<&'static str>>,
     #[cfg(test)]
     file_gate: Option<Arc<FileGate>>,
+    #[cfg(test)]
+    text_fixture: Option<&'static [u8]>,
 }
 
 impl Converter {
@@ -127,11 +131,14 @@ impl Converter {
             ))),
             persist_state: true,
             state_dirty: false,
+            selected_tracks: None,
             gpu_ocr: None,
             gpu_health: Mutex::new(None),
             gpu_failure: Mutex::new(None),
             #[cfg(test)]
             file_gate: None,
+            #[cfg(test)]
+            text_fixture: None,
         })
     }
 
@@ -276,7 +283,8 @@ impl Converter {
                         .iter()
                         .map(|c| {
                             json!({
-                                "number": c[2].parse::<u64>().unwrap_or(0),
+                                "id": c[2].parse::<u64>().ok(),
+                                "number": c[2].parse::<u64>().ok(),
                                 "language": short_language(&bounded_track_language(&c[1]), &self.language_aliases),
                                 "forced": false, "hi": false, "format": "VobSub"
                             })
@@ -377,7 +385,41 @@ impl Converter {
                 continue;
             }
             let key = path.to_string_lossy().to_string();
-            let previous = self.state.get(&key).cloned().unwrap_or_else(|| json!({}));
+            let selection_coverage = if let Some(ids) = &self.selected_tracks {
+                let description = self.describe_with_stop(&path, stop)?;
+                validate_track_ids(&description, ids)?;
+                let selected = description
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|track| track["number"].as_u64().is_some_and(|id| ids.contains(&id)));
+                let mut selected_languages = BTreeSet::new();
+                let mut required_text = false;
+                let mut required_ocr = false;
+                for track in selected {
+                    selected_languages.insert(short_language(
+                        track["language"].as_str().unwrap_or("und"),
+                        &self.language_aliases,
+                    ));
+                    let image = is_image_format(track["format"].as_str().unwrap_or(""));
+                    required_text |= !image && workload != Workload::Ocr;
+                    required_ocr |= image && workload != Workload::Text && self.enable_ocr;
+                }
+                json!({"languages":selected_languages,"text":required_text,"ocr":required_ocr})
+            } else {
+                json!({"languages":languages.iter().map(|language| if language == "*" { "*".to_owned() } else {short_language(language, &self.language_aliases)}).collect::<BTreeSet<_>>(),
+                    "text":workload != Workload::Ocr,"ocr":workload != Workload::Text && self.enable_ocr})
+            };
+            let scope = self.selection_key();
+            let previous = self
+                .state
+                .get(&key)
+                .and_then(|entry| match &scope {
+                    Some(scope) => entry.get("track_selections")?.get(scope),
+                    None => Some(entry),
+                })
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let previous_outputs = safe_outputs(&previous);
             if previous.get("fingerprint") == Some(&fingerprint_json(&before)) {
                 let covered = previous
@@ -405,6 +447,22 @@ impl Converter {
                     && text_covered
                     && outputs_exist
                 {
+                    if scope.is_none() {
+                        let mut cached_entry = previous.clone();
+                        cached_entry["selection_coverage"] = selection_coverage.clone();
+                        let needs_refresh = cached_entry["track_selections"]
+                            .as_object()
+                            .is_some_and(|selections| {
+                                selections.values().any(|selection| {
+                                    selection.get("fingerprint") != cached_entry.get("fingerprint")
+                                        || resolved_selection(&cached_entry, selection)
+                                })
+                            });
+                        if needs_refresh {
+                            self.set_scoped_state_entry(&key, None, cached_entry)?;
+                            self.persist_state()?;
+                        }
+                    }
                     bump(&mut summary, "cached");
                     progress(json!({"status":"cached","path":path,"summary":summary}));
                     continue;
@@ -454,7 +512,7 @@ impl Converter {
                     let ocr_complete = (workload != Workload::Text && self.enable_ocr)
                         || (unchanged
                             && previous["ocr"].as_bool().unwrap_or(previous["ok"] == true));
-                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"outputs":output_names,"ok":true,"languages":completed_languages,"ocr":ocr_complete,"ocr_pending":ocr_pending && !ocr_complete,"text_complete":text_complete}));
+                    self.set_scoped_state_entry(&key, scope.as_deref(), json!({"fingerprint":fingerprint_json(&before),"outputs":output_names,"ok":true,"languages":completed_languages,"ocr":ocr_complete,"ocr_pending":ocr_pending && !ocr_complete,"text_complete":text_complete,"selection_coverage":selection_coverage}))?;
                     if self.persist_state().is_err() {
                         bump(&mut summary, "failed");
                         continue;
@@ -481,7 +539,7 @@ impl Converter {
                     bump(&mut summary, "failed");
                     let safe = bounded_message(&message);
                     progress(json!({"status":"failed","path":path,"error":safe,"summary":summary}));
-                    self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION,"ocr_pending":workload==Workload::Ocr || previous["ocr_pending"]==true,"text_complete":previous["text_complete"].as_bool().unwrap_or(previous["ok"]==true),"outputs":previous_outputs}));
+                    self.set_scoped_state_entry(&key, scope.as_deref(), json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION,"ocr_pending":workload==Workload::Ocr || previous["ocr_pending"]==true,"text_complete":previous["text_complete"].as_bool().unwrap_or(previous["ok"]==true),"outputs":previous_outputs,"selection_coverage":selection_coverage}))?;
                     let _ = self.persist_state();
                 }
             }
@@ -523,6 +581,168 @@ impl Converter {
         self.worker_with_state(json!({}))
     }
 
+    /// IDs identify existing embedded tracks, never command arguments.
+    pub fn select_tracks(&mut self, ids: Vec<u64>) -> Result<(), String> {
+        if ids.is_empty()
+            || ids.len() > MAX_TRACKS
+            || ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len()
+        {
+            return Err("Choose 1–64 unique subtitle track IDs".into());
+        }
+        self.selected_tracks = Some(ids);
+        Ok(())
+    }
+
+    fn selection_key(&self) -> Option<String> {
+        let mut ids = self.selected_tracks.clone()?;
+        ids.sort_unstable();
+        Some(ids.iter().map(u64::to_string).collect::<Vec<_>>().join(","))
+    }
+
+    fn set_scoped_state_entry(
+        &mut self,
+        key: &str,
+        scope: Option<&str>,
+        mut entry: Value,
+    ) -> Result<(), String> {
+        let previous = self.state.get(key);
+        let current_fingerprint = entry.get("fingerprint").cloned();
+        if let Some(scope) = scope {
+            let mut merged = previous.cloned().unwrap_or_else(|| json!({}));
+            let mut outputs: BTreeSet<_> = safe_outputs(&merged).into_iter().collect();
+            outputs.extend(safe_outputs(&entry));
+            merged["outputs"] = json!(outputs);
+            if !merged["track_selections"].is_object() {
+                merged["track_selections"] = json!({});
+            }
+            if let Some(selections) = merged["track_selections"].as_object_mut() {
+                selections.retain(|_, selection| {
+                    selection.get("fingerprint") == current_fingerprint.as_ref()
+                });
+                // One file remains bounded even after many different manual selections.
+                if selections.len() >= MAX_TRACKS
+                    && !selections.contains_key(scope)
+                    && let Some(oldest) = selections.keys().next().cloned()
+                {
+                    selections.remove(&oldest);
+                }
+                selections.insert(scope.to_owned(), entry);
+            }
+            entry = merged;
+        } else if let Some(selections) =
+            previous.and_then(|previous| previous.get("track_selections"))
+        {
+            let retained: serde_json::Map<_, _> = selections
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, selection)| {
+                    selection.get("fingerprint") == current_fingerprint.as_ref()
+                        && !resolved_selection(&entry, selection)
+                })
+                .map(|(scope, selection)| (scope.clone(), selection.clone()))
+                .collect();
+            entry["track_selections"] = json!(retained);
+            let mut outputs: BTreeSet<_> = safe_outputs(&entry).into_iter().collect();
+            outputs.extend(previous.into_iter().flat_map(safe_outputs));
+            entry["outputs"] = json!(outputs);
+        }
+        if let Some(fingerprint) = current_fingerprint {
+            entry["processing_fingerprint"] = fingerprint;
+        }
+        // Keep each worker snapshot within its existing 64 KiB bound. Evict
+        // older selection caches; never erase the legacy whole-file success.
+        while crate::util::bounded_json_clone(&entry, 64 * 1024).is_err() {
+            let selections = entry["track_selections"]
+                .as_object_mut()
+                .ok_or("File state exceeds its size limit")?;
+            let oldest = selections
+                .keys()
+                .find(|key| Some(key.as_str()) != scope)
+                .cloned()
+                .ok_or("Selected file state exceeds its size limit")?;
+            selections.remove(&oldest);
+        }
+        self.set_state_entry(key, entry);
+        Ok(())
+    }
+
+    /// Snapshot from bounded persisted state only. No filesystem queries or probes.
+    pub fn pipeline_counts(&self) -> Value {
+        let mut outputs = BTreeSet::new();
+        let mut pending = 0_u64;
+        let mut failed = 0_u64;
+        let mut output_count_available = true;
+        for (source, entry) in self.state.as_object().into_iter().flatten() {
+            let path = Path::new(source);
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+                || !self.roots.iter().any(|root| path.starts_with(root))
+            {
+                continue;
+            }
+            for name in entry["outputs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if Path::new(name).file_name().and_then(|value| value.to_str()) == Some(name)
+                    && Path::new(name).extension().is_some_and(|ext| ext == "srt")
+                    && let Some(parent) = path.parent()
+                {
+                    if outputs.len() < MAX_TRACKED_OUTPUTS {
+                        outputs.insert((parent, name));
+                    } else if !outputs.contains(&(parent, name)) {
+                        output_count_available = false;
+                    }
+                }
+            }
+            let mut file_pending = false;
+            let mut file_failed = false;
+            for item in current_processing_entries(entry) {
+                file_pending |= item["ocr_pending"] == true;
+                file_failed |= failed_state(item);
+            }
+            pending += u64::from(file_pending);
+            failed += u64::from(file_failed);
+        }
+        json!({"generated_srt_count":if output_count_available {Some(outputs.len())}else{None},"pending_ocr_files":pending,"failed_files":failed,"generated_srt_count_available":output_count_available})
+    }
+
+    pub fn file_processing(&self, path: &str) -> Value {
+        let Some(entry) = self.state.get(path) else {
+            return json!({"pending_ocr":false,"failed":false,"generated_srt_count":0});
+        };
+        let mut outputs = BTreeSet::new();
+        let mut available = true;
+        for name in entry["outputs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|name| {
+                Path::new(name).file_name().and_then(|value| value.to_str()) == Some(*name)
+                    && Path::new(name).extension().is_some_and(|ext| ext == "srt")
+            })
+        {
+            if outputs.len() < MAX_TRACKED_OUTPUTS {
+                outputs.insert(name);
+            } else if !outputs.contains(name) {
+                available = false;
+            }
+        }
+        let mut pending = false;
+        let mut failed = false;
+        for item in current_processing_entries(entry) {
+            pending |= item["ocr_pending"] == true;
+            failed |= failed_state(item);
+        }
+        json!({"pending_ocr":pending,"failed":failed,"generated_srt_count":if available {Some(outputs.len())}else{None}})
+    }
+
     fn worker_with_state(&self, state: Value) -> Self {
         Self {
             roots: self.roots.clone(),
@@ -541,11 +761,14 @@ impl Converter {
             metadata: Arc::clone(&self.metadata),
             persist_state: false,
             state_dirty: false,
+            selected_tracks: None,
             gpu_ocr: None,
             gpu_health: Mutex::new(None),
             gpu_failure: Mutex::new(None),
             #[cfg(test)]
             file_gate: self.file_gate.clone(),
+            #[cfg(test)]
+            text_fixture: self.text_fixture,
         }
     }
 
@@ -822,6 +1045,11 @@ impl Converter {
         } else {
             Vec::new()
         };
+        if let Some(ids) = &self.selected_tracks
+            && is_video(path)
+        {
+            validate_selected_tracks(&tracks, ids)?;
+        }
         let mut counts: BTreeMap<(String, bool, bool), usize> = BTreeMap::new();
         for track in &tracks {
             *counts
@@ -837,7 +1065,10 @@ impl Converter {
         if is_video(path) {
             for track in tracks {
                 let lang = short_language(&track.language, &self.language_aliases);
-                if !wants(&track.language, languages, &self.language_aliases) {
+                if self.selected_tracks.as_ref().map_or_else(
+                    || !wants(&track.language, languages, &self.language_aliases),
+                    |ids| !track.number.as_u64().is_some_and(|id| ids.contains(&id)),
+                ) {
                     continue;
                 }
                 let mut stem = path
@@ -900,7 +1131,7 @@ impl Converter {
             };
             if idx.exists() {
                 let text = read_index_text(&idx)?;
-                let re = Regex::new(r"(?mi)^id:\s*([a-zA-Z-]+),\s*index:\s*\d+.*$")
+                let re = Regex::new(r"(?mi)^id:\s*([a-zA-Z-]+),\s*index:\s*(\d+).*$")
                     .map_err(|_| "Invalid subtitle parser")?;
                 let caps: Vec<_> = re.captures_iter(&text).take(MAX_TRACKS + 1).collect();
                 if caps.len() > MAX_TRACKS {
@@ -910,7 +1141,11 @@ impl Converter {
                 let body_re = Regex::new(r"(?mi)^(id:.*index:)\s*\d+").unwrap();
                 for (n, c) in caps.iter().enumerate() {
                     let lang = bounded_track_language(&c[1]);
-                    if !wants(&lang, languages, &self.language_aliases) {
+                    let track_id = c[2].parse::<u64>().ok();
+                    if self.selected_tracks.as_ref().map_or_else(
+                        || !wants(&lang, languages, &self.language_aliases),
+                        |ids| !track_id.is_some_and(|id| ids.contains(&id)),
+                    ) {
                         continue;
                     }
                     if workload == Workload::Text || !self.enable_ocr {
@@ -923,6 +1158,22 @@ impl Converter {
                         .and_then(|s| s.to_str())
                         .unwrap_or("subtitle")
                         .to_owned();
+                    if caps
+                        .iter()
+                        .filter(|capture| {
+                            short_language(
+                                &bounded_track_language(&capture[1]),
+                                &self.language_aliases,
+                            ) == label
+                        })
+                        .count()
+                        > 1
+                    {
+                        stem.push_str(&format!(
+                            ".track{}",
+                            track_id.ok_or("VobSub track ID is invalid")?
+                        ));
+                    }
                     if filename_language(path, &self.language_aliases) != label {
                         stem.push_str(&format!(".{label}"));
                     }
@@ -1101,12 +1352,7 @@ impl Converter {
                 command
                     .args(["-c:s", "srt", "-threads", "1", "-f", "srt"])
                     .arg(&staged);
-                crate::util::bounded_process(
-                    &mut command,
-                    self.timeout,
-                    stop,
-                    MAX_CONVERTER_OUTPUT,
-                )?;
+                self.extract_text(&mut command, &staged, stop)?;
             }
             if staged.is_symlink() {
                 return Err("Converter created an unsafe symbolic-link output".into());
@@ -1130,6 +1376,19 @@ impl Converter {
             }
         }
         Ok((outputs, ocr_pending, published))
+    }
+
+    fn extract_text(
+        &self,
+        command: &mut Command,
+        _staged: &Path,
+        stop: &AtomicBool,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(bytes) = self.text_fixture {
+            return fs::write(_staged, bytes).map_err(|_| "Cannot write fixture subtitle".into());
+        }
+        crate::util::bounded_process(command, self.timeout, stop, MAX_CONVERTER_OUTPUT).map(|_| ())
     }
 
     fn ocr_for(&self, language: &str) -> String {
@@ -1349,7 +1608,100 @@ fn is_image_format(format: &str) -> bool {
     .any(|v| f.contains(v))
 }
 fn track_json(t: Track) -> Value {
-    json!({"number":t.number,"language":t.language,"format":t.format,"forced":t.forced,"hi":t.hi})
+    json!({"id":t.number,"number":t.number,"language":t.language,"format":t.format,"forced":t.forced,"hi":t.hi})
+}
+
+fn validate_selected_tracks(tracks: &[Track], ids: &[u64]) -> Result<(), String> {
+    if ids.iter().any(|id| {
+        tracks
+            .iter()
+            .filter(|track| track.number.as_u64() == Some(*id))
+            .count()
+            != 1
+    }) {
+        return Err(
+            "Selected subtitle track is unknown or ambiguous; refresh the inventory".into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_track_ids(description: &Value, ids: &[u64]) -> Result<(), String> {
+    if ids.is_empty()
+        || ids.len() > MAX_TRACKS
+        || ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len()
+    {
+        return Err("Choose 1–64 unique subtitle track IDs".into());
+    }
+    if ids.iter().any(|id| {
+        description
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|track| track["number"].as_u64() == Some(*id))
+            .count()
+            != 1
+    }) {
+        return Err(
+            "Selected subtitle track is unknown or ambiguous; refresh the inventory".into(),
+        );
+    }
+    Ok(())
+}
+
+fn failed_state(entry: &Value) -> bool {
+    entry["ok"] == false
+        && (entry["error"].is_string()
+            || (entry["ocr_pending"] != true && entry["text_complete"] != true))
+}
+
+fn current_processing_entries(entry: &Value) -> impl Iterator<Item = &Value> {
+    let fingerprint = entry
+        .get("processing_fingerprint")
+        .or_else(|| entry.get("fingerprint"));
+    let scopes = entry["track_selections"]
+        .as_object()
+        .into_iter()
+        .flat_map(|scopes| scopes.values());
+    std::iter::once(entry).chain(scopes).filter(move |item| {
+        fingerprint.is_none_or(|fingerprint| item.get("fingerprint") == Some(fingerprint))
+    })
+}
+
+fn resolved_selection(whole: &Value, selection: &Value) -> bool {
+    if whole["ok"] != true || (!failed_state(selection) && selection["ocr_pending"] != true) {
+        return false;
+    }
+    let whole_coverage = &whole["selection_coverage"];
+    let completed_languages = whole_coverage
+        .get("languages")
+        .unwrap_or(&whole["languages"]);
+    let all_languages = completed_languages
+        .as_array()
+        .is_some_and(|languages| languages.iter().any(|language| language == "*"));
+    let coverage = &selection["selection_coverage"];
+    let languages_covered = all_languages
+        || coverage["languages"].as_array().is_some_and(|languages| {
+            !languages.is_empty()
+                && languages.iter().all(|language| {
+                    completed_languages
+                        .as_array()
+                        .is_some_and(|completed| completed.contains(language))
+                })
+        });
+    // Legacy scope entries lack precise pass coverage, so only a complete
+    // whole-file text/OCR pass may resolve their failures.
+    let text_needed = coverage["text"].as_bool().unwrap_or(true);
+    let ocr_needed = coverage["ocr"].as_bool().unwrap_or(true) || selection["ocr_pending"] == true;
+    let text_covered = whole_coverage["text"]
+        .as_bool()
+        .unwrap_or(whole["text_complete"] == true);
+    let ocr_covered = whole_coverage["ocr"]
+        .as_bool()
+        .unwrap_or(whole["ocr"] == true);
+    languages_covered
+        && (!text_needed || text_covered)
+        && (!ocr_needed || (ocr_covered && whole["ocr_pending"] != true))
 }
 
 fn numeric_stream_id(stream: &Value) -> Option<u64> {
@@ -1788,6 +2140,401 @@ mod tests {
         assert!(failure_retry_delayed(&current, false, 1001.0, interval));
         assert!(!failure_retry_delayed(&current, true, 1001.0, interval));
         assert!(!failure_retry_delayed(&current, false, 4601.0, interval));
+    }
+
+    #[test]
+    fn selected_same_language_track_extracts_only_its_stream_and_has_independent_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("selected.mkv");
+        fs::write(&media, b"disposable media fixture").unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.min_age = Duration::ZERO;
+        converter.text_fixture = Some(b"1\n00:00:00,000 --> 00:00:01,000\nFixture subtitle\n");
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        let tracks: Vec<_> = [(3, 7), (4, 11)]
+            .into_iter()
+            .map(|(number, stream)| Track {
+                number: json!(number),
+                native_number: Some(number.to_string()),
+                stream_index: Some(stream),
+                language: "eng".into(),
+                format: "SubRip".into(),
+                forced: false,
+                hi: false,
+            })
+            .collect();
+        converter.metadata.lock().unwrap().insert(
+            &media.to_string_lossy(),
+            fingerprint_json(&fingerprint(&media).unwrap()),
+            json!(tracks),
+        );
+        converter.set_state_entry(&media.to_string_lossy(), json!({"ok":true,"fingerprint":fingerprint_json(&fingerprint(&media).unwrap()),"languages":["*"],"outputs":[]}));
+        converter.select_tracks(vec![4]).unwrap();
+        let mut events = Vec::new();
+        let first = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["fr".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert_eq!(first["converted"], 1);
+        let extracting: Vec<_> = events
+            .iter()
+            .filter(|event| event["status"] == "extracting")
+            .collect();
+        assert_eq!(extracting.len(), 1);
+        assert_eq!(extracting[0]["track"], 11);
+        assert!(dir.path().join("selected.track4.en.srt").is_file());
+        assert!(!dir.path().join("selected.track3.en.srt").exists());
+        let second = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["fr".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(second["cached"], 1);
+        converter.select_tracks(vec![3]).unwrap();
+        let third = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["en".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(third["converted"], 1);
+        assert!(dir.path().join("selected.track3.en.srt").is_file());
+        assert_eq!(converter.pipeline_counts()["generated_srt_count"], 2);
+        converter.selected_tracks = None;
+        let legacy = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(legacy["cached"], 1);
+        converter.select_tracks(vec![99]).unwrap();
+        assert!(
+            converter
+                .scan(
+                    &[media],
+                    &["*".into()],
+                    false,
+                    &AtomicBool::new(false),
+                    &mut |_| {}
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vobsub_selection_uses_section_ids_even_with_duplicate_languages() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("selected.idx");
+        fs::write(&idx, "langidx: 0\nid: en, index: 2\ntimestamp: 00:00:00:000, filepos: 000000\nid: en, index: 7\ntimestamp: 00:00:01:000, filepos: 000010\n").unwrap();
+        fs::write(idx.with_extension("sub"), b"disposable payload").unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.select_tracks(vec![7]).unwrap();
+        converter.enable_ocr = true;
+        converter.seconv = dir.path().join("missing-tool");
+        let description = converter.describe(&idx).unwrap();
+        assert_eq!(description[1]["id"], 7);
+        validate_track_ids(&description, &[7]).unwrap();
+        assert!(validate_track_ids(&description, &[1]).is_err());
+        let mut events = Vec::new();
+        assert!(
+            converter
+                .convert(
+                    &idx,
+                    &["fr".into()],
+                    Workload::All,
+                    &AtomicBool::new(false),
+                    &mut |event| events.push(event)
+                )
+                .is_err()
+        );
+        let extracting: Vec<_> = events
+            .iter()
+            .filter(|event| event["status"] == "extracting")
+            .collect();
+        assert_eq!(extracting.len(), 1);
+        assert_eq!(extracting[0]["output"], "selected.track7.en.srt");
+    }
+
+    #[test]
+    fn successful_whole_file_retry_resolves_same_fingerprint_selected_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("retry.mkv");
+        fs::write(&media, b"disposable source").unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.min_age = Duration::ZERO;
+        converter.enable_ocr = false;
+        converter.ffmpeg = dir.path().join("missing-fixture-tool");
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        let track = Track {
+            number: json!(3),
+            native_number: Some("3".into()),
+            stream_index: Some(7),
+            language: "eng".into(),
+            format: "SubRip".into(),
+            forced: false,
+            hi: false,
+        };
+        converter.metadata.lock().unwrap().insert(
+            &media.to_string_lossy(),
+            fingerprint_json(&fingerprint(&media).unwrap()),
+            json!([track]),
+        );
+        converter.select_tracks(vec![3]).unwrap();
+        let failed = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["fr".into()],
+                true,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(failed["failed"], 1);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        assert_eq!(
+            converter.file_processing(&media.to_string_lossy())["failed"],
+            true
+        );
+        assert_eq!(
+            converter.state[media.to_string_lossy().as_ref()]["track_selections"]["3"]["selection_coverage"]
+                ["languages"],
+            json!(["en"])
+        );
+        converter.selected_tracks = None;
+        converter.text_fixture = Some(b"1\n00:00:00,000 --> 00:00:01,000\nFixture subtitle\n");
+        let retried = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["en".into()],
+                true,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(retried["converted"], 1);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 0);
+        assert_eq!(
+            converter.file_processing(&media.to_string_lossy())["failed"],
+            false
+        );
+        assert!(
+            converter.state[media.to_string_lossy().as_ref()]["track_selections"]
+                .get("3")
+                .is_none()
+        );
+        let restarted = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        assert_eq!(restarted.pipeline_counts()["failed_files"], 0);
+    }
+
+    #[test]
+    fn valid_whole_file_cache_hit_also_resolves_covered_selected_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("cached-retry.mkv");
+        fs::write(&media, b"disposable source").unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.min_age = Duration::ZERO;
+        converter.enable_ocr = false;
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        let fp = fingerprint_json(&fingerprint(&media).unwrap());
+        converter.set_state_entry(&media.to_string_lossy(),json!({"fingerprint":fp,"ok":true,"languages":["*"],"text_complete":true,"ocr":false,"outputs":[],"track_selections":{
+            "3":{"fingerprint":fp,"ok":false,"error":"Retry fixture","selection_coverage":{"languages":["en"],"text":true,"ocr":false}}
+        }}));
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        let result = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["en".into()],
+                true,
+                Workload::Text,
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(result["cached"], 1);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 0);
+        assert_eq!(
+            converter.file_processing(&media.to_string_lossy())["failed"],
+            false
+        );
+        let restarted = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        assert_eq!(restarted.pipeline_counts()["failed_files"], 0);
+    }
+
+    #[test]
+    fn source_change_excludes_stale_scopes_and_successful_whole_pass_prunes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir
+            .path()
+            .join("changed.mkv")
+            .to_string_lossy()
+            .into_owned();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        let old = json!([[10, 1000]]);
+        let current = json!([[20, 2000]]);
+        converter.set_state_entry(
+            &source,
+            json!({"fingerprint":current,"ok":true,"outputs":["changed.en.srt"],"track_selections":{
+                "3":{"fingerprint":old,"ok":false,"error":"Old failure"},
+                "4":{"fingerprint":old,"ok":true,"ocr_pending":true}
+            }}),
+        );
+        assert_eq!(converter.pipeline_counts()["failed_files"], 0);
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 0);
+        assert_eq!(converter.file_processing(&source)["failed"], false);
+        assert_eq!(converter.file_processing(&source)["pending_ocr"], false);
+        converter.set_scoped_state_entry(&source,None,json!({"fingerprint":current,"ok":true,"languages":["*"],"text_complete":true,"ocr":true,"outputs":["changed.en.srt"]})).unwrap();
+        assert!(
+            converter.state[&source]["track_selections"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        // A new selected pass also hides a prior whole-file failure, without
+        // replacing the old whole-file cache fingerprint or tracked outputs.
+        converter.set_state_entry(&source,json!({"fingerprint":old,"ok":false,"error":"Old whole-file failure","outputs":["changed.en.srt"]}));
+        converter
+            .set_scoped_state_entry(
+                &source,
+                Some("5"),
+                json!({"fingerprint":current,"ok":true,"outputs":[]}),
+            )
+            .unwrap();
+        assert_eq!(converter.state[&source]["fingerprint"], old);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 0);
+        assert_eq!(converter.pipeline_counts()["generated_srt_count"], 1);
+    }
+
+    #[test]
+    fn whole_file_coverage_retains_unresolved_ocr_other_languages_and_success_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir
+            .path()
+            .join("coverage.mkv")
+            .to_string_lossy()
+            .into_owned();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        let fingerprint = json!([[10, 1000]]);
+        converter.set_state_entry(&source,json!({"fingerprint":fingerprint,"outputs":[],"track_selections":{
+            "3":{"fingerprint":fingerprint,"ok":true,"ocr_pending":true,"selection_coverage":{"languages":["en"],"text":false,"ocr":false}},
+            "4":{"fingerprint":fingerprint,"ok":false,"error":"French OCR failure","selection_coverage":{"languages":["fr"],"text":false,"ocr":true}},
+            "5":{"fingerprint":fingerprint,"ok":true,"outputs":[],"languages":["en"]}
+        }}));
+        converter.set_scoped_state_entry(&source,None,json!({"fingerprint":fingerprint,"ok":true,"languages":["en","fr"],"text_complete":true,"ocr":true,"outputs":[],"selection_coverage":{"languages":["en"],"text":true,"ocr":false}})).unwrap();
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 1);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        assert_eq!(
+            converter.state[&source]["track_selections"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        converter.set_scoped_state_entry(&source,None,json!({"fingerprint":fingerprint,"ok":true,"languages":["en"],"text_complete":true,"ocr":true,"outputs":[]})).unwrap();
+        assert!(
+            converter.state[&source]["track_selections"]
+                .get("3")
+                .is_none()
+        );
+        assert!(
+            converter.state[&source]["track_selections"]
+                .get("4")
+                .is_some()
+        );
+        assert!(
+            converter.state[&source]["track_selections"]
+                .get("5")
+                .is_some()
+        );
+        converter.set_scoped_state_entry(&source,None,json!({"fingerprint":fingerprint,"ok":true,"languages":["*"],"text_complete":true,"ocr":true,"outputs":[]})).unwrap();
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 0);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 0);
+        assert!(
+            converter.state[&source]["track_selections"]
+                .get("5")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn track_ids_reject_empty_duplicate_unknown_and_ambiguous_selections() {
+        let tracks = json!([{"number":3},{"number":4},{"number":null}]);
+        for ids in [vec![], vec![3, 3], vec![0], vec![99], vec![3; 65]] {
+            assert!(validate_track_ids(&tracks, &ids).is_err());
+        }
+        assert!(validate_track_ids(&json!([{"number":3},{"number":3}]), &[3]).is_err());
+        validate_track_ids(&tracks, &[3, 4]).unwrap();
+    }
+
+    #[test]
+    fn tracked_output_counts_become_unavailable_at_the_explicit_allocation_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        let source = dir
+            .path()
+            .join("fixture.mkv")
+            .to_string_lossy()
+            .into_owned();
+        let outputs: Vec<_> = (0..=MAX_TRACKED_OUTPUTS)
+            .map(|index| format!("fixture.{index}.srt"))
+            .collect();
+        converter.set_state_entry(&source, json!({"ok":true,"outputs":outputs}));
+        let summary = converter.pipeline_counts();
+        assert!(summary["generated_srt_count"].is_null());
+        assert_eq!(summary["generated_srt_count_available"], false);
+        assert!(converter.file_processing(&source)["generated_srt_count"].is_null());
     }
 
     #[test]

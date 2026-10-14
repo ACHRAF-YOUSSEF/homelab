@@ -103,6 +103,9 @@ struct Runtime {
     inventory_updated: f64,
     inventory_truncated: bool,
     inventory_partial: bool,
+    cached_roots: Vec<Value>,
+    pipeline_counts: Value,
+    state_revision: u64,
 }
 pub struct App {
     runtime: Mutex<Runtime>,
@@ -211,7 +214,8 @@ fn inventory_rows(value: &Value, mounts: &[PathBuf], roots: &[PathBuf]) -> Vec<V
                 result.insert(key.into(), json!(track[key].as_str().unwrap_or("").chars().take(35).collect::<String>()));
             }
             for key in ["forced", "hi"] { result.insert(key.into(), json!(track[key].as_bool().unwrap_or(false))); }
-            result.insert("number".into(), json!(track["number"].as_u64().unwrap_or(0)));
+            result.insert("number".into(), json!(track["number"].as_u64()));
+            result.insert("id".into(), json!(track["number"].as_u64()));
             Value::Object(result)
         }).collect::<Vec<_>>();
         let root_id = roots.iter().filter(|root| Path::new(path).starts_with(root)).max_by_key(|root| root.components().count()).map(|root| root_info(root, mounts)["id"].clone()).unwrap_or(Value::Null);
@@ -307,6 +311,12 @@ impl App {
             runtime.inventory_partial = saved["partial"].as_bool().unwrap_or(false);
         }
         // Inventory is stored once, independently of rotating job history.
+        runtime.cached_roots = runtime
+            .roots
+            .iter()
+            .map(|root| root_info(root, &mounts))
+            .collect();
+        runtime.pipeline_counts = converter.pipeline_counts();
         for job in &mut runtime.history {
             if job["kind"] == "inspect" {
                 job["results"] = json!([]);
@@ -452,7 +462,25 @@ impl App {
                 job["status"] = json!(completed_status(job));
             }
         }
-        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial},"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"settings":settings})
+        let mut pipeline = runtime.pipeline_counts.clone();
+        pipeline["files_inspected"] = json!(runtime.inventory.len());
+        pipeline["root_count"] = json!(runtime.roots.len());
+        pipeline["unreachable_roots"] = json!(
+            runtime
+                .cached_roots
+                .iter()
+                .filter(|root| root["status"] == "unavailable")
+                .count()
+        );
+        pipeline["scope"] = json!({"outputs":"tracked_published_outputs","files":"saved_inventory","roots":"cached_root_metadata"});
+        pipeline["available"] = json!({"generated_srt_count":pipeline["generated_srt_count_available"],"pending_ocr_files":true,"failed_files":true,"files_inspected":runtime.inventory_updated>0.0,"unreachable_roots":true});
+        if let Some(object) = pipeline.as_object_mut() {
+            object.remove("generated_srt_count_available");
+        }
+        pipeline["inventory_updated"] = json!(runtime.inventory_updated);
+        pipeline["inventory_truncated"] = json!(runtime.inventory_truncated);
+        pipeline["inventory_partial"] = json!(runtime.inventory_partial);
+        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"pipeline":pipeline,"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision},"roots":runtime.cached_roots,"settings":settings})
     }
     fn tasks(&self) -> Value {
         let mut value = lock(&self.scheduler).public();
@@ -520,7 +548,19 @@ impl App {
     }
     fn inventory(&self) -> Value {
         let runtime = lock(&self.runtime);
-        json!({"items":runtime.inventory,"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial})
+        let converter = lock(&self.converter);
+        let mut rows = runtime.inventory.clone();
+        for row in &mut rows {
+            row["processing"] = converter.file_processing(row["path"].as_str().unwrap_or(""));
+        }
+        json!({"items":rows,"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision})
+    }
+
+    fn refresh_pipeline(&self) {
+        let counts = lock(&self.converter).pipeline_counts();
+        let mut runtime = lock(&self.runtime);
+        runtime.pipeline_counts = counts;
+        runtime.state_revision = runtime.state_revision.saturating_add(1);
     }
     fn widget(&self) -> Value {
         let runtime = lock(&self.runtime);
@@ -545,8 +585,13 @@ impl App {
         )
     }
     fn root_folders(&self) -> Value {
-        let runtime = lock(&self.runtime);
-        json!({"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"mounts":self.mounts_value()})
+        let mut runtime = lock(&self.runtime);
+        runtime.cached_roots = runtime
+            .roots
+            .iter()
+            .map(|root| root_info(root, &self.mounts))
+            .collect();
+        json!({"roots":runtime.cached_roots,"mounts":self.mounts_value()})
     }
     fn save_preferences(&self, languages: &[String], roots: &[PathBuf]) -> Result<(), String> {
         write_private(
@@ -706,6 +751,36 @@ impl App {
         if kind == "extract" && paths.is_empty() {
             return Err("Choose a file to extract".into());
         }
+        let track_ids = if let Some(selection) = data.get("track_ids") {
+            if kind != "extract" || origin != "manual" || paths.len() != 1 {
+                return Err(
+                    "Track selection requires manual extraction of exactly one file".into(),
+                );
+            }
+            let values = selection
+                .as_array()
+                .filter(|values| !values.is_empty() && values.len() <= 64)
+                .ok_or("Choose 1–64 unique subtitle track IDs")?;
+            let ids = values
+                .iter()
+                .map(|id| {
+                    id.as_u64()
+                        .ok_or("Subtitle track IDs must be nonnegative integers")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let source = paths.first().ok_or("Choose one file to extract")?;
+            let description = runtime
+                .inventory
+                .iter()
+                .find(|row| row["path"] == *source)
+                .map(|row| row["tracks"].clone())
+                .or_else(|| lock(&self.converter).cached_description(Path::new(source)))
+                .ok_or("Inspect this file before selecting subtitle tracks")?;
+            crate::converter::validate_track_ids(&description, &ids)?;
+            Some(ids)
+        } else {
+            None
+        };
         let languages = Converter::normalize_languages(
             data.get("languages").unwrap_or(&json!(runtime.languages)),
         )?;
@@ -726,6 +801,10 @@ impl App {
                 && origin == "manual"
                 && data["include_ocr"].as_bool().unwrap_or(true));
         let job = json!({"id":token(8),"task_id":task_id,"workload":if kind=="ocr" {"ocr"}else if include_ocr {"all"}else{"text"},"include_ocr":include_ocr,"kind":kind,"status":"queued","created":now(),"started":null,"finished":null,"current":null,"summary":{},"error":null,"results":[],"languages":languages,"root_ids":roots.iter().map(|root|root_info(root,&self.mounts)["id"].clone()).collect::<Vec<_>>(),"root_paths":roots,"paths":paths,"retry":data["retry"].as_bool().unwrap_or(false),"origin":origin,"provider":provider,"processed":0,"total":0});
+        let mut job = job;
+        if let Some(track_ids) = track_ids {
+            job["track_ids"] = json!(track_ids);
+        }
         runtime.queue.push_back(job.clone());
         self.wake.notify_one();
         Ok(Some(job))
@@ -793,6 +872,33 @@ impl App {
             job["processed"] = json!(count(&job["processed"]) + 1);
         }
         if event["status"] == "failed" {
+            if let Some(path) = event["path"].as_str().filter(|path| path.len() <= 4096) {
+                let source = Path::new(path);
+                let authorized = source.is_absolute()
+                    && !source
+                        .components()
+                        .any(|part| matches!(part, Component::ParentDir))
+                    && job["root_paths"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .any(|root| source.starts_with(Path::new(root)));
+                if authorized {
+                    if !job["failed_paths"].is_array() {
+                        job["failed_paths"] = json!([]);
+                    }
+                    if let Some(paths) = job["failed_paths"].as_array_mut()
+                        && !paths.iter().any(|item| item == path)
+                    {
+                        if paths.len() < 64 {
+                            paths.push(json!(path));
+                        } else {
+                            job["failed_paths_truncated"] = json!(true);
+                        }
+                    }
+                }
+            }
             let message = event["error"]
                 .as_str()
                 .unwrap_or("Conversion failed")
@@ -867,6 +973,16 @@ impl App {
             return Err("File worker input exceeds its path limit".into());
         }
         let languages = strings(&job["languages"]);
+        let track_ids = job
+            .get("track_ids")
+            .map(|ids| {
+                ids.as_array()
+                    .ok_or("Invalid track selection")?
+                    .iter()
+                    .map(|id| id.as_u64().ok_or("Invalid track selection"))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
         let retry = job["retry"].as_bool().unwrap_or(false);
         let automatic = job["origin"] == "schedule"
             || ["sonarr", "radarr"].contains(&job["origin"].as_str().unwrap_or(""));
@@ -972,6 +1088,15 @@ impl App {
                             continue;
                         }
                     };
+                    if let Some(ids) = &track_ids
+                        && let Err(error) = worker.select_tracks(ids.clone())
+                    {
+                        lock(&self.workers).active.retain(|worker| worker.id != id);
+                        failure = Some(error);
+                        self.cancel.store(true, Ordering::Relaxed);
+                        pending.clear();
+                        break;
+                    }
                     if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed)
                     {
                         self.cancel.store(true, Ordering::Relaxed);
@@ -1089,12 +1214,15 @@ impl App {
                                 if let Some(health) = outcome.gpu_health {
                                     lock(&self.workers).gpu.verified = Some(health);
                                 }
-                                if let Err(error) =
-                                    lock(&self.converter).merge_file_state(&path, outcome.state)
-                                {
+                                let changed = outcome.state.is_some();
+                                let merged =
+                                    lock(&self.converter).merge_file_state(&path, outcome.state);
+                                if let Err(error) = merged {
                                     failure = Some(error);
                                     self.cancel.store(true, Ordering::Relaxed);
                                     pending.clear();
+                                } else if changed {
+                                    self.refresh_pipeline();
                                 }
                                 for &key in if matches!(mode, FileMode::Inspect { .. }) {
                                     &["inspected", "failed", "metadata_pending"][..]
@@ -1163,6 +1291,12 @@ impl App {
                     json!({"configured_mounts":self.mounts.len(),"unavailable_mounts":unavailable,"state_directory_available":self.data.is_dir() && !symlink_component(&self.data),"network_checks":0})
                 }
             };
+            if job["kind"] == "cleanup" {
+                self.refresh_pipeline();
+            }
+            if job["kind"] == "health" {
+                self.root_folders();
+            }
             if let Some(running) = lock(&self.runtime).running.as_mut() {
                 running["results"] = json!([result]);
                 running["summary"] = json!({"processed":1});
@@ -2055,6 +2189,8 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         let reader_app = Arc::clone(&app);
         let reader = std::thread::spawn(move || {
+            let status = reader_app.status();
+            assert!(status["pipeline"].is_object());
             sender.send(reader_app.system()).expect("reader");
         });
         let response = receiver.recv_timeout(Duration::from_secs(2));
@@ -2168,7 +2304,9 @@ mod tests {
         app.execute(&job, &mut integrations).expect("discovery");
         let inventory = app.inventory();
         assert_eq!(inventory["items"].as_array().unwrap().len(), 1);
-        assert_eq!(inventory["items"][0]["tracks"], tracks);
+        let mut expected_tracks = tracks;
+        expected_tracks[0]["id"] = json!(3);
+        assert_eq!(inventory["items"][0]["tracks"], expected_tracks);
         assert_eq!(inventory["items"][0]["metadata_pending"], true);
         assert!(inventory["items"][0].get("error").is_none());
         assert_eq!(app.status()["running"]["summary"]["inspection_failed"], 0);
@@ -2200,5 +2338,85 @@ mod tests {
         let restarted =
             App::new(vec![mount], data, Duration::from_secs(21600), false).expect("app");
         assert_eq!(restarted.status()["converted_count"], 2);
+    }
+
+    #[test]
+    fn pipeline_counts_unique_published_outputs_from_state_and_uses_cached_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mount = temporary.path().join("media");
+        let data = temporary.path().join("data");
+        fs::create_dir(&mount).unwrap();
+        fs::create_dir(&data).unwrap();
+        let first = mount.join("first.mkv");
+        let second = mount.join("second.mkv");
+        write_private(&data.join("state.json"), &json!({
+            first.to_string_lossy():{"ok":true,"outputs":["shared.en.srt","first.fr.srt","../escape.srt","cover.jpg"],"ocr_pending":true},
+            second.to_string_lossy():{"ok":false,"error":"Fixture conversion failure","outputs":["shared.en.srt"]},
+            mount.join("no-output.mkv").to_string_lossy():{"ok":true,"outputs":[]},
+            "untrusted-outside-path":{"ok":true,"outputs":["outside.srt"]}
+        })).unwrap();
+        write_private(&data.join("inventory.json"), &json!({"updated":10.0,"items":[{"path":first,"type":"video","tracks":[]},{"path":second,"type":"video","tracks":[]}]})).unwrap();
+        let app = App::new(vec![mount.clone()], data, Duration::from_secs(21600), false).unwrap();
+        let status = app.status();
+        assert_eq!(status["pipeline"]["generated_srt_count"], 2);
+        assert_eq!(status["pipeline"]["pending_ocr_files"], 1);
+        assert_eq!(status["pipeline"]["failed_files"], 1);
+        assert_eq!(status["pipeline"]["files_inspected"], 2);
+        assert_eq!(
+            status["pipeline"]["scope"]["outputs"],
+            "tracked_published_outputs"
+        );
+        assert!(status["pipeline"].get("processed_count").is_none());
+        assert_eq!(
+            app.inventory()["items"][0]["processing"]["pending_ocr"],
+            true
+        );
+        assert_eq!(app.inventory()["items"][1]["processing"]["failed"], true);
+        fs::remove_dir(&mount).unwrap();
+        assert_eq!(app.status()["pipeline"]["unreachable_roots"], 0);
+        app.root_folders();
+        assert_eq!(app.status()["pipeline"]["unreachable_roots"], 1);
+        app.refresh_pipeline();
+        assert_eq!(app.status()["inventory"]["state_revision"], 1);
+        assert_eq!(app.status()["inventory"]["updated"], 10.0);
+        assert_eq!(app.inventory()["state_revision"], 1);
+    }
+
+    #[test]
+    fn failed_paths_are_authorized_unique_and_bounded_for_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mount = temporary.path().join("media");
+        fs::create_dir(&mount).unwrap();
+        let app = App::new(
+            vec![mount.clone()],
+            temporary.path().join("data"),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        lock(&app.runtime).running = Some(json!({"root_paths":[mount]}));
+        for index in 0..65 {
+            let path = mount.join(format!("{index}.mkv"));
+            app.progress(json!({"status":"failed","path":path,"error":"Disposable fixture error"}));
+            app.progress(json!({"status":"failed","path":path,"error":"Disposable fixture error"}));
+        }
+        app.progress(json!({"status":"failed","path":temporary.path().join("outside.mkv"),"error":"Fixture"}));
+        let running = &app.status()["running"];
+        assert_eq!(running["failed_paths"].as_array().unwrap().len(), 64);
+        assert_eq!(running["failed_paths_truncated"], true);
+        assert!(
+            running["failed_paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|path| Path::new(path.as_str().unwrap()).starts_with(&mount))
+        );
+        assert_eq!(
+            running["file_errors"][0]["examples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 }

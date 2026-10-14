@@ -17,6 +17,9 @@
   state.inventoryUpdated=null;
   state.inventoryLoaded=false;
   state.inventoryBusy=false;
+  state.inventoryRevision=null;
+  state.drawerSelection=new Set();
+  state.integrationChecks=new Map();
   state.inventoryRestoreRoot=null;
   state.collapsedPanels=new Set();
   state.errorViews=new Map();
@@ -51,9 +54,37 @@
     return payload;
   };
   const jobList = () => { const status = state.status || {}; return [status.running,...(status.queue || []),...(status.history || [])].filter(Boolean); };
-  const langLabel = code => { const base = String(code || '').split('-')[0].toLowerCase(); return languages.find(item => item[0] === base)?.[1] || String(code || '').toUpperCase(); };
+  const languageAliases={eng:'en',fra:'fr',fre:'fr',ara:'ar',deu:'de',ger:'de',spa:'es',ita:'it',por:'pt',jpn:'ja',zho:'zh',chi:'zh',kor:'ko',rus:'ru',nld:'nl',dut:'nl',tur:'tr',pol:'pl',heb:'he',hin:'hi',ukr:'uk',swe:'sv',dan:'da',fin:'fi',nor:'no',ces:'cs',cze:'cs',ron:'ro',rum:'ro',ell:'el',gre:'el',hun:'hu',tha:'th',vie:'vi',ind:'id'};
+  const languageCode = code => {const value=String(code||'und').toLowerCase(),parts=value.split('-');parts[0]=languageAliases[parts[0]]||parts[0];return parts.join('-');};
+  const langLabel = code => { const base = languageCode(code).split('-')[0]; return languages.find(item => item[0] === base)?.[1] || String(code || '').toUpperCase(); };
   const isAll = list => !Array.isArray(list) || list.includes('*');
   const languageDescription = list => isAll(list) ? 'All languages' : `${list.length} ${list.length === 1 ? 'language' : 'languages'} · ${list.slice(0,3).map(langLabel).join(', ')}${list.length > 3 ? ` +${list.length - 3}` : ''}`;
+  const iconSvg = type => {
+    const paths={scan:'M4 4h6M4 4v6m16-6h-6m6 0v6M4 20h6m-6 0v-6m16 6h-6m6 0v-6',inspect:'m21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',convert:'M4 7h15m-4-4 4 4-4 4M20 17H5m4-4-4 4 4 4',ocr:'M3 5h18v14H3zM6 15l4-5 4 5 3-3 3 4M16 8h.01',backup:'M5 3h14v18H5zM8 3v6h8V3M8 21v-7h8v7',health:'M3 12h4l3-8 4 16 3-8h4',cleanup:'M5 6h14M9 6V3h6v3M7 6l1 15h8l1-15',refresh:'M20 8a8 8 0 1 0 0 8M20 3v5h-5',file:'M6 3h8l4 4v14H6zM14 3v5h4'};
+    const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');
+    const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d',paths[type]||paths.file);svg.append(path);return svg;
+  };
+  const trackFormat = track => {
+    const codec=String(track.codec||track.codec_id||track.format||'').toLowerCase();
+    if(/pgs|hdmv|sup|vobsub|dvd|dvb/.test(codec)||track.image===true||track.kind==='image')return {label:/pgs|hdmv|sup/.test(codec)?'PGS (img)':'VobSub (img)',style:'image',image:true};
+    if(/ass|ssa/.test(codec))return {label:'ASS',style:'ass',image:false};
+    if(/srt|subrip|utf8/.test(codec))return {label:'SRT',style:'srt',image:false};
+    return {label:/vtt|webvtt/.test(codec)?'VTT':codec?codec.replace(/^s_text\//,'').toUpperCase().slice(0,16):'Text',style:'text',image:false};
+  };
+  const trackBadge = track => {const format=trackFormat(track),pill=document.createElement('span');pill.className=`format-badge format-${format.style}`;pill.textContent=`${languageCode(track.language).toUpperCase()} · ${format.label}`;pill.title=`${langLabel(track.language||'und')} · ${track.codec||track.codec_id||track.format||format.label}`;return pill;};
+  const filterLibrary = filter => {$('#inventory-filter').value=filter;$('#inventory-root').value='';$('#inventory-search').value='';state.inventoryPage=1;renderInventory();saveInventoryView();navigate('library');};
+  const renderPipeline = () => {
+    const data=state.status?.pipeline||{},available=data.available||{},running=state.status?.running;
+    const count=(key)=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
+    setText($('#pipeline-roots'),count('root_count'));setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));
+    setText($('#pipeline-convert'),count('pending_ocr_files'));const queued=(state.status?.queue||[]).length;setText($('[data-pipeline-stage="convert"] .stage-unit'),`pending OCR${queued?` · ${queued} job${queued===1?'':'s'} queued`:''}`);
+    setText($('#pipeline-status'),running?`${({scan:'Scan',inspect:'Inspect',extract:'Convert',ocr:'OCR'})[running.kind]||'Task'} · ${jobPercent(running)}%`:'Idle · saved library data');
+    $('#pipeline-progress').value=running?jobPercent(running):0;
+    $('#pipeline-ready').title='SRT outputs recorded by Subforge; existing external SRT files are not included.';
+    setText($('#attention-pending'),count('pending_ocr_files'));setText($('#attention-failed'),count('failed_files'));setText($('#attention-unreachable'),count('unreachable_roots'));
+    setText($('#attention-summary'),`${data.inventory_truncated?'Counts use the saved inventory; some files are outside this snapshot.':'Pending OCR and failures use saved conversion state.'} Path health is checked during startup or health checks.`);
+    $('[data-attention="pending"]').title='Show image subtitle files waiting for scheduled OCR';
+  };
   const disclosureIcon = () => {
     const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');
     const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d','m6 9 6 6 6-6');svg.append(path);return svg;
@@ -96,7 +127,9 @@
       if(group.provider){const settings=document.createElement('button');settings.type='button';settings.className='text-button';settings.textContent=`Review ${group.label} settings`;settings.dataset.jobFocus=`${key}:${group.source}:${group.provider}:${group.message}`;settings.addEventListener('click',()=>{navigate('settings',group.provider);const card=$(`[data-provider="${group.provider}"]`);if(card?.classList.contains('is-collapsed'))$('.collapse-toggle',card).click();});row.append(settings);}
       list.append(row);
     }
-    content.append(list);details.append(content);details.addEventListener('toggle',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});content.addEventListener('scroll',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});return details;
+    content.append(list);
+    if(Array.isArray(job.failed_paths)&&job.failed_paths.length&& !['running','queued'].includes(job.status)){const retry=document.createElement('button');retry.type='button';retry.className='button button-secondary retry-failed';retry.dataset.jobFocus=`${key}:retry`;retry.textContent='Retry failed';retry.title=`Retry ${job.failed_paths.length} recorded files${job.failed_paths_truncated?' (first 64 failures)':''}`;retry.addEventListener('click',async()=>{retry.disabled=true;await startJob({kind:job.kind==='inspect'?'inspect':'extract',paths:job.failed_paths.slice(0,64),languages:job.languages||['*'],retry:true,includeOcr:job.kind==='ocr'||job.include_ocr===true,trackIds:job.failed_paths.length===1?job.track_ids:undefined});retry.disabled=false;});content.append(retry);}
+    details.append(content);details.addEventListener('toggle',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});content.addEventListener('scroll',()=>{if(details.isConnected)state.errorViews.set(key,{open:details.open,scroll:content.scrollTop});});return details;
   };
   const renderRootSelectors = roots => {
     const rootList = $('#root-list'); rootList.replaceChildren();
@@ -133,9 +166,9 @@
   };
   const renderJobCard = (job, compact = false) => {
     const card = document.createElement('article'); card.className = `job-card${compact ? ' job-card-compact' : ''}`;
-    const icon = document.createElement('div'); icon.className = `job-icon ${escStatus(job.status)}`; icon.textContent = job.kind === 'inspect' ? '⌕' : job.kind === 'extract' ? '▶' : '↻';
+    const icon = document.createElement('div'),type=job.kind==='extract'?'convert':job.kind; icon.className = `job-icon job-${escStatus(type)}`; icon.append(iconSvg(type));
     const detail = document.createElement('div'); detail.className = 'job-detail';
-    const title = document.createElement('strong'); title.textContent = job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider] || 'Integration'} ${job.provider==='bazarr'?'sync and scan':'library refresh'}`:({scan:'Library discovery and text conversion',inspect:'Library inspection',extract:'Subtitle extraction',ocr:'Daily subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind] || 'Converter job';
+    const title = document.createElement('strong'); title.textContent = job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider] || 'Integration'} ${job.provider==='bazarr'?'sync and scan':'library refresh'}`:({scan:'Scan and convert text',inspect:'Inspect subtitle tracks',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind] || 'Converter job';
     const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = currentLabel(job.current) || (job.paths && job.paths.length ? shortPath(job.paths[0]) : job.root_label || 'All scan roots');
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
@@ -161,7 +194,7 @@
     const focusKey=container.contains(document.activeElement)?document.activeElement.dataset.jobFocus:null;
     for(const details of $$('.job-error',container))state.errorViews.set(details.dataset.errorKey,{open:details.open,scroll:$('.job-error-content',details).scrollTop});
     container.jobSignature=signature;container.replaceChildren();for(const job of jobs)container.append(renderJobCard(job,compact));
-    if(!jobs.length){const empty=document.createElement('div');empty.className=`empty-state${compact?' compact':''}`;const icon=document.createElement('span');icon.className='empty-icon';icon.textContent='◷';const title=document.createElement('strong');title.textContent=compact?'No activity yet':'No jobs yet';const hint=document.createElement('span');hint.textContent=compact?'Start a scan to see progress here.':'Start a scan or extraction to see it here.';empty.append(icon,title,hint);container.append(empty);}
+    if(!jobs.length){const empty=document.createElement('div');empty.className=`empty-state${compact?' compact':''}`;const icon=document.createElement('span');icon.className='empty-icon';icon.textContent='◷';const title=document.createElement('strong');title.textContent=compact?'No activity yet':'No jobs yet';const hint=document.createElement('span');hint.textContent=compact?'Start a scan to see progress here.':'Start a scan or conversion to see it here.';empty.append(icon,title,hint);container.append(empty);}
     if(focusKey)$$('[data-job-focus]',container).find(node=>node.dataset.jobFocus===focusKey)?.focus({preventScroll:true});
     for(const details of $$('.job-error',container))$('.job-error-content',details).scrollTop=state.errorViews.get(details.dataset.errorKey)?.scroll || 0;
   };
@@ -188,9 +221,9 @@
   };
   const setConnection = good => { $('#connection-dot').classList.toggle('offline',!good); setText($('#connection-text'),good ? 'Service connected' : 'Service unavailable'); };
   const loadInventory = async summary => {
-    if(state.inventoryBusy || state.inventoryLoaded && state.inventoryUpdated===summary?.updated)return;
+    if(state.inventoryBusy || state.inventoryLoaded && state.inventoryUpdated===summary?.updated&&state.inventoryRevision===summary?.state_revision)return;
     state.inventoryBusy=true;
-    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;renderInventory();}
+    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryRevision=data.state_revision;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;renderInventory();}
     catch(error){notify(`Could not load library inventory: ${error.message}`,'error');}
     finally{state.inventoryBusy=false;}
   };
@@ -198,16 +231,17 @@
     try {sessionStorage.setItem('subforge.inventory-view',JSON.stringify({page:state.inventoryPage,pageSize:state.inventoryPageSize,search:$('#inventory-search').value,root:$('#inventory-root').value,filter:$('#inventory-filter').value}));}catch{}
   };
   const restoreInventoryView = () => {
-    try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:25;$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','video','sidecar','issues'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
+    try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:25;$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
   };
   const pollStatus = async () => {
     if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
-    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
+    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderPipeline(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateIntegrationDots(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
-  const startJob = async ({kind,rootIds=[],paths=[],languages: selected=state.selectedLanguages,retry=false}) => {
-    try { const result=await api('/api/jobs',{method:'POST',body:JSON.stringify({kind,root_ids:rootIds,paths,languages:selected,retry})}); notify(result.message || 'Job queued.'); await pollStatus(); return result; }
+  const startJob = async ({kind,rootIds=[],paths=[],languages: selected=state.selectedLanguages,retry=false,trackIds,includeOcr}) => {
+    const payload={kind,root_ids:rootIds,paths,languages:selected,retry};if(trackIds!==undefined)payload.track_ids=trackIds;if(includeOcr!==undefined)payload.include_ocr=includeOcr;
+    try { const result=await api('/api/jobs',{method:'POST',body:JSON.stringify(payload)}); notify(result.message || 'Job queued.'); await pollStatus(); return result; }
     catch (error) { notify(error.message,'error'); return null; }
   };
   const selectedRootIds = selector => { const value=$(selector).value; return value ? [value] : []; };
@@ -216,7 +250,12 @@
     const filter=$('#inventory-filter').value, root=$('#inventory-root').value, query=$('#inventory-search').value.trim().toLowerCase();
     let rows=state.inventory.filter(row=>!root || row.root_id===root);
     if (filter==='video'||filter==='sidecar') rows=rows.filter(row=>row.type===filter);
-    if (filter==='issues') rows=rows.filter(row=>row.error || row.type==='video' && !(row.tracks || []).length);
+    if (filter==='issues') rows=rows.filter(row=>row.error || row.processing?.failed || row.processing?.pending_ocr || row.type==='video' && !(row.tracks || []).length);
+    if(filter==='has_tracks')rows=rows.filter(row=>row.tracks?.length);
+    if(filter==='pending')rows=rows.filter(row=>row.processing?.pending_ocr);
+    if(filter==='failed')rows=rows.filter(row=>row.processing?.failed||row.error);
+    if(filter==='ready')rows=rows.filter(row=>row.processing?.generated_srt_count>0);
+    if(filter==='metadata')rows=rows.filter(row=>row.metadata_pending);
     if (query) rows=rows.filter(row=>`${row.name || ''}\n${row.path || ''}`.toLowerCase().includes(query));
     const count=rows.length, pages=Math.max(1,Math.ceil(count/state.inventoryPageSize));
     if(state.inventoryLoaded)state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
@@ -231,24 +270,43 @@
     $('#inventory-limit-note').classList.toggle('hidden',!state.inventoryTruncated);
     const refreshing=state.status?.running?.kind==='inspect'||(state.status?.queue||[]).some(job=>job.kind==='inspect');
     setText($('#inventory-snapshot-note'),state.inventoryUpdated?`${refreshing?'Refreshing… Showing the saved inventory. ':''}Last inspection: ${fmtDate(state.inventoryUpdated)}${state.status?.inventory?.partial?' · Partial inventory':''}`:refreshing?'Building your first inventory…':'');
-    const emptyMessage=state.inventory.length?'No files match your search or filters.':'No inventory yet. Choose Refresh inventory to list available subtitle tracks.';
+    const emptyMessage=state.inventory.length?'No files match your search or filters.':'No inventory yet. Choose Inspect library to read available subtitle tracks.';
     const viewKey=JSON.stringify([visibleRows,visibleRows.length?'':emptyMessage]);
     if (viewKey===state.inventoryViewKey) return;
     state.inventoryViewKey=viewKey;body.replaceChildren();
     if (!count) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=5; td.className='table-empty'; td.textContent=emptyMessage; tr.append(td); body.append(tr); return; }
     for (const row of visibleRows) {
-      const tr=document.createElement('tr'); const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`; fileIcon.textContent=row.type==='sidecar'?'S':'▣'; const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; name.append(fileIcon,filename);
+      const tr=document.createElement('tr');tr.tabIndex=0;tr.classList.toggle('inventory-row-empty',!row.tracks?.length&&!row.error);tr.setAttribute('aria-label',`Subtitle details: ${row.name||row.path}`);tr.addEventListener('click',()=>openTrackDrawer(row));tr.addEventListener('keydown',event=>{if(event.target===tr&&['Enter',' '].includes(event.key)){event.preventDefault();openTrackDrawer(row);}});const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`;fileIcon.append(iconSvg('file')); const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; name.append(fileIcon,filename);
       const type=document.createElement('td'); const badge=document.createElement('span'); badge.className='type-badge'; badge.textContent=row.error?'Issue':row.type==='sidecar'?'Sidecar':'Video'; type.append(badge);
       const tracks=document.createElement('td'); tracks.textContent=row.error ? row.error : `${(row.tracks || []).length} track${(row.tracks || []).length===1?'':'s'}`;
-      const lang=document.createElement('td'); lang.className='language-tags'; for (const item of [...new Set((row.tracks || []).map(track=>track.language || 'und'))].slice(0,4)) { const tag=document.createElement('span'); tag.textContent=langLabel(item); lang.append(tag); } if (!lang.childNodes.length) lang.textContent='—';
-      const action=document.createElement('td'); if (!row.error && (row.type==='sidecar' || row.type==='video' && row.tracks?.length)) { const button=document.createElement('button'); button.className='row-action'; button.textContent='Extract'; button.title='Extract selected languages from this file'; button.addEventListener('click',()=>startJob({kind:'extract',paths:[row.path],rootIds:row.root_id?[row.root_id]:[]})); action.append(button); } else if (row.error) { const issue=document.createElement('span'); issue.className='issue-dot'; issue.textContent='!'; issue.title=row.error; action.append(issue); } else action.textContent='—';
+      const lang=document.createElement('td'); lang.className='language-tags';for(const track of (row.tracks||[]).slice(0,3))lang.append(trackBadge(track));if(row.tracks?.length>3){const more=document.createElement('span');more.className='muted';more.textContent=`+${row.tracks.length-3}`;lang.append(more);}if(!lang.childNodes.length)lang.textContent='—';
+      const action=document.createElement('td'),button=document.createElement('button');button.type='button';button.className='row-action';button.textContent='Details';button.title='Review tracks and choose which to convert';button.addEventListener('click',event=>{event.stopPropagation();openTrackDrawer(row);});action.append(button);
       tr.append(name,type,tracks,lang,action); body.append(tr);
     }
+  };
+  const syncDrawerSelection = () => {$('#convert-selected-tracks').disabled=!state.drawerSelection.size||state.drawerSelection.size>64;setText($('#track-drawer-hint'),state.selectedFile?.error||(state.drawerSelection.size>64?'Choose up to 64 tracks per conversion.':`${state.drawerSelection.size} selected · Image tracks use OCR when deployment permissions allow it.`));};
+  const openTrackDrawer = row => {
+    state.selectedFile=row;state.modalTrigger=document.activeElement;state.drawerSelection=new Set();const list=$('#track-drawer-list');list.replaceChildren();
+    setText($('#track-drawer-title'),row.name||'Subtitle tracks');setText($('#track-drawer-path'),row.path);
+    const tracks=row.tracks||[],counts=new Map();for(const track of tracks){const id=track.id??track.number;if(Number.isSafeInteger(id))counts.set(id,(counts.get(id)||0)+1);}
+    tracks.forEach((track,index)=>{const id=track.id??track.number,format=trackFormat(track),single=tracks.length===1&&row.type==='sidecar'&&id==null,key=single?'source':id;
+      const supported=single||Number.isSafeInteger(id)&&counts.get(id)===1,permitted=!format.image||state.settings?.permissions?.ocr===true;
+      const label=document.createElement('label');label.className='track-choice';const input=document.createElement('input');input.type='checkbox';input.disabled=!supported||!permitted||!!row.error;input.checked=!input.disabled;if(input.checked)state.drawerSelection.add(key);input.dataset.trackKey=String(key);input.setAttribute('aria-label',`Convert track ${id??index+1}, ${langLabel(track.language||'und')}, ${format.label}`);input.addEventListener('change',()=>{if(input.checked)state.drawerSelection.add(key);else state.drawerSelection.delete(key);syncDrawerSelection();});
+      const copy=document.createElement('span'),title=document.createElement('strong'),source=document.createElement('small');title.textContent=`Track ${id??index+1} · ${langLabel(track.language||'und')}`;source.className='track-source';source.textContent=`${track.codec||track.codec_id||track.format||format.label} · ${row.type==='sidecar'?'Sidecar':'Embedded'}${!supported?' · Inspect again to obtain an unambiguous track ID':!permitted?' · OCR permission locked':''}`;copy.append(title,source);
+      const flags=document.createElement('span');flags.className='track-flags';flags.append(trackBadge(track));for(const [key,text] of [['forced','Forced'],['hi','SDH'],['sdh','SDH'],['hearing_impaired','SDH']])if(track[key]&&!(text==='SDH'&&flags.textContent.includes('SDH'))){const flag=document.createElement('span');flag.className='type-badge';flag.textContent=text;flags.append(flag);}label.append(input,copy,flags);list.append(label);
+    });
+    if(!tracks.length){const empty=document.createElement('p');empty.className='muted';empty.textContent=row.metadata_pending?'Track metadata is pending. Inspect this file to read its tracks.':'No subtitle tracks are recorded for this file.';list.append(empty);}
+    syncDrawerSelection();showDialog($('#track-drawer-backdrop'));$('.modal-close',$('#track-drawer-backdrop')).focus();
+  };
+  const convertDrawerSelection = async () => {
+    const row=state.selectedFile;if(!row||!state.drawerSelection.size)return;const button=$('#convert-selected-tracks');button.disabled=true;
+    const trackIds=state.drawerSelection.has('source')?undefined:[...state.drawerSelection];const result=await startJob({kind:'extract',paths:[row.path],rootIds:row.root_id?[row.root_id]:[],languages:['*'],trackIds,retry:row.processing?.failed===true});
+    if(result)closeDialog($('#track-drawer-backdrop'));else syncDrawerSelection();
   };
   const inspect = async () => { const result=await startJob({kind:'inspect',rootIds:selectedRootIds('#inventory-root')}); if (!result) return; if (Array.isArray(result.results)) { state.inventory=result.results; state.inventoryTruncated=!!result.truncated; renderInventory(); } };
   const renderLanguageList = () => {
     const list=$('#language-list'), term=$('#language-search').value.trim().toLowerCase(); list.replaceChildren();
-    const allLabel=document.createElement('label'); allLabel.className='language-option all-option'; const all=document.createElement('input'); all.type='checkbox'; all.checked=isAll(state.draftLanguages); all.addEventListener('change',()=>{state.draftLanguages=all.checked?['*']:[];renderLanguageList();}); const allCopy=document.createElement('span'); const allTitle=document.createElement('strong'); allTitle.textContent='All languages'; const allHint=document.createElement('small'); allHint.textContent='Extract every supported subtitle track'; allCopy.append(allTitle,allHint); allLabel.append(all,allCopy); list.append(allLabel);
+    const allLabel=document.createElement('label'); allLabel.className='language-option all-option'; const all=document.createElement('input'); all.type='checkbox'; all.checked=isAll(state.draftLanguages); all.addEventListener('change',()=>{state.draftLanguages=all.checked?['*']:[];renderLanguageList();}); const allCopy=document.createElement('span'); const allTitle=document.createElement('strong'); allTitle.textContent='All languages'; const allHint=document.createElement('small'); allHint.textContent='Convert every supported subtitle track'; allCopy.append(allTitle,allHint); allLabel.append(all,allCopy); list.append(allLabel);
     const codes=new Set(languages.map(x=>x[0].toLowerCase())); for (const code of state.draftLanguages) if (code!=='*' && !codes.has(code.toLowerCase())) languages.push([code,`${langLabel(code)} · ${code.toUpperCase()}`]);
     for (const [code,name] of languages) {
       if (term && !`${name} ${code}`.toLowerCase().includes(term)) continue;
@@ -257,17 +315,18 @@
     updateLanguageCount();
   };
   const updateLanguageCount = () => setText($('#language-count'),isAll(state.draftLanguages)?'All languages selected':`${state.draftLanguages.length} language${state.draftLanguages.length===1?'':'s'} selected`);
-  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...state.selectedLanguages]; $('#language-search').value=''; $('#language-modal').classList.remove('hidden'); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
-  const closeDialog = backdrop => { if (!backdrop || backdrop.classList.contains('hidden')) return; backdrop.classList.add('hidden'); if (state.modalTrigger?.isConnected) state.modalTrigger.focus(); };
+  const showDialog = backdrop => {backdrop.classList.remove('hidden');$('.shell').inert=true;document.body.classList.add('modal-open');};
+  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...state.selectedLanguages]; $('#language-search').value='';showDialog($('#language-modal')); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
+  const closeDialog = backdrop => { if (!backdrop || backdrop.classList.contains('hidden')) return; backdrop.classList.add('hidden');$('.shell').inert=false;document.body.classList.remove('modal-open'); if (state.modalTrigger?.isConnected) state.modalTrigger.focus();else{const heading=$(`#page-${state.currentPage} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} };
   const addCustomLanguage = () => { const input=$('#custom-language'), code=input.value.trim().toLowerCase(); if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/.test(code)) { notify('Enter a valid ISO language code, such as pl or pt-BR.','error'); return; } languages.push([code,code.toUpperCase()]); state.draftLanguages=isAll(state.draftLanguages)?[code]:[...new Set([...state.draftLanguages,code])]; input.value=''; renderLanguageList(); };
   const buildIntegrationCard = (provider, config={}) => {
     const card=$('#integration-template').content.firstElementChild.cloneNode(true); card.dataset.provider=provider;
-    const title={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'}[provider]; const description={sonarr:'Trigger subtitle scans when episodes are imported, and notify Sonarr when sidecars are ready.',radarr:'Trigger subtitle scans when movies are imported, and notify Radarr when sidecars are ready.',jellyfin:'Refresh selected Jellyfin libraries after subtitle extraction.',bazarr:'Automatically sync and scan affected media after each extraction batch. Bazarr may download missing subtitles according to its own rules during sync.'}[provider];
+    const title={sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'}[provider]; const description={sonarr:'Trigger subtitle scans when episodes are imported, and notify Sonarr when sidecars are ready.',radarr:'Trigger subtitle scans when movies are imported, and notify Radarr when sidecars are ready.',jellyfin:'Refresh selected Jellyfin libraries after subtitle conversion.',bazarr:'Automatically sync and scan affected media after each conversion batch. Bazarr may download missing subtitles according to its own rules during sync.'}[provider];
     setText($('.integration-title',card),title); setText($('.integration-description',card),description);
     const usage=document.createElement('div');usage.className='path-map-field';
     const usageTitle=document.createElement('strong');usageTitle.textContent='How this integration is used';
-    const usageCopy=document.createElement('p');usageCopy.className='field-explainer';usageCopy.textContent={sonarr:'An optional Sonarr Connect webhook starts extraction when episodes are imported or renamed. New SRT files trigger a rescan of the matching series.',radarr:'An optional Radarr Connect webhook starts extraction when movies are imported or renamed. New SRT files trigger a rescan of the matching movie.',jellyfin:'New SRT files trigger metadata refreshes within your selected movie and series libraries. Refresh selected libraries runs a broader manual refresh.',bazarr:'Changed movies and episodes are synchronized and their subtitles indexed after the extraction batch. Sync and scan library runs the broader manual tasks.'}[provider];
-    const last=document.createElement('p');last.className='field-explainer integration-last-result';last.textContent='No extraction notification recorded yet.';usage.append(usageTitle,usageCopy,last);$('.integration-fields',card).append(usage);
+    const usageCopy=document.createElement('p');usageCopy.className='field-explainer';usageCopy.textContent={sonarr:'An optional Sonarr Connect webhook starts conversion when episodes are imported or renamed. New SRT files trigger a rescan of the matching series.',radarr:'An optional Radarr Connect webhook starts conversion when movies are imported or renamed. New SRT files trigger a rescan of the matching movie.',jellyfin:'New SRT files trigger metadata refreshes within your selected movie and series libraries. Refresh selected libraries runs a broader manual refresh.',bazarr:'Changed movies and episodes are synchronized and their subtitles indexed after the conversion batch. Sync and scan library runs the broader manual tasks.'}[provider];
+    const last=document.createElement('p');last.className='field-explainer integration-last-result';last.textContent='No conversion notification recorded yet.';usage.append(usageTitle,usageCopy,last);$('.integration-fields',card).append(usage);
     $('.integration-enabled',card).checked=!!config.enabled; $('.integration-url',card).value=config.url || '';
     $('.integration-key',card).value=config.api_key || ''; setText($('.api-key-hint',card),config.api_key_set?'A key is saved. Leave blank to keep it.':'');
     if (provider==='jellyfin') {
@@ -279,7 +338,7 @@
       $('.integration-key',card).type='text'; $('.integration-key',card).classList.add('managed-value');
       setText($('.api-key-hint',card),`Managed by JELLYFIN_INTERNAL_URL and JELLYFIN_API_KEY · ${config.api_key_set?'key configured':'key missing'}`);
       renderMappings(card,(state.settings?.path_mappings || []).filter(item=>!item.provider || item.provider==='jellyfin'));
-      populateLibraryOptions(card,state.jellyfinLibraries.length?state.jellyfinLibraries.filter(item=>item.type==='movies'):config.movie_libraries || [],state.jellyfinLibraries.length?state.jellyfinLibraries.filter(item=>item.type==='series'):config.series_libraries || [],config.movie_libraries || [],config.series_libraries || []);
+      populateLibraryOptions(card,state.jellyfinLibraries.length?state.jellyfinLibraries.filter(item=>/movie/i.test(item.type)):config.movie_libraries || [],state.jellyfinLibraries.length?state.jellyfinLibraries.filter(item=>/series|tv/i.test(item.type)):config.series_libraries || [],config.movie_libraries || [],config.series_libraries || []);
       $('.refresh-movies',card).checked=!!config.refresh_movies; $('.refresh-series',card).checked=!!config.refresh_series; $('.refresh-mode',card).value=config.refresh_mode || 'immediate';
       $('.refresh-integration',card).textContent='Refresh selected libraries';
     } else {
@@ -297,13 +356,13 @@
     for (const [selector,values,selected] of [['.movie-libraries',movies,selectedMovies],['.series-libraries',series,selectedSeries]]) {
       const container=$(selector,card); container.replaceChildren();
       if (!values.length) { const muted=document.createElement('span'); muted.className='muted'; muted.textContent='Load libraries to choose where refreshes apply.'; container.append(muted); continue; }
-      for (const item of values) { const label=document.createElement('label'); label.className='library-check'; const input=document.createElement('input'); input.type='checkbox'; input.value=typeof item==='string'?item:item.id; input.checked=selected.some(value=>(typeof value==='string'?value:value.id)===input.value); const text=document.createElement('span'); text.textContent=typeof item==='string'?item:item.name || item.id; label.append(input,text); container.append(label); }
+      for (const item of values) { const label=document.createElement('label'); label.className='library-check'; const input=document.createElement('input'); input.type='checkbox'; input.value=typeof item==='string'?item:item.id; input.checked=selected.some(value=>(typeof value==='string'?value:value.id)===input.value);const cached=state.jellyfinLibraries.find(library=>library.id===input.value),copy=document.createElement('span'),text=document.createElement('strong'),helper=document.createElement('small');text.textContent=(typeof item==='object'?item.name:null)||cached?.name||(selector==='.movie-libraries'?'Movie library':'TV library');helper.className='library-id';helper.textContent=input.value;copy.append(text,helper);label.append(input,copy); container.append(label); }
     }
   };
   const renderMappings = (card,entries) => {
     const list=$('.path-map-list',card); list.replaceChildren();
     for (const mapping of entries) {
-      const row=document.createElement('div'); row.className='path-map-row'; const remote=document.createElement('input'); remote.className='input map-remote'; remote.value=mapping.remote || ''; remote.placeholder='Remote path, e.g. /tv'; remote.setAttribute('aria-label','Remote path'); const arrow=document.createElement('span'); arrow.textContent='→'; const local=document.createElement('input'); local.className='input map-local'; local.value=mapping.local || ''; local.placeholder='Local path, e.g. /media/tv'; local.setAttribute('aria-label','Local path'); const remove=document.createElement('button'); remove.type='button'; remove.className='icon-button remove-map'; remove.setAttribute('aria-label','Remove path mapping'); remove.textContent='×'; remove.addEventListener('click',()=>row.remove()); row.append(remote,arrow,local,remove); list.append(row);
+      const row=document.createElement('div'); row.className='path-map-row'; const remote=document.createElement('input'); remote.className='input map-remote'; remote.value=mapping.remote || ''; remote.placeholder='Remote path, e.g. /tv'; remote.setAttribute('aria-label','Remote path'); const arrow=document.createElement('span'); arrow.textContent='→'; const local=document.createElement('input'); local.className='input map-local'; local.value=mapping.local || ''; local.placeholder='Local path, e.g. /media/tv'; local.setAttribute('aria-label','Local path'); const remove=document.createElement('button'); remove.type='button'; remove.className='icon-button remove-map'; remove.setAttribute('aria-label','Remove path mapping'); remove.title='Remove path mapping';remove.textContent='×'; remove.addEventListener('click',()=>row.remove()); row.append(remote,arrow,local,remove); list.append(row);
     }
   };
   const readMappings = card => $$('.path-map-row',card).map(row=>({remote:$('.map-remote',row).value.trim(),local:$('.map-local',row).value.trim()})).filter(item=>item.remote || item.local);
@@ -356,7 +415,7 @@
     const selected=path || state.rootFolders.mounts.find(mount=>mount.status==='ready')?.path || '';
     const mount=state.rootFolders.mounts.filter(item=>selected===item.path||selected.startsWith(item.path.replace(/[\\/]$/,'')+'/')||selected.startsWith(item.path.replace(/[\\/]$/,'')+'\\')).sort((a,b)=>b.path.length-a.path.length)[0];
     if(mount)select.value=mount.path;
-    $('#root-folder-modal').classList.remove('hidden');$('#folder-path').focus();await browseRootFolder(selected);
+    showDialog($('#root-folder-modal'));$('#folder-path').focus();await browseRootFolder(selected);
   };
   const persistSettings = async () => { const data=await api('/api/settings',{method:'PUT',body:JSON.stringify(gatherSettings())}); state.settings=data; return data; };
   const loadSettings = async () => {
@@ -364,9 +423,9 @@
       const data=await api('/api/settings'); state.settings=data; state.selectedLanguages=data.languages || ['*'];
       const ocrEnabled=data.permissions?.ocr===true;
       setText($('#ocr-permission-state'),ocrEnabled?'Enabled':'Locked');
-      setText($('#ocr-permission-note'),ocrEnabled?'Image subtitle extraction is enabled for this service.':'Text subtitles are enabled. To include image subtitles, enable CONVERTER_ENABLE_OCR and use a 1536 MiB memory limit.');
+      setText($('#ocr-permission-note'),ocrEnabled?'Image subtitle conversion is enabled for this service.':'Text subtitles are enabled. To include image subtitles, enable CONVERTER_ENABLE_OCR and use a 1536 MiB memory limit.');
       for (const provider of ['sonarr','radarr','jellyfin','bazarr']) { const node=$(`#${provider}-settings`); node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})})); }
-      updateLanguageLabels(); updateHookStates(); updateIntegrationUsage();
+      updateLanguageLabels(); updateHookStates(); updateIntegrationUsage();updateIntegrationDots();
     } catch(error) { notify(`Could not load settings: ${error.message}`,'error'); }
   };
   const gatherSettings = () => {
@@ -386,24 +445,32 @@
     catch(error) { setText(note,error.message); notify(`Settings not saved: ${error.message}`,'error'); }
     finally { button.disabled=false; setTimeout(()=>setText(note,''),5000); }
   };
-  const testIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.test-integration',card); button.disabled=true; setText(result,'Testing…'); result.className='test-result muted';
-    try { await persistSettings(); const response=await api(`/api/integrations/${provider}/test`,{method:'POST',body:'{}'}); setText(result,response.message || `Connected${response.version?` · ${response.version}`:''}`); result.className=`test-result ${response.connected===false?'error-text':'success-text'}`; if(provider==='jellyfin'&&Array.isArray(response.libraries)) {const config=state.settings?.integrations?.jellyfin || {};populateLibraryOptions(card,response.libraries.filter(x=>/movie/i.test(x.type)),response.libraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]);} }
-    catch(error) { setText(result,error.message); result.className='test-result error-text'; }
-    finally { button.disabled=false; }
+  const rememberLibraries = libraries => {state.jellyfinLibraries=(libraries||[]).filter(item=>typeof item?.id==='string'&&typeof item.name==='string').slice(0,100).map(({id,name,type})=>({id,name,type}));try{sessionStorage.setItem('subforge.jellyfin-libraries',JSON.stringify(state.jellyfinLibraries));}catch{}};
+  const setIntegrationResult = (node,text,kind) => {setText(node,text);node.className=`test-result integration-result result-${kind}`;node.setAttribute('role','status');};
+  const updateIntegrationDots = () => {
+    for(const dot of $$('[data-integration-dot]')){const provider=dot.dataset.integrationDot,config=state.settings?.integrations?.[provider]||state.status?.settings?.integrations?.[provider]||{},check=state.integrationChecks.get(provider);let latest=null;
+      for(const job of jobList()){const result=[...(job.notifications||[]),...(job.results||[])].find(item=>item?.provider===provider&&typeof item.ok==='boolean');if(result){latest={ok:result.ok,at:Number(job.finished||job.started||job.created||0)*1000};break;}}
+      const observed=check&&(!latest||check.at>=latest.at)?check:latest,kind=!config.enabled?'disabled':observed?observed.ok?'connected':'error':'unknown';dot.dataset.state=kind;const label=kind==='disabled'?'Integration disabled':observed?`Last connection request ${observed.ok?'succeeded':'failed'} · ${fmtDate(observed.at)}`:'Configured; connection has not been checked';dot.title=label;dot.setAttribute('aria-label',label);
+    }
+  };
+  const testIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.test-integration',card); button.disabled=true;setIntegrationResult(result,'Testing…','pending');
+    try { await persistSettings(); const response=await api(`/api/integrations/${provider}/test`,{method:'POST',body:'{}'}),ok=response.connected!==false;state.integrationChecks.set(provider,{ok,at:Date.now()});setIntegrationResult(result,ok?`Connected · ${{sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'}[provider]}${response.version?` ${response.version}`:''}`:`Failed: ${response.message||'Connection rejected'}`,ok?'success':'error');if(provider==='jellyfin'&&Array.isArray(response.libraries)){rememberLibraries(response.libraries);const config=state.settings?.integrations?.jellyfin||{};populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]);} }
+    catch(error) {state.integrationChecks.set(provider,{ok:false,at:Date.now()});setIntegrationResult(result,`Failed: ${error.message}`,'error');}
+    finally { button.disabled=false;updateIntegrationDots(); }
   };
   const refreshIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.refresh-integration',card); button.disabled=true; setText(result,'Queueing refresh…'); result.className='test-result muted';
     try { await persistSettings(); const response=await api(`/api/integrations/${provider}/refresh`,{method:'POST',body:'{}'}); setText(result,response.message || 'Refresh job queued.'); result.className='test-result success-text'; notify(response.message || `${provider} refresh queued.`,'success'); await pollStatus(); }
     catch(error) { setText(result,error.message); result.className='test-result error-text'; notify(error.message,'error'); }
     finally { button.disabled=false; }
   };
-  const loadLibraries = async card => { try { const data=await api('/api/integrations/jellyfin/libraries'); state.jellyfinLibraries=data.libraries||[]; const config=state.settings?.integrations?.jellyfin || {}; populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]); notify('Jellyfin libraries loaded.','success'); } catch(error) { notify(error.message,'error'); } };
+  const loadLibraries = async card => { try { const data=await api('/api/integrations/jellyfin/libraries');rememberLibraries(data.libraries); const config=state.settings?.integrations?.jellyfin || {}; populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]); notify('Jellyfin libraries loaded.','success'); } catch(error) { notify(error.message,'error'); } };
   const updateHookStates = () => { const integrations=state.status?.settings?.integrations || state.settings?.integrations || {}; for(const name of ['sonarr','radarr']) { const enabled=!!integrations[name]?.webhook_enabled; const node=$(`#${name}-hook-state`); if(node){node.className=`connection-state ${enabled?'is-on':''}`;setText(node,enabled?'READY':'TOKEN REQUIRED');} } };
   const updateIntegrationUsage = () => {
     for(const provider of ['sonarr','radarr','jellyfin','bazarr']) {
       const node=$(`[data-provider="${provider}"] .integration-last-result`);if(!node)continue;
       const jobs=jobList();let match=null;
       for(const job of jobs){const result=[...(job.notifications||[]),...(job.results||[])].find(item=>item?.provider===provider&&typeof item.ok==='boolean');if(result){match={job,result};break;}}
-      setText(node,match?`Latest recorded request: ${match.result.ok?'Succeeded':'Failed'} · ${fmtDate(match.job.finished||match.job.started||match.job.created)}`:'No extraction notification recorded yet. Connection tests check access; they do not register import webhooks.');
+      setText(node,match?`Latest recorded request: ${match.result.ok?'Succeeded':'Failed'} · ${fmtDate(match.job.finished||match.job.started||match.job.created)}`:'No conversion notification recorded yet. Connection tests check access; they do not register import webhooks.');
     }
   };
   const editionLabel = edition => ({cpu:'CPU only',cuda:'CUDA'})[edition] || 'Unavailable';
@@ -488,7 +555,7 @@
       const row=document.createElement('tr');const elapsed=Math.max(0,Math.floor(Date.now()/1000-Number(worker.started||Date.now()/1000)));
       for(const [label,value] of [['Worker',`#${worker.id}`],['Processor',worker.resource==='gpu'?'GPU OCR':worker.resource==='cpu_ocr'?'CPU OCR':'CPU'],['Media file',shortPath(worker.path||'')],['Status',worker.status||'Processing'],['Elapsed',`${Math.floor(elapsed/60)}m ${elapsed%60}s`]]){const cell=document.createElement('td');cell.dataset.label=label;cell.textContent=value;if(label==='Media file'){cell.className='worker-file';cell.title=worker.path||'';}row.append(cell);}body.append(row);
     }
-    if(!body.children.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.className='table-empty';cell.textContent=paused?'New work is paused. Running files will finish before this pool becomes idle.':'No file workers running. Start a scan, extraction, or inventory refresh to use this pool.';row.append(cell);body.append(row);}
+    if(!body.children.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.className='table-empty';cell.textContent=paused?'New work is paused. Running files will finish before this pool becomes idle.':'No file workers running. Start a scan, conversion, or inspection to use this pool.';row.append(cell);body.append(row);}
     setText($('#worker-live-state'),`Live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
   };
   const loadWorkers = async (quiet=false) => {
@@ -541,6 +608,10 @@
     const limit=measuredNumber(memory.cgroup_limit_bytes);
     const ram=measuredNumber(memory.cgroup_current_bytes)!==null?`${formatBytes(memory.cgroup_current_bytes)}${limit!==null?` / ${formatBytes(limit)}`:memory.cgroup_limit_unlimited===true?' · no memory limit':''}`:'Unavailable';
     const cacheCount=measuredNumber(cache.entries),cacheMaximum=measuredNumber(cache.max_entries);
+    const setBar=(name,value)=>{const bar=$(`#system-${name}-bar`),label=$(`#system-${name}-bar-label`);if(measuredNumber(value)===null){bar.removeAttribute('value');bar.hidden=true;setText(label,'—');bar.title='Measurement unavailable';}else{bar.hidden=false;bar.value=Math.min(100,value);setText(label,`${Math.round(value)}%`);bar.title=`${value.toFixed(1)}% of allowance`;}};
+    setBar('cpu',percent);setBar('ram',limit>0&&measuredNumber(memory.cgroup_current_bytes)!==null?100*memory.cgroup_current_bytes/limit:null);
+    const slots=Number(policy.conversion_workers||0)+Number(policy.gpu_workers||0);setBar('workers',slots>0&&measuredNumber(worker.active)!==null?100*worker.active/slots:null);
+    setBar('cache',cache.max_bytes>0&&measuredNumber(cache.accounted_bytes)!==null?100*cache.accounted_bytes/cache.max_bytes:null);
     renderSystemRows($('#system-resource-usage'),[
       ['Effective CPU allowance',allowance,'system-cpu-allowance'],['Container CPU usage',cpuUsage,'system-cpu-usage'],
       ['Container RAM',ram,'system-container-ram'],['Rust process RAM',formatBytes(memory.process_rss_bytes),'system-process-ram'],
@@ -604,8 +675,8 @@
       if(!state.settings)loadSettings();
       if(changed&&section==='media')loadRootFolders();
     }
-    const administration=page==='settings'&&['tasks','workers','status'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
-    if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else{loadSystem();if(section==='workers')loadWorkers();}}
+    const administration=page==='settings'&&['tasks','workers','status','media'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
+    if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else if(section!=='media'){loadSystem();if(section==='workers')loadWorkers();}}
     syncSystemMonitor();
   };
   const restoreRoute = () => {
@@ -621,6 +692,8 @@
   };
   const cancelJob = async id => { try { const result=await api(`/api/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:'{}'}); notify(result.message || 'Cancellation requested.'); await pollStatus(); } catch(error) { notify(error.message,'error'); } };
   const bind = () => {
+    $$('button[aria-label]').forEach(button=>{if(!button.title)button.title=button.getAttribute('aria-label');});
+    try{const libraries=JSON.parse(sessionStorage.getItem('subforge.jellyfin-libraries')||'[]');if(Array.isArray(libraries))rememberLibraries(libraries);}catch{}
     try{const saved=JSON.parse(localStorage.getItem('subforge.collapsed-panels')||'[]');if(Array.isArray(saved))state.collapsedPanels=new Set(saved.filter(key=>typeof key==='string'));}catch{}
     $$('[data-collapse]').forEach(makePanelCollapsible);
     const mobileBackdrop=document.createElement('button'); mobileBackdrop.type='button'; mobileBackdrop.className='sidebar-backdrop'; mobileBackdrop.setAttribute('aria-label','Close navigation'); mobileBackdrop.setAttribute('aria-hidden','true'); document.body.append(mobileBackdrop);try{state.sidebarCollapsed=localStorage.getItem('subforge.sidebar-collapsed')==='true';}catch{}syncNavigation();
@@ -628,7 +701,12 @@
     $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>node.addEventListener('click',()=>navigate(node.dataset.page)));
     $('#mobile-menu').addEventListener('click',toggleMobileMenu); $('#sidebar-collapse').addEventListener('click',toggleMobileMenu); mobileBackdrop.addEventListener('click',()=>closeMobileMenu(true));
     window.addEventListener('resize',()=>{if(!window.matchMedia('(max-width: 800px)').matches)closeMobileMenu();else syncNavigation();});
-    $('#refresh-button').addEventListener('click',()=>{pollStatus();if(systemVisible())loadSystem();if(workersVisible())loadWorkers();}); $('#clear-view-button').addEventListener('click',()=>pollStatus());
+    $('#refresh-button').addEventListener('click',()=>{pollStatus();if(systemVisible())loadSystem();if(workersVisible())loadWorkers();if(state.currentPage==='settings'&&state.settingsSection==='tasks')loadTasks();if(state.currentPage==='settings'&&state.settingsSection==='media')loadRootFolders();}); $('#clear-view-button').addEventListener('click',()=>pollStatus());
+    $$('[data-pipeline-stage]').forEach(button=>button.addEventListener('click',()=>filterLibrary(({scan:'all',inspect:'has_tracks',convert:'pending',ready:'ready'})[button.dataset.pipelineStage])));
+    $$('[data-attention]').forEach(button=>button.addEventListener('click',()=>button.dataset.attention==='paths'?navigate('settings','media'):filterLibrary(button.dataset.attention)));
+    $('#convert-selected-tracks').addEventListener('click',convertDrawerSelection);
+    for(const [selector,checked] of [['#select-all-tracks',true],['#select-no-tracks',false]])$(selector).addEventListener('click',()=>{$$('#track-drawer-list input:not(:disabled)').forEach(input=>{if(input.checked!==checked){input.checked=checked;input.dispatchEvent(new Event('change'));}});});
+    $('#inspect-drawer-file').addEventListener('click',async()=>{const row=state.selectedFile;if(!row)return;const result=await startJob({kind:'inspect',paths:[row.path],rootIds:row.root_id?[row.root_id]:[]});if(result)closeDialog($('#track-drawer-backdrop'));});
     $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>startJob({kind:'scan'})));
     $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{navigate('library');await inspect();}));
     $('#quick-form').addEventListener('submit',event=>{event.preventDefault();startJob({kind:'scan',rootIds:selectedRootIds('#quick-root')});});

@@ -42,7 +42,7 @@ RUN --mount=type=bind,from=gpu-model-cache,target=/model-cache \
 COPY gpu/paddleocr /usr/local/bin/paddleocr
 RUN chmod 0555 /usr/local/bin/paddleocr
 
-FROM homelab-subtitle-converter:0.3.1-cpu AS final
+FROM homelab-subtitle-converter:0.4.0-cpu AS final
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libglib2.0-0 libgl1 libgomp1 libstdc++6 \
@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=cuda-tools /usr/local /usr/local
 COPY --from=cuda-tools /opt/paddle-models /opt/paddle-models
 COPY --from=cuda-build /build/subforge /usr/local/bin/subforge
-LABEL org.opencontainers.image.version="0.3.1" \
+LABEL org.opencontainers.image.version="0.4.0" \
       io.subforge.edition="cuda"
 USER 1000:1000
 ENV CONVERTER_ENABLE_GPU=true \
