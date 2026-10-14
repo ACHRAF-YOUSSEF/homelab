@@ -242,6 +242,10 @@ button {
   display:flex;
   justify-content:space-between;
 }
+.sidebar-release {display:flex;align-items:center;gap:6px;}
+.edition-chip {display:inline-flex;align-items:center;flex-shrink:0;white-space:nowrap;padding:3px 6px;border:1px solid var(--line-soft);border-radius:4px;color:var(--muted);font-size:10px;line-height:1.4;}
+.edition-chip[hidden] {display:none;}
+.edition-chip[data-edition="cuda"] {color:var(--teal);border-color:#235b52;}
 .sidebar-footer span {
   font-size:9px;
   color:#637471;

@@ -202,7 +202,7 @@
   };
   const pollStatus = async () => {
     if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
-    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateVersion(state.status.version); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
+    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
@@ -406,12 +406,18 @@
       setText(node,match?`Latest recorded request: ${match.result.ok?'Succeeded':'Failed'} · ${fmtDate(match.job.finished||match.job.started||match.job.created)}`:'No extraction notification recorded yet. Connection tests check access; they do not register import webhooks.');
     }
   };
-  const updateVersion = version => {if(typeof version==='string'&&/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(version)){setText($('#version-label'),`v${version}`);$('#version-label').title=`Subforge ${version}`;}};
+  const editionLabel = edition => ({cpu:'CPU only',cuda:'CUDA'})[edition] || 'Unavailable';
+  const updateEdition = edition => {
+    if(!['cpu','cuda'].includes(edition))return;
+    state.edition=edition;
+    for(const selector of ['#edition-label','#header-edition']){const node=$(selector);setText(node,editionLabel(edition));node.hidden=false;node.dataset.edition=edition;node.title=edition==='cuda'?'CUDA edition; GPU workers require a granted device and a saved allocation.':'CPU-only edition; GPU workers are unavailable.';}
+  };
+  const updateVersion = (version,edition) => {updateEdition(edition);if(typeof version==='string'&&/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(version)){setText($('#version-label'),`v${version}`);$('#version-label').title=`Subforge ${version} (${editionLabel(state.edition)})`;$('.brand').title=$('#version-label').title;}};
   const intervalLabel = seconds => seconds%604800===0?`Every ${seconds/604800===1?'week':`${seconds/604800} weeks`}`:seconds%86400===0?`Every ${seconds/86400===1?'day':`${seconds/86400} days`}`:`Every ${seconds/3600===1?'hour':`${seconds/3600} hours`}`;
   const markTasksDirty = () => {state.tasksDirty=true;$('#save-task-schedules').disabled=false;setText($('#task-schedule-note'),'Unsaved schedule changes. Manual Run uses the saved schedule and permissions.');};
   const renderTasks = () => {
     if(!state.tasks)return;
-    updateVersion(state.tasks.version);
+    updateVersion(state.tasks.version,state.tasks.edition);
     const paused=!!state.tasks.paused;setText($('#scheduler-state'),paused?'Paused':'Scheduled');$('#scheduler-state').className=`status-pill ${paused?'cancelled':'completed'}`;
     if(state.tasksDirty)return;
     $('#pause-schedules').checked=paused;
@@ -461,6 +467,7 @@
   };
   const renderWorkers = () => {
     const data=state.workersInfo;if(!data)return;
+    updateEdition(data.edition);
     const allocation=data.allocation||{},effective=data.effective||{},active=data.active||{},detected=data.detected||{},usage=state.systemInfo?.resource_usage||{},cpu=usage.cpu||{},memory=usage.memory||{};
     if(!state.workersDirty&&!state.workersSaving){for(const [kind,selector] of Object.entries(workerFields))$(selector).value=String(allocation[kind]??0);$('#worker-paused').checked=!!allocation.paused;}
     renderWorkerSteppers();
@@ -471,7 +478,7 @@
     setText($('#worker-cpu-usage'),measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% of allowance in use`:'Waiting for a CPU sample');
     setText($('#worker-ram'),measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
     const meter=$('#worker-memory-meter');meter.value=memory.cgroup_limit_bytes>0?Math.min(1,(memory.cgroup_current_bytes||0)/memory.cgroup_limit_bytes):0;meter.hidden=measuredNumber(memory.cgroup_current_bytes)===null||!(memory.cgroup_limit_bytes>0);
-    setText($('#worker-gpu-availability'),detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA checked':'Runtime enabled'):'Unavailable');setText($('#worker-gpu-reason'),detected.gpu_reason||'GPU OCR requires an explicitly enabled runtime and device.');
+    setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA checked':'Runtime enabled'):'Unavailable');setText($('#worker-gpu-reason'),detected.gpu_reason||'GPU OCR requires the CUDA edition, an enabled runtime and a granted device.');
     setText($('#worker-cpu-capacity'),`${active.cpu_workers||0} active · ${effective.cpu_workers??0} effective slots${data.cpu_limit_reason?` · ${data.cpu_limit_reason}`:''}`);
     setText($('#worker-ocr-capacity'),`${active.ocr_workers||0} active · ${effective.ocr_workers??0} effective slots${data.ocr_limit_reason?` · ${data.ocr_limit_reason}`:''}`);
     setText($('#worker-gpu-capacity'),`${active.gpu_workers||0} active · ${effective.gpu_workers??0} effective slots`);
@@ -521,9 +528,9 @@
   };
   const renderSystem = () => {
     const info=state.systemInfo,policy=info.resource_policy||{},usage=info.resource_usage||{},cpu=usage.cpu||{},memory=usage.memory||{},cache=usage.metadata_cache||{},worker=usage.worker||{};
-    updateVersion(info.version);
+    updateVersion(info.version,info.edition);
     renderSystemRows($('#system-about'),[
-      ['Subforge version',info.version?`v${info.version}`:'Unavailable'],['Runtime',info.runtime||'Unavailable'],
+      ['Subforge version',info.version?`v${info.version}`:'Unavailable'],['Image edition',editionLabel(info.edition)],['Runtime',info.runtime||'Unavailable'],
       ['Operating system',[info.os,info.arch].filter(Boolean).join(' · ')||'Unavailable'],
       ['Uptime',formatUptime(Number(info.uptime_seconds)||0),'system-uptime'],['Browser time zone',Intl.DateTimeFormat().resolvedOptions().timeZone]
     ]);

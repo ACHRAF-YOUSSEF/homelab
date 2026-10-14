@@ -31,7 +31,7 @@
         <div class="connection"><span class="status-dot" id="connection-dot"></span><span id="connection-text">Connecting…</span></div>
         <button class="nav-link settings-link" data-page="settings" aria-label="Settings" title="Settings"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></button>
         <div class="sidebar-controls"><button class="sidebar-toggle" id="sidebar-collapse" type="button" aria-label="Collapse sidebar" title="Collapse sidebar" aria-controls="sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="sidebar-chevron" d="m15 6-6 6 6 6"/></svg></button></div>
-        <div class="sidebar-footer">Subforge <span id="version-label">—</span></div>
+        <div class="sidebar-footer">Subforge <div class="sidebar-release"><span id="version-label">—</span><span id="edition-label" class="edition-chip">—</span></div></div>
       </div>
     </aside>
 
@@ -39,7 +39,7 @@
       <header class="topbar">
         <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open navigation" title="Open navigation" aria-controls="sidebar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
         <div class="crumb"><span>Subforge</span><span class="crumb-slash">/</span><strong id="page-crumb">Overview</strong></div>
-        <div class="top-actions"><span id="last-updated" class="updated-label">Waiting for service</span><button class="icon-button" id="refresh-button" title="Refresh status" aria-label="Refresh status">↻</button></div>
+        <div class="top-actions"><span id="header-edition" class="edition-chip" hidden></span><span id="last-updated" class="updated-label">Waiting for service</span><button class="icon-button" id="refresh-button" title="Refresh status" aria-label="Refresh status">↻</button></div>
       </header>
 
       <div id="toast" class="toast hidden" role="status"></div>

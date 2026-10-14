@@ -139,10 +139,11 @@ The gateway proxies Glance and emits sanitized JSON snapshots, keeping Jellyfin 
 | [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; processed-file count, queued jobs, configured roots, recent failures, current run/progress, and selected languages | `15s` |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
 
-The Subforge widget is optional. The Compose service `subtitle-converter` uses
-the opt-in `subtitle-conversion` profile, so a token does not start it. To enable
-the widget, set a private random `CONVERTER_WIDGET_TOKEN` of 32–256 characters
-in the ignored root `.env`; the same variable is supplied to Glance and
+The Subforge widget is optional. The `subtitle-converter` service starts with
+the regular Compose stack after its selected local image has been built. The
+token only enables the widget endpoint. Set a private random
+`CONVERTER_WIDGET_TOKEN` of 32–256 characters in the ignored root `.env`; the
+same variable is supplied to Glance and
 Subforge. It is separate from dashboard, webhook, and media-server credentials.
 The widget endpoint returns only aggregate status and does not expose media
 paths or accept actions. Its link uses `SUBFORGE_PUBLIC_URL` (default
@@ -160,11 +161,18 @@ Basic Authentication.
 After changing the token in `.env`, recreate both containers to apply it:
 
 ```shell
-docker compose --profile subtitle-conversion up -d --force-recreate glance subtitle-converter
+docker compose up -d --force-recreate glance subtitle-converter
 ```
 
-The command works in PowerShell, Bash, and Zsh when run from the repository
-root. After changing only a Subforge public or internal URL, recreate Glance.
+Run the matching command from the repository root. For a CUDA deployment, use
+the CUDA override so recreating the service keeps its selected image:
+
+```shell
+docker compose -f docker-compose.yml -f compose/subtitle-converter.cuda.yml up -d --force-recreate glance subtitle-converter
+```
+
+After changing only a Subforge public or internal URL, recreate Glance with the
+same Compose files you use for the selected edition.
 
 The qBittorrent relay can use optional `QBITTORRENT_USERNAME` and
 `QBITTORRENT_PASSWORD` values kept in the ignored `.env`; configure both or

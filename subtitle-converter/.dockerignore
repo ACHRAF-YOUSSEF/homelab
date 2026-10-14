@@ -1,6 +1,6 @@
 *
 !Dockerfile
-!Dockerfile.gpu
+!Dockerfile.cuda
 !converter.py
 !server.py
 !integrations.py

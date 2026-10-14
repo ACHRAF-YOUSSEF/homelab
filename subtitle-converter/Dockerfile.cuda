@@ -1,12 +1,21 @@
-# Optional NVIDIA GPU runtime. Build only for linux/amd64 and after the CPU
-# image has been built locally from Dockerfile.
+# CUDA edition for linux/amd64. Build the matching CPU image locally first.
 FROM scratch AS gpu-wheel-cache
 FROM scratch AS gpu-model-cache
-FROM --platform=linux/amd64 python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 AS python-runtime
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS cuda-build
+WORKDIR /build
+ENV CARGO_BUILD_JOBS=1
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+COPY web/ ./web/
+COPY tests/ ./tests/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo test --locked --features cuda \
+    && cargo build --release --locked --features cuda \
+    && cp target/release/subforge /build/subforge
 
-FROM --platform=linux/amd64 homelab-subtitle-converter:0.3.0
-USER root
-COPY --from=python-runtime /usr/local /usr/local
+# Keep the heavy, locked OCR tools independent of the application revision.
+FROM python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 AS cuda-tools
 COPY gpu/requirements.lock /tmp/gpu-requirements.txt
 RUN --mount=type=bind,from=gpu-wheel-cache,target=/wheel-cache \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -32,8 +41,21 @@ RUN --mount=type=bind,from=gpu-model-cache,target=/model-cache \
     && python3.12 -c 'from importlib.metadata import version; print(version("paddlepaddle-gpu"), version("paddleocr"), version("paddlex"))'
 COPY gpu/paddleocr /usr/local/bin/paddleocr
 RUN chmod 0555 /usr/local/bin/paddleocr
+
+FROM homelab-subtitle-converter:0.3.1-cpu AS final
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libglib2.0-0 libgl1 libgomp1 libstdc++6 \
+      libbz2-1.0 libffi8 liblzma5 libncursesw6 libreadline8 libsqlite3-0 libssl3 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=cuda-tools /usr/local /usr/local
+COPY --from=cuda-tools /opt/paddle-models /opt/paddle-models
+COPY --from=cuda-build /build/subforge /usr/local/bin/subforge
+LABEL org.opencontainers.image.version="0.3.1" \
+      io.subforge.edition="cuda"
 USER 1000:1000
 ENV CONVERTER_ENABLE_GPU=true \
+    CONVERTER_ENABLE_OCR=true \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \

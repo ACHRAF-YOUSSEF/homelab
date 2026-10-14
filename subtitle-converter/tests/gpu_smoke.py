@@ -197,6 +197,8 @@ def main() -> None:
 
             dashboard = Dashboard(port)
             before_get = dashboard.json("GET", "/api/workers")
+            if before_get.get("edition") != "cuda" or dashboard.json("GET", "/api/system").get("edition") != "cuda":
+                raise AssertionError("GPU fixture requires the compiled CUDA edition")
             before_verification = before_get.get("detected", {}).get("gpu_verification")
             # Re-reading worker status must be observational and must not launch
             # the costly CUDA probe.
@@ -272,6 +274,7 @@ def main() -> None:
             elapsed = round(time.monotonic() - start, 2)
             metrics = {
                 "ok": True,
+                "edition": "cuda",
                 "fixture_cues": args.cues,
                 "first_job_converted": first_summary.get("converted", 0),
                 "repeat_job_cached": second_summary.get("cached", 0),

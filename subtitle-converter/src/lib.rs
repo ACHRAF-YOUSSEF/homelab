@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod converter;
+pub mod edition;
 mod gpu;
 pub mod integrations;
 pub mod maintenance;

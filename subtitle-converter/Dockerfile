@@ -14,8 +14,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 ARG TARGETARCH
-LABEL org.opencontainers.image.title="Subforge" \
-      org.opencontainers.image.version="0.3.0"
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl ffmpeg libicu72 libfontconfig1 libgssapi-krb5-2 \
       fonts-dejavu-core iso-codes mkvtoolnix tesseract-ocr tesseract-ocr-all \
@@ -54,6 +52,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD ["/usr/local/bin/subforge", "healthcheck"]
 # Container listener; Compose publishes only the configured host interface.
 CMD ["/usr/local/bin/subforge", "--host", "0.0.0.0"]
+LABEL org.opencontainers.image.title="Subforge" \
+      org.opencontainers.image.version="0.3.1" \
+      io.subforge.edition="cpu"
 
 # Python is a test harness dependency only, excluded from the final app image.
 FROM runtime AS test

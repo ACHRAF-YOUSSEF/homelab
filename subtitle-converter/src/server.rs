@@ -441,7 +441,7 @@ impl App {
         for name in ["sonarr", "radarr"] {
             connections[name]["webhook_enabled"] = json!(!self.webhook.is_empty());
         }
-        json!({"languages":runtime.languages,"integrations":connections,"path_mappings":public["path_mappings"],"scan_interval":scan_interval,"permissions":{"ocr":std::env::var("CONVERTER_ENABLE_OCR").is_ok_and(|value|value=="true" || value=="1")},"runtime":"rust","version":env!("CARGO_PKG_VERSION")})
+        json!({"languages":runtime.languages,"integrations":connections,"path_mappings":public["path_mappings"],"scan_interval":scan_interval,"permissions":{"ocr":std::env::var("CONVERTER_ENABLE_OCR").is_ok_and(|value|value=="true" || value=="1")},"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME})
     }
     fn status(&self) -> Value {
         let settings = self.settings();
@@ -452,7 +452,7 @@ impl App {
                 job["status"] = json!(completed_status(job));
             }
         }
-        json!({"version":env!("CARGO_PKG_VERSION"),"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial},"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"settings":settings})
+        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial},"roots":runtime.roots.iter().map(|root|root_info(root,&self.mounts)).collect::<Vec<_>>(),"settings":settings})
     }
     fn tasks(&self) -> Value {
         let mut value = lock(&self.scheduler).public();
@@ -490,7 +490,7 @@ impl App {
                 "kind":runtime.running.as_ref().map(|job| job["kind"].clone())})
         };
         usage["worker"] = worker;
-        json!({"version":env!("CARGO_PKG_VERSION"),"runtime":"rust","os":std::env::consts::OS,"arch":std::env::consts::ARCH,"uptime_seconds":self.started.elapsed().as_secs(),"resource_usage":usage,"resource_policy":{"conversion_workers":limits.cpu_workers,"ocr_threads":1,"ocr_workers":limits.ocr_workers,"gpu_workers":limits.gpu_workers,"metadata_cache_max_bytes":crate::metadata::LIMIT_BYTES,"metadata_cache_max_entries":crate::metadata::MAX_ENTRIES,"discovery_interval_seconds":interval,"ocr_permission":self.ocr_permission,"automatic_ocr_new_or_changed_only":true},"scheduler":{"paused":schedule["paused"]}})
+        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"runtime":"rust","os":std::env::consts::OS,"arch":std::env::consts::ARCH,"uptime_seconds":self.started.elapsed().as_secs(),"resource_usage":usage,"resource_policy":{"conversion_workers":limits.cpu_workers,"ocr_threads":1,"ocr_workers":limits.ocr_workers,"gpu_workers":limits.gpu_workers,"metadata_cache_max_bytes":crate::metadata::LIMIT_BYTES,"metadata_cache_max_entries":crate::metadata::MAX_ENTRIES,"discovery_interval_seconds":interval,"ocr_permission":self.ocr_permission,"automatic_ocr_new_or_changed_only":true},"scheduler":{"paused":schedule["paused"]}})
     }
 
     fn workers(&self) -> Value {

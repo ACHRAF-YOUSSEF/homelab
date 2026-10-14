@@ -178,7 +178,7 @@ impl Scheduler {
     }
 
     pub fn public(&self) -> Value {
-        json!({"version": env!("CARGO_PKG_VERSION"), "paused": self.paused, "tasks": self.tasks.iter().map(|t| {
+        json!({"version": env!("CARGO_PKG_VERSION"), "edition": crate::edition::NAME, "paused": self.paused, "tasks": self.tasks.iter().map(|t| {
             let spec = TASKS.iter().find(|s| s.0 == t.id).expect("fixed task");
             let available = t.id != "ocr" || self.ocr_available;
             let mut item = json!({"id":t.id,"name":spec.1,"description":spec.2,"enabled":t.enabled,"interval_seconds":t.interval,"min_interval_seconds":spec.5,"next_run":t.next_run,"last_run":t.last_run,"last_result":t.last_result,"status":t.status,"available":available});

@@ -166,6 +166,8 @@ jobs:
         run: |
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --all-targets --locked
+          cargo clippy --all-targets --locked --features cuda -- -D warnings
+          cargo test --all-targets --locked --features cuda
 
       - name: Install pinned RustSec audit tool
         run: cargo install --locked cargo-audit --version 0.22.2

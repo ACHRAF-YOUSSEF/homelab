@@ -1,5 +1,5 @@
 //! Optional trusted GPU adapter boundary. Core builds never import GPU code.
-//! Eligibility is configuration and fixed-file detection; only the adapter's
+//! Eligibility requires the compiled CUDA edition, grants and fixed files; only the adapter's
 //! bounded per-file CUDA health check establishes runtime verification.
 
 use serde::{Deserialize, Serialize};
@@ -33,16 +33,35 @@ pub struct Capability {
 
 impl Capability {
     pub fn detect(ocr_allowed: bool, granted: usize) -> Self {
-        let permitted = std::env::var("CONVERTER_ENABLE_GPU")
-            .is_ok_and(|value| value == "true" || value == "1");
+        Self::detect_with(
+            ocr_allowed,
+            granted,
+            || {
+                std::env::var("CONVERTER_ENABLE_GPU")
+                    .is_ok_and(|value| value == "true" || value == "1")
+            },
+            fixed_adapter_available,
+            fixed_device_available,
+        )
+    }
+
+    fn detect_with(
+        ocr_allowed: bool,
+        granted: usize,
+        permitted: impl FnOnce() -> bool,
+        adapter_available: impl FnOnce() -> bool,
+        device_available: impl FnOnce() -> bool,
+    ) -> Self {
         let granted = granted.min(HARD_GPU_LIMIT);
-        let (eligible, reason) = if !permitted || granted == 0 {
+        let (eligible, reason) = if !crate::edition::CUDA_ENABLED {
+            (false, "GPU OCR requires the CUDA image edition")
+        } else if granted == 0 || !permitted() {
             (false, "GPU OCR is disabled by deployment permissions")
         } else if !ocr_allowed {
             (false, "OCR is disabled by deployment permissions")
-        } else if !fixed_adapter_available() {
+        } else if !adapter_available() {
             (false, "The optional trusted GPU OCR adapter is unavailable")
-        } else if !fixed_device_available() {
+        } else if !device_available() {
             (
                 false,
                 "An explicitly granted NVIDIA GPU device is unavailable",
@@ -107,6 +126,9 @@ fn fixed_device_available() -> bool {
 }
 
 pub fn probe(stop: &AtomicBool, minimum_free_mib: u32) -> Result<Health, &'static str> {
+    if !crate::edition::CUDA_ENABLED {
+        return Err("GPU OCR requires the CUDA image edition");
+    }
     if !fixed_adapter_available() || !fixed_device_available() {
         return Err("The explicitly granted GPU runtime is unavailable");
     }
@@ -142,6 +164,46 @@ fn parse_health(success: bool, bytes: &[u8], minimum_free: u64) -> Result<Health
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cpu_edition_denies_gpu_before_permissions_or_runtime_detection() {
+        let capability = Capability::detect_with(
+            true,
+            HARD_GPU_LIMIT,
+            || panic!("CPU edition must not inspect GPU permissions"),
+            || panic!("CPU edition must not inspect the GPU adapter"),
+            || panic!("CPU edition must not inspect GPU devices"),
+        );
+        assert!(!capability.eligible);
+        assert_eq!(capability.max_workers, 0);
+        assert!(capability.verified.is_none());
+        assert_eq!(capability.reason, "GPU OCR requires the CUDA image edition");
+        assert!(probe(&AtomicBool::new(false), 0).is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_edition_requires_all_grants_and_fixed_runtime_before_health() {
+        for (ocr, granted, permitted, adapter, device) in [
+            (false, 1, true, true, true),
+            (true, 0, true, true, true),
+            (true, 1, false, true, true),
+            (true, 1, true, false, true),
+            (true, 1, true, true, false),
+        ] {
+            let capability =
+                Capability::detect_with(ocr, granted, || permitted, || adapter, || device);
+            assert!(!capability.eligible);
+            assert_eq!(capability.max_workers, 0);
+            assert!(capability.verified.is_none());
+        }
+        let capability = Capability::detect_with(true, usize::MAX, || true, || true, || true);
+        assert!(capability.eligible);
+        assert_eq!(capability.max_workers, HARD_GPU_LIMIT);
+        assert!(capability.verified.is_none());
+    }
+
     #[test]
     fn health_requires_success_cuda_device_and_valid_memory() {
         let valid = br#"{"ok":true,"cuda":true,"device_count":1,"free_bytes":2147483648,"total_bytes":8589934592}"#;

@@ -1,5 +1,12 @@
 # Subforge revisions
 
+## 0.3.1
+
+- Split Subforge into fixed local tags `homelab-subtitle-converter:0.3.1-cpu` and `homelab-subtitle-converter:0.3.1-cuda`; Compose starts prebuilt images and never builds or pulls them.
+- Start the service with the regular Compose stack after building the selected local image; use the CUDA override when running the CUDA edition.
+- Compile the image edition into the Rust binary and report it in the API and dashboard; GPU OCR requires the CUDA edition plus explicit runtime permissions and an allocated GPU worker.
+- Keep the CPU image Python-free, build the CUDA Rust binary in its own stage, and isolate locked Python/PaddleOCR tools in a separately cacheable stage.
+
 ## 0.3.0
 
 - Add persisted CPU/OCR allocations, pause/resume, and live file-worker monitoring in Settings → Workers.
@@ -9,7 +16,7 @@
 - Keep per-tool CPU threads limited to one and preserve cancellation, source files, and existing SRT outputs.
 - Add optional NVIDIA GPU OCR using a separate linux/amd64 image, one explicitly granted device, and a default-zero GPU worker allocation.
 - Lock 81 Python dependency pins across two files, verify all 15 bundled model archives against their SHA-256 manifest, and allow optional hash-verified wheel and model-archive BuildKit caches without adding cache payload to the runtime image.
-- Validate GPU OCR with a 200-distinct-cue synthetic SUP fixture on one RTX 3060: one GPU worker observed, source preserved, cached repeat confirmed, and 897 MiB peak container memory under a 1536 MiB ceiling; this does not establish full-library peaks or results on other GPUs/drivers.
+- Validate GPU OCR with a 200-distinct-cue synthetic SUP fixture on one RTX 3060: one GPU worker observed, source preserved, cached repeat confirmed, 9.32 seconds including startup and repeat, and 1,097,826,304 bytes (about 1,047 MiB) peak container memory under a 1536 MiB ceiling. This does not establish full-library peaks or results on other GPUs/drivers.
 
 ## 0.2.4
 

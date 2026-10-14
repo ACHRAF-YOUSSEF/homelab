@@ -550,7 +550,9 @@ impl Converter {
     }
 
     pub(crate) fn enable_gpu_ocr(&mut self, minimum_free_mib: u32) {
-        self.gpu_ocr = Some(minimum_free_mib.min(65536));
+        if crate::edition::CUDA_ENABLED {
+            self.gpu_ocr = Some(minimum_free_mib.min(65536));
+        }
     }
 
     pub(crate) fn gpu_status(&self) -> (Option<crate::gpu::Health>, Option<&'static str>) {

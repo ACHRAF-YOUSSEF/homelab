@@ -297,7 +297,7 @@ impl Workers {
             .iter()
             .filter(|worker| worker.resource == "gpu")
             .count();
-        json!({"allocation":self.allocation,"effective":effective,
+        json!({"edition":crate::edition::NAME,"allocation":self.allocation,"effective":effective,
             "configuration_path":"/data/workers.conf",
             "configuration":self.configuration,
             "deployment":{"max_cpu_workers":self.max_cpu,"max_ocr_workers":self.max_ocr,"max_gpu_workers":self.gpu.max_workers},

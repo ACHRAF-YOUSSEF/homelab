@@ -59,6 +59,10 @@ impl Server {
     }
 
     fn start_with_probe_delay(delay: Option<Duration>) -> Self {
+        Self::start_with_environment(delay, &[])
+    }
+
+    fn start_with_environment(delay: Option<Duration>, environment: &[(&str, &str)]) -> Self {
         let temp = tempfile::tempdir().expect("temporary test directory");
         let root = temp.path().join("media");
         let data = temp.path().join("data");
@@ -134,6 +138,9 @@ impl Server {
             .env("CONVERTER_ENABLE_OCR", "false")
             .env("CONVERTER_ENABLE_GPU", "false")
             .env("CONVERTER_SCAN_INTERVAL", "3600");
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         if let Some(path) = &ffprobe {
             command.env("CONVERTER_FFPROBE", path);
         }
@@ -586,6 +593,70 @@ fn inventory_api_is_separate_from_status_and_snapshot_survives_backend_restart()
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn api_edition_is_compiled_and_ignores_deployment_labels() {
+    let spoof = if subforge::edition::CUDA_ENABLED {
+        "cpu"
+    } else {
+        "cuda"
+    };
+    let server = Server::start_with_environment(
+        None,
+        &[("CONVERTER_EDITION", spoof), ("SUBFORGE_EDITION", spoof)],
+    );
+    let auth = server.auth_header();
+    for path in ["/api/status", "/api/system", "/api/workers", "/api/tasks"] {
+        let response = server
+            .request("GET", path, &[("Authorization", &auth)], None)
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["edition"], subforge::edition::NAME);
+    }
+    let status = server
+        .request("GET", "/api/status", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(status.body["settings"]["edition"], subforge::edition::NAME);
+    let csrf = server.csrf();
+    let tasks = server.json_request("PUT", "/api/tasks", &csrf, &json!({"paused":true}));
+    assert_eq!(tasks.status, 200);
+    assert_eq!(tasks.body["edition"], subforge::edition::NAME);
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn cpu_edition_rejects_gpu_allocation_even_when_deployment_grants_it() {
+    let server = Server::start_with_environment(
+        None,
+        &[
+            ("CONVERTER_ENABLE_OCR", "true"),
+            ("CONVERTER_ENABLE_GPU", "true"),
+        ],
+    );
+    let auth = server.auth_header();
+    let response = server
+        .request("GET", "/api/workers", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(response.body["edition"], "cpu");
+    assert_eq!(response.body["deployment"]["max_gpu_workers"], 0);
+    assert_eq!(response.body["effective"]["gpu_workers"], 0);
+    assert_eq!(response.body["detected"]["gpu_available"], false);
+    assert_eq!(
+        response.body["detected"]["gpu_reason"],
+        "GPU OCR requires the CUDA image edition"
+    );
+    let configuration_path = server.data.join("workers.conf");
+    let original = fs::read(&configuration_path).unwrap();
+    let csrf = server.csrf();
+    let denied = server.json_request(
+        "PUT",
+        "/api/workers",
+        &csrf,
+        &json!({"cpu_workers":1,"ocr_workers":1,"gpu_workers":1,"paused":false}),
+    );
+    assert_eq!(denied.status, 400);
+    assert_eq!(fs::read(&configuration_path).unwrap(), original);
 }
 
 #[test]

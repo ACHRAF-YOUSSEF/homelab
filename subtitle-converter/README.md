@@ -1,21 +1,27 @@
 # Subforge — Automatic Subtitle Conversion
 
-**Subforge** is the name of the subtitle-conversion dashboard. The Compose service and folder remain `subtitle-converter`. It is an opt-in Rust watcher and local web dashboard that creates UTF-8 SubRip (`.srt`) sidecars from embedded subtitle tracks and supported subtitle files. FFmpeg handles common text tracks; TTML and SBV sidecars use the official [Subtitle Edit command-line converter](https://github.com/SubtitleEdit/subtitleedit/releases) even when OCR is disabled. Image-based subtitle tracks use Subtitle Edit with Tesseract OCR only when OCR is explicitly enabled. The runtime image is built locally with a pinned Rust builder and a Debian Bookworm runtime; it does not include Python.
+**Subforge** is the name of the subtitle-conversion dashboard. The Compose service and folder remain `subtitle-converter`. It is a Rust watcher and local web dashboard that creates UTF-8 SubRip (`.srt`) sidecars from embedded subtitle tracks and supported subtitle files. FFmpeg handles common text tracks; TTML and SBV sidecars use the official [Subtitle Edit command-line converter](https://github.com/SubtitleEdit/subtitleedit/releases) even when OCR is disabled. Image-based subtitle tracks use Subtitle Edit with Tesseract OCR only when OCR is explicitly enabled. The CPU image is a locally built Rust edition on a Debian Bookworm runtime and contains no Python. The optional CUDA edition compiles the same app with its CUDA feature and adds the separately locked Python/PaddleOCR helper; its dashboard and API report the compiled edition.
 
 ## Start the service
 
-Set the four `CONVERTER_*_DIR` values in the ignored root `.env` to the host folders used for your movie and TV libraries. The `.env.example` values are examples for the current Compose layout; replace them with paths on your machine. On Windows with Docker Desktop, use Windows drive paths shared with Docker Desktop. On macOS and Linux, use absolute host paths such as `/Volumes/media/movies` or `/srv/media/movies`.
+Compose requires the ignored root `.env` for interpolation. Create it from `.env.example` if it does not exist, then set the four `CONVERTER_*_DIR` values to host folders used for your movie and TV libraries. The sample paths match the current Compose layout; replace them with paths on your machine. On Windows with Docker Desktop, use drive paths shared with Docker Desktop. On macOS and Linux, use absolute host paths such as `/Volumes/media/movies` or `/srv/media/movies`. The dashboard binds to loopback by default; `CONVERTER_ALLOWED_HOSTS` defaults to the local names and service name. `CONVERTER_UI_PASSWORD` may remain blank to generate a persistent password. Media-service keys are optional; keep any real keys in the ignored `.env`. Direct `docker run` does not read Compose's `.env`; supply equivalent runtime settings and all four media bind mounts plus persistent `/data` yourself.
 
-Start the service and its `subtitle-conversion` Compose profile from the repository root:
+Build the selected edition locally before starting it. Compose only starts a prebuilt tag: it neither builds nor pulls Subforge, and startup fails if the selected local tag is missing.
 
 ```shell
-docker compose --profile subtitle-conversion up -d --build subtitle-converter
+docker build --target final --tag homelab-subtitle-converter:0.3.1-cpu subtitle-converter
 ```
 
-Open the responsive Subforge dashboard at `http://localhost:8100`. Routes are bookmarkable: reloading the page and using browser back/forward preserves the selected page and Settings section. On narrow screens, the navigation becomes a slide-out menu, the dashboard cards and settings stack vertically, and the subtitle inventory remains horizontally scrollable. The dashboard always requires HTTP Basic Authentication with username `admin`. If `CONVERTER_UI_PASSWORD` is blank, the service creates a random password once and stores it in `/data/ui-password` with mode `0600`; the password is not written to logs. Retrieve it from PowerShell, Bash, or Zsh with:
+Then start the prebuilt CPU image from the repository root:
 
 ```shell
-docker compose --profile subtitle-conversion exec subtitle-converter cat /data/ui-password
+docker compose up -d --no-deps subtitle-converter
+```
+
+Open the responsive Subforge dashboard at `http://localhost:8100`. Routes are bookmarkable: reloading the page and using browser back/forward preserves the selected page and Settings section. On narrow screens, the navigation becomes a slide-out menu, the dashboard cards and settings stack vertically, and the subtitle inventory remains horizontally scrollable. The dashboard always requires HTTP Basic Authentication with username `admin`. **Settings → Status**, the sidebar, and the header identify whether the running binary is the compiled CPU-only or CUDA edition; environment variables cannot change this build-time edition. If `CONVERTER_UI_PASSWORD` is blank, the service creates a random password once and stores it in `/data/ui-password` with mode `0600`; the password is not written to logs. Retrieve it from PowerShell, Bash, or Zsh with:
+
+```shell
+docker compose exec subtitle-converter cat /data/ui-password
 ```
 
 Alternatively, set `CONVERTER_UI_PASSWORD` in the ignored root `.env` to a private password of at least 12 characters. The named `subtitle_converter_data` volume preserves the generated password, jobs, settings, preferences, and scan state across container rebuilds. The Rust runtime reads the existing JSON state/settings/preferences/history files and password, preserving compatible data when the image is upgraded; Jellyfin connection details remain managed through environment variables.
@@ -31,8 +37,10 @@ Unix media tools run with a fixed UTF-8 locale so non-ASCII Matroska titles cann
 If the service exits during startup and its logs identify `CONVERTER_UI_PASSWORD` as invalid, set it privately in the ignored root `.env` to a strong printable password of 12–256 characters, or leave it blank to use the persistent generated password. Recreate only this service:
 
 ```shell
-docker compose --profile subtitle-conversion up -d --build subtitle-converter
+docker compose up -d --no-deps subtitle-converter
 ```
+
+For a CUDA deployment, keep `-f compose/subtitle-converter.cuda.yml` in the command so troubleshooting does not switch the service to the CPU image.
 
 When using the generated password, retrieve it with the command above. Startup validation reports the setting and phase without printing its value; never paste credentials into logs or shared documentation.
 
@@ -59,7 +67,7 @@ The dashboard's Overview shows conversion progress, queue, recent activity, and 
 
 Task intervals can be adjusted in Settings → Tasks subject to each task's displayed minimum; the maximum is 30 days. **Pause automatic schedules** persists across restarts. It does not cancel a running job, and manual Run actions remain available while paused. On first startup, `CONVERTER_SCAN_INTERVAL` sets the discovery interval; values below 21,600 seconds are clamped to six hours, and Compose defaults it to `21600`. After that, the saved interval in `tasks.json` takes precedence. Worker allocation and worker-pool pause are stored separately in `/data/workers.conf`; pausing workers stops dispatching new files and lets active files finish. The metadata cache is capped at 32 MiB and 5,000 entries. Each tool process stays single-threaded; independent file workers provide bounded parallelism. Compose defaults to a 1 CPU and 1536 MiB memory ceiling; the text-only memory option is 512 MiB. Worker resource budgets are soft estimates, not reserved or guaranteed memory; see [Memory use and OCR](#memory-use-and-ocr) for details.
 
-The runtime, CLI `--version`, API, and dashboard report the compiled package version from `Cargo.toml`; **Settings → Status** and the sidebar show `v0.3.0`. Version is release metadata, not an editable setting or environment variable. Patch fixes advance the patch version (for example, `0.2.0` → `0.2.1` → `0.2.2`); features advance the minor version. For each revision, update `Cargo.toml` and the root package entry in `Cargo.lock`, the fixed Dockerfile image-version label, and the fixed `homelab-subtitle-converter:0.3.0` image reference in `compose/media.yml` together. Rebuilding the same revision keeps its version. Old `#/system/tasks` and `#/system/status` bookmarks redirect to their unified Settings sections. See the [revision history](CHANGELOG.md) for the changes in each version. The dashboard and Glance totals count input files with a completed conversion pass, not generated SRT files. Completed text passes remain counted when later OCR fails, including text passes that queued image tracks without creating a text SRT.
+The runtime, CLI `--version`, API, and dashboard report the compiled package version from `Cargo.toml`; **Settings → Status** and the sidebar show `v0.3.1`. Version is release metadata, not an editable setting or environment variable. Patch fixes advance the patch version (for example, `0.2.0` → `0.2.1` → `0.2.2`); features advance the minor version. For each revision, update `Cargo.toml` and the root package entry in `Cargo.lock`, the fixed Dockerfile image-version label, and the fixed `homelab-subtitle-converter:0.3.1-cpu` and `homelab-subtitle-converter:0.3.1-cuda` references in the Compose files together. The edition is compiled into each image; the CPU edition cannot be switched to CUDA by setting environment variables. Rebuilding the same revision keeps its version. Old `#/system/tasks` and `#/system/status` bookmarks redirect to their unified Settings sections. See the [revision history](CHANGELOG.md) for the changes in each version. The dashboard and Glance totals count input files with a completed conversion pass, not generated SRT files. Completed text passes remain counted when later OCR fails, including text passes that queued image tracks without creating a text SRT.
 
 Overview's Recent activity, Quick extraction, and Live log panels; the Library inventory; Activity's Jobs list; and the settings cards for languages, hooks, root folders, Sonarr, Radarr, Bazarr, and Jellyfin can be collapsed. The browser remembers each panel's open or collapsed state. Job failures, per-file conversion causes, integration notifications, and refresh results appear in a collapsed disclosure grouped by origin, provider, and repeated message, with a count and a preview; opening it shows bounded examples and, when a provider is identified, a shortcut to its settings. Jobs that finish processing files with failures are marked **Completed with errors**. The disclosure's open state and scroll position are preserved during status refreshes. Integration diagnostics give a safe HTTP or connection category without exposing API keys or raw server responses; they explain errors but do not repair an integration configuration.
 
@@ -69,11 +77,14 @@ The Glance **Media** page includes a Subforge custom API widget. It displays the
 
 The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. The Compose file passes this dedicated token only to Glance and Subforge. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is Glance's container-to-container base URL and defaults to `http://subtitle-converter:8100`.
 
-Subforge remains in the opt-in `subtitle-conversion` Compose profile. A token does not start or enable that profile. Start the service explicitly as described above. After changing the token, recreate both containers so each receives the same value:
+Subforge is part of the regular Compose stack and starts after its selected local image has been built. The widget token only enables the read-only widget endpoint. After changing the token, recreate both containers so each receives the same value:
 
 ```shell
-docker compose --profile subtitle-conversion up -d --force-recreate glance subtitle-converter
+docker compose up -d --force-recreate glance subtitle-converter
 ```
+
+For a CUDA deployment, add `-f compose/subtitle-converter.cuda.yml` after
+`docker-compose.yml` to both this command and the CUDA service start command.
 
 After changing only either URL, recreate Glance. A `404` status means the widget endpoint is disabled; `401` means the tokens do not match. A connection error usually means Subforge is stopped or `GLANCE_SUBFORGE_INTERNAL_URL` cannot reach it on the Compose network.
 
@@ -104,7 +115,8 @@ The Compose service lets you change the four host-side library folders through `
 | `CONVERTER_TIMEOUT` | Maximum runtime for an individual conversion operation, in seconds | `7200` |
 | `CONVERTER_RETRY_INTERVAL` | Delay before retrying an unchanged failed manual conversion, in seconds | `3600` |
 | `CONVERTER_MEMORY_LIMIT` | Container memory ceiling; 512 MiB is a text-only option | `1536m` |
-| `CONVERTER_ENABLE_OCR` | Enable OCR for image subtitle tracks; requires a compatible memory ceiling | `false` |
+| `CONVERTER_ENABLE_OCR` | Permit image OCR; CPU Compose reads this setting, while CUDA Compose enables it | `false` in CPU Compose |
+| `CONVERTER_ENABLE_GPU` | CUDA runtime permission for direct Docker runs; CPU Compose forces `false`, CUDA Compose sets `true`. Environment values cannot make the CPU edition GPU-capable | `false` in CPU Compose |
 | `CONVERTER_OCR_LANGUAGE` | Tesseract fallback language for unknown image-subtitle language | `eng` |
 | `CONVERTER_BIND_ADDRESS` | Host interface for the dashboard publication | `127.0.0.1` |
 | `CONVERTER_ALLOWED_HOSTS` | Comma-separated `Host` header allowlist; preserve the defaults and add your browser hostname if needed | `localhost,127.0.0.1,::1,subtitle-converter` |
@@ -112,6 +124,8 @@ The Compose service lets you change the four host-side library folders through `
 | `CONVERTER_WEBHOOK_TOKEN` | Shared Sonarr/Radarr webhook token; blank disables the hook endpoints | Blank |
 | `BAZARR_INTERNAL_URL` | Bazarr URL reachable from the converter on `homelab` | `http://bazarr:6767` |
 | `BAZARR_API_KEY` | Bazarr API key; keep it private in `.env` | Blank |
+
+The four `CONVERTER_*_DIR` paths are required Compose inputs. `CONVERTER_UI_PASSWORD` may stay blank (Subforge generates and persists a private password), and `CONVERTER_ALLOWED_HOSTS` may stay at its local/service-name default. For the CPU edition, `CONVERTER_ENABLE_OCR` is optional and defaults to false. The CUDA Compose override enables both OCR and GPU permission and supplies the NVIDIA visibility/capability settings; do not set worker-count environment variables, because worker allocation is saved through **Settings → Workers** in `/data/workers.conf`.
 
 For example, to use `/srv/media/movies` as the first movie library on Linux, set `CONVERTER_MOVIES_DIR=/srv/media/movies` in `.env`; the container will still see it at `/movies`. On Windows, use a drive path available to Docker Desktop, such as the example `D:/film`. The mounted host folders must be writable by container UID/GID 1000 so the converter can create SRT sidecars. Keep them aligned with Bazarr and media-manager access. In Subforge, **Settings → Media Management** lets you select which mounted folders or subfolders to scan; add, browse, scan, or remove roots there. This selection is saved immediately and applies to future scans. Folder browsing is restricted to the configured mounts. Changing a `CONVERTER_*_DIR` changes the host folder behind its corresponding mount; changing container-side destinations instead requires updating the Compose mount and matching `subforge --root` arguments. The `subtitle_converter_data` named volume mounted at `/data` separately persists the generated dashboard password, settings, selected scan roots, job history, and scan state across rebuilds. `.env.example` keeps API-key entries blank; store real service keys and any chosen dashboard or webhook passwords only in the ignored `.env`.
 
@@ -147,39 +161,44 @@ Changing allocation affects newly dispatched files; active files finish with the
 The configuration's `max_cpu_workers` defaults to 4 and is hard-capped at 8. `max_ocr_workers` defaults to 1 and is hard-capped at 2, with CPU OCR slots always limited by the CPU allocation. `max_gpu_workers` is hard-capped at one and is effective only with the explicitly granted GPU runtime and device. `CONVERTER_CPU_LIMIT` separately sets Docker's CPU ceiling. A value of `4` allows the container to use up to four CPUs; it does not request four jobs by itself. Increase the allocation in **Settings → Workers** after the container has enough CPU and RAM capacity. Changing Docker's `CONVERTER_CPU_LIMIT` requires recreating the service; `docker compose restart` alone retains the existing container configuration. Use this generic command from the repository root on PowerShell, Bash, or Zsh:
 
 ```shell
-docker compose --profile subtitle-conversion up -d --force-recreate --no-deps subtitle-converter
+docker compose up -d --force-recreate --no-deps subtitle-converter
 ```
 
 This recreates only `subtitle-converter`, without rebuilding its image or starting dependencies.
 
 ### Optional NVIDIA GPU OCR
 
-The default Compose service and CPU image expose no GPU devices. The optional path uses a separate `linux/amd64` image based on `Dockerfile.gpu` with a PaddleOCR helper and packaged language-specific mobile OCR models. The image pins Python 3.12, PaddleOCR/PaddleX 3.7.0, and Paddle GPU 3.2.2 for CUDA 11.8. The GPU stack has 80 full-hash-locked dependencies plus a separate setuptools 84.0.0 runtime-packaging lock (81 pins across two files); the final image passes `pip check`, and 15 model archives are checksum-verified at build time. A normal build uses the pinned upstream wheel source and needs network access to package and model sources. An optional BuildKit wheel cache can supply the large Paddle GPU wheel without adding it to the resulting image. From the repository root, place `paddlepaddle_gpu-3.2.2-cp312-cp312-linux_x86_64.whl` in `output/gpu-cache/wheels` and build with this command. Docker verifies any cached wheel against its locked hash during installation:
+The default Compose service and CPU image expose no GPU devices. The optional path uses a separate `linux/amd64` image built with `Dockerfile.cuda`, a `cuda` Rust feature, and the PaddleOCR helper with packaged language-specific mobile OCR models. The CUDA-tools stage pins Python 3.12, PaddleOCR/PaddleX 3.7.0, and Paddle GPU 3.2.2 for CUDA 11.8, separately from the Rust CUDA build stage. The GPU stack has 80 full-hash-locked dependencies plus a separate setuptools 84.0.0 runtime-packaging lock (81 pins across two files); the final image passes `pip check`, and 15 model archives are checksum-verified at build time. A normal build uses the pinned upstream wheel and model sources and needs network access. Optional BuildKit wheel and model-archive caches can avoid downloading matching artifacts without adding cache payload to the runtime image. From the repository root, build the CPU edition first. To reuse the Paddle GPU wheel, place `paddlepaddle_gpu-3.2.2-cp312-cp312-linux_x86_64.whl` in `output/gpu-cache/wheels`; place any desired model archives in `output/gpu-cache/models`.
 
 ```shell
-docker build --file subtitle-converter/Dockerfile.gpu --build-context gpu-wheel-cache=output/gpu-cache/wheels --build-context gpu-model-cache=output/gpu-cache/models --tag homelab-subtitle-converter:0.3.0-gpu subtitle-converter
+docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --build-context gpu-wheel-cache=output/gpu-cache/wheels --build-context gpu-model-cache=output/gpu-cache/models --tag homelab-subtitle-converter:0.3.1-cuda subtitle-converter
 ```
 
-The model cache is also optional. Put any desired model `.tar` archives from the fixed upstream source in `output/gpu-cache/models`; the build reuses an archive only when its filename and full SHA-256 match `gpu/models.sha256` and its size is at most 128 MiB. It safely extracts the checked archives into the image, then discards the archive cache mount, so the cache adds no runtime files or write access. The standard Compose build works with empty cache contexts and downloads from the pinned sources. The model layer runs before the helper is copied, so helper-only edits do not force model downloads again.
+The wheel and model cache contexts are optional; the build works with empty contexts and downloads from the pinned sources. It verifies cached files against their locked hashes, caps model archives at 128 MiB, and mounts both caches read-only at build time. The model layer runs before the helper is copied, so helper-only edits do not force model downloads again.
 
 The running OCR helper uses the packaged models and does not download models on first startup. CUDA execution is checked explicitly, including a GPU tensor and available memory. If CUDA cannot be used or the selected model language is unsupported, GPU OCR fails; it does not silently fall back to CPU OCR.
 
 This configuration is provided for compatible NVIDIA-enabled Docker hosts on Linux/amd64. Windows requires Docker Desktop's WSL 2 backend with NVIDIA GPU support enabled; macOS GPUs do not provide CUDA. These are platform requirements from the image and runtime configuration; this repository's configuration alone does not establish that a particular host, driver, or Docker setup works. Check [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and [Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/) for host prerequisites.
 
-From the repository root, build the CPU base image first, then build and start the GPU variant with the explicit override:
+The CPU and CUDA images are built separately; Compose never builds or pulls these local tags. Build CPU first because the CUDA Dockerfile reuses its runtime base, then build CUDA:
 
 ```shell
-docker build --target final --tag homelab-subtitle-converter:0.3.0 subtitle-converter
-docker compose -f docker-compose.yml -f compose/subtitle-converter.gpu.yml --profile subtitle-conversion build subtitle-converter
-docker compose -f docker-compose.yml -f compose/subtitle-converter.gpu.yml --profile subtitle-conversion up -d --no-deps subtitle-converter
+docker build --target final --tag homelab-subtitle-converter:0.3.1-cpu subtitle-converter
+docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.3.1-cuda subtitle-converter
 ```
 
-The override grants only NVIDIA device `0`, with the `compute` and `utility` driver capabilities. It does not grant every GPU or the Docker socket. GPU OCR permission is enabled in this variant, but the saved GPU worker allocation remains zero until you set **Settings → Workers → GPU OCR slots** to one. The default free-memory threshold in workers.conf is 2048 MiB. With the GPU worker allocation left at zero, Subforge starts no GPU OCR work and leaves device memory available to other GPU applications such as LM Studio. GPU usage shares device memory with other processes such as LM Studio; the threshold is checked before work, but Docker does not reserve or cap GPU VRAM. Keep the GPU worker count at one when sharing the device. The override configures a `1536m` container RAM ceiling by default; this is system memory, separate from device VRAM. The small-fixture validation result and its hardware limits are documented in [Development checks](#development-checks).
-
-To return to the CPU image, start the service from the ordinary Compose entrypoint without the GPU override. On startup, Subforge clamps the saved worker allocation to the permissions and limits of the current image and persists the adjusted values, so GPU slots return to zero when the GPU runtime is removed:
+Create the ignored root `.env` from `.env.example`, set the four host media directories, and start the CUDA edition with its override:
 
 ```shell
-docker compose --profile subtitle-conversion up -d --build --force-recreate --no-deps subtitle-converter
+docker compose -f docker-compose.yml -f compose/subtitle-converter.cuda.yml up -d --no-deps subtitle-converter
+```
+
+The override grants only NVIDIA device `0`, with the `compute` and `utility` driver capabilities, and sets `CONVERTER_ENABLE_OCR=true`, `CONVERTER_ENABLE_GPU=true`, `NVIDIA_VISIBLE_DEVICES=0`, and `NVIDIA_DRIVER_CAPABILITIES=compute,utility`. It does not grant every GPU or the Docker socket. For direct `docker run`, set those four environment values and separately grant device access (for example `--gpus device=0`); environment variables alone do not expose a GPU. The CUDA-edition dashboard, API, sidebar, and header identify the compiled edition, while **Settings → Workers** reports whether the runtime and device are eligible. The saved GPU worker allocation remains zero until you set **GPU OCR slots** to one. The default free-memory threshold in workers.conf is 2048 MiB. With the GPU worker allocation left at zero, Subforge starts no GPU OCR work and leaves device memory available to other GPU applications such as LM Studio. The threshold is checked before work, but Docker does not reserve or cap GPU VRAM. Keep the GPU worker count at one when sharing the device. The override configures a `1536m` container RAM ceiling by default; this is system memory, separate from device VRAM. The small-fixture validation result and its hardware limits are documented in [Development checks](#development-checks).
+
+To return to the CPU image, recreate the service from the ordinary Compose entrypoint without the CUDA override. On startup, Subforge clamps the saved worker allocation to the compiled edition's permissions and deployment limits, then persists the adjusted values, so GPU slots return to zero:
+
+```shell
+docker compose up -d --force-recreate --no-deps subtitle-converter
 ```
 
 ## Media server connections
@@ -208,7 +227,7 @@ If Jellyfin uses different paths, add mappings on its Settings tab. A native Win
 The Rust executable includes a read-only connection check for configured media integrations. Run it from the repository root with the service running:
 
 ```shell
-docker compose --profile subtitle-conversion exec subtitle-converter subforge integration-check bazarr
+docker compose exec subtitle-converter subforge integration-check bazarr
 ```
 
 Replace `bazarr` with `sonarr`, `radarr`, or `jellyfin` to check another integration. The diagnostic uses the converter's configured credentials, prints only the provider, connection result, and—for Jellyfin—library/selection counts. It does not print server addresses, library names, API keys, or raw server responses. A nonzero exit status means the configured connection check failed; use the dashboard's safe diagnostic and service logs for next steps. This check verifies connectivity only and does not change server settings or queue scans.
@@ -257,15 +276,15 @@ cargo build --locked --release --manifest-path subtitle-converter/Cargo.toml
 
 OCR coverage and third-party media tools can vary by codec, language data, and filesystem; successful Rust tests do not establish behavior for every media file or deployment.
 
-The GPU adapter and model-archive unit tests use Python's standard library and fake CUDA modules; CI runs them in a pinned container with the GPU source mounted read-only and networking disabled; CI also audits the adapter source and both Python lock files with pip-audit, and checks the external Paddle GPU wheel version separately through OSV. The optional hardware smoke test in `tests/gpu_smoke.py` must run from the GPU image with `/tests` mounted read-only, network access disabled, and NVIDIA device 0 explicitly granted. The hardware smoke test passed on an NVIDIA RTX 3060 with CUDA and one explicitly exposed GPU, using 200 distinct synthetic SUP subtitle cues. The read-only, network-disabled container completed in 7.51 seconds including startup and the cached repeat; peak container memory was 940,969,984 bytes (about 897 MiB), the Rust server high-water RSS was 6.1 MiB for this tiny fixture, the GPU worker was observed, the source remained unchanged, and the repeat used cached OCR output. This validates that fixture on that GPU/driver setup only; it does not predict full-library memory peaks or conversion speed, or establish compatibility with other NVIDIA devices and drivers.
-After building the optional GPU image, run this hardware smoke test from a Linux Bash or WSL 2 shell at the repository root. It exposes only NVIDIA device 0 and mounts the test fixtures read-only:
+The GPU adapter and model-archive unit tests use Python's standard library and fake CUDA modules; CI runs them in a pinned container with the GPU source mounted read-only and networking disabled; CI also audits the adapter source and both Python lock files with pip-audit, and checks the external Paddle GPU wheel version separately through OSV. The optional hardware smoke test in `tests/gpu_smoke.py` must run from the GPU image with `/tests` mounted read-only, network access disabled, and NVIDIA device 0 explicitly granted. The hardware smoke test passed on an NVIDIA RTX 3060 with CUDA and one explicitly exposed GPU, using 200 distinct synthetic SUP subtitle cues. The read-only, network-disabled container completed in 9.32 seconds including startup and the cached repeat; peak container memory was 1,097,826,304 bytes (about 1,047 MiB), the Rust server high-water RSS was 6.3 MiB for this tiny fixture, the GPU worker was observed, the source remained unchanged, and the repeat used cached OCR output. This validates that fixture on that GPU/driver setup only; it does not predict full-library memory peaks or conversion speed, or establish compatibility with other NVIDIA devices and drivers.
+After building the CUDA image, run this hardware smoke test from a Linux Bash or WSL 2 shell at the repository root. It exposes only NVIDIA device 0 and mounts the test fixtures read-only:
 
 ```shell
-docker run --rm --gpus '"device=0"' --network none --read-only \
+docker run --rm --gpus device=0 --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges --memory 1536m --cpus 2 \
   --tmpfs /tmp:rw,nosuid,nodev,size=512m \
   --mount type=bind,source=./subtitle-converter/tests,target=/tests,readonly \
-  --entrypoint python3.12 homelab-subtitle-converter:0.3.0-gpu \
+  --entrypoint python3.12 homelab-subtitle-converter:0.3.1-cuda \
   /tests/gpu_smoke.py --cues 200
 ```
 
