@@ -13,7 +13,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::Builder;
 use walkdir::WalkDir;
@@ -34,6 +34,13 @@ const MAX_TRACK_LABEL: usize = 32;
 // failures immediately. Successful fingerprint caches are independent.
 const ERROR_CACHE_REVISION: u64 = 1;
 const MAX_CANDIDATES: usize = 20_000;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FileGate {
+    pub entered: std::sync::atomic::AtomicUsize,
+    pub released: AtomicBool,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Track {
@@ -78,7 +85,14 @@ pub struct Converter {
     enable_ocr: bool,
     ocr_language: String,
     language_aliases: BTreeMap<String, String>,
-    metadata: Mutex<crate::metadata::MetadataCache>,
+    metadata: Arc<Mutex<crate::metadata::MetadataCache>>,
+    persist_state: bool,
+    state_dirty: bool,
+    gpu_ocr: Option<u32>,
+    gpu_health: Mutex<Option<crate::gpu::Health>>,
+    gpu_failure: Mutex<Option<&'static str>>,
+    #[cfg(test)]
+    file_gate: Option<Arc<FileGate>>,
 }
 
 impl Converter {
@@ -108,9 +122,16 @@ impl Converter {
             enable_ocr,
             ocr_language,
             language_aliases: language_aliases(),
-            metadata: Mutex::new(crate::metadata::MetadataCache::new(
+            metadata: Arc::new(Mutex::new(crate::metadata::MetadataCache::new(
                 state_path.with_file_name("metadata.json"),
-            )),
+            ))),
+            persist_state: true,
+            state_dirty: false,
+            gpu_ocr: None,
+            gpu_health: Mutex::new(None),
+            gpu_failure: Mutex::new(None),
+            #[cfg(test)]
+            file_gate: None,
         })
     }
 
@@ -319,6 +340,20 @@ impl Converter {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            #[cfg(test)]
+            if let Some(gate) = &self.file_gate {
+                gate.entered.fetch_add(1, Ordering::Relaxed);
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !gate.released.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("Fixture file gate timed out".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             let path = match Self::safe_path(&raw_path.to_string_lossy(), &self.roots) {
                 Ok(path) => path,
                 Err(_) => {
@@ -382,9 +417,8 @@ impl Converter {
                     continue;
                 }
             }
-            let existing = sibling_srt_names(&path);
             match self.convert(&path, &languages, workload, stop, progress) {
-                Ok((outputs, ocr_pending)) => {
+                Ok((outputs, ocr_pending, published)) => {
                     let after = match fingerprint(&path) {
                         Ok(v) => v,
                         Err(_) => {
@@ -421,13 +455,13 @@ impl Converter {
                         || (unchanged
                             && previous["ocr"].as_bool().unwrap_or(previous["ok"] == true));
                     self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"outputs":output_names,"ok":true,"languages":completed_languages,"ocr":ocr_complete,"ocr_pending":ocr_pending && !ocr_complete,"text_complete":text_complete}));
-                    if crate::util::write_private(&self.state_path, &self.state).is_err() {
+                    if self.persist_state().is_err() {
                         bump(&mut summary, "failed");
                         continue;
                     }
                     bump(&mut summary, "converted");
-                    let new_outputs: Vec<String> = sibling_srt_names(&path)
-                        .difference(&existing)
+                    let new_outputs: Vec<String> = published
+                        .iter()
                         .map(|n| {
                             path.parent()
                                 .unwrap_or(Path::new("/"))
@@ -448,7 +482,7 @@ impl Converter {
                     let safe = bounded_message(&message);
                     progress(json!({"status":"failed","path":path,"error":safe,"summary":summary}));
                     self.set_state_entry(&key, json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION,"ocr_pending":workload==Workload::Ocr || previous["ocr_pending"]==true,"text_complete":previous["text_complete"].as_bool().unwrap_or(previous["ok"]==true),"outputs":previous_outputs}));
-                    let _ = crate::util::write_private(&self.state_path, &self.state);
+                    let _ = self.persist_state();
                 }
             }
         }
@@ -457,10 +491,116 @@ impl Converter {
     }
 
     pub fn persist_metadata(&self) -> Result<(), String> {
+        if !self.persist_state {
+            return Ok(());
+        }
         self.metadata
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .persist()
+    }
+
+    fn persist_state(&self) -> Result<(), String> {
+        if self.persist_state {
+            crate::util::write_private_limited(&self.state_path, &self.state, MAX_STATE_BYTES)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Only immutable tool configuration and one bounded persisted entry are
+    /// copied. Metadata is shared behind its short lookup/insert mutex.
+    pub fn file_worker(&self, path: &Path) -> Result<Self, String> {
+        let key = path.to_string_lossy();
+        let mut state = json!({});
+        if let Some(previous) = self.state.get(key.as_ref()) {
+            state[key.as_ref()] = crate::util::bounded_json_clone(previous, 64 * 1024)?;
+        }
+        Ok(self.worker_with_state(state))
+    }
+
+    pub fn inspection_worker(&self) -> Self {
+        self.worker_with_state(json!({}))
+    }
+
+    fn worker_with_state(&self, state: Value) -> Self {
+        Self {
+            roots: self.roots.clone(),
+            state,
+            state_path: self.state_path.clone(),
+            ffprobe: self.ffprobe.clone(),
+            ffmpeg: self.ffmpeg.clone(),
+            mkvmerge: self.mkvmerge.clone(),
+            seconv: self.seconv.clone(),
+            min_age: self.min_age,
+            timeout: self.timeout,
+            retry_interval: self.retry_interval,
+            enable_ocr: self.enable_ocr,
+            ocr_language: self.ocr_language.clone(),
+            language_aliases: self.language_aliases.clone(),
+            metadata: Arc::clone(&self.metadata),
+            persist_state: false,
+            state_dirty: false,
+            gpu_ocr: None,
+            gpu_health: Mutex::new(None),
+            gpu_failure: Mutex::new(None),
+            #[cfg(test)]
+            file_gate: self.file_gate.clone(),
+        }
+    }
+
+    pub(crate) fn enable_gpu_ocr(&mut self, minimum_free_mib: u32) {
+        self.gpu_ocr = Some(minimum_free_mib.min(65536));
+    }
+
+    pub(crate) fn gpu_status(&self) -> (Option<crate::gpu::Health>, Option<&'static str>) {
+        (
+            *self
+                .gpu_health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            *self
+                .gpu_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_file_gate(&mut self, gate: Arc<FileGate>, missing_tool: PathBuf) {
+        self.file_gate = Some(gate);
+        self.min_age = Duration::ZERO;
+        self.ffmpeg = missing_tool;
+    }
+
+    pub fn merge_file_state(&mut self, path: &Path, entry: Option<Value>) -> Result<(), String> {
+        if let Some(entry) = entry {
+            let key = path.to_string_lossy().into_owned();
+            let previous = self
+                .state
+                .as_object_mut()
+                .ok_or("Conversion state is unavailable")?
+                .insert(key.clone(), entry);
+            if let Err(error) = self.persist_state() {
+                if let Some(entries) = self.state.as_object_mut() {
+                    entries.remove(&key);
+                    if let Some(previous) = previous {
+                        entries.insert(key, previous);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn take_file_state(&mut self, path: &Path) -> Option<Value> {
+        if !self.state_dirty {
+            return None;
+        }
+        self.state
+            .as_object_mut()?
+            .remove(path.to_string_lossy().as_ref())
     }
 
     pub fn cached_description(&self, path: &Path) -> Option<Value> {
@@ -479,6 +619,13 @@ impl Converter {
 
     pub fn ocr_allowed(&self) -> bool {
         self.enable_ocr
+    }
+
+    pub fn metadata_usage(&self) -> Arc<crate::metadata::CacheUsage> {
+        self.metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage()
     }
 
     pub fn ocr_candidates(&self, roots: &[PathBuf], retry: bool) -> Vec<PathBuf> {
@@ -516,6 +663,7 @@ impl Converter {
     fn set_state_entry(&mut self, key: &str, value: Value) {
         if let Some(map) = self.state.as_object_mut() {
             map.insert(key.to_owned(), value);
+            self.state_dirty = true;
         }
     }
 
@@ -660,7 +808,7 @@ impl Converter {
         workload: Workload,
         stop: &AtomicBool,
         progress: &mut dyn FnMut(Value),
-    ) -> Result<(Vec<String>, bool), String> {
+    ) -> Result<(Vec<String>, bool, Vec<String>), String> {
         let before = fingerprint(path)?;
         let parent = path.parent().ok_or("Media path has no parent directory")?;
         let staging = Builder::new()
@@ -856,6 +1004,38 @@ impl Converter {
             );
             let staged = staging.path().join(&name);
             if image || seconv {
+                let gpu = image && self.gpu_ocr.is_some();
+                if let Some(minimum_free_mib) = self.gpu_ocr.filter(|_| gpu)
+                    && self.gpu_status().0.is_none()
+                {
+                    progress(json!({"status":"checking_gpu","path":path}));
+                    match crate::gpu::probe(stop, minimum_free_mib) {
+                        Ok(health) => {
+                            *self
+                                .gpu_health
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(health);
+                        }
+                        Err(error) => {
+                            *self
+                                .gpu_failure
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                            return Err(error.into());
+                        }
+                    }
+                }
+                let engine = if gpu { "paddle" } else { "tesseract" };
+                let language = if gpu {
+                    let language = short_language(&language, &self.language_aliases);
+                    if language == "und" {
+                        short_language(&self.ocr_language, &self.language_aliases)
+                    } else {
+                        language
+                    }
+                } else {
+                    ocr_lang.clone()
+                };
                 let mut command = Command::new(&self.seconv);
                 command
                     .arg(&source)
@@ -868,20 +1048,30 @@ impl Converter {
                         "--encoding",
                         "utf-8-no-bom",
                         "--ocr-engine",
-                        "tesseract",
+                        engine,
                         "--ocr-language",
-                        &ocr_lang,
+                        &language,
                         "--json",
                     ]);
                 if let Some(track_number) = native_track.as_deref() {
                     command.args(["--track-number", track_number]);
                 }
-                let (_exit_success, report) = crate::util::bounded_process_allow_failure(
-                    &mut command,
-                    self.timeout,
-                    stop,
-                    MAX_CONVERTER_OUTPUT,
-                )?;
+                let (_exit_success, report) = if gpu {
+                    crate::util::bounded_gpu_process(
+                        &mut command,
+                        self.timeout,
+                        stop,
+                        MAX_CONVERTER_OUTPUT,
+                        self.gpu_ocr.unwrap_or(2048),
+                    )
+                } else {
+                    crate::util::bounded_process_allow_failure(
+                        &mut command,
+                        self.timeout,
+                        stop,
+                        MAX_CONVERTER_OUTPUT,
+                    )
+                }?;
                 let report: Value = serde_json::from_slice(&report)
                     .map_err(|_| "OCR converter returned an unreadable report")?;
                 if report.get("success").and_then(Value::as_bool) != Some(true) {
@@ -929,12 +1119,15 @@ impl Converter {
         if fingerprint(path)? != before || stop.load(Ordering::Relaxed) {
             return Err("Source changed or conversion was cancelled".into());
         }
+        let mut published = Vec::new();
         for name in &outputs {
             let staged = staging.path().join(name);
             let destination = parent.join(name);
-            publish_noclobber(&staged, &destination)?;
+            if publish_noclobber(&staged, &destination)? {
+                published.push(name.clone());
+            }
         }
-        Ok((outputs, ocr_pending))
+        Ok((outputs, ocr_pending, published))
     }
 
     fn ocr_for(&self, language: &str) -> String {
@@ -1254,19 +1447,6 @@ fn safe_outputs(previous: &Value) -> Vec<String> {
 
 fn ocr_coverage(previous: &Value, enabled: bool) -> bool {
     !enabled || previous.get("ocr").and_then(Value::as_bool).unwrap_or(true)
-}
-fn sibling_srt_names(path: &Path) -> BTreeSet<String> {
-    fs::read_dir(path.parent().unwrap_or(Path::new("/")))
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let p = e.path();
-            (extension(&p).as_deref() == Some("srt"))
-                .then(|| p.file_name()?.to_str().map(str::to_owned))
-                .flatten()
-        })
-        .collect()
 }
 fn bump(summary: &mut Value, key: &str) {
     if let Some(entry) = summary.as_object_mut().and_then(|map| map.get_mut(key)) {
@@ -1658,6 +1838,52 @@ mod tests {
             fingerprint_json(&fingerprint(media).unwrap()),
             json!([track]),
         );
+    }
+
+    #[test]
+    fn gpu_health_is_not_probed_for_cached_or_noop_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("image.mkv");
+        fs::write(&media, b"fixture media").unwrap();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        converter.enable_ocr = true;
+        converter.min_age = Duration::ZERO;
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        cache_image_track(&converter, &media);
+        fs::write(dir.path().join("image.en.srt"), b"existing output").unwrap();
+        converter.enable_gpu_ocr(2048);
+        let first = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                Workload::All,
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(first["converted"], 1);
+        assert!(converter.gpu_status().0.is_none());
+        assert!(converter.gpu_status().1.is_none());
+        let second = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                Workload::All,
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(second["cached"], 1);
+        assert!(converter.gpu_status().0.is_none());
+        assert!(converter.gpu_status().1.is_none());
     }
 
     #[test]

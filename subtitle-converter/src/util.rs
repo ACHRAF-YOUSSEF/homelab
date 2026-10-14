@@ -49,7 +49,45 @@ pub fn read_json(path: &Path, limit: usize) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|_| "State file contains invalid JSON".into())
 }
 
+pub fn bounded_json_clone(value: &Value, limit: usize) -> Result<Value, String> {
+    struct Buffer {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("JSON entry size limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Buffer {
+        bytes: Vec::with_capacity(limit.min(4096)),
+        limit,
+    };
+    serde_json::to_writer(&mut buffer, value)
+        .map_err(|_| "State entry exceeds its worker size limit")?;
+    serde_json::from_slice(&buffer.bytes).map_err(|_| "State entry could not be prepared".into())
+}
+
 pub fn write_private(path: &Path, value: &Value) -> Result<(), String> {
+    write_private_limited(path, value, u64::MAX)
+}
+
+pub fn write_private_limited(path: &Path, value: &Value, limit: u64) -> Result<(), String> {
+    write_json_private(path, value, limit, false)
+}
+
+pub fn write_private_pretty(path: &Path, value: &Value) -> Result<(), String> {
+    write_json_private(path, value, 4096, true)
+}
+
+fn write_json_private(path: &Path, value: &Value, limit: u64, pretty: bool) -> Result<(), String> {
     let parent = path.parent().ok_or("State storage requires a directory")?;
     fs::create_dir_all(parent).map_err(|_| "State storage is unavailable")?;
     if path.is_symlink() {
@@ -65,7 +103,35 @@ pub fn write_private(path: &Path, value: &Value) -> Result<(), String> {
             .set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|_| "Cannot protect state file")?;
     }
-    serde_json::to_writer(&mut temporary, value).map_err(|_| "Cannot serialize state")?;
+    struct LimitedWriter<'a> {
+        output: &'a mut tempfile::NamedTempFile,
+        remaining: u64,
+    }
+    impl Write for LimitedWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let length = u64::try_from(bytes.len())
+                .map_err(|_| std::io::Error::other("State size limit"))?;
+            if length > self.remaining {
+                return Err(std::io::Error::other("State size limit"));
+            }
+            let written = self.output.write(bytes)?;
+            self.remaining = self.remaining.saturating_sub(written as u64);
+            Ok(written)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.output.flush()
+        }
+    }
+    let mut output = LimitedWriter {
+        output: &mut temporary,
+        remaining: limit,
+    };
+    if pretty {
+        serde_json::to_writer_pretty(&mut output, value)
+    } else {
+        serde_json::to_writer(&mut output, value)
+    }
+    .map_err(|_| "State could not be serialized within its size limit")?;
     temporary.flush().map_err(|_| "Cannot flush state")?;
     temporary
         .as_file()
@@ -108,6 +174,7 @@ fn kill_tree(child: &mut std::process::Child) {
             .unwrap_or_else(|| std::path::PathBuf::from("C:/Windows"))
             .join("System32/taskkill.exe");
         let _ = Command::new(taskkill)
+            .env_clear()
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -123,10 +190,42 @@ pub fn bounded_process_allow_failure(
     stop: &AtomicBool,
     max_bytes: usize,
 ) -> Result<(bool, Vec<u8>), String> {
+    run_process(command, timeout, stop, max_bytes, None)
+}
+
+pub fn bounded_gpu_process(
+    command: &mut Command,
+    timeout: Duration,
+    stop: &AtomicBool,
+    max_bytes: usize,
+    minimum_free_mib: u32,
+) -> Result<(bool, Vec<u8>), String> {
+    run_process(
+        command,
+        timeout,
+        stop,
+        max_bytes,
+        Some(minimum_free_mib.min(65536)),
+    )
+}
+
+fn run_process(
+    command: &mut Command,
+    timeout: Duration,
+    stop: &AtomicBool,
+    max_bytes: usize,
+    gpu: Option<u32>,
+) -> Result<(bool, Vec<u8>), String> {
+    if stop.load(Ordering::Relaxed) {
+        return Err("Conversion was cancelled before tool dispatch".into());
+    }
     let temporary = tempfile::tempdir().map_err(|_| "Cannot create tool scratch space")?;
     let mut stdout = tempfile::tempfile().map_err(|_| "Cannot create tool output buffer")?;
     let stderr = tempfile::tempfile().map_err(|_| "Cannot create tool error buffer")?;
     configure_tool_environment(command, temporary.path());
+    if let Some(minimum_free_mib) = gpu {
+        configure_gpu_environment(command, minimum_free_mib);
+    }
     command
         .stdin(Stdio::null())
         .stdout(
@@ -143,6 +242,9 @@ pub fn bounded_process_allow_failure(
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Err("Conversion was cancelled before tool dispatch".into());
     }
     let mut child = command
         .spawn()
@@ -184,6 +286,23 @@ pub fn bounded_process_allow_failure(
     Ok((success, bytes))
 }
 
+fn configure_gpu_environment(command: &mut Command, minimum_free_mib: u32) {
+    // These fixed values describe only the explicitly granted first device.
+    // No credentials or arbitrary inherited library paths enter GPU children.
+    command
+        .env("CUDA_VISIBLE_DEVICES", "0")
+        .env("NVIDIA_VISIBLE_DEVICES", "0")
+        .env("NVIDIA_DRIVER_CAPABILITIES", "compute,utility")
+        .env(
+            "LD_LIBRARY_PATH",
+            "/usr/lib/wsl/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/lib",
+        )
+        .env("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "true")
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("MKL_NUM_THREADS", "1")
+        .env("GPU_MIN_FREE_MIB", minimum_free_mib.min(65536).to_string());
+}
+
 fn configure_tool_environment(command: &mut Command, scratch: &Path) {
     command.env_clear();
     for name in [
@@ -220,6 +339,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_json_and_persistence_do_not_replace_state_on_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let original = serde_json::json!({"safe":true});
+        write_private(&path, &original).unwrap();
+        let oversized = serde_json::json!({"oversized":"x".repeat(1024)});
+        assert!(bounded_json_clone(&oversized, 64).is_err());
+        assert!(write_private_limited(&path, &oversized, 64).is_err());
+        assert_eq!(read_json(&path, 4096).unwrap(), original);
+        assert_eq!(bounded_json_clone(&original, 64).unwrap(), original);
+    }
+
+    #[test]
     fn tool_environment_drops_custom_values_and_uses_private_scratch() {
         let mut command = Command::new("unused-test-executable");
         command.env("SUBFORGE_TEST_SECRET", "fixture-value");
@@ -244,5 +376,40 @@ mod tests {
                 Some(std::ffi::OsStr::new("C.UTF-8"))
             );
         }
+    }
+
+    #[test]
+    fn gpu_environment_is_explicit_and_does_not_enter_cpu_children() {
+        let scratch = Path::new("private-scratch");
+        let mut command = Command::new("unused-test-executable");
+        command
+            .env("SUBFORGE_TEST_SECRET", "fixture-value")
+            .env("LD_LIBRARY_PATH", "untrusted-path")
+            .env("CUDA_VISIBLE_DEVICES", "all");
+        configure_tool_environment(&mut command, scratch);
+        assert!(
+            !command
+                .get_envs()
+                .any(|(name, _)| name == "CUDA_VISIBLE_DEVICES" || name == "LD_LIBRARY_PATH")
+        );
+        configure_gpu_environment(&mut command, 2048);
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert!(!environment.contains_key(std::ffi::OsStr::new("SUBFORGE_TEST_SECRET")));
+        assert_eq!(
+            environment
+                .get(std::ffi::OsStr::new("CUDA_VISIBLE_DEVICES"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("0"))
+        );
+        assert_eq!(
+            environment
+                .get(std::ffi::OsStr::new("LD_LIBRARY_PATH"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new(
+                "/usr/lib/wsl/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/lib"
+            ))
+        );
     }
 }

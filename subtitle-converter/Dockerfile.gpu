@@ -1,0 +1,40 @@
+# Optional NVIDIA GPU runtime. Build only for linux/amd64 and after the CPU
+# image has been built locally from Dockerfile.
+FROM scratch AS gpu-wheel-cache
+FROM scratch AS gpu-model-cache
+FROM --platform=linux/amd64 python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 AS python-runtime
+
+FROM --platform=linux/amd64 homelab-subtitle-converter:0.3.0
+USER root
+COPY --from=python-runtime /usr/local /usr/local
+COPY gpu/requirements.lock /tmp/gpu-requirements.txt
+RUN --mount=type=bind,from=gpu-wheel-cache,target=/wheel-cache \
+    apt-get update && apt-get install -y --no-install-recommends \
+      libglib2.0-0 libgl1 libgomp1 libstdc++6 \
+      libbz2-1.0 libffi8 liblzma5 libncursesw6 libreadline8 libsqlite3-0 libssl3 zlib1g \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.12 -c 'from pathlib import Path; p=Path("/tmp/gpu-requirements.txt"); w=Path("/wheel-cache/paddlepaddle_gpu-3.2.2-cp312-cp312-linux_x86_64.whl"); s=p.read_text(); p.write_text(s.replace("https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/"+w.name, w.as_uri()) if w.is_file() else s)' \
+    && python3.12 -m pip install --no-cache-dir \
+      --no-deps --require-hashes -r /tmp/gpu-requirements.txt
+
+# Model artifacts are checksum-locked and safely unpacked at build time. The
+# runtime adapter only reads these local, read-only model files.
+COPY gpu/models.sha256 /tmp/models.sha256
+COPY gpu/download_models.py /tmp/download_models.py
+COPY gpu/requirements-runtime.lock /tmp/gpu-runtime-requirements.txt
+RUN --mount=type=bind,from=gpu-model-cache,target=/model-cache \
+    python3.12 -m pip install --no-cache-dir --no-deps --require-hashes -r /tmp/gpu-runtime-requirements.txt \
+    && MODEL_ARCHIVE_CACHE=/model-cache python3.12 /tmp/download_models.py \
+    && rm /tmp/download_models.py /tmp/models.sha256 /tmp/gpu-runtime-requirements.txt \
+    && find /opt/paddle-models -type d -exec chmod 0555 {} + \
+    && find /opt/paddle-models -type f -exec chmod 0444 {} + \
+    && python3.12 -m pip check \
+    && python3.12 -c 'from importlib.metadata import version; print(version("paddlepaddle-gpu"), version("paddleocr"), version("paddlex"))'
+COPY gpu/paddleocr /usr/local/bin/paddleocr
+RUN chmod 0555 /usr/local/bin/paddleocr
+USER 1000:1000
+ENV CONVERTER_ENABLE_GPU=true \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1

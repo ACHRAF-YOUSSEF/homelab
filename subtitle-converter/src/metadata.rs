@@ -1,9 +1,13 @@
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
-const LIMIT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_ENTRIES: usize = 5_000;
+pub const LIMIT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_ENTRIES: usize = 5_000;
 const MAX_ENTRY_BYTES: usize = 64 * 1024;
 const MAX_TRACKS: usize = 64;
 const MAX_LABEL: usize = 32;
@@ -15,11 +19,28 @@ struct Entry {
     bytes: usize,
 }
 
+/// Serialized entry accounting, not an estimate of heap or process RSS.
+/// Readers never acquire the cache or converter mutex.
+#[derive(Default)]
+pub struct CacheUsage {
+    entries: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl CacheUsage {
+    pub fn snapshot(&self) -> Value {
+        json!({"entries":self.entries.load(Ordering::Relaxed),
+            "accounted_bytes":self.bytes.load(Ordering::Relaxed),
+            "byte_accounting":"serialized_entries", "max_entries":MAX_ENTRIES,"max_bytes":LIMIT_BYTES})
+    }
+}
+
 pub struct MetadataCache {
     path: PathBuf,
     entries: BTreeMap<String, Entry>,
     bytes: usize,
     dirty: bool,
+    usage: Arc<CacheUsage>,
 }
 
 impl MetadataCache {
@@ -29,6 +50,7 @@ impl MetadataCache {
             entries: BTreeMap::new(),
             bytes: 0,
             dirty: false,
+            usage: Arc::new(CacheUsage::default()),
         };
         let Ok(saved) = crate::util::read_json(&cache.path, LIMIT_BYTES) else {
             return cache;
@@ -56,7 +78,19 @@ impl MetadataCache {
                 },
             );
         }
+        cache.publish_usage();
         cache
+    }
+
+    pub fn usage(&self) -> Arc<CacheUsage> {
+        Arc::clone(&self.usage)
+    }
+
+    fn publish_usage(&self) {
+        self.usage
+            .entries
+            .store(self.entries.len(), Ordering::Relaxed);
+        self.usage.bytes.store(self.bytes, Ordering::Relaxed);
     }
 
     pub fn get(&self, key: &str, fingerprint: &Value) -> Option<Value> {
@@ -90,6 +124,7 @@ impl MetadataCache {
         entry.bytes = size;
         self.bytes += size;
         self.entries.insert(key.to_owned(), entry);
+        self.publish_usage();
         self.dirty = true;
     }
 
@@ -129,6 +164,7 @@ impl MetadataCache {
         }
         if !remove.is_empty() {
             self.dirty = true;
+            self.publish_usage();
         }
         remove.len()
     }
@@ -265,5 +301,29 @@ mod tests {
         cache.persist().unwrap();
         assert!(cache.get("/root/a.mkv", &json!(1)).is_some());
         assert!(cache.get("/other/b.mkv", &json!(1)).is_none());
+    }
+
+    #[test]
+    fn shared_usage_tracks_load_replace_eviction_and_compaction() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let mut cache = MetadataCache::new(path.clone());
+        let usage = cache.usage();
+        assert_eq!(usage.snapshot()["entries"], 0);
+        for index in 0..MAX_ENTRIES + 1 {
+            cache.insert(&format!("/root/{index:05}.mkv"), json!(index), tracks());
+        }
+        assert_eq!(usage.snapshot()["entries"], MAX_ENTRIES);
+        assert!(usage.snapshot()["accounted_bytes"].as_u64().unwrap() <= LIMIT_BYTES as u64);
+        assert!(cache.get("/root/00000.mkv", &json!(0)).is_none());
+        let previous_bytes = usage.snapshot()["accounted_bytes"].clone();
+        cache.insert("/root/00001.mkv", json!(1), json!([]));
+        assert!(usage.snapshot()["accounted_bytes"].as_u64() < previous_bytes.as_u64());
+        cache.persist().unwrap();
+        let loaded = MetadataCache::new(path);
+        assert_eq!(loaded.usage().snapshot(), usage.snapshot());
+        cache.compact(|_| false);
+        assert_eq!(usage.snapshot()["entries"], 0);
+        assert_eq!(usage.snapshot()["accounted_bytes"], 0);
     }
 }

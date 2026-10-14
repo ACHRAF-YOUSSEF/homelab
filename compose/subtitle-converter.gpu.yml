@@ -1,0 +1,23 @@
+# Explicit opt-in override for local NVIDIA PaddleOCR. The base image and
+# allocation remain CPU-only unless this file is supplied. Select one device;
+# never grant the Docker socket or every GPU. Worker slots in workers.conf
+# still default to zero; this override exposes only NVIDIA device 0.
+services:
+  subtitle-converter:
+    image: homelab-subtitle-converter:0.3.0-gpu
+    build:
+      context: ./subtitle-converter
+      dockerfile: Dockerfile.gpu
+    mem_limit: ${CONVERTER_GPU_MEMORY_LIMIT:-1536m}
+    environment:
+      CONVERTER_ENABLE_OCR: "true"
+      CONVERTER_ENABLE_GPU: "true"
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]

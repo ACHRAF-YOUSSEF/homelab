@@ -1,5 +1,6 @@
 *
 !Dockerfile
+!Dockerfile.gpu
 !converter.py
 !server.py
 !integrations.py
@@ -16,3 +17,7 @@
 !src/**
 !tests/
 !tests/**
+!gpu/
+!gpu/**
+gpu/models/
+gpu/__pycache__/

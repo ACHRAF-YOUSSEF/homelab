@@ -5,6 +5,7 @@ use crate::converter::{Converter, Workload};
 use crate::integrations::Integrations;
 use crate::tasks::Scheduler;
 use crate::util::{constant_equal, now, read_json, token, write_private};
+use crate::workers::{ActiveWorker, Workers};
 use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,45 @@ const INVENTORY_LIMIT: usize = 2000;
 const HISTORY_LIMIT: usize = 100;
 const JSON_LIMIT: usize = 32 * 1024 * 1024;
 const HTTP_WORKERS: usize = 4;
+
+struct FileOutcome {
+    state: Option<Value>,
+    summary: Value,
+    terminal: Option<Value>,
+    gpu_health: Option<crate::gpu::Health>,
+    description: Option<Result<Option<Value>, String>>,
+}
+
+#[derive(Clone, Copy)]
+enum FileMode {
+    Convert(Workload),
+    Inspect { cached_only: bool },
+}
+
+type Descriptions = BTreeMap<PathBuf, Result<Option<Value>, String>>;
+
+enum FileFailure {
+    Conversion(String),
+    Gpu(&'static str),
+}
+
+impl From<String> for FileFailure {
+    fn from(message: String) -> Self {
+        Self::Conversion(message)
+    }
+}
+
+enum FileEvent {
+    Progress {
+        id: usize,
+        event: Value,
+    },
+    Finished {
+        id: usize,
+        path: PathBuf,
+        outcome: Result<FileOutcome, FileFailure>,
+    },
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -67,6 +107,9 @@ struct Runtime {
 pub struct App {
     runtime: Mutex<Runtime>,
     converter: Mutex<Converter>,
+    metadata_usage: Arc<crate::metadata::CacheUsage>,
+    resources: Mutex<crate::resources::Sampler>,
+    workers: Mutex<Workers>,
     integrations: Mutex<Integrations>,
     public_integrations: Mutex<Value>,
     mounts: Vec<PathBuf>,
@@ -208,6 +251,8 @@ impl App {
         }
         let converter = Converter::new(mounts.clone(), data.join("state.json"))?;
         let ocr_permission = converter.ocr_allowed();
+        let metadata_usage = converter.metadata_usage();
+        let workers = Workers::new(data.join("workers.conf"), ocr_permission)?;
         let schedule_path = data.join("tasks.json");
         let new_schedule = !schedule_path.exists();
         let mut scheduler = Scheduler::new(schedule_path, now(), auto_scan)?;
@@ -345,6 +390,9 @@ impl App {
             public_integrations: Mutex::new(integrations.public_settings()),
             runtime: Mutex::new(runtime),
             converter: Mutex::new(converter),
+            metadata_usage,
+            resources: Mutex::new(crate::resources::Sampler::default()),
+            workers: Mutex::new(workers),
             integrations: Mutex::new(integrations),
             mounts,
             data,
@@ -362,7 +410,7 @@ impl App {
         });
         app.log(
             "INFO",
-            "Rust dashboard ready; conversion runs one tool at a time",
+            "Rust dashboard ready; file workers use bounded allocation",
         );
         Ok(app)
     }
@@ -431,7 +479,29 @@ impl App {
             .find(|task| task["id"] == "discovery")
             .map(|task| task["interval_seconds"].clone())
             .unwrap_or(json!(21600));
-        json!({"version":env!("CARGO_PKG_VERSION"),"runtime":"rust","os":std::env::consts::OS,"arch":std::env::consts::ARCH,"uptime_seconds":self.started.elapsed().as_secs(),"resource_policy":{"conversion_workers":1,"ocr_threads":1,"metadata_cache_max_bytes":33554432,"metadata_cache_max_entries":2000,"discovery_interval_seconds":interval,"ocr_permission":std::env::var("CONVERTER_ENABLE_OCR").is_ok_and(|value|value=="true" || value=="1"),"automatic_ocr_new_or_changed_only":true},"scheduler":{"paused":schedule["paused"]}})
+        let sample = lock(&self.resources).snapshot();
+        let limits = lock(&self.workers).limits(&sample);
+        let active = lock(&self.workers).active.len();
+        let mut usage = json!(sample);
+        usage["metadata_cache"] = self.metadata_usage.snapshot();
+        let worker = {
+            let runtime = lock(&self.runtime);
+            json!({"active":active,
+                "kind":runtime.running.as_ref().map(|job| job["kind"].clone())})
+        };
+        usage["worker"] = worker;
+        json!({"version":env!("CARGO_PKG_VERSION"),"runtime":"rust","os":std::env::consts::OS,"arch":std::env::consts::ARCH,"uptime_seconds":self.started.elapsed().as_secs(),"resource_usage":usage,"resource_policy":{"conversion_workers":limits.cpu_workers,"ocr_threads":1,"ocr_workers":limits.ocr_workers,"gpu_workers":limits.gpu_workers,"metadata_cache_max_bytes":crate::metadata::LIMIT_BYTES,"metadata_cache_max_entries":crate::metadata::MAX_ENTRIES,"discovery_interval_seconds":interval,"ocr_permission":self.ocr_permission,"automatic_ocr_new_or_changed_only":true},"scheduler":{"paused":schedule["paused"]}})
+    }
+
+    fn workers(&self) -> Value {
+        let sample = lock(&self.resources).snapshot();
+        lock(&self.workers).public(&sample)
+    }
+
+    fn update_workers(&self, data: &Value) -> Result<Value, String> {
+        lock(&self.workers).update(data)?;
+        self.wake.notify_all();
+        Ok(self.workers())
     }
     fn enqueue_task(&self, id: &str, origin: &str, retry: bool) -> Result<Option<Value>, String> {
         let kind = match id {
@@ -710,8 +780,15 @@ impl App {
         if let Some(summary) = event.get("summary") {
             job["summary"] = summary.clone();
         }
-        if ["converted", "failed", "pending", "cached"]
-            .contains(&event["status"].as_str().unwrap_or(""))
+        if [
+            "converted",
+            "failed",
+            "pending",
+            "cached",
+            "inspected",
+            "metadata_pending",
+        ]
+        .contains(&event["status"].as_str().unwrap_or(""))
         {
             job["processed"] = json!(count(&job["processed"]) + 1);
         }
@@ -765,6 +842,313 @@ impl App {
             }
         }
     }
+
+    /// A single job/cancellation scope owns the bounded per-file threads.
+    /// Workers never persist shared state or call network integrations.
+    fn convert_files(
+        &self,
+        paths: &[PathBuf],
+        job: &Value,
+        workload: Workload,
+        integrations: &mut Integrations,
+    ) -> Result<Value, String> {
+        self.run_files(paths, job, FileMode::Convert(workload), integrations)
+            .map(|(summary, _)| summary)
+    }
+
+    fn run_files(
+        &self,
+        paths: &[PathBuf],
+        job: &Value,
+        mode: FileMode,
+        integrations: &mut Integrations,
+    ) -> Result<(Value, Descriptions), String> {
+        if paths.len() > 20_000 {
+            return Err("File worker input exceeds its path limit".into());
+        }
+        let languages = strings(&job["languages"]);
+        let retry = job["retry"].as_bool().unwrap_or(false);
+        let automatic = job["origin"] == "schedule"
+            || ["sonarr", "radarr"].contains(&job["origin"].as_str().unwrap_or(""));
+        let ocr = matches!(mode, FileMode::Convert(workload) if workload != Workload::Text)
+            && self.ocr_permission;
+        let mut seen = HashSet::new();
+        let mut pending: VecDeque<_> = paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| seen.insert(path).then_some(index))
+            .collect();
+        if let Some(running) = lock(&self.runtime).running.as_mut() {
+            running["total"] = json!(pending.len());
+            if matches!(mode, FileMode::Inspect { .. }) {
+                running["processed"] = json!(0);
+            }
+        }
+        let mut summary = if matches!(mode, FileMode::Inspect { .. }) {
+            json!({"inspected":0,"failed":0,"metadata_pending":0})
+        } else {
+            json!({"converted":0,"cached":0,"pending":0,"failed":0,"planned":0})
+        };
+        let mut descriptions = BTreeMap::new();
+        let mut failure = None;
+        std::thread::scope(|scope| {
+            let (sender, receiver) = mpsc::sync_channel::<FileEvent>(16);
+            let mut handles = BTreeMap::new();
+            while !pending.is_empty() || !handles.is_empty() {
+                if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed) {
+                    self.cancel.store(true, Ordering::Relaxed);
+                    pending.clear();
+                }
+                loop {
+                    if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed)
+                    {
+                        self.cancel.store(true, Ordering::Relaxed);
+                        pending.clear();
+                        break;
+                    }
+                    if pending.is_empty() || failure.is_some() {
+                        break;
+                    }
+                    let sample = lock(&self.resources).snapshot();
+                    let admission = {
+                        let mut workers = lock(&self.workers);
+                        let resource = if ocr && workers.can_start_resource(&sample, "gpu") {
+                            Some("gpu")
+                        } else if workers
+                            .can_start_resource(&sample, if ocr { "cpu_ocr" } else { "cpu" })
+                        {
+                            Some(if ocr { "cpu_ocr" } else { "cpu" })
+                        } else {
+                            None
+                        };
+                        if let Some(resource) = resource {
+                            let next = pending.iter().position(|index| {
+                                paths.get(*index).is_some_and(|path| {
+                                    workers.active.iter().all(|active| {
+                                        matches!(mode, FileMode::Inspect { .. })
+                                            || !crate::workers::conflicts(&active.path, path)
+                                    })
+                                })
+                            });
+                            next.and_then(|next| pending.remove(next))
+                                .and_then(|index| paths.get(index))
+                                .and_then(|path| {
+                                    let id = (0..crate::workers::HARD_TOTAL_LIMIT)
+                                        .find(|id| !handles.contains_key(id))?;
+                                    workers.active.push(ActiveWorker {
+                                        id,
+                                        resource,
+                                        path: path.clone(),
+                                        started: now(),
+                                        status: if resource == "gpu" {
+                                            "checking_gpu"
+                                        } else {
+                                            "processing"
+                                        },
+                                    });
+                                    Some((id, path.clone(), resource))
+                                })
+                        } else {
+                            None
+                        }
+                    };
+                    let Some((id, path, resource)) = admission else {
+                        break;
+                    };
+                    let worker = {
+                        let converter = lock(&self.converter);
+                        if matches!(mode, FileMode::Inspect { .. }) {
+                            Ok(converter.inspection_worker())
+                        } else {
+                            converter.file_worker(&path)
+                        }
+                    };
+                    let mut worker = match worker {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            lock(&self.workers).active.retain(|worker| worker.id != id);
+                            summary["failed"] = json!(count(&summary["failed"]) + 1);
+                            self.progress(json!({"status":"failed","path":path,"error":error,"summary":summary}));
+                            continue;
+                        }
+                    };
+                    if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed)
+                    {
+                        self.cancel.store(true, Ordering::Relaxed);
+                        pending.clear();
+                        lock(&self.workers).active.retain(|worker| worker.id != id);
+                        break;
+                    }
+                    if resource == "gpu" {
+                        worker.enable_gpu_ocr(lock(&self.workers).gpu_min_free_mib());
+                    }
+                    let worker_path = path.clone();
+                    let worker_sender = sender.clone();
+                    let worker_languages = &languages;
+                    let handle = std::thread::Builder::new()
+                        .name(format!("subforge-file-{id}"))
+                        .stack_size(2 * 1024 * 1024)
+                        .spawn_scoped(scope, move || {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    if let FileMode::Inspect { cached_only } = mode {
+                                        let _ = worker_sender.send(FileEvent::Progress { id, event: json!({"status":"inspecting","path":worker_path}) });
+                                        let description = if cached_only { Ok(worker.cached_description(&worker_path)) }
+                                            else { worker.describe_with_stop(&worker_path, &self.cancel).map(Some) };
+                                        let (summary, terminal) = match &description {
+                                            Ok(Some(_)) => (json!({"inspected":1,"failed":0}), json!({"status":"inspected","path":worker_path})),
+                                            Ok(None) => (json!({"metadata_pending":1}), json!({"status":"metadata_pending","path":worker_path})),
+                                            Err(error) => (json!({"inspected":0,"failed":1}), json!({"status":"failed","path":worker_path,"error":error})),
+                                        };
+                                        return Ok(FileOutcome { state: None, summary, terminal: Some(terminal), gpu_health: None, description: Some(description) });
+                                    }
+                                    let FileMode::Convert(workload) = mode else { return Err(FileFailure::Conversion("Unsupported file worker operation".into())); };
+                                    let mut terminal = None;
+                                    let summary = worker.scan_workload(
+                                        std::slice::from_ref(&worker_path),
+                                        worker_languages,
+                                        retry,
+                                        workload,
+                                        automatic,
+                                        &self.cancel,
+                                        &mut |event| {
+                                            if ["converted", "cached", "failed", "pending"]
+                                                .contains(&event["status"].as_str().unwrap_or(""))
+                                            {
+                                                terminal = Some(event);
+                                            } else {
+                                                let _ = worker_sender
+                                                    .send(FileEvent::Progress { id, event });
+                                            }
+                                        },
+                                    )?;
+                                    let (gpu_health, gpu_failure) = worker.gpu_status();
+                                    if let Some(error) = gpu_failure { return Err(FileFailure::Gpu(error)); }
+                                    Ok(FileOutcome {
+                                        state: worker.take_file_state(&worker_path),
+                                        summary,
+                                        terminal,
+                                        gpu_health,
+                                        description: None,
+                                    })
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(FileFailure::Conversion("File worker failed safely".into()))
+                                });
+                            let _ = worker_sender.send(FileEvent::Finished {
+                                id,
+                                path: worker_path,
+                                outcome: result,
+                            });
+                        });
+                    match handle {
+                        Ok(handle) => {
+                            handles.insert(id, handle);
+                        }
+                        Err(_) => {
+                            lock(&self.workers).active.retain(|worker| worker.id != id);
+                            failure = Some("File worker capacity is unavailable".into());
+                            self.cancel.store(true, Ordering::Relaxed);
+                            pending.clear();
+                            break;
+                        }
+                    }
+                }
+                if pending.is_empty() && handles.is_empty() {
+                    break;
+                }
+                match receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(FileEvent::Progress { id, mut event }) => {
+                        if let Some(worker) = lock(&self.workers)
+                            .active
+                            .iter_mut()
+                            .find(|worker| worker.id == id)
+                        {
+                            worker.status = match event["status"].as_str() {
+                                Some("extracting") => "extracting",
+                                Some("inspecting") => "inspecting",
+                                Some("checking_gpu") => "checking_gpu",
+                                _ => "processing",
+                            };
+                        }
+                        if let Some(object) = event.as_object_mut() {
+                            object.remove("summary");
+                        }
+                        self.progress(event);
+                    }
+                    Ok(FileEvent::Finished { id, path, outcome }) => {
+                        if let Some(handle) = handles.remove(&id) {
+                            let _ = handle.join();
+                        }
+                        lock(&self.workers).active.retain(|worker| worker.id != id);
+                        match outcome {
+                            Ok(outcome) => {
+                                if let Some(description) = outcome.description {
+                                    descriptions.insert(path.clone(), description);
+                                }
+                                if let Some(health) = outcome.gpu_health {
+                                    lock(&self.workers).gpu.verified = Some(health);
+                                }
+                                if let Err(error) =
+                                    lock(&self.converter).merge_file_state(&path, outcome.state)
+                                {
+                                    failure = Some(error);
+                                    self.cancel.store(true, Ordering::Relaxed);
+                                    pending.clear();
+                                }
+                                for &key in if matches!(mode, FileMode::Inspect { .. }) {
+                                    &["inspected", "failed", "metadata_pending"][..]
+                                } else {
+                                    &["converted", "cached", "pending", "failed", "planned"][..]
+                                } {
+                                    summary[key] = json!(
+                                        count(&summary[key])
+                                            .saturating_add(count(&outcome.summary[key]))
+                                    );
+                                }
+                                if let Some(mut event) = outcome.terminal {
+                                    let outputs = strings(&event["new_outputs"]);
+                                    if !matches!(mode, FileMode::Inspect { cached_only: true }) {
+                                        event["summary"] = summary.clone();
+                                    }
+                                    self.progress(event);
+                                    if failure.is_none() && !outputs.is_empty() {
+                                        self.notifications(integrations.notify(&outputs));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let error = match error {
+                                    FileFailure::Conversion(error) => error,
+                                    FileFailure::Gpu(error) => {
+                                        lock(&self.workers).gpu.failed();
+                                        failure = Some(error.into());
+                                        self.cancel.store(true, Ordering::Relaxed);
+                                        pending.clear();
+                                        error.into()
+                                    }
+                                };
+                                summary["failed"] = json!(count(&summary["failed"]) + 1);
+                                self.progress(json!({"status":"failed","path":path,"error":error,"summary":summary}));
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        failure = Some("File worker channel is unavailable".into());
+                        self.cancel.store(true, Ordering::Relaxed);
+                        pending.clear();
+                    }
+                }
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        lock(&self.converter).persist_metadata()?;
+        Ok((summary, descriptions))
+    }
+
     fn execute(&self, job: &Value, integrations: &mut Integrations) -> Result<(), String> {
         if ["health", "cleanup", "backup"].contains(&job["kind"].as_str().unwrap_or("")) {
             let result = match job["kind"].as_str().unwrap_or("") {
@@ -825,27 +1209,20 @@ impl App {
                 "all" => Workload::All,
                 _ => Workload::Text,
             };
-            let summary = lock(&self.converter).scan_workload(
-                &paths,
-                &strings(&job["languages"]),
-                job["retry"].as_bool().unwrap_or(false),
-                workload,
-                job["origin"] == "schedule"
-                    || ["sonarr", "radarr"].contains(&job["origin"].as_str().unwrap_or("")),
-                &self.cancel,
-                &mut |event| {
-                    let outputs = strings(&event["new_outputs"]);
-                    self.progress(event);
-                    if !outputs.is_empty() {
-                        self.notifications(integrations.notify(&outputs));
-                    }
-                },
-            )?;
+            let summary = self.convert_files(&paths, job, workload, integrations)?;
             if let Some(running) = lock(&self.runtime).running.as_mut() {
                 running["summary"] = summary;
             }
         }
         if job["kind"] == "inspect" || job["task_id"] == "discovery" {
+            let (_, mut descriptions) = self.run_files(
+                &paths[..paths.len().min(INVENTORY_LIMIT)],
+                job,
+                FileMode::Inspect {
+                    cached_only: job["task_id"] == "discovery",
+                },
+                integrations,
+            )?;
             let previous_rows = lock(&self.runtime)
                 .inventory
                 .iter()
@@ -863,20 +1240,10 @@ impl App {
                 if self.cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                self.progress(json!({"status":"inspecting","path":path}));
-                let cache_miss = job["task_id"] == "discovery"
-                    && lock(&self.converter).cached_description(path).is_none();
-                let result = Converter::safe_path(&path.to_string_lossy(), &roots).and_then(|_| {
-                    if job["task_id"] == "discovery" {
-                        lock(&self.converter)
-                            .cached_description(path)
-                            .ok_or_else(|| {
-                                "Metadata unavailable; inspect this file manually".into()
-                            })
-                    } else {
-                        lock(&self.converter).describe_with_stop(path, &self.cancel)
-                    }
-                });
+                let Some(result) = descriptions.remove(path) else {
+                    continue;
+                };
+                let cache_miss = matches!(result, Ok(None));
                 let root_id = roots
                     .iter()
                     .find(|root| path.starts_with(root))
@@ -893,15 +1260,15 @@ impl App {
                     row
                 } else {
                     match result {
-                        Ok(tracks) => {
+                        Ok(Some(tracks)) => {
                             inspected += 1;
                             json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":if ["mkv","mks","mp4","m4v","webm","mov","avi","ts","m2ts"].contains(&path.extension().and_then(|value|value.to_str()).unwrap_or("")){"video"}else{"sidecar"},"tracks":tracks})
                         }
                         Err(error) => {
                             failed += 1;
-                            self.progress(json!({"status":"failed","path":path,"error":error}));
                             json!({"path":path,"name":path.file_name().map(|name|name.to_string_lossy().into_owned()),"root_id":root_id,"type":"video","tracks":[],"error":error})
                         }
+                        Ok(None) => continue,
                     }
                 };
                 results.push(result);
@@ -945,7 +1312,12 @@ impl App {
             }
             let job = {
                 let mut runtime = lock(&self.runtime);
-                match runtime.queue.pop_front() {
+                let paused = lock(&self.workers).allocation.paused;
+                match if paused {
+                    None
+                } else {
+                    runtime.queue.pop_front()
+                } {
                     Some(mut job) => {
                         self.cancel.store(false, Ordering::Relaxed);
                         job["status"] = json!("running");
@@ -1281,6 +1653,7 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/api/status" => Reply::json(200, app.status()),
             "/api/tasks" => Reply::json(200, app.tasks()),
             "/api/system" => Reply::json(200, app.system()),
+            "/api/workers" => Reply::json(200, app.workers()),
             "/api/inventory" => Reply::json(200, app.inventory()),
             "/api/widget" => Reply::json(200, app.widget()),
             "/api/settings" => Reply::json(200, app.settings()),
@@ -1326,6 +1699,7 @@ fn handle(app: &App, request: &Request) -> Reply {
     let result: Result<(u16, Value), String> = if request.method == "PUT" {
         match request.target.as_str() {
             "/api/settings" => app.update_settings(&data).map(|value| (200, value)),
+            "/api/workers" => app.update_workers(&data).map(|value| (200, value)),
             "/api/root-folders" => app.update_roots(&data).map(|value| (200, value)),
             "/api/tasks" => lock(&app.scheduler)
                 .update(&data, now())
@@ -1547,6 +1921,165 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gated_workers_fixture() -> (
+        tempfile::TempDir,
+        Arc<App>,
+        Vec<PathBuf>,
+        Arc<crate::converter::FileGate>,
+    ) {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let mount = temporary.path().join("media");
+        fs::create_dir(&mount).expect("fixture");
+        let app = App::new(
+            vec![mount.clone()],
+            temporary.path().join("data"),
+            Duration::from_secs(21600),
+            false,
+        )
+        .expect("app");
+        app.update_workers(
+            &json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":false}),
+        )
+        .expect("allocation");
+        lock(&app.resources).set_fixture(crate::resources::Snapshot::fixture(
+            4.0,
+            Some(1536 * 1024 * 1024),
+        ));
+        let gate = Arc::new(crate::converter::FileGate::default());
+        lock(&app.converter)
+            .set_file_gate(Arc::clone(&gate), temporary.path().join("no-tool-can-run"));
+        let paths = (1..=3)
+            .map(|episode| {
+                let path = mount.join(format!("show.S01E{episode:02}.ass"));
+                fs::write(&path, b"disposable fixture").expect("fixture");
+                fs::write(path.with_extension("srt"), b"existing output must survive")
+                    .expect("fixture");
+                Converter::safe_path(&path.to_string_lossy(), std::slice::from_ref(&mount))
+                    .expect("path")
+            })
+            .collect();
+        lock(&app.runtime).running = Some(json!({"kind":"extract","processed":0,"summary":{}}));
+        (temporary, app, paths, gate)
+    }
+
+    fn wait_for_fixture(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(condition(), "bounded worker fixture must make progress");
+    }
+
+    #[test]
+    fn parallel_files_deduplicate_and_pause_only_new_dispatch() {
+        let (_temporary, app, mut paths, gate) = gated_workers_fixture();
+        paths.push(paths[0].clone());
+        let runner = Arc::clone(&app);
+        let thread = std::thread::spawn(move || {
+            let mut integrations = Integrations::new(runner.data.join("settings.json")).unwrap();
+            runner.convert_files(
+                &paths,
+                &json!({"languages":["*"],"retry":true}),
+                Workload::Text,
+                &mut integrations,
+            )
+        });
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 2);
+        assert_eq!(app.workers()["active"]["cpu_workers"], 2);
+        assert_eq!(app.status()["running"]["total"], 3);
+        app.update_workers(&json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":true}))
+            .unwrap();
+        gate.released.store(true, Ordering::Relaxed);
+        wait_for_fixture(|| lock(&app.workers).active.is_empty());
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 2);
+        assert!(
+            !thread.is_finished(),
+            "paused dispatch leaves the third file pending"
+        );
+        app.update_workers(
+            &json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":false}),
+        )
+        .unwrap();
+        let summary = thread.join().unwrap().unwrap();
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 3);
+        assert_eq!(summary["converted"], 3);
+        assert_eq!(
+            read_json(&app.data.join("state.json"), JSON_LIMIT)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(app.status()["running"]["processed"], 3);
+        assert!(lock(&app.workers).active.is_empty());
+    }
+
+    #[test]
+    fn cancellation_joins_all_active_files_and_preserves_existing_outputs() {
+        let (_temporary, app, paths, gate) = gated_workers_fixture();
+        let output = paths[0].with_extension("srt");
+        let runner = Arc::clone(&app);
+        let thread = std::thread::spawn(move || {
+            let mut integrations = Integrations::new(runner.data.join("settings.json")).unwrap();
+            runner.convert_files(
+                &paths,
+                &json!({"languages":["*"]}),
+                Workload::Text,
+                &mut integrations,
+            )
+        });
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 2);
+        app.cancel.store(true, Ordering::Relaxed);
+        assert!(thread.join().unwrap().is_ok());
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 2);
+        assert!(lock(&app.workers).active.is_empty());
+        assert_eq!(fs::read(output).unwrap(), b"existing output must survive");
+    }
+
+    #[test]
+    fn system_snapshot_stays_responsive_with_converter_locked() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let mount = temporary.path().join("media");
+        fs::create_dir(&mount).expect("fixture");
+        let app = App::new(
+            vec![mount],
+            temporary.path().join("data"),
+            Duration::from_secs(21600),
+            false,
+        )
+        .expect("app");
+        lock(&app.runtime).running = Some(json!({"kind":"ocr","status":"running"}));
+        let converter_guard = lock(&app.converter);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader_app = Arc::clone(&app);
+        let reader = std::thread::spawn(move || {
+            sender.send(reader_app.system()).expect("reader");
+        });
+        let response = receiver.recv_timeout(Duration::from_secs(2));
+        drop(converter_guard);
+        reader.join().expect("reader");
+        let system = response.expect("system must not wait for long conversion or OCR");
+        assert_eq!(
+            system["resource_policy"]["metadata_cache_max_entries"],
+            crate::metadata::MAX_ENTRIES
+        );
+        assert_eq!(
+            system["resource_policy"]["metadata_cache_max_bytes"],
+            crate::metadata::LIMIT_BYTES
+        );
+        assert_eq!(system["resource_policy"]["conversion_workers"], 1);
+        assert_eq!(system["resource_policy"]["ocr_threads"], 1);
+        assert_eq!(system["resource_usage"]["worker"]["active"], 0);
+        assert_eq!(system["resource_usage"]["worker"]["kind"], "ocr");
+        assert_eq!(system["resource_usage"]["metadata_cache"]["entries"], 0);
+        assert_eq!(
+            system["resource_usage"]["metadata_cache"]["byte_accounting"],
+            "serialized_entries"
+        );
+    }
+
     #[test]
     fn statuses_distinguish_partial_and_refresh_failure() {
         assert_eq!(

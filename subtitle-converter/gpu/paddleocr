@@ -1,0 +1,220 @@
+#!/usr/local/bin/python3
+"""Offline, fail-closed PaddleOCR adapter for Subtitle Edit 5.2."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import json
+import os
+import subprocess
+import tempfile
+import sys
+from pathlib import Path
+
+MAX_IMAGES = 10_000
+IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+MODEL_ROOT = Path("/opt/paddle-models")
+
+
+class AdapterError(Exception):
+    pass
+
+
+def _prepare_environment():
+    scratch = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve(strict=True)
+    os.environ.update({
+        "HOME": str(scratch),
+        "XDG_CACHE_HOME": str(scratch / "cache"),
+        "PADDLE_PDX_CACHE_HOME": str(scratch / "paddlex"),
+        "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK": "True",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+
+
+def _gpu_memory():
+    executable = next((path for path in ("/usr/bin/nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi") if Path(path).is_file()), None)
+    if executable is None:
+        raise AdapterError("trusted NVIDIA memory query is unavailable")
+    result = subprocess.run(
+        [executable, "--id=0", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True, timeout=5,
+    )
+    fields = result.stdout.strip().split(",")
+    if len(fields) != 2 or len(result.stdout) > 128 or not all(field.strip().isdigit() for field in fields):
+        raise AdapterError("invalid NVIDIA memory query response")
+    free_bytes, total_bytes = (int(field.strip()) * 1024**2 for field in fields)
+    if total_bytes == 0 or free_bytes > total_bytes:
+        raise AdapterError("invalid NVIDIA memory query response")
+    return free_bytes, total_bytes
+
+
+def _cuda_probe(paddle):
+    if not paddle.device.is_compiled_with_cuda():
+        raise AdapterError("PaddlePaddle was built without CUDA support")
+    count = paddle.device.cuda.device_count()
+    if count != 1:
+        raise AdapterError("exactly one CUDA GPU must be available to PaddlePaddle")
+    paddle.device.set_device("gpu:0")
+    probe = paddle.to_tensor([1], place=paddle.CUDAPlace(0))
+    paddle.device.cuda.synchronize(0)
+    if "gpu:0" not in str(probe.place).lower():
+        raise AdapterError("CUDA probe tensor was not allocated on GPU 0")
+    free_bytes, total_bytes = _gpu_memory()
+    try:
+        min_free_mib = int(os.environ.get("GPU_MIN_FREE_MIB", "2048"))
+    except ValueError as exc:
+        raise AdapterError("invalid configured GPU free-memory threshold") from exc
+    if not 0 <= min_free_mib <= 65536:
+        raise AdapterError("invalid configured GPU free-memory threshold")
+    if free_bytes < min_free_mib * 1024**2:
+        raise AdapterError("GPU 0 has less than the configured free-memory threshold")
+    return {"cuda": True, "device_count": count, "free_bytes": int(free_bytes), "total_bytes": int(total_bytes)}
+
+
+def health():
+    try:
+        _prepare_environment()
+        # Paddle can emit startup notices; keep health output machine-readable.
+        with contextlib.redirect_stdout(io.StringIO()):
+            import paddle
+            info = _cuda_probe(paddle)
+        print(json.dumps({"ok": True, "models_checked": False, **info}, separators=(",", ":")))
+        return 0
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, AdapterError) else "CUDA runtime probe failed"
+        print(json.dumps({"ok": False, "error": message}, separators=(",", ":")))
+        return 1
+
+
+def _models(lang: str):
+    v6 = {"ch", "chinese_cht", "en", "japan", "zh"}
+    v6.update("af az bs ca cs cy da de es et eu fi fr ga gl hr hu id is it ku la lb lt lv mi ms mt nl no oc pl pt qu rm ro rs_latin sk sl sq sv sw tl tr uz vi french german".split())
+    arabic = set("ar bal fa ps sd ug ur".split())
+    eslav = set("ru be uk".split())
+    cyrillic = set("rs_cyrillic bg mn abq ady kbd ava dar inh che lbe lez tab ba bua cv kaa kk kv ky mhr mk mo os sah tg tt tyv udm xal".split())
+    devanagari = set("hi mr ne bh mai ang bho mah sck new gom bgc sa".split())
+    v6_model = ("PP-OCRv6_small_det", "PP-OCRv6_small_rec")
+    v5_detector = "PP-OCRv5_mobile_det"
+    families = {code: v6_model for code in v6}
+    families.update({code: (v5_detector, "arabic_PP-OCRv5_mobile_rec") for code in arabic})
+    families.update({code: (v5_detector, "eslav_PP-OCRv5_mobile_rec") for code in eslav})
+    families.update({code: (v5_detector, "cyrillic_PP-OCRv5_mobile_rec") for code in cyrillic})
+    families.update({code: (v5_detector, "devanagari_PP-OCRv5_mobile_rec") for code in devanagari})
+    families.update({code: (v5_detector, f"{code}_PP-OCRv5_mobile_rec") for code in ("el", "ta", "te", "th")})
+    families.update({
+        "korean": (v5_detector, "korean_PP-OCRv5_mobile_rec"),
+        "ka": ("PP-OCRv3_mobile_det", "ka_PP-OCRv3_mobile_rec"),
+        "pi": (v5_detector, "latin_PP-OCRv5_mobile_rec"),
+    })
+    normalized = lang.strip().lower()
+    normalized = {"zh-tw": "chinese_cht", "zh-hant": "chinese_cht", "zh-cn": "ch"}.get(normalized, normalized)
+    if "-" in normalized:
+        normalized = normalized.split("-", 1)[0]
+    normalized = {"ja": "japan", "ko": "korean", "zh": "ch"}.get(normalized, normalized)
+    try:
+        det_name, rec_name = families[normalized]
+    except KeyError as exc:
+        raise AdapterError(f"unsupported OCR language: {lang}") from exc
+    pairs = {"text_detection_model_name": det_name, "text_recognition_model_name": rec_name}
+    kwargs = {}
+    for key, name in pairs.items():
+        model_dir = MODEL_ROOT / name
+        if not model_dir.is_dir() or not (model_dir / "inference.json").is_file():
+            raise AdapterError(f"required packaged OCR model is unavailable ({name})")
+        kwargs[key] = name
+        kwargs[key.replace("_name", "_dir")] = str(model_dir)
+    return kwargs
+
+
+def _scratch_path(path: Path) -> Path:
+    scratch = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve(strict=True)
+    absolute = path.absolute()
+    if any(part.is_symlink() for part in (absolute, *absolute.parents)):
+        raise AdapterError("OCR directories must not contain symlinks")
+    resolved = absolute.resolve()
+    if scratch not in resolved.parents:
+        raise AdapterError("OCR directories must be inside the private scratch directory")
+    return resolved
+
+
+def run(input_dir: Path, output_dir: Path, lang: str):
+    input_dir = _scratch_path(input_dir)
+    if not input_dir.is_dir():
+        raise AdapterError("input path must be a directory")
+    output_dir = _scratch_path(output_dir)
+    if input_dir == output_dir or input_dir in output_dir.parents or output_dir in input_dir.parents:
+        raise AdapterError("input and output directories must not overlap")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    images = []
+    with os.scandir(input_dir) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                continue
+            if entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in IMAGE_SUFFIXES:
+                if len(images) == MAX_IMAGES:
+                    raise AdapterError(f"input directory exceeds the {MAX_IMAGES}-image limit")
+                images.append(Path(entry.path))
+    images.sort(key=lambda p: p.name.casefold())
+    if not images:
+        raise AdapterError("input directory contains no supported images")
+
+    # Ignore ambient proxy and thread settings; inference is entirely local.
+    _prepare_environment()
+    import cv2
+    cv2.setNumThreads(1)
+    import paddle
+
+    _cuda_probe(paddle)
+    from paddleocr import PaddleOCR
+
+    ocr = PaddleOCR(
+        **_models(lang),
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        text_recognition_batch_size=1,
+        cpu_threads=1,
+        device="gpu:0",
+    )
+    for image in images:
+        results = iter(ocr.predict(str(image)))
+        result = next(results, None)
+        if result is None:
+            # PaddleOCR may return no result for unreadable images; preserve an empty schema.
+            raise AdapterError(f"OCR returned no result for input image {image.name}")
+        result.save_to_json(str(output_dir))
+    return 0
+
+
+def main():
+    if sys.argv[1:] == ["--health-json"]:
+        return health()
+    parser = argparse.ArgumentParser(prog="paddleocr")
+    sub = parser.add_subparsers(dest="command", required=True)
+    ocr_parser = sub.add_parser("ocr")
+    ocr_parser.add_argument("-i", required=True, dest="input_dir")
+    ocr_parser.add_argument("--lang", required=True)
+    ocr_parser.add_argument("--save_path", required=True)
+    ocr_parser.add_argument("--use_angle_cls", choices=("false",), default="false")
+    args, unknown = parser.parse_known_args()
+    # SeConv invocation is fixed; reject all additional flags to avoid unsafe path/config inputs.
+    if unknown:
+        print("paddleocr: unsupported arguments", file=sys.stderr)
+        return 2
+    try:
+        return run(Path(args.input_dir), Path(args.save_path), args.lang)
+    except AdapterError as exc:
+        print(f"paddleocr: {exc}", file=sys.stderr)
+        return 2
+    except Exception:
+        print("paddleocr: OCR runtime failed", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

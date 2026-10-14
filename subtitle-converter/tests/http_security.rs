@@ -27,6 +27,22 @@ struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("/bin/kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .env_clear()
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if self.child.try_wait().is_ok_and(|status| status.is_some()) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -53,9 +69,16 @@ impl Server {
             {
                 let path = temp.path().join("fixture-ffprobe.sh");
                 let seconds = format!("{}.{:03}", delay.as_secs(), delay.subsec_millis());
+                let marker = format!(
+                    "'{}'",
+                    temp.path()
+                        .join("probe-starts.log")
+                        .to_string_lossy()
+                        .replace('\'', "'\\''")
+                );
                 fs::write(
                     &path,
-                    format!("#!/bin/sh\nsleep {seconds}\nprintf '{{\"streams\":[]}}'\n"),
+                    format!("#!/bin/sh\nprintf 'started\\n' >> {marker}\nsleep {seconds}\nprintf '{{\"streams\":[]}}'\n"),
                 )
                 .expect("write local fake ffprobe");
                 use std::os::unix::fs::PermissionsExt;
@@ -82,6 +105,16 @@ impl Server {
         let port_text = port.to_string();
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_subforge"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .env("TMP", temp.path())
+            .env("TEMP", temp.path())
+            .env("TMPDIR", temp.path());
         command
             .args([
                 "--host",
@@ -99,6 +132,7 @@ impl Server {
             .env("CONVERTER_WIDGET_TOKEN", WIDGET_TOKEN)
             .env("CONVERTER_WEBHOOK_TOKEN", WEBHOOK_TOKEN)
             .env("CONVERTER_ENABLE_OCR", "false")
+            .env("CONVERTER_ENABLE_GPU", "false")
             .env("CONVERTER_SCAN_INTERVAL", "3600");
         if let Some(path) = &ffprobe {
             command.env("CONVERTER_FFPROBE", path);
@@ -130,6 +164,16 @@ impl Server {
         let _ = self.child.wait();
         let port_text = self.port.to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_subforge"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .env("TMP", self._temp.path())
+            .env("TEMP", self._temp.path())
+            .env("TMPDIR", self._temp.path());
         command
             .args([
                 "--host",
@@ -147,6 +191,7 @@ impl Server {
             .env("CONVERTER_WIDGET_TOKEN", WIDGET_TOKEN)
             .env("CONVERTER_WEBHOOK_TOKEN", WEBHOOK_TOKEN)
             .env("CONVERTER_ENABLE_OCR", "false")
+            .env("CONVERTER_ENABLE_GPU", "false")
             .env("CONVERTER_SCAN_INTERVAL", "3600");
         if let Some(path) = &self.ffprobe {
             command.env("CONVERTER_FFPROBE", path);
@@ -572,6 +617,60 @@ fn task_and_system_endpoints_require_auth_and_report_ocr_permission() {
         "OCR is disabled by deployment permissions"
     );
     assert_eq!(system.body["resource_policy"]["ocr_permission"], false);
+    assert_eq!(system.body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        system.body["resource_usage"]["metadata_cache"]["max_entries"],
+        5000
+    );
+    assert_eq!(
+        system.body["resource_policy"]["metadata_cache_max_entries"],
+        5000
+    );
+    assert_eq!(system.body["resource_usage"]["worker"]["active"], 0);
+
+    let first_uptime = system.body["uptime_seconds"].as_u64().unwrap();
+    thread::sleep(Duration::from_millis(1100));
+    let repeated = server
+        .request("GET", "/api/system", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(repeated.status, 200);
+    assert!(repeated.body["uptime_seconds"].as_u64().unwrap() > first_uptime);
+}
+
+#[cfg(unix)]
+#[test]
+fn system_telemetry_stays_responsive_while_inspection_tool_is_running() {
+    let server = Server::start_with_slow_probe();
+    fs::write(server.root.join("Fixture.mkv"), b"fixture media").expect("write media fixture");
+    let csrf = server.csrf();
+    let job_id = server.enqueue_inspection(&csrf);
+    let auth = server.auth_header();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let status = server
+            .request("GET", "/api/status", &[("Authorization", &auth)], None)
+            .expect("read inspection status");
+        if status.body["running"]["id"] == job_id
+            && status.body["running"]["current"]["status"] == "inspecting"
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "slow inspection did not start");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let started = Instant::now();
+    let system = server
+        .request("GET", "/api/system", &[("Authorization", &auth)], None)
+        .expect("read system telemetry during inspection");
+    let elapsed = started.elapsed();
+    assert_eq!(system.status, 200);
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "system request took {elapsed:?}"
+    );
+    assert_eq!(system.body["resource_usage"]["worker"]["active"], 1);
+    assert_eq!(system.body["resource_usage"]["worker"]["kind"], "inspect");
 }
 
 #[test]
@@ -624,6 +723,193 @@ fn task_updates_validate_and_persist_across_backend_restart() {
         .unwrap();
     assert_eq!(discovery["enabled"], false);
     assert_eq!(discovery["interval_seconds"], 43200);
+}
+
+#[test]
+fn worker_configuration_is_created_private_validated_and_preserved() {
+    let mut server = Server::start();
+    let path = server.data.join("workers.conf");
+    let configuration: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(configuration["cpu_workers"], 1);
+    assert_eq!(configuration["ocr_workers"], 1);
+    assert_eq!(configuration["gpu_workers"], 0);
+    assert_eq!(configuration["max_cpu_workers"], 4);
+    assert_eq!(configuration["max_gpu_workers"], 1);
+    assert_eq!(configuration["gpu_min_free_mib"], 2048);
+    assert!(fs::read_to_string(&path).unwrap().contains('\n'));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        server
+            .request("GET", "/api/workers", &[], None)
+            .unwrap()
+            .status,
+        401
+    );
+    let auth = server.auth_header();
+    let body = r#"{"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":true}"#;
+    assert_eq!(
+        server
+            .request(
+                "PUT",
+                "/api/workers",
+                &[
+                    ("Authorization", &auth),
+                    ("Content-Type", "application/json")
+                ],
+                Some(body)
+            )
+            .unwrap()
+            .status,
+        403
+    );
+    let csrf = server.csrf();
+    let update = json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":true});
+    assert_eq!(
+        server
+            .json_request("PUT", "/api/workers", &csrf, &update)
+            .status,
+        200
+    );
+    let written = fs::read(&path).unwrap();
+    for invalid in [
+        json!({"cpu_workers":0,"ocr_workers":1,"gpu_workers":0,"paused":false}),
+        json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":1,"paused":false}),
+        json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":false,"max_cpu_workers":8}),
+    ] {
+        assert_eq!(
+            server
+                .json_request("PUT", "/api/workers", &csrf, &invalid)
+                .status,
+            400
+        );
+        assert_eq!(fs::read(&path).unwrap(), written);
+    }
+    server.restart();
+    let workers = server
+        .request("GET", "/api/workers", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(workers.body["allocation"], update);
+    assert_eq!(workers.body["configuration_path"], "/data/workers.conf");
+    assert_eq!(workers.body["configuration"]["max_cpu_workers"], 4);
+}
+
+#[test]
+fn legacy_worker_allocation_migrates_without_configuration_environment() {
+    let mut server = Server::start();
+    fs::remove_file(server.data.join("workers.conf")).unwrap();
+    let allocation = json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":true});
+    fs::write(server.data.join("workers.json"), allocation.to_string()).unwrap();
+    server.restart();
+    let auth = server.auth_header();
+    let workers = server
+        .request("GET", "/api/workers", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(workers.body["allocation"], allocation);
+    assert!(server.data.join("workers.conf").is_file());
+    assert!(server.data.join("workers.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn two_inspection_children_overlap_and_pause_stops_the_third_file() {
+    let server = Server::start_with_probe_delay(Some(Duration::from_secs(2)));
+    for episode in 1..=3 {
+        fs::write(
+            server.root.join(format!("show.S01E{episode:02}.mkv")),
+            b"fixture media",
+        )
+        .unwrap();
+    }
+    let csrf = server.csrf();
+    let allocation = json!({"cpu_workers":2,"ocr_workers":1,"gpu_workers":0,"paused":false});
+    let workers = server.json_request("PUT", "/api/workers", &csrf, &allocation);
+    assert_eq!(workers.status, 200);
+    if workers.body["effective"]["cpu_workers"]
+        .as_u64()
+        .unwrap_or(0)
+        < 2
+    {
+        eprintln!(
+            "Parallel tool fixture requires two effective CPUs and the bounded two-worker RAM budget"
+        );
+        return;
+    }
+    let job_id = server.enqueue_inspection(&csrf);
+    let marker = server._temp.path().join("probe-starts.log");
+    let starts = || {
+        fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while starts() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "two real fixture children must overlap"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(starts(), 2);
+    let mut paused = allocation.clone();
+    paused["paused"] = json!(true);
+    assert_eq!(
+        server
+            .json_request("PUT", "/api/workers", &csrf, &paused)
+            .status,
+        200
+    );
+    let auth = server.auth_header();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let workers = server
+            .request("GET", "/api/workers", &[("Authorization", &auth)], None)
+            .unwrap();
+        if workers.body["active"]["cpu_workers"] == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "existing files must finish while dispatch is paused"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(starts(), 2);
+    assert_eq!(
+        server
+            .json_request("PUT", "/api/workers", &csrf, &allocation)
+            .status,
+        200
+    );
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let status = server
+            .request("GET", "/api/status", &[("Authorization", &auth)], None)
+            .unwrap();
+        if let Some(job) = status.body["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["id"] == job_id)
+        {
+            assert_eq!(job["status"], "completed");
+            assert_eq!(job["summary"]["inspected"], 3);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resuming must dispatch the remaining file"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(starts(), 3);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 services:
   # Open WebUI - Self-hosted web interface for local language models
   open-webui:
-    image: ghcr.io/open-webui/open-webui:cuda
+    image: ghcr.io/open-webui/open-webui:main
     container_name: open-webui
     mem_limit: ${OPEN_WEBUI_MEMORY_LIMIT:-1280m}
     restart: unless-stopped
@@ -14,13 +14,6 @@ services:
     environment:
       - OPENAI_API_BASE_URL=http://host.docker.internal:1234/v1
       - OPENAI_API_KEY=lmstudio
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     networks:
       - homelab
 

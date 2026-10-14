@@ -22,6 +22,13 @@
   state.errorViews=new Map();
   state.tasks=null;
   state.systemInfo=null;
+  state.systemBusy=false;
+  state.systemReceivedAt=0;
+  state.systemSampleHealthy=false;
+  state.workersInfo=null;
+  state.workersBusy=false;
+  state.workersDirty=false;
+  state.workersSaving=false;
   state.tasksDirty=false;
   state.tasksBusy=false;
   state.tasksLoadedAt=0;
@@ -440,13 +447,122 @@
     catch(error){notify(error.message,'error');}
     finally{state.taskRequests.delete(id);renderTasks();}
   };
-  const loadSystem = async () => {
-    if(!state.csrf)return;
-    try{state.systemInfo=await api('/api/system');const info=state.systemInfo,policy=info.resource_policy||{};updateVersion(info.version);const uptime=Math.max(0,Math.floor(Number(info.uptime_seconds)||0)),rows=[['Subforge version',info.version?`v${info.version}`:'—'],['Runtime',info.runtime||'Rust'],['Operating system',[info.os,info.arch].filter(Boolean).join(' · ')],['Uptime',`${Math.floor(uptime/86400)}d ${Math.floor(uptime%86400/3600)}h ${Math.floor(uptime%3600/60)}m`],['Browser time zone',Intl.DateTimeFormat().resolvedOptions().timeZone],['Conversion workers',policy.conversion_workers??1],['OCR threads',policy.ocr_threads??1],['Track metadata cache',`${Math.round(Number(policy.metadata_cache_max_bytes||0)/1048576)} MiB · ${Number(policy.metadata_cache_max_entries||0).toLocaleString()} files maximum`]];const about=$('#system-about');about.replaceChildren();for(const[label,value]of rows){const term=document.createElement('dt'),detail=document.createElement('dd');term.textContent=label;detail.textContent=String(value);about.append(term,detail);}setText($('#system-policy'),`Discovery and import hooks convert text tracks and queue new or changed image tracks. Daily OCR handles that queue with one worker and one OCR thread${policy.ocr_permission?'':'; OCR is currently disabled by deployment permissions'}. Unchanged outputs and failures stay cached. Manual inventory refreshes reuse cached metadata. The container CPU and RAM ceilings are configured in Docker Compose.`);}
-    catch(error){notify(`Could not load system status: ${error.message}`,'error');}
+  const workersVisible = () => state.currentPage==='settings'&&state.settingsSection==='workers'&&!document.hidden;
+  const workerFields={cpu_workers:'#worker-cpu-count',ocr_workers:'#worker-ocr-count',gpu_workers:'#worker-gpu-count'};
+  const workerDirty = () => {state.workersDirty=true;$('#save-worker-allocation').disabled=state.workersSaving;setText($('#worker-allocation-note'),'Unsaved allocation. Save to apply it to the next files; running files keep their current resources.');renderWorkerSteppers();};
+  const renderWorkerSteppers = () => {
+    const data=state.workersInfo;if(!data)return;
+    for(const [kind,selector] of Object.entries(workerFields)){
+      const input=$(selector),ceiling=Number(data.deployment?.[`max_${kind}`]??0);
+      input.max=String(kind==='ocr_workers'?Math.min(ceiling,Number($('#worker-cpu-count').value)||1):ceiling);
+      input.disabled=ceiling===0||state.workersSaving;
+      $$(`[data-worker-step="${kind}"]`).forEach(button=>{const next=Number(input.value)+Number(button.dataset.delta);button.disabled=input.disabled||next<Number(input.min)||next>Number(input.max);});
+    }
+  };
+  const renderWorkers = () => {
+    const data=state.workersInfo;if(!data)return;
+    const allocation=data.allocation||{},effective=data.effective||{},active=data.active||{},detected=data.detected||{},usage=state.systemInfo?.resource_usage||{},cpu=usage.cpu||{},memory=usage.memory||{};
+    if(!state.workersDirty&&!state.workersSaving){for(const [kind,selector] of Object.entries(workerFields))$(selector).value=String(allocation[kind]??0);$('#worker-paused').checked=!!allocation.paused;}
+    renderWorkerSteppers();
+    const paused=!!allocation.paused,total=Number(active.cpu_workers||0)+Number(active.gpu_workers||0);
+    setText($('#worker-pool-state'),paused?'Paused':total?`${total} active`:'Ready');$('#worker-pool-state').className=`status-pill ${paused?'cancelled':total?'running':'completed'}`;
+    const allowance=measuredNumber(cpu.effective_cores)??measuredNumber(detected.cpu_allowance_cores);
+    setText($('#worker-cpu-allowance'),allowance===null?'Unavailable':`${allowance.toLocaleString()} CPU${allowance===1?'':'s'}`);
+    setText($('#worker-cpu-usage'),measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% of allowance in use`:'Waiting for a CPU sample');
+    setText($('#worker-ram'),measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
+    const meter=$('#worker-memory-meter');meter.value=memory.cgroup_limit_bytes>0?Math.min(1,(memory.cgroup_current_bytes||0)/memory.cgroup_limit_bytes):0;meter.hidden=measuredNumber(memory.cgroup_current_bytes)===null||!(memory.cgroup_limit_bytes>0);
+    setText($('#worker-gpu-availability'),detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA checked':'Runtime enabled'):'Unavailable');setText($('#worker-gpu-reason'),detected.gpu_reason||'GPU OCR requires an explicitly enabled runtime and device.');
+    setText($('#worker-cpu-capacity'),`${active.cpu_workers||0} active · ${effective.cpu_workers??0} effective slots${data.cpu_limit_reason?` · ${data.cpu_limit_reason}`:''}`);
+    setText($('#worker-ocr-capacity'),`${active.ocr_workers||0} active · ${effective.ocr_workers??0} effective slots${data.ocr_limit_reason?` · ${data.ocr_limit_reason}`:''}`);
+    setText($('#worker-gpu-capacity'),`${active.gpu_workers||0} active · ${effective.gpu_workers??0} effective slots`);
+    if(!state.workersDirty&&!state.workersSaving)setText($('#worker-allocation-note'),paused?'New file work is paused. Resume and save to continue; running files finish safely.':'Allocation is saved in workers.conf. Each tool uses one CPU thread; CPU and RAM limits keep parallel work bounded. GPU slots stay off until you enable them.');
+    const body=$('#workers-body');body.replaceChildren();
+    for(const worker of (data.workers||[]).slice(0,9)){
+      const row=document.createElement('tr');const elapsed=Math.max(0,Math.floor(Date.now()/1000-Number(worker.started||Date.now()/1000)));
+      for(const [label,value] of [['Worker',`#${worker.id}`],['Processor',worker.resource==='gpu'?'GPU OCR':worker.resource==='cpu_ocr'?'CPU OCR':'CPU'],['Media file',shortPath(worker.path||'')],['Status',worker.status||'Processing'],['Elapsed',`${Math.floor(elapsed/60)}m ${elapsed%60}s`]]){const cell=document.createElement('td');cell.dataset.label=label;cell.textContent=value;if(label==='Media file'){cell.className='worker-file';cell.title=worker.path||'';}row.append(cell);}body.append(row);
+    }
+    if(!body.children.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.className='table-empty';cell.textContent=paused?'New work is paused. Running files will finish before this pool becomes idle.':'No file workers running. Start a scan, extraction, or inventory refresh to use this pool.';row.append(cell);body.append(row);}
+    setText($('#worker-live-state'),`Live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
+  };
+  const loadWorkers = async (quiet=false) => {
+    if(!state.csrf||state.workersBusy||state.workersSaving)return;state.workersBusy=true;
+    try{state.workersInfo=await api('/api/workers');renderWorkers();}
+    catch(error){setText($('#worker-live-state'),'Disconnected · retrying');if(!quiet)notify(`Could not load workers: ${error.message}`,'error');}
+    finally{state.workersBusy=false;}
+  };
+  const saveWorkers = async event => {
+    event.preventDefault();if(state.workersSaving||!state.workersInfo)return;
+    const allocation={paused:$('#worker-paused').checked};
+    for(const [kind,selector] of Object.entries(workerFields)){const input=$(selector),value=Number(input.value);if(!Number.isInteger(value)||value<Number(input.min)||value>Number(input.max)){notify('Choose whole worker counts within the available limits.','error');input.focus();return;}allocation[kind]=value;}
+    state.workersSaving=true;$('#save-worker-allocation').disabled=true;renderWorkerSteppers();
+    try{state.workersInfo=await api('/api/workers',{method:'PUT',body:JSON.stringify(allocation)});state.workersDirty=false;notify('Worker allocation saved. It applies to new files.','success');}
+    catch(error){notify(error.message,'error');}
+    finally{state.workersSaving=false;$('#save-worker-allocation').disabled=!state.workersDirty;renderWorkers();if(systemVisible())loadSystem(true);}
+  };
+  const systemVisible = () => state.currentPage==='settings'&&['status','workers'].includes(state.settingsSection)&&!document.hidden;
+  const measuredNumber = value => typeof value==='number'&&Number.isFinite(value)&&value>=0?value:null;
+  const formatBytes = value => {
+    const bytes=measuredNumber(value);if(bytes===null)return 'Unavailable';
+    if(bytes<1024)return `${Math.round(bytes)} B`;
+    const unit=bytes>=1073741824?['GiB',1073741824]:bytes>=1048576?['MiB',1048576]:['KiB',1024];
+    return `${(bytes/unit[1]).toLocaleString(undefined,{maximumFractionDigits:2})} ${unit[0]}`;
+  };
+  const renderSystemRows = (container,rows) => {
+    const signature=JSON.stringify(rows);if(container.systemSignature===signature)return;
+    container.systemSignature=signature;container.replaceChildren();
+    for(const [label,value,id] of rows){const term=document.createElement('dt'),detail=document.createElement('dd');term.textContent=label;detail.textContent=String(value??'Unavailable');if(id)detail.id=id;container.append(term,detail);}
+  };
+  const formatUptime = seconds => {const uptime=Math.max(0,Math.floor(seconds));return `${Math.floor(uptime/86400)}d ${Math.floor(uptime%86400/3600)}h ${Math.floor(uptime%3600/60)}m ${uptime%60}s`;};
+  const tickSystemUptime = () => {
+    if(!systemVisible()||state.settingsSection!=='status'||!state.systemSampleHealthy||!state.systemInfo)return;
+    const elapsed=(performance.now()-state.systemReceivedAt)/1000;
+    if(elapsed>15){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Sample stale');return;}
+    setText($('#system-uptime'),formatUptime(Number(state.systemInfo.uptime_seconds||0)+elapsed));
+  };
+  const renderSystem = () => {
+    const info=state.systemInfo,policy=info.resource_policy||{},usage=info.resource_usage||{},cpu=usage.cpu||{},memory=usage.memory||{},cache=usage.metadata_cache||{},worker=usage.worker||{};
+    updateVersion(info.version);
+    renderSystemRows($('#system-about'),[
+      ['Subforge version',info.version?`v${info.version}`:'Unavailable'],['Runtime',info.runtime||'Unavailable'],
+      ['Operating system',[info.os,info.arch].filter(Boolean).join(' · ')||'Unavailable'],
+      ['Uptime',formatUptime(Number(info.uptime_seconds)||0),'system-uptime'],['Browser time zone',Intl.DateTimeFormat().resolvedOptions().timeZone]
+    ]);
+    const cores=measuredNumber(cpu.effective_cores),quota=measuredNumber(cpu.quota_cores);
+    const allowance=cores===null?'Unavailable':cpu.limit_unlimited===true?`${cores.toLocaleString()} allowed CPUs · no quota`:`${cores.toLocaleString()} CPU${cores===1?'':'s'}${quota!==null&&quota!==cores?' · quota restricted by CPU affinity':''}`;
+    const percent=measuredNumber(cpu.quota_usage_percent),absolute=measuredNumber(cpu.usage_percent);
+    const cpuUsage=percent!==null?`${percent.toFixed(1)}% of allowance${absolute!==null?` · ${(absolute/100).toFixed(2)} CPUs used`:''}`:absolute!==null?`${(absolute/100).toFixed(2)} CPUs used`:cpu.usage_sample_state==='collecting'?'Collecting first sample…':'Unavailable';
+    const limit=measuredNumber(memory.cgroup_limit_bytes);
+    const ram=measuredNumber(memory.cgroup_current_bytes)!==null?`${formatBytes(memory.cgroup_current_bytes)}${limit!==null?` / ${formatBytes(limit)}`:memory.cgroup_limit_unlimited===true?' · no memory limit':''}`:'Unavailable';
+    const cacheCount=measuredNumber(cache.entries),cacheMaximum=measuredNumber(cache.max_entries);
+    renderSystemRows($('#system-resource-usage'),[
+      ['Effective CPU allowance',allowance,'system-cpu-allowance'],['Container CPU usage',cpuUsage,'system-cpu-usage'],
+      ['Container RAM',ram,'system-container-ram'],['Rust process RAM',formatBytes(memory.process_rss_bytes),'system-process-ram'],
+      ['Active file workers',measuredNumber(worker.active)===null?'Unavailable':`${worker.active} / ${Number(policy.conversion_workers||0)+Number(policy.gpu_workers||0)}${worker.kind?` · ${worker.kind}`:''}`,'system-active-workers'],
+      ['Rust process threads',measuredNumber(usage.process?.threads)??'Unavailable','system-process-threads'],
+      ['Cached media files',cacheCount===null?'Unavailable':`${cacheCount.toLocaleString()} / ${cacheMaximum?.toLocaleString()??'—'}`,'system-cache-entries'],
+      ['Cache payload estimate',`${formatBytes(cache.accounted_bytes)}${measuredNumber(cache.max_bytes)!==null?` / ${formatBytes(cache.max_bytes)}`:''}`,'system-cache-bytes']
+    ]);
+    renderSystemRows($('#system-limits'),[
+      ['Effective CPU workers',policy.conversion_workers??'Unavailable'],['Effective CPU OCR slots',policy.ocr_workers??'Unavailable'],['Effective GPU OCR slots',policy.gpu_workers??0],['CPU threads per tool',policy.ocr_threads??'Unavailable'],
+      ['Metadata cache budget',`${formatBytes(policy.metadata_cache_max_bytes)} · ${measuredNumber(policy.metadata_cache_max_entries)?.toLocaleString()??'—'} files maximum`]
+    ]);
+    setText($('#system-sample-state'),`Live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
+    setText($('#system-policy'),`Set parallel file allocations in Settings → Workers. CPU OCR slots share the CPU pool; each tool uses one CPU thread. Docker's CPU and memory limits remain the hard ceiling, while memory admission may reduce simultaneous work. Discovery and import hooks convert text and queue new or changed image tracks for scheduled OCR${policy.ocr_permission?'':'; OCR is disabled by deployment permissions'}. Changing a Docker limit requires recreating the container. Unsupported measurements are shown as unavailable.`);
+  };
+  const loadSystem = async (quiet=false) => {
+    if(!state.csrf||state.systemBusy)return;state.systemBusy=true;
+    try{state.systemInfo=await api('/api/system');state.systemReceivedAt=performance.now();state.systemSampleHealthy=true;renderSystem();if(workersVisible())renderWorkers();}
+    catch(error){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Disconnected · retrying');if(!quiet)notify(`Could not load system status: ${error.message}`,'error');}
+    finally{state.systemBusy=false;}
+  };
+  const syncSystemMonitor = () => {
+    clearTimeout(state.systemTimer);clearInterval(state.systemClock);
+    if(!systemVisible())return;
+    tickSystemUptime();state.systemClock=setInterval(tickSystemUptime,1000);
+    state.systemTimer=setTimeout(async()=>{await Promise.all([loadSystem(true),workersVisible()?loadWorkers(true):Promise.resolve()]);syncSystemMonitor();},3000);
   };
   const pageNames={overview:'Overview',library:'Library',activity:'Activity',settings:'Settings'};
-  const settingsSections=['general','media','tasks','status','sonarr','radarr','jellyfin','bazarr'];
+  const settingsSections=['general','media','tasks','workers','status','sonarr','radarr','jellyfin','bazarr'];
   state.settingsSection='general';
   const routeHash = (page,section) => `#/${page}${page==='settings'?`/${section}`:''}`;
   const readRoute = () => {
@@ -481,8 +597,9 @@
       if(!state.settings)loadSettings();
       if(changed&&section==='media')loadRootFolders();
     }
-    const administration=page==='settings'&&['tasks','status'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
-    if(administration&&state.csrf&&changed){loadTasks();loadSystem();}
+    const administration=page==='settings'&&['tasks','workers','status'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
+    if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else{loadSystem();if(section==='workers')loadWorkers();}}
+    syncSystemMonitor();
   };
   const restoreRoute = () => {
     const route=readRoute(),hash=routeHash(route.page,route.section);
@@ -504,7 +621,7 @@
     $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>node.addEventListener('click',()=>navigate(node.dataset.page)));
     $('#mobile-menu').addEventListener('click',toggleMobileMenu); $('#sidebar-collapse').addEventListener('click',toggleMobileMenu); mobileBackdrop.addEventListener('click',()=>closeMobileMenu(true));
     window.addEventListener('resize',()=>{if(!window.matchMedia('(max-width: 800px)').matches)closeMobileMenu();else syncNavigation();});
-    $('#refresh-button').addEventListener('click',()=>pollStatus()); $('#clear-view-button').addEventListener('click',()=>pollStatus());
+    $('#refresh-button').addEventListener('click',()=>{pollStatus();if(systemVisible())loadSystem();if(workersVisible())loadWorkers();}); $('#clear-view-button').addEventListener('click',()=>pollStatus());
     $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>startJob({kind:'scan'})));
     $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{navigate('library');await inspect();}));
     $('#quick-form').addEventListener('submit',event=>{event.preventDefault();startJob({kind:'scan',rootIds:selectedRootIds('#quick-root')});});
@@ -523,7 +640,11 @@
     $('#folder-mount').addEventListener('change',()=>browseRootFolder($('#folder-mount').value));$('#browse-root-folder').addEventListener('click',()=>browseRootFolder($('#folder-path').value.trim()));$('#folder-path').addEventListener('input',()=>{state.folderRequest++;state.currentFolder=null;$('#select-root-folder').disabled=true;setText($('#folder-browser-note'),'Browse to check this folder before adding it.');});$('#folder-path').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();browseRootFolder($('#folder-path').value.trim());}});
     $('#folder-parent-button').addEventListener('click',()=>{if(state.folderParent)browseRootFolder(state.folderParent);});$('#select-root-folder').addEventListener('click',()=>{if(state.currentFolder)saveRootFolders([...state.rootFolders.roots.map(root=>root.path),state.currentFolder]);});
     $$('.settings-tab').forEach(button=>button.addEventListener('click',()=>navigate('settings',button.dataset.settingTab)));
-    $('#refresh-system').addEventListener('click',()=>{loadTasks();loadSystem();});
+    $('#refresh-system').addEventListener('click',()=>{if(state.settingsSection==='tasks')loadTasks();else{loadSystem();if(workersVisible())loadWorkers();}});
+    $('#worker-allocation-form').addEventListener('submit',saveWorkers);
+    $('#worker-paused').addEventListener('change',workerDirty);
+    for(const selector of Object.values(workerFields))$(selector).addEventListener('input',workerDirty);
+    $$('[data-worker-step]').forEach(button=>button.addEventListener('click',()=>{const input=$(workerFields[button.dataset.workerStep]),next=Number(input.value)+Number(button.dataset.delta);input.value=String(Math.max(Number(input.min),Math.min(Number(input.max),next)));workerDirty();}));
     $('#pause-schedules').addEventListener('change',markTasksDirty);
     $('#save-task-schedules').addEventListener('click',saveTasks);
     window.addEventListener('popstate',restoreRoute);window.addEventListener('hashchange',restoreRoute);
@@ -536,6 +657,6 @@
     });
   };
   const scheduleStatusPoll = () => {clearTimeout(state.pollTimer);const busy=!!state.status?.running||!!state.status?.queue?.length;state.pollTimer=setTimeout(async()=>{await pollStatus();scheduleStatusPoll();},document.hidden?60000:busy?3000:15000);};
-  const initialize = async () => { bind();restoreRoute(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]);if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();if(state.currentPage==='settings'&&['tasks','status'].includes(state.settingsSection))await Promise.all([loadTasks(),loadSystem()]); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } scheduleStatusPoll();document.addEventListener('visibilitychange',async()=>{if(!document.hidden)await pollStatus();scheduleStatusPoll();}); };
+  const initialize = async () => { bind();restoreRoute(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]);if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();if(state.currentPage==='settings'&&state.settingsSection==='tasks')await loadTasks();if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers(); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } scheduleStatusPoll();syncSystemMonitor();document.addEventListener('visibilitychange',async()=>{syncSystemMonitor();if(!document.hidden){await pollStatus();if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers();}scheduleStatusPoll();}); };
   initialize();
 })();

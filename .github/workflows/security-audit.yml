@@ -174,6 +174,68 @@ jobs:
         working-directory: subtitle-converter
         run: cargo audit --file Cargo.lock --deny warnings
 
+  subtitle-converter-gpu:
+    name: Subforge GPU adapter tests and audits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test GPU adapter and model archive with fake CUDA modules
+        run: |
+          docker run --rm --platform linux/amd64 --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges --memory 512m --cpus 1 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu,target=/gpu,readonly" \
+            --workdir /gpu \
+            python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 \
+            python -m unittest discover -s /gpu -p 'test_*.py' -v
+
+      - name: Audit GPU adapter source and hashed Python dependencies
+        run: |
+          docker run --rm --platform linux/amd64 --read-only \
+            --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 1 \
+            --tmpfs /tmp:rw,nosuid,nodev,exec,size=1g \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/paddleocr,target=/paddleocr.py,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/download_models.py,target=/download_models.py,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/requirements.lock,target=/requirements.lock,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/requirements-runtime.lock,target=/requirements-runtime.lock,readonly" \
+            python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 \
+            sh -eu -c '
+              python -m pip install --disable-pip-version-check --no-cache-dir \
+                --target /tmp/audit-tools bandit==1.9.4 pip-audit==2.10.1
+              export PYTHONPATH=/tmp/audit-tools
+              sed "/^paddlepaddle-gpu @ /,+1d" /requirements.lock \
+                > /tmp/pypi-requirements.lock
+              gpu_version=$(sed -nE "s@.*paddlepaddle_gpu-([^-]+)-cp312-cp312-linux_x86_64.whl.*@\\1@p" /requirements.lock)
+              [ -n "$gpu_version" ]
+              printf "paddlepaddle-gpu==%s\\n" "$gpu_version" \
+                > /tmp/paddle-gpu-requirement.txt
+              set +e
+              python -m bandit --severity-level medium --confidence-level medium \
+                --format custom --msg-template "{relpath}:{line}: {test_id} {severity}/{confidence}" \
+                /paddleocr.py /download_models.py
+              bandit_status=$?
+              python -m pip_audit --strict --disable-pip --no-deps \
+                --requirement /tmp/pypi-requirements.lock \
+                --requirement /requirements-runtime.lock --progress-spinner off \
+                --cache-dir /tmp/pip-audit-cache
+              pypi_audit_status=$?
+              # pip-audit cannot resolve a version from this pinned external wheel URL.
+              # Audit that exact lock version separately through OSV.
+              python -m pip_audit --strict --disable-pip --no-deps \
+                --vulnerability-service osv --requirement /tmp/paddle-gpu-requirement.txt \
+                --progress-spinner off --cache-dir /tmp/pip-audit-cache
+              gpu_audit_status=$?
+              if [ "$bandit_status" -ne 0 ]; then exit "$bandit_status"; fi
+              if [ "$pypi_audit_status" -ne 0 ]; then exit "$pypi_audit_status"; fi
+              exit "$gpu_audit_status"
+            '
+
   subtitle-conversion:
     name: Subtitle conversion with isolated media and OCR fixtures
     runs-on: ubuntu-24.04
@@ -202,6 +264,14 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
             --env OMP_THREAD_LIMIT=1 --entrypoint python3 \
             subtitle-converter-test /tests/rust_smoke.py
+
+      - name: Test actual CPU and memory telemetry in an isolated container
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 512m --cpus 2 --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --entrypoint python3 subtitle-converter-test /tests/resource_smoke.py \
+            --expected-cpus 2 --expected-memory-mib 512
 
   frontend-dependencies:
     name: Frontend dependency audit including build tools

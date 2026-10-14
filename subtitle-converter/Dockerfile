@@ -15,7 +15,7 @@ FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595
 
 ARG TARGETARCH
 LABEL org.opencontainers.image.title="Subforge" \
-      org.opencontainers.image.version="0.2.3"
+      org.opencontainers.image.version="0.3.0"
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl ffmpeg libicu72 libfontconfig1 libgssapi-krb5-2 \
       fonts-dejavu-core iso-codes mkvtoolnix tesseract-ocr tesseract-ocr-all \
