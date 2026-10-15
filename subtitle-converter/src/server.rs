@@ -29,6 +29,7 @@ const HISTORY_LIMIT: usize = 100;
 const JSON_LIMIT: usize = 32 * 1024 * 1024;
 const HTTP_WORKERS: usize = 4;
 const LOG_LIMIT: usize = 200;
+const EXECUTOR_LIMIT: usize = 64;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 // Fingerprints bound confirmation state to about 1.3 MiB, even for a large job.
 const INDEX_CONFIRM_LIMIT: usize = 20_000;
@@ -113,6 +114,65 @@ fn log_text(value: &str, limit: usize) -> String {
         .collect()
 }
 
+fn executor_details(value: &Value) -> Option<Value> {
+    let resource = match value["resource"].as_str()? {
+        "cpu" => "cpu",
+        "cpu_ocr" => "cpu_ocr",
+        "gpu" => "gpu",
+        _ => return None,
+    };
+    let execution = match value["execution"].as_str()? {
+        "local" => "local",
+        "remote" => "remote",
+        _ => return None,
+    };
+    let node_id = log_text(value["node_id"].as_str()?, 64);
+    let node_name = log_text(value["node_name"].as_str()?, 64);
+    if node_id.is_empty() || node_name.is_empty() {
+        return None;
+    }
+    Some(json!({"node_id":node_id,"node_name":node_name,"resource":resource,"execution":execution}))
+}
+
+fn worker_event(mut event: Value, worker_id: usize, executor: &Value) -> Value {
+    if let Some(fields) = event.as_object_mut() {
+        // Execution identity comes only from coordinator admission, including
+        // on failure and after a remote lease has been removed.
+        for key in ["node_id", "node_name", "resource", "execution"] {
+            fields.remove(key);
+        }
+        if let Some(executor) =
+            executor_details(executor).and_then(|value| value.as_object().cloned())
+        {
+            fields.extend(executor);
+        }
+        fields.insert("worker_id".into(), json!(worker_id));
+    }
+    event
+}
+
+fn remember_executor(job: &mut Value, event: &Value) {
+    let Some(executor) = executor_details(event) else {
+        return;
+    };
+    if !job["executors"].is_array() {
+        job["executors"] = json!([]);
+    }
+    let entries = job["executors"].as_array_mut().expect("initialized array");
+    if entries.iter().any(|entry| {
+        entry["node_id"] == executor["node_id"]
+            && entry["resource"] == executor["resource"]
+            && entry["execution"] == executor["execution"]
+    }) {
+        return;
+    }
+    if entries.len() < EXECUTOR_LIMIT {
+        entries.push(executor);
+    } else {
+        job["executors_truncated"] = json!(true);
+    }
+}
+
 /// Both sinks receive the same bounded JSON record. Only explicit operational
 /// fields enter logs; requests, headers, endpoints and subprocess output do not.
 fn progress_log(event: &Value) -> Value {
@@ -126,6 +186,22 @@ fn progress_log(event: &Value) -> Value {
     if let Some(name) = &name {
         message.push_str(&format!(": {name}"));
     }
+    let executor = executor_details(event);
+    if let Some(executor) = &executor {
+        let processor = match executor["resource"].as_str() {
+            Some("gpu") => "GPU OCR",
+            Some("cpu_ocr") => "CPU OCR",
+            _ => "CPU",
+        };
+        message.push_str(&format!(
+            "; node {} ({processor}, {})",
+            executor["node_name"].as_str().unwrap_or(""),
+            executor["execution"].as_str().unwrap_or("")
+        ));
+    }
+    if let Some(worker) = event["worker_id"].as_u64() {
+        message.push_str(&format!("; worker #{worker}"));
+    }
     if let Some(track) = event["track"].as_u64() {
         message.push_str(&format!("; track {track}"));
     }
@@ -138,7 +214,12 @@ fn progress_log(event: &Value) -> Value {
     if let Some(reason) = event["reason"].as_str() {
         message.push_str(&format!("; {}", log_text(reason, 240)));
     }
-    let mut entry = json!({"time":now(),"level":if status=="failed" {"ERROR"} else {"INFO"},"message":message,"status":status});
+    let level = match status.as_str() {
+        "failed" => "ERROR",
+        "remote_retry" => "WARNING",
+        _ => "INFO",
+    };
+    let mut entry = json!({"time":now(),"level":level,"message":message,"status":status});
     if let Some(name) = name {
         entry["file"] = json!(name);
     }
@@ -162,6 +243,9 @@ fn progress_log(event: &Value) -> Value {
         if let Some(value) = event[key].as_str() {
             entry[key] = json!(log_text(value, 48));
         }
+    }
+    if let Some(executor) = executor.and_then(|value| value.as_object().cloned()) {
+        entry.as_object_mut().expect("log object").extend(executor);
     }
     entry
 }
@@ -1685,6 +1769,7 @@ impl App {
         let Some(job) = runtime.running.as_mut() else {
             return;
         };
+        remember_executor(job, &event);
         job["current"] = event.clone();
         if let Some(summary) = event.get("summary") {
             job["summary"] = summary.clone();
@@ -1908,6 +1993,7 @@ impl App {
         std::thread::scope(|scope| {
             let (sender, receiver) = mpsc::sync_channel::<FileEvent>(16);
             let mut handles = BTreeMap::new();
+            let mut executors = BTreeMap::new();
             let mut remote_jobs: BTreeMap<usize, (usize, PathBuf, String)> = BTreeMap::new();
             let mut remote_retries: BTreeMap<usize, u8> = BTreeMap::new();
             while !pending.is_empty() || !handles.is_empty() || !remote_jobs.is_empty() {
@@ -1917,6 +2003,9 @@ impl App {
                     let mut remote = lock(&self.remote);
                     for (_, _, ticket) in remote_jobs.values() {
                         remote.cancel(ticket);
+                    }
+                    for id in remote_jobs.keys() {
+                        executors.remove(id);
                     }
                     remote_jobs.clear();
                 }
@@ -1990,7 +2079,8 @@ impl App {
                                     break;
                                 }
                             };
-                            let offered = match lock(&self.remote).offer(
+                            let mut remote = lock(&self.remote);
+                            let offered = match remote.offer(
                                 &path,
                                 file_languages
                                     .get(path.to_string_lossy().as_ref())
@@ -2024,9 +2114,22 @@ impl App {
                                 }
                             };
                             if let Some(ticket) = offered {
+                                let Some(executor) = remote.executor(&ticket) else {
+                                    remote.cancel(&ticket);
+                                    failure =
+                                        Some("Remote worker attribution is unavailable".into());
+                                    pending.clear();
+                                    break;
+                                };
+                                drop(remote);
                                 pending.remove(position);
                                 remote_jobs.insert(id, (index, path.clone(), ticket));
-                                self.progress(json!({"status":"remote_queued","path":path,"worker_id":id,"resource":resource}));
+                                self.progress(worker_event(
+                                    json!({"status":"remote_queued","path":path}),
+                                    id,
+                                    &executor,
+                                ));
+                                executors.insert(id, executor);
                                 continue;
                             }
                         }
@@ -2086,6 +2189,7 @@ impl App {
                     let Some((id, path, resource)) = admission else {
                         break;
                     };
+                    let executor = json!({"node_id":"local","node_name":"Local","resource":resource,"execution":"local"});
                     let worker = {
                         let converter = lock(&self.converter);
                         if matches!(mode, FileMode::Inspect { .. }) {
@@ -2099,7 +2203,7 @@ impl App {
                         Err(error) => {
                             lock(&self.workers).active.retain(|worker| worker.id != id);
                             summary["failed"] = json!(count(&summary["failed"]) + 1);
-                            self.progress(json!({"status":"failed","path":path,"error":error,"summary":summary}));
+                            self.progress(worker_event(json!({"status":"failed","path":path,"error":error,"summary":summary}), id, &executor));
                             continue;
                         }
                     };
@@ -2150,7 +2254,12 @@ impl App {
                     if resource == "gpu" {
                         worker.enable_gpu_ocr(lock(&self.workers).gpu_min_free_mib());
                     }
-                    self.progress(json!({"status":"dispatched","path":path,"worker_id":id,"resource":resource}));
+                    self.progress(worker_event(
+                        json!({"status":"dispatched","path":path}),
+                        id,
+                        &executor,
+                    ));
+                    executors.insert(id, executor);
                     let worker_path = path.clone();
                     let worker_sender = sender.clone();
                     let worker_languages = file_languages
@@ -2219,6 +2328,7 @@ impl App {
                         }
                         Err(_) => {
                             lock(&self.workers).active.retain(|worker| worker.id != id);
+                            executors.remove(&id);
                             failure = Some("File worker capacity is unavailable".into());
                             self.cancel.store(true, Ordering::Relaxed);
                             pending.clear();
@@ -2262,7 +2372,9 @@ impl App {
                             let attempts = remote_retries.entry(index).or_default();
                             *attempts = attempts.saturating_add(1);
                             pending.push_back(index);
-                            self.log("WARNING", &format!("Remote lease expired or result was rejected; file requeued (attempt {attempts}, local fallback after two attempts)"));
+                            if let Some(executor) = executors.remove(&id) {
+                                self.progress(worker_event(json!({"status":"remote_retry","path":path,"reason":format!("Remote lease expired or result was rejected; file requeued (attempt {attempts}, local fallback after two attempts)")}), id, &executor));
+                            }
                         }
                     }
                     completed
@@ -2291,9 +2403,13 @@ impl App {
                             object.remove("summary");
                             object.insert("worker_id".into(), json!(id));
                         }
+                        if let Some(executor) = executors.get(&id) {
+                            event = worker_event(event, id, executor);
+                        }
                         self.progress(event);
                     }
                     Ok(FileEvent::Finished { id, path, outcome }) => {
+                        let executor = executors.remove(&id);
                         if let Some(handle) = handles.remove(&id) {
                             let _ = handle.join();
                         }
@@ -2327,6 +2443,9 @@ impl App {
                                     );
                                 }
                                 if let Some(mut event) = outcome.terminal {
+                                    if let Some(executor) = &executor {
+                                        event = worker_event(event, id, executor);
+                                    }
                                     event["file_terminal"] = json!(true);
                                     let outputs = strings(&event["new_outputs"]);
                                     if !matches!(mode, FileMode::Inspect { cached_only: true }) {
@@ -2367,7 +2486,11 @@ impl App {
                                     }
                                 };
                                 summary["failed"] = json!(count(&summary["failed"]) + 1);
-                                self.progress(json!({"status":"failed","path":path,"error":error,"summary":summary}));
+                                let mut event = json!({"status":"failed","path":path,"error":error,"summary":summary});
+                                if let Some(executor) = &executor {
+                                    event = worker_event(event, id, executor);
+                                }
+                                self.progress(event);
                             }
                         }
                     }
@@ -3958,6 +4081,112 @@ mod tests {
         assert!(status["logs"].as_array().unwrap().len() <= LOG_LIMIT);
     }
 
+    #[test]
+    fn assigned_executor_overwrites_event_identity_and_logs_bounded_fields() {
+        let executor = json!({"node_id":"assigned-node","node_name":"Studio\nGPU","resource":"gpu","execution":"remote","lease":"do-not-log","path":"/private/do-not-log"});
+        for status in ["extracting", "ocr", "converted", "failed", "remote_retry"] {
+            let event = worker_event(
+                json!({"status":status,"node_id":"forged","node_name":"forged","resource":"cpu","execution":"local","path":"/media/film.mkv"}),
+                42,
+                &executor,
+            );
+            let entry = progress_log(&event);
+            assert_eq!(entry["node_id"], "assigned-node");
+            assert_eq!(entry["node_name"], "StudioGPU");
+            assert_eq!(entry["resource"], "gpu");
+            assert_eq!(entry["execution"], "remote");
+            assert_eq!(entry["worker_id"], 42);
+            assert!(
+                entry["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("StudioGPU (GPU OCR, remote)")
+            );
+            assert!(!entry.to_string().contains("forged"));
+            assert!(!entry.to_string().contains("do-not-log"));
+            if status == "remote_retry" {
+                assert_eq!(entry["level"], "WARNING");
+            }
+        }
+        let legacy = progress_log(&json!({"status":"converted","path":"/media/old.mkv"}));
+        assert!(
+            legacy.get("node_name").is_none(),
+            "do not infer a processor for older events"
+        );
+    }
+
+    #[test]
+    fn completed_job_preserves_multiple_executors_after_refresh_and_restart() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let cpu =
+            json!({"node_id":"local","node_name":"Local","resource":"cpu","execution":"local"});
+        let gpu = json!({"node_id":"remote-gpu","node_name":"Studio GPU","resource":"gpu","execution":"remote"});
+        app.progress(worker_event(
+            json!({"status":"dispatched","path":"/media/first.mkv"}),
+            0,
+            &cpu,
+        ));
+        app.progress(worker_event(
+            json!({"status":"converted","path":"/media/first.mkv"}),
+            0,
+            &cpu,
+        ));
+        app.progress(worker_event(
+            json!({"status":"converted","path":"/media/second.mkv"}),
+            128,
+            &gpu,
+        ));
+        app.progress(json!({"status":"refreshing","path":"Bazarr inventory"}));
+        {
+            let mut runtime = lock(&app.runtime);
+            let mut job = runtime.running.take().unwrap();
+            assert_eq!(job["executors"], json!([cpu, gpu]));
+            job["status"] = json!("completed");
+            runtime.history.push_back(job);
+            app.persist_history(&runtime);
+        }
+        let restarted = App::new(
+            app.mounts.clone(),
+            app.data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.status()["history"][0]["executors"][1]["node_name"],
+            "Studio GPU"
+        );
+        assert_eq!(
+            restarted.status()["history"][0]["executors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn executor_history_deduplicates_and_caps_distinct_node_resource_pairs() {
+        let mut job = json!({});
+        for index in 0..EXECUTOR_LIMIT + 5 {
+            let event = json!({"node_id":format!("node-{index}"),"node_name":"x".repeat(1000),"resource":"cpu","execution":"remote"});
+            remember_executor(&mut job, &event);
+            remember_executor(&mut job, &event);
+        }
+        assert_eq!(job["executors"].as_array().unwrap().len(), EXECUTOR_LIMIT);
+        assert_eq!(job["executors_truncated"], true);
+        assert_eq!(job["executors"][0]["node_name"].as_str().unwrap().len(), 64);
+        assert!(serde_json::to_vec(&job).unwrap().len() < 16 * 1024);
+        let mut mixed = json!({});
+        for resource in ["cpu", "cpu_ocr", "gpu"] {
+            remember_executor(
+                &mut mixed,
+                &json!({"node_id":"same-node","node_name":"Same node","resource":resource,"execution":"remote"}),
+            );
+        }
+        assert_eq!(mixed["executors"].as_array().unwrap().len(), 3);
+    }
+
     fn gated_workers_fixture() -> (
         tempfile::TempDir,
         Arc<App>,
@@ -4049,6 +4278,24 @@ mod tests {
             3
         );
         assert_eq!(app.status()["running"]["processed"], 3);
+        assert_eq!(
+            app.status()["running"]["executors"],
+            json!([{"node_id":"local","node_name":"Local","resource":"cpu","execution":"local"}])
+        );
+        let status = app.status();
+        for entry in status["logs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["status"] == "converted")
+        {
+            assert_eq!(entry["node_name"], "Local");
+            assert_eq!(entry["resource"], "cpu");
+            assert!(
+                entry["worker_id"].is_number(),
+                "finished files retain their worker after slot removal"
+            );
+        }
         assert!(lock(&app.workers).active.is_empty());
     }
 
@@ -4196,6 +4443,21 @@ mod tests {
         assert!(paths[0].parent().unwrap().join(output).is_file());
         assert_eq!(gate.entered.load(Ordering::Relaxed), 0);
         assert_eq!(app.workers()["remote"]["active"], 0);
+        assert_eq!(
+            app.status()["running"]["executors"],
+            json!([{"node_id":node,"node_name":"fixture-node","resource":"cpu","execution":"remote"}])
+        );
+        let status = app.status();
+        let terminal = status["logs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["status"] == "converted")
+            .unwrap();
+        assert_eq!(terminal["node_name"], "fixture-node");
+        assert_eq!(terminal["resource"], "cpu");
+        assert_eq!(terminal["execution"], "remote");
+        assert!(terminal["worker_id"].as_u64().unwrap() >= crate::workers::HARD_TOTAL_LIMIT as u64);
         assert!(lock(&app.workers).active.is_empty());
         assert_eq!(
             read_json(&app.data.join("state.json"), JSON_LIMIT).unwrap()

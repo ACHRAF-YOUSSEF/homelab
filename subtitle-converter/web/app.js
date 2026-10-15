@@ -209,6 +209,26 @@
     const done = Number(summary.converted || 0) + Number(summary.cached || 0) + Number(summary.failed || 0);
     return counts ? Math.round(100 * done / counts) : job.status === 'completed' ? 100 : 0;
   };
+  const renderJobExecutors = job => {
+    const executors=Array.isArray(job.executors)?job.executors.slice(0,64):[];
+    if(!executors.length&&job.executors_truncated!==true)return null;
+    const list=document.createElement('ul');list.className='job-executors';list.setAttribute('aria-label','Job executors');
+    const label=executor=>{
+      const resource=({cpu:'CPU',cpu_ocr:'CPU OCR',gpu:'GPU OCR'})[executor.resource]||'Worker';
+      const node=typeof executor.node_name==='string'&&executor.node_name.trim()?executor.node_name.trim():executor.execution==='remote'?'Remote worker':'Local';
+      return `${resource} · ${node}${executor.execution==='remote'?' (remote)':''}`;
+    };
+    const addItem=(parent,text,className='')=>{const item=document.createElement('li');if(className)item.className=className;item.textContent=text;parent.append(item);return item;};
+    executors.slice(0,4).forEach(executor=>addItem(list,label(executor)));
+    if(executors.length>4){
+      const item=document.createElement('li');item.className='job-executors-more';
+      const details=document.createElement('details'),summary=document.createElement('summary');summary.textContent=`${executors.length-4} more workers`;
+      const remaining=document.createElement('ul');executors.slice(4).forEach(executor=>addItem(remaining,label(executor)));
+      details.append(summary,remaining);item.append(details);list.append(item);
+    }
+    if(job.executors_truncated===true)addItem(list,'Additional workers not shown','job-executors-truncated');
+    return list;
+  };
   const renderJobCard = (job, compact = false) => {
     const card = document.createElement('article'); card.className = `job-card${compact ? ' job-card-compact' : ''}`;
     const icon = document.createElement('div'),type=job.kind==='extract'?'convert':job.kind; icon.className = `job-icon job-${escStatus(type)}`; icon.append(iconSvg(type));
@@ -222,6 +242,7 @@
     const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.started || job.created);
     status.append(pill,time);
     card.append(icon,detail,status);
+    const executors=renderJobExecutors(job);if(executors)card.append(executors);
     if (job.status === 'running' || job.status === 'queued') {
       const progress = document.createElement('div'); progress.className='job-progress'; const bar=document.createElement('span'); bar.style.width=`${jobPercent(job)}%`; progress.append(bar); card.append(progress);
       if (job.id) { const cancel=document.createElement('button'); cancel.className='text-button cancel-job'; cancel.textContent='Cancel'; cancel.dataset.jobId=job.id; cancel.dataset.jobFocus=`${errorViewKey(job,compact)}:cancel`; status.append(cancel); }

@@ -140,6 +140,23 @@ impl Coordinator {
         })).collect();
         json!({"enabled":self.enabled(),"nodes":nodes,"active":self.leases.len(),"max_nodes":MAX_NODES,"lease_seconds":LEASE_TIME.as_secs()})
     }
+    /// Coordinator-owned attribution for a dispatched attempt. Capture this
+    /// with the offer lock held; taking or cancelling the lease removes it.
+    /// The resource is the requested slot, which may be CPU text on an
+    /// OCR-capable node. Worker terminal messages cannot supply this identity.
+    pub fn executor(&self, ticket: &str) -> Option<Value> {
+        let lease = self.leases.get(ticket)?;
+        let node = self.nodes.get(&lease.node)?;
+        let resource = match lease.request.get("resource")?.as_str()? {
+            "cpu" => "cpu",
+            "cpu_ocr" => "cpu_ocr",
+            "gpu" => "gpu",
+            _ => return None,
+        };
+        Some(
+            json!({"node_id":lease.node,"node_name":node.name,"resource":resource,"execution":"remote"}),
+        )
+    }
     pub fn has_capacity(&self, resource: &str) -> bool {
         self.enabled()
             && self.leases.len() < MAX_LEASES
@@ -1391,6 +1408,49 @@ mod tests {
                 .to_string()
                 .contains(&"t".repeat(32))
         );
+    }
+
+    #[test]
+    fn executor_uses_registered_identity_and_requested_slot_not_worker_terminal_fields() {
+        let mut fixture = Fixture::new();
+        assert!(fixture.coordinator.executor("missing-ticket").is_none());
+        fixture.coordinator.nodes.clear();
+        let registration = fixture
+            .coordinator
+            .handle(
+                "/api/remote/register",
+                &json!({"name":"Remote OCR node","resource":"cpu_ocr","roots":[fixture.root]}),
+            )
+            .unwrap();
+        fixture.node = registration["node"].as_str().unwrap().to_owned();
+        fixture
+            .coordinator
+            .handle("/api/remote/lease", &json!({"node":fixture.node}))
+            .unwrap();
+        let ticket = fixture.offer();
+        let expected = json!({"node_id":fixture.node,"node_name":"Remote OCR node","resource":"cpu","execution":"remote"});
+        assert_eq!(
+            fixture.coordinator.executor(&ticket),
+            Some(expected.clone())
+        );
+        let mut completion = fixture.result(&ticket);
+        completion["terminal"]["node_id"] = json!("forged-id");
+        completion["terminal"]["node_name"] = json!("Forged node");
+        completion["terminal"]["resource"] = json!("gpu");
+        completion["terminal"]["execution"] = json!("local");
+        fixture
+            .coordinator
+            .handle("/api/remote/complete", &completion)
+            .unwrap();
+        let executor = fixture.coordinator.executor(&ticket).unwrap();
+        assert_eq!(executor, expected);
+        assert_eq!(
+            executor.as_object().unwrap().len(),
+            4,
+            "attribution must expose only its four operational fields"
+        );
+        fixture.coordinator.cancel(&ticket);
+        assert!(fixture.coordinator.executor(&ticket).is_none());
     }
 
     #[test]

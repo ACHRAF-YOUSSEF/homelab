@@ -345,6 +345,13 @@ tbody tr:last-child td { border-bottom: 0; }
 .job-progress span { display: block; height: 100%; background: var(--accent); }
 .job-summary { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 5px; }
 .job-summary span { padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); background: var(--surface-raised); font-size: 13px; }
+.job-executors { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 0; padding: 0; margin: 0; list-style: none; }
+.job-executors > li, .job-executors-more summary { max-width: 100%; padding: 3px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); background: var(--surface-raised); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }
+.job-executors-more { padding: 0 !important; border: 0 !important; background: transparent !important; }
+.job-executors-more summary { cursor: pointer; list-style: none; }
+.job-executors-more summary::-webkit-details-marker { display: none; }
+.job-executors-more ul { display: flex; flex-wrap: wrap; gap: 5px; padding: 5px 0 0; margin: 0; list-style: none; }
+.job-executors .job-executors-truncated { color: var(--text); border-style: dashed; }
 .job-result { grid-column: 2 / -1; margin: 0; color: var(--success); font-size: 13px; }
 .job-error { grid-column: 2 / -1; overflow: hidden; border: 1px solid #51202a; border-left: 4px solid var(--error); border-radius: 6px; background: #181014; }
 .job-error summary { min-height: 45px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 10px; cursor: pointer; list-style: none; }
@@ -534,7 +541,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .task-retry-controls .form-hint { margin: 0; }
   .job-card { grid-template-columns: 30px minmax(0,1fr); }
   .job-status-block { grid-column: 2; align-items: flex-start; flex-direction: row; flex-wrap: wrap; }
-  .job-progress, .job-summary, .job-result, .job-error { grid-column: 2; }
+  .job-progress, .job-summary, .job-executors, .job-result, .job-error { grid-column: 2; }
   .cancel-job { grid-column: 2; grid-row: auto; justify-self: start; }
   .job-detail strong { white-space: normal; }
   .modal-backdrop { align-items: end; padding: 0; }

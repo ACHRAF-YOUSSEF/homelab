@@ -54,6 +54,7 @@ async function main() {
     ];
     const jobs = [
       { id: 'failed-1', kind: 'extract', status: 'completed_with_errors', created: now, finished: now, paths: [items[0].path], summary: { failed: 1 }, file_errors: [{ message: items[0].processing.last_error, count: 1, examples: [items[0].name] }], failed_paths: [items[0].path] },
+      { id: 'executors-1', kind: 'extract', status: 'completed', created: now - 30, finished: now - 30, paths: ['/media/movies/executors-fixture.mkv'], summary: { converted: 6 }, executors: [{ node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu_ocr', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }], executors_truncated: true },
       { id: 'backup-1', kind: 'backup', status: 'completed', created: now - 60, summary: {} }
     ];
     let inventorySource = 'filesystem', inventoryAuthority = { status: 'ready' }, revision = 1;
@@ -138,6 +139,15 @@ async function main() {
     assert.doesNotMatch(await page.locator('#jobs-list').innerText(), /State backup/);
     await page.locator('#activity-kind').selectOption('all');
     assert.match(await page.locator('#jobs-list').innerText(), /State backup/);
+    const executorCard=page.locator('#jobs-list .job-card').filter({ hasText: 'executors-fixture.mkv' });
+    assert.equal(await executorCard.count(),1,'persisted activity includes the completed multiworker job');
+    assert.deepEqual(await executorCard.locator('.job-executors > li:not(.job-executors-more):not(.job-executors-truncated)').allTextContents(),['CPU · Local','GPU OCR · Studio GPU (remote)','CPU OCR · Local','GPU OCR · Studio GPU (remote)']);
+    assert.equal(await executorCard.locator('.job-executors-more summary').textContent(),'2 more workers');
+    await executorCard.locator('.job-executors-more summary').click();
+    assert.deepEqual(await executorCard.locator('.job-executors-more ul li').allTextContents(),['CPU · Local','GPU OCR · Studio GPU (remote)']);
+    assert.match(await executorCard.locator('.job-executors').innerText(),/Additional workers not shown/);
+    const legacyCard=page.locator('#jobs-list .job-card').filter({ hasText: 'Example movie.mkv' });
+    assert.equal(await legacyCard.locator('.job-executors').count(),0,'legacy history does not invent executor hardware');
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     assert.equal(await page.locator('.settings-tab.active').getAttribute('aria-current'), 'page');
     await page.locator('[data-open-languages="settings"]').click();
@@ -297,6 +307,13 @@ async function main() {
       assert.deepEqual(await page.locator('.topbar').boundingBox(), header, 'scrolling long activity keeps the header visible');
       const last = await page.locator('#jobs-list .job-card').last().boundingBox();
       assert(last.y + last.height <= height + 1, 'the final activity row remains reachable');
+      if (width===320) {
+        const executorList=executorCard.locator('.job-executors');
+        await executorList.scrollIntoViewIfNeeded();
+        assert(await executorList.isVisible());
+        assert.equal(await executorList.evaluate(el=>el.scrollWidth===el.clientWidth),true,'executor labels wrap without horizontal overflow at 320px');
+        if(output)await executorCard.screenshot({ path: path.join(output,'executor-workers-mobile.png'), style: '.toast { visibility: hidden; }' });
+      }
     }
     await page.setViewportSize({ width: 1440, height: 640 });
     await page.locator('#activity-status').focus();
@@ -312,7 +329,7 @@ async function main() {
     assert.notEqual(selectStyles.optionBackground, 'rgb(255, 255, 255)', 'select options use the dark palette');
     if (output) await page.screenshot({ path: path.join(output, 'activity-fixed-viewport.png'), style: '.toast { visibility: hidden; }' });
     assert.deepEqual(errors, [], 'browser must have no uncaught errors');
-    console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, keyboard, Bazarr coverage/authority, and pending indexing confirmation regressions');
+    console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, executor metadata, keyboard, Bazarr coverage/authority, and pending indexing confirmation regressions');
     await context.close();
   } finally {
     if (browser) await browser.close();
