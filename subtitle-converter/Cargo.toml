@@ -9,6 +9,12 @@ default-run = "subforge"
 [features]
 default = []
 cuda = []
+smoke-tests = []
+
+[[bin]]
+name = "subforge-smoke"
+path = "src/bin/subforge-smoke.rs"
+required-features = ["smoke-tests"]
 
 [dependencies]
 base64 = "=0.22.1"

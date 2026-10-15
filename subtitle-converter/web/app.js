@@ -55,7 +55,7 @@
   const currentLabel = current => {
     if(!current)return '';if(typeof current!=='object')return String(current);
     const phase=({checking_gpu:'Checking GPU runtime',extracting:'Extracting text',ocr:'Recognizing images',validating:'Validating SRT',track_complete:'Track complete',processing:'Processing file',cached:'Already converted',pending:'Awaiting OCR',failed:'Failed'})[current.status]||current.status||'Processing';
-    const backend=({ffmpeg:'FFmpeg / CPU',tesseract:'Tesseract / CPU',paddle:'PaddleOCR / GPU',seconv:'Subtitle Edit'})[current.backend];
+    const backend=({ffmpeg:'FFmpeg / CPU',tesseract:'Tesseract / CPU',paddle:'PaddleOCR / GPU',ocr_rs_cpu:'ocr-rs / CPU',ocr_rs_cuda:'ocr-rs / GPU',seconv:'Subtitle Edit'})[current.backend];
     return [phase,backend,current.track!=null?`track ${current.track}`:'',shortPath(current.path||current.output||'')].filter(Boolean).join(' · ');
   };
   const shortPath = value => { const path = String(value || ''); return path.length > 80 ? `…${path.slice(-77)}` : path; };
@@ -70,7 +70,8 @@
     if (!response.ok) throw new Error(typeof payload === 'object' ? payload.error || payload.message || `Request failed (${response.status})` : payload || `Request failed (${response.status})`);
     return payload;
   };
-  const jobList = () => { const status = state.status || {}; return [status.running,...(status.queue || []),...(status.history || [])].filter(Boolean); };
+  const activeJobs = () => state.status?.active_jobs?.length?state.status.active_jobs:[state.status?.running].filter(Boolean);
+  const jobList = () => { const status=state.status||{},seen=new Set();return [...activeJobs(),...(status.queue||[]),...(status.history||[])].filter(job=>{if(!job)return false;const key=job.id||job;if(seen.has(key))return false;seen.add(key);return true;}); };
   const languageAliases={eng:'en',fra:'fr',fre:'fr',ara:'ar',deu:'de',ger:'de',spa:'es',ita:'it',por:'pt',jpn:'ja',zho:'zh',chi:'zh',kor:'ko',rus:'ru',nld:'nl',dut:'nl',tur:'tr',pol:'pl',heb:'he',hin:'hi',ukr:'uk',swe:'sv',dan:'da',fin:'fi',nor:'no',ces:'cs',cze:'cs',ron:'ro',rum:'ro',ell:'el',gre:'el',hun:'hu',tha:'th',vie:'vi',ind:'id'};
   const languageCode = code => {const value=String(code||'und').toLowerCase(),parts=value.split('-');parts[0]=languageAliases[parts[0]]||parts[0];return parts.join('-');};
   const langLabel = code => { const base = languageCode(code).split('-')[0]; return languages.find(item => item[0] === base)?.[1] || String(code || '').toUpperCase(); };
@@ -120,7 +121,7 @@
   const trackBadge = track => {const format=trackFormat(track),pill=document.createElement('span');pill.className=`format-badge format-${format.style}`;pill.textContent=`${languageCode(track.language).toUpperCase()} · ${format.label}`;pill.title=`${langLabel(track.language||'und')} · ${track.codec||track.codec_id||track.format||format.label}`;return pill;};
   const filterLibrary = filter => {$('#inventory-filter').value=filter;$('#inventory-root').value='';$('#inventory-search').value='';state.inventoryPage=1;renderInventory();saveInventoryView();navigate('library');};
   const renderPipeline = () => {
-    const data=state.status?.pipeline||{},available=data.available||{},running=state.status?.running,queued=(state.status?.queue||[]).length;
+    const data=state.status?.pipeline||{},available=data.available||{},active=activeJobs(),running=active[0],queued=(state.status?.queue||[]).length;
     const count=key=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
     setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));
     const inventoryStatus=$('#pipeline-status');
@@ -133,7 +134,7 @@
     const progress=$('#pipeline-progress');progress.hidden=!running;
     if(running&&Number(running.total)>0){progress.value=jobPercent(running);progress.setAttribute('aria-label',`${running.processed||0} of ${running.total} files processed`);}else progress.removeAttribute('value');
     const content=$('#current-work-content');content.replaceChildren();
-    setText($('#current-work-summary'),running?[running.total?`${running.processed||0} / ${running.total} files`:'Discovering work',queued?`${queued} queued job${queued===1?'':'s'}`:''].filter(Boolean).join(' · '):queued?`${queued} queued job${queued===1?'':'s'} · waiting for a worker`:'No jobs running');
+    setText($('#current-work-summary'),running?[active.length>1?`${active.length} jobs in progress`:running.total?`${running.processed||0} / ${running.total} files`:'Discovering work',queued?`${queued} queued job${queued===1?'':'s'}`:''].filter(Boolean).join(' · '):queued?`${queued} queued job${queued===1?'':'s'} · waiting for a worker`:'No jobs running');
     const title=document.createElement('strong'),detail=document.createElement('span');detail.className='muted';
     title.textContent=running?({scan:'Converting text subtitles',inspect:'Inspecting media',extract:'Converting selected tracks',ocr:'Recognizing image subtitles'})[running.kind]||'Running maintenance':queued?'Work is queued':'';
     detail.textContent=running?currentLabel(running.current)||'Preparing files':queued?'Review the queue in Activity or check worker capacity below.':'';

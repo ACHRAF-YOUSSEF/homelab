@@ -9,7 +9,7 @@ const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 32;
 const RETAIN: usize = 3;
-const FILES: [&str; 10] = [
+const FILES: [&str; 11] = [
     "state.json",
     "metadata.json",
     "tasks.json",
@@ -19,6 +19,7 @@ const FILES: [&str; 10] = [
     "workers.conf",
     "inventory.json",
     "jobs.json",
+    "publication-queue.json",
     "ui-password",
 ];
 

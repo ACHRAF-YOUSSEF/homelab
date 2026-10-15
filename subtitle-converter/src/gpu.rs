@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-pub const ADAPTER: &str = "/usr/local/bin/paddleocr";
+pub const ADAPTER: &str = "/usr/local/bin/subforge-ocr";
 pub const HARD_GPU_LIMIT: usize = 4;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]

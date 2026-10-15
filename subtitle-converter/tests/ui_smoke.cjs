@@ -78,7 +78,7 @@ async function main() {
     let allocation = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1, paused: false };
     const remote = { enabled: true, nodes: [{ id: 'node-1', name: 'Studio GPU', resource: 'gpu', last_seen_seconds: 2, active: 1, status: 'busy' }], pending: 0, active: 1 };
     const longGpuAdmissionReason = 'GPU admission is paused because memory headroom is below the configured safety threshold and will retry when the next file starts.';
-    let runningJob = null, queuedJobs = [], fileWorkers = [];
+    let runningJob = null, activeJobs = [], queuedJobs = [], fileWorkers = [];
     const workerData = () => ({ edition: 'cuda', max_requested: 1000000, allocation, requested: allocation, effective: { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1 }, active: { cpu_workers: fileWorkers.filter(worker => worker.resource !== 'gpu').length, ocr_workers: fileWorkers.filter(worker => worker.resource === 'cpu_ocr').length, gpu_workers: fileWorkers.filter(worker => worker.resource === 'gpu').length }, detected: { cpu_allowance_cores: 4, gpu_available: true, gpu_verification: 'verified', gpu_reason: 'CUDA runtime enabled' }, deployment: { max_cpu_workers: 32, max_ocr_workers: 16, max_gpu_workers: 4 }, admission: { gpu: { allowed: false, reason: longGpuAdmissionReason } }, workers: fileWorkers, remote });
     await page.route('**/api/**', async route => {
       const request = route.request(), endpoint = new URL(request.url()).pathname;
@@ -90,7 +90,7 @@ async function main() {
         if (endpoint === '/api/settings') settings = { ...settings, ...body };
       }
       if (endpoint === '/api/session') value = { csrf_token: 'disposable-ui-fixture' };
-      else if (endpoint === '/api/status') value = { edition: 'cuda', version: 'fixture', roots, running: runningJob, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline: { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true } };
+      else if (endpoint === '/api/status') value = { edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline: { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true } };
       else if (endpoint === '/api/inventory') value = { items, updated: now, state_revision: revision, truncated: inventorySource !== 'bazarr', source: inventorySource, authority: inventoryAuthority };
       else if (endpoint === '/api/settings') value = settings;
       else if (endpoint === '/api/workers') value = workerData();
@@ -163,6 +163,52 @@ async function main() {
     await page.locator('#current-work-panel').waitFor({ state: 'hidden' });
     await page.locator('#active-workers-panel').waitFor({ state: 'hidden' });
 
+    // Multiple selected files may be active concurrently. The legacy `running`
+    // field aliases the first active job and must not duplicate it in Activity.
+    const parallelA = { id: 'parallel-a', kind: 'extract', status: 'running', created: now + 1, total: 4, processed: 1, paths: ['/media/movies/Parallel A.mkv'], current: { path: '/media/movies/Parallel A.mkv', stage: 'Extracting subtitles' } };
+    const parallelB = { id: 'parallel-b', kind: 'extract', status: 'running', created: now + 2, total: 3, processed: 0, paths: ['/media/tv/Parallel B.mkv'], current: { path: '/media/tv/Parallel B.mkv', stage: 'Recognizing image subtitles' } };
+    activeJobs = [parallelA, parallelB]; runningJob = parallelA;
+    fileWorkers = [
+      { id: 41, resource: 'cpu', path: parallelA.paths[0], status: 'Extracting subtitles', started: now },
+      { id: 42, resource: 'ocr_rs_cuda', path: parallelB.paths[0], status: 'Recognizing image subtitles', started: now }
+    ];
+    await page.locator('#refresh-button').click();
+    await page.locator('#current-work-panel').getByText('2 jobs in progress', { exact: false }).waitFor();
+    assert.equal(await page.locator('#workers-body tr').count(), 2, 'Overview exposes both active file workers');
+    if (output) await page.screenshot({ path: path.join(output, 'overview-parallel-jobs.png'), style: '.toast { visibility: hidden; }' });
+    await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.locator('#activity-kind').selectOption('all');
+    await page.locator('#activity-status').selectOption('all');
+    await page.locator('#refresh-button').click();
+    const parallelRowA = page.locator('#jobs-list .job-row').filter({ hasText: 'Parallel A.mkv' });
+    const parallelRowB = page.locator('#jobs-list .job-row').filter({ hasText: 'Parallel B.mkv' });
+    await parallelRowA.waitFor(); await parallelRowB.waitFor();
+    assert.equal(await parallelRowA.count(), 1, 'running alias does not duplicate active job A in Activity');
+    assert.equal(await parallelRowB.count(), 1, 'active job B appears once in Activity');
+    assert.equal(await page.locator('#jobs-list .job-row').count(), 5, 'active jobs, queue, and history are merged without duplicates');
+    await parallelRowB.locator('[data-view-job]').click();
+    const parallelCard = page.locator('#job-drawer-content .job-card');
+    await parallelCard.waitFor();
+    assert.match(await parallelCard.innerText(), /Parallel B\.mkv/);
+    assert.match(await parallelCard.innerText(), /Running/);
+    // Finish A while B remains active. Visibility polling refreshes the open
+    // detail drawer without clicking the inert page behind it.
+    activeJobs = [parallelB]; runningJob = parallelB;
+    jobs.unshift({ ...parallelA, status: 'completed', finished: now + 3, summary: { converted: 1 }, current: undefined });
+    fileWorkers = [fileWorkers[1]];
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await page.locator('#job-drawer-content .job-card').getByText('Running', { exact: true }).waitFor();
+    assert.equal(await parallelRowA.count(), 1);
+    assert.match(await parallelRowA.locator('.job-row-status').innerText(), /Completed/);
+    assert.equal(await parallelRowB.count(), 1);
+    assert.match(await parallelRowB.locator('.job-row-status').innerText(), /Running/);
+    await page.getByRole('button', { name: 'Close job details' }).click();
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
+    await page.locator('#current-work-summary').getByText(/0 \/ 3 files/, { exact: false }).waitFor();
+    activeJobs = []; runningJob = null; fileWorkers = [];
+    await page.locator('#refresh-button').click();
+    await page.locator('#current-work-panel').waitFor({ state: 'hidden' });
+
     await page.setViewportSize({ width: 1440, height: 640 });
     await assertViewport('short desktop');
     const headerBefore = await page.locator('.topbar').boundingBox(), footerBefore = await page.locator('.sidebar-bottom').boundingBox();
@@ -212,6 +258,7 @@ async function main() {
     assert.equal(await page.locator('#convert-selected-tracks').textContent(), 'Convert 1 track');
     await page.getByRole('button', { name: 'Close track details' }).click();
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.locator('#activity-kind').selectOption('subtitle');
     assert.doesNotMatch(await page.locator('#jobs-list').innerText(), /State backup/);
     await page.locator('#activity-kind').selectOption('all');
     assert.match(await page.locator('#jobs-list').innerText(), /State backup/);

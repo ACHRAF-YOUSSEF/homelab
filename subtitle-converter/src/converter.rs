@@ -44,6 +44,7 @@ const MAX_COVERAGE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Default)]
 pub(crate) struct FileGate {
     pub entered: std::sync::atomic::AtomicUsize,
+    pub released_count: std::sync::atomic::AtomicUsize,
     pub released: AtomicBool,
 }
 
@@ -139,6 +140,7 @@ pub struct Converter {
     gpu_failure: Mutex<Option<&'static str>>,
     remote_staging: Option<PathBuf>,
     staged_outputs: Mutex<Vec<String>>,
+    published_outputs: Mutex<Vec<String>>,
     #[cfg(test)]
     file_gate: Option<Arc<FileGate>>,
     #[cfg(test)]
@@ -186,6 +188,7 @@ impl Converter {
             gpu_failure: Mutex::new(None),
             remote_staging: None,
             staged_outputs: Mutex::new(Vec::new()),
+            published_outputs: Mutex::new(Vec::new()),
             #[cfg(test)]
             file_gate: None,
             #[cfg(test)]
@@ -404,9 +407,12 @@ impl Converter {
             }
             #[cfg(test)]
             if let Some(gate) = &self.file_gate {
-                gate.entered.fetch_add(1, Ordering::Relaxed);
+                let ticket = gate.entered.fetch_add(1, Ordering::Relaxed);
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                while !gate.released.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                while !gate.released.load(Ordering::Relaxed)
+                    && gate.released_count.load(Ordering::Relaxed) <= ticket
+                    && !stop.load(Ordering::Relaxed)
+                {
                     if std::time::Instant::now() >= deadline {
                         return Err("Fixture file gate timed out".into());
                     }
@@ -1075,6 +1081,7 @@ impl Converter {
             gpu_failure: Mutex::new(None),
             remote_staging: None,
             staged_outputs: Mutex::new(Vec::new()),
+            published_outputs: Mutex::new(Vec::new()),
             #[cfg(test)]
             file_gate: self.file_gate.clone(),
             #[cfg(test)]
@@ -1111,6 +1118,17 @@ impl Converter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Receipts exist only after validated no-clobber publication. Keep them
+    /// independent of final track/state success so post-publication errors
+    /// cannot hide files from the coordinator's deferred index refresh.
+    pub(crate) fn take_published_outputs(&mut self) -> Vec<String> {
+        std::mem::take(
+            self.published_outputs
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub(crate) fn gpu_status(&self) -> (Option<crate::gpu::Health>, Option<&'static str>) {
@@ -1391,6 +1409,10 @@ impl Converter {
             return Err("Remote staging must be a safe direct sibling of the media file".into());
         }
         self.staged_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.published_outputs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1702,9 +1724,9 @@ impl Converter {
                 continue;
             }
             let backend = if image && self.gpu_ocr.is_some() {
-                "paddle"
+                "ocr_rs_cuda"
             } else if image {
-                "tesseract"
+                "ocr_rs_cpu"
             } else if seconv {
                 "seconv"
             } else {
@@ -1737,8 +1759,11 @@ impl Converter {
                         }
                     }
                 }
-                let engine = if gpu { "paddle" } else { "tesseract" };
-                let language = if gpu {
+                // Subtitle Edit's fixed Paddle-compatible protocol delegates
+                // bitmap recognition to our native ocr-rs executable on both
+                // CPU and CUDA. No Python/PaddlePaddle runtime is involved.
+                let engine = "paddle";
+                let language = if image {
                     let language = short_language(&language, &self.language_aliases);
                     if language == "und" {
                         short_language(&self.ocr_language, &self.language_aliases)
@@ -1792,7 +1817,7 @@ impl Converter {
                 })?;
                 if !exit_success || report.get("success").and_then(Value::as_bool) != Some(true) {
                     return Err(conversion_error_context(
-                        &classify_ocr_failure(&report),
+                        &classify_ocr_failure(&report, gpu),
                         native_track.as_deref(),
                         stream,
                         &language,
@@ -1869,6 +1894,14 @@ impl Converter {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(name.clone());
+                } else {
+                    let mut receipts = self
+                        .published_outputs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if receipts.len() < MAX_TRACKED_OUTPUTS {
+                        receipts.push(destination.to_string_lossy().into_owned());
+                    }
                 }
             }
         }
@@ -2646,7 +2679,7 @@ fn parse_conversion_report(bytes: &[u8]) -> Result<Value, &'static str> {
     )
 }
 
-fn classify_ocr_failure(report: &Value) -> String {
+fn classify_ocr_failure(report: &Value, gpu: bool) -> String {
     let mut messages = report
         .get("errors")
         .and_then(Value::as_array)
@@ -2668,17 +2701,11 @@ fn classify_ocr_failure(report: &Value) -> String {
         || text.contains("memory limit")
     {
         "OCR exceeded available memory. Increase the worker memory limit or reduce concurrent OCR workers.".into()
-    } else if text.contains("cuda")
-        || text.contains("cudnn")
-        || text.contains("paddle")
-        || text.contains("gpu")
-    {
+    } else if gpu || text.contains("cuda") || text.contains("cudnn") || text.contains("gpu") {
         "GPU OCR failed. Check the granted CUDA runtime, available GPU memory, and packaged OCR models.".into()
-    } else if text.contains("tesseract")
-        || text.contains("traineddata")
-        || text.contains("language")
-    {
-        "OCR failed. Check that the selected language data is installed and supported.".into()
+    } else if text.contains("model") || text.contains("language") {
+        "OCR failed. Check that the selected ocr-rs language model is packaged and supported."
+            .into()
     } else {
         "OCR converter could not convert this track. Check the image subtitle format and logs."
             .into()
@@ -2933,6 +2960,66 @@ mod tests {
             forced,
             hi,
         }
+    }
+
+    #[test]
+    fn validated_publication_receipts_survive_a_later_state_write_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut converter, media) = coverage_fixture(
+            directory.path(),
+            vec![fixture_track(1, "en", false, false, false)],
+        );
+        let state_directory = directory.path().join("state-destination-is-a-directory");
+        fs::create_dir(&state_directory).unwrap();
+        converter.state_path = state_directory;
+        let summary = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["en".into()],
+                true,
+                Workload::Text,
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            summary["failed"], 1,
+            "final state cannot replace a directory"
+        );
+        let output = media.with_extension("en.srt");
+        validate_srt(&output).unwrap();
+        assert_eq!(
+            converter.take_published_outputs(),
+            vec![output.to_string_lossy().into_owned()]
+        );
+        assert!(
+            converter.take_published_outputs().is_empty(),
+            "receipts are consumed once"
+        );
+        let rejected = tempfile::tempdir().unwrap();
+        let (mut converter, media) = coverage_fixture(
+            rejected.path(),
+            vec![fixture_track(1, "en", false, false, false)],
+        );
+        converter.text_fixture = Some(b"invalid subtitle fixture");
+        let summary = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["en".into()],
+                true,
+                Workload::Text,
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary["failed"], 1);
+        assert!(
+            converter.take_published_outputs().is_empty(),
+            "unvalidated staging files are never publication receipts"
+        );
+        assert!(!media.with_extension("en.srt").exists());
     }
 
     #[test]

@@ -51,6 +51,8 @@ struct Lease {
     expires: Instant,
     #[cfg(test)]
     validation_gate: Option<Arc<ValidationGate>>,
+    #[cfg(test)]
+    publication_gate: Option<Arc<ValidationGate>>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +169,13 @@ impl Coordinator {
                     && accepts(&node.resource, resource)
             })
     }
+    /// Offered and leased files reserve their whole subtitle output family
+    /// across all concurrently running coordinator jobs.
+    pub fn path_active(&self, path: &Path) -> bool {
+        self.leases
+            .values()
+            .any(|lease| crate::workers::conflicts(&lease.path, path))
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn offer(
         &mut self,
@@ -183,7 +192,7 @@ impl Coordinator {
         state: Option<Value>,
     ) -> Result<Option<String>, String> {
         self.prune();
-        if !self.has_capacity(resource) {
+        if !self.has_capacity(resource) || self.path_active(path) {
             return Ok(None);
         }
         let path = Converter::safe_path(&path.to_string_lossy(), &self.mounts)?;
@@ -265,6 +274,8 @@ impl Coordinator {
                 expires: Instant::now() + LEASE_TIME,
                 #[cfg(test)]
                 validation_gate: None,
+                #[cfg(test)]
+                publication_gate: None,
             },
         );
         if let Some(node) = self.nodes.get_mut(&node_id) {
@@ -529,6 +540,24 @@ fn valid_commit(lease: &Lease, cancelled: &AtomicBool) -> Result<(), RemoteError
     }
     Ok(())
 }
+fn partial_publication(
+    lease: &Lease,
+    published: Vec<String>,
+    error: RemoteError,
+) -> Result<RemoteOutcome, RemoteError> {
+    if published.is_empty() {
+        return Err(error);
+    }
+    // Keep receipts for already committed, validated files. Never merge the
+    // worker's complete state after a partial commit, or blindly retry this
+    // lease and hide its published files from the index refresh.
+    Ok(RemoteOutcome {
+        state: None,
+        summary: json!({"converted":0,"cached":0,"pending":0,"failed":1,"planned":0}),
+        terminal: Some(json!({"status":"failed","path":lease.path,"error":error.0,
+            "new_outputs":published,"outputs":published})),
+    })
+}
 fn publish(
     lease: &Lease,
     mut result: Completion,
@@ -647,16 +676,34 @@ fn publish(
     }
     valid_commit(lease, cancelled)?;
     for (name, snapshot) in snapshots {
-        valid_commit(lease, cancelled)?;
+        if let Err(error) = valid_commit(lease, cancelled) {
+            return partial_publication(lease, published, error);
+        }
         match snapshot.persist_noclobber(parent.join(name)) {
             Ok(_) => published.push(parent.join(name).to_string_lossy().into_owned()),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => {
-                return Err(RemoteError(
-                    "Could not publish remote output without replacement",
-                ));
+                return partial_publication(
+                    lease,
+                    published,
+                    RemoteError("Could not publish remote output without replacement"),
+                );
             }
         }
+        #[cfg(test)]
+        if published.len() == 1
+            && let Some(gate) = &lease.publication_gate
+        {
+            gate.entered.store(true, Ordering::SeqCst);
+            while !gate.released.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    if !published.is_empty() && result.terminal.is_none() {
+        result.terminal = Some(
+            json!({"status":if result.summary["failed"].as_u64().unwrap_or(0)>0 {"failed"} else {"converted"},"path":lease.path}),
+        );
     }
     if let Some(terminal) = result.terminal.as_mut() {
         terminal["new_outputs"] = json!(published);
@@ -1304,6 +1351,25 @@ mod tests {
     }
 
     #[test]
+    fn offered_output_families_are_reserved_globally_until_release() {
+        let mut fixture = Fixture::new();
+        let ticket = fixture.offer();
+        assert!(fixture.coordinator.path_active(&fixture.path));
+        assert!(
+            fixture
+                .coordinator
+                .path_active(&fixture.root.join("movie.en.ass"))
+        );
+        assert!(
+            !fixture
+                .coordinator
+                .path_active(&fixture.root.join("other.ass"))
+        );
+        fixture.coordinator.cancel(&ticket);
+        assert!(!fixture.coordinator.path_active(&fixture.path));
+    }
+
+    #[test]
     fn leases_preserve_exact_targets_and_require_explicit_tracks_for_force() {
         let mut fixture = Fixture::new();
         let targets = vec![SubtitleTarget {
@@ -1511,6 +1577,89 @@ mod tests {
         assert!(!fixture.coordinator.has_capacity("cpu"));
         fixture.coordinator.cancel(&ticket);
         assert!(fixture.coordinator.has_capacity("cpu"));
+    }
+
+    #[test]
+    fn committed_remote_outputs_receive_receipts_even_without_a_worker_terminal() {
+        let mut fixture = Fixture::new();
+        let ticket = fixture.offer();
+        let mut result = fixture.result(&ticket);
+        result["terminal"] = Value::Null;
+        fixture
+            .coordinator
+            .handle("/api/remote/complete", &result)
+            .unwrap();
+        let RemotePoll::Finished(outcome) =
+            fixture.coordinator.take(&ticket, &AtomicBool::new(false))
+        else {
+            panic!("validated output must finish")
+        };
+        let terminal = outcome.terminal.unwrap();
+        assert_eq!(terminal["status"], "converted");
+        assert_eq!(terminal["path"], json!(fixture.path));
+        assert_eq!(
+            terminal["new_outputs"],
+            json!([fixture.root.join("movie.en.srt")])
+        );
+    }
+
+    #[test]
+    fn cancellation_after_one_remote_publication_preserves_receipt_and_stops_remaining_commit() {
+        let mut fixture = Fixture::new();
+        let ticket = fixture.offer();
+        let mut result = fixture.result(&ticket);
+        let lease = fixture.coordinator.leases.get_mut(&ticket).unwrap();
+        fs::write(lease.staging.path().join("movie.fr.srt"), SRT).unwrap();
+        result["outputs"] = json!(["movie.en.srt", "movie.fr.srt"]);
+        result["state"]["outputs"] = result["outputs"].clone();
+        fixture
+            .coordinator
+            .handle("/api/remote/complete", &result)
+            .unwrap();
+        let gate = Arc::new(ValidationGate::default());
+        fixture
+            .coordinator
+            .leases
+            .get_mut(&ticket)
+            .unwrap()
+            .publication_gate = Some(Arc::clone(&gate));
+        let cancelled = AtomicBool::new(false);
+        let outcome = std::thread::scope(|scope| {
+            let coordinator = &mut fixture.coordinator;
+            let thread = scope.spawn(|| coordinator.take(&ticket, &cancelled));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !gate.entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let reached = gate.entered.load(Ordering::SeqCst);
+            cancelled.store(true, Ordering::SeqCst);
+            gate.released.store(true, Ordering::SeqCst);
+            let outcome = thread.join().unwrap();
+            assert!(
+                reached,
+                "first publication must reach its deterministic barrier"
+            );
+            outcome
+        });
+        let RemotePoll::Finished(outcome) = outcome else {
+            panic!("partial committed output must retain its receipt instead of retrying")
+        };
+        assert!(
+            outcome.state.is_none(),
+            "partial publication cannot commit the worker's complete state"
+        );
+        assert_eq!(outcome.summary["failed"], 1);
+        let terminal = outcome.terminal.unwrap();
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(
+            terminal["new_outputs"],
+            json!([fixture.root.join("movie.en.srt")])
+        );
+        crate::converter::validate_srt(&fixture.root.join("movie.en.srt")).unwrap();
+        assert!(
+            !fixture.root.join("movie.fr.srt").exists(),
+            "cancellation prevents the next file's publication"
+        );
     }
 
     #[test]

@@ -82,7 +82,7 @@ jobs:
             -color
 
   python-security:
-    name: Python source and dependency audits
+    name: Remaining Python source and dependency audits
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -106,14 +106,8 @@ jobs:
             --format custom --msg-template '{relpath}:{line}: {test_id} {severity}/{confidence}' \
             subtitle-worker/worker.py subtitle-worker/download_model.py \
             subtitle-worker/validate_srt.py subtitle-worker/http_client.py \
-            subtitle-converter/converter.py subtitle-converter/server.py \
-            subtitle-converter/integrations.py subtitle-converter/http_client.py \
             glance/jellyfin-counts-cache.py \
             .github/scripts/audit_repository.py
-
-      - name: Test automatic subtitle conversion with disposable fixtures
-        if: ${{ !cancelled() }}
-        run: python -m unittest discover -s subtitle-converter -p 'test_*.py'
 
       - name: Test HTTP request security boundaries
         if: ${{ !cancelled() }}
@@ -195,7 +189,9 @@ jobs:
 
       - name: Check Rust formatting
         working-directory: subtitle-converter
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path native-ocr/Cargo.toml -- --check
 
       - name: Run Rust lint and tests with warnings denied
         working-directory: subtitle-converter
@@ -204,87 +200,34 @@ jobs:
         run: |
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --all-targets --locked
+          cargo clippy --locked --features smoke-tests --bin subforge-smoke -- -D warnings
+          cargo check --locked --features smoke-tests --bin subforge-smoke
           cargo clippy --all-targets --locked --features cuda -- -D warnings
           cargo test --all-targets --locked --features cuda
+          cargo clippy --locked --features 'cuda smoke-tests' --bin subforge-smoke -- -D warnings
+          cargo check --locked --features 'cuda smoke-tests' --bin subforge-smoke
 
       - name: Install pinned RustSec audit tool
         run: cargo install --locked cargo-audit --version 0.22.2
 
       - name: Audit locked Rust dependencies
         working-directory: subtitle-converter
-        run: cargo audit --file Cargo.lock --deny warnings
-
-  subtitle-converter-gpu:
-    name: Subforge GPU adapter tests and audits
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Test GPU adapter and model archive with fake CUDA modules
         run: |
-          docker run --rm --platform linux/amd64 --network none --read-only \
-            --cap-drop ALL --security-opt no-new-privileges --memory 512m --cpus 1 \
-            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
-            --env PYTHONDONTWRITEBYTECODE=1 \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu,target=/gpu,readonly" \
-            --workdir /gpu \
-            python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 \
-            python -m unittest discover -s /gpu -p 'test_*.py' -v
-
-      - name: Audit GPU adapter source and hashed Python dependencies
-        run: |
-          docker run --rm --platform linux/amd64 --read-only \
-            --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 1 \
-            --tmpfs /tmp:rw,nosuid,nodev,exec,size=1g \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/paddleocr,target=/paddleocr.py,readonly" \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/download_models.py,target=/download_models.py,readonly" \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/requirements.lock,target=/requirements.lock,readonly" \
-            --mount "type=bind,source=$GITHUB_WORKSPACE/subtitle-converter/gpu/requirements-runtime.lock,target=/requirements-runtime.lock,readonly" \
-            python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 \
-            sh -eu -c '
-              python -m pip install --disable-pip-version-check --no-cache-dir \
-                --target /tmp/audit-tools bandit==1.9.4 pip-audit==2.10.1
-              export PYTHONPATH=/tmp/audit-tools
-              sed "/^paddlepaddle-gpu @ /,+1d" /requirements.lock \
-                > /tmp/pypi-requirements.lock
-              gpu_version=$(sed -nE "s@.*paddlepaddle_gpu-([^-]+)-cp312-cp312-linux_x86_64.whl.*@\\1@p" /requirements.lock)
-              [ -n "$gpu_version" ]
-              printf "paddlepaddle-gpu==%s\\n" "$gpu_version" \
-                > /tmp/paddle-gpu-requirement.txt
-              set +e
-              python -m bandit --severity-level medium --confidence-level medium \
-                --format custom --msg-template "{relpath}:{line}: {test_id} {severity}/{confidence}" \
-                /paddleocr.py /download_models.py
-              bandit_status=$?
-              python -m pip_audit --strict --disable-pip --no-deps \
-                --requirement /tmp/pypi-requirements.lock \
-                --requirement /requirements-runtime.lock --progress-spinner off \
-                --cache-dir /tmp/pip-audit-cache
-              pypi_audit_status=$?
-              # pip-audit cannot resolve a version from this pinned external wheel URL.
-              # Audit that exact lock version separately through OSV.
-              python -m pip_audit --strict --disable-pip --no-deps \
-                --vulnerability-service osv --requirement /tmp/paddle-gpu-requirement.txt \
-                --progress-spinner off --cache-dir /tmp/pip-audit-cache
-              gpu_audit_status=$?
-              if [ "$bandit_status" -ne 0 ]; then exit "$bandit_status"; fi
-              if [ "$pypi_audit_status" -ne 0 ]; then exit "$pypi_audit_status"; fi
-              exit "$gpu_audit_status"
-            '
+          cargo audit --file Cargo.lock --deny warnings
+          cargo audit --file native-ocr/Cargo.lock --deny warnings
 
   subtitle-conversion:
     name: Subtitle conversion with isolated media and OCR fixtures
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Build, lint, and test the standalone CPU OCR helper
+        run: docker build --target native-ocr-build --tag subforge-native-ocr-build:test subtitle-converter
 
       - name: Build isolated Rust runtime test stage
         run: docker build --target test --tag subtitle-converter-test subtitle-converter
@@ -294,23 +237,25 @@ jobs:
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --memory 512m --cpus 2 --pids-limit 128 \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-            --env OMP_THREAD_LIMIT=1 --entrypoint python3 \
-            subtitle-converter-test /tests/rust_smoke.py --text-only
+            --env OMP_THREAD_LIMIT=1 \
+            --entrypoint /usr/local/bin/subforge-smoke \
+            subtitle-converter-test extraction --text-only
 
       - name: Test OCR extraction without network or host media
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --memory 1536m --cpus 2 --pids-limit 128 \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-            --env OMP_THREAD_LIMIT=1 --entrypoint python3 \
-            subtitle-converter-test /tests/rust_smoke.py
+            --env OMP_THREAD_LIMIT=1 \
+            --entrypoint /usr/local/bin/subforge-smoke \
+            subtitle-converter-test extraction
 
       - name: Test actual CPU and memory telemetry in an isolated container
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --memory 512m --cpus 2 --pids-limit 128 \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-            --entrypoint python3 subtitle-converter-test /tests/resource_smoke.py \
+            --entrypoint /usr/local/bin/subforge-smoke subtitle-converter-test resources \
             --expected-cpus 2 --expected-memory-mib 512
 
   frontend-dependencies:

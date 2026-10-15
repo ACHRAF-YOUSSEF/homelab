@@ -1,10 +1,6 @@
 *
 !Dockerfile
 !Dockerfile.cuda
-!converter.py
-!server.py
-!integrations.py
-!http_client.py
 !web/
 !web/index.html
 !web/app.js
@@ -17,7 +13,9 @@
 !src/**
 !tests/
 !tests/**
-!gpu/
-!gpu/**
-gpu/models/
-gpu/__pycache__/
+!native-ocr/
+!native-ocr/Cargo.toml
+!native-ocr/Cargo.lock
+!native-ocr/models.sha256
+!native-ocr/src/
+!native-ocr/src/**

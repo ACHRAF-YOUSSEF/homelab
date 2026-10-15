@@ -1,6 +1,47 @@
-# CUDA edition for linux/amd64. Build the matching CPU image locally first.
-FROM scratch AS gpu-wheel-cache
-FROM scratch AS gpu-model-cache
+# Native CUDA inference; source, SDK, models and Rust dependencies are pinned.
+FROM scratch AS native-source-cache
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97 AS cuda-sdk
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04@sha256:4a801ef9232d2b05e69df4eb8aa054dbbe2824e5499e1e6e857320bb01ac41a9 AS cuda-runtime
+
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS native-tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl clang libclang-dev cmake pkg-config g++ make nasm \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,from=native-source-cache,target=/native-source-cache \
+    if [ -f /native-source-cache/mnn-6b1db4c2eacf8193e6b7a1841acb6e31a1938e82.tar.gz ]; then \
+      cp /native-source-cache/mnn-6b1db4c2eacf8193e6b7a1841acb6e31a1938e82.tar.gz /tmp/mnn.tar.gz; \
+    else curl --fail --location --retry 3 \
+      https://codeload.github.com/alibaba/MNN/tar.gz/6b1db4c2eacf8193e6b7a1841acb6e31a1938e82 \
+      --output /tmp/mnn.tar.gz; fi \
+    && echo 'b22142b69082b2720eb4a86598d4d189cd6f44aeca28fc8d7f23ca34345b81c0  /tmp/mnn.tar.gz' | sha256sum --check --strict \
+    && mkdir /opt/mnn \
+    && tar -xzf /tmp/mnn.tar.gz --strip-components=1 -C /opt/mnn \
+    && rm /tmp/mnn.tar.gz
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add clippy
+COPY --from=cuda-sdk /usr/local/cuda-12.8 /usr/local/cuda
+ENV MNN_SOURCE_DIR=/opt/mnn \
+    CUDA_HOME=/usr/local/cuda \
+    CUDACXX=/usr/local/cuda/bin/nvcc \
+    PATH=/usr/local/cuda/bin:$PATH \
+    CMAKE_BUILD_PARALLEL_LEVEL=2 \
+    CARGO_BUILD_JOBS=1
+
+FROM native-tools AS native-ocr-build
+WORKDIR /ocr-build
+COPY native-ocr/Cargo.toml native-ocr/Cargo.lock ./
+COPY native-ocr/src/ ./src/
+COPY native-ocr/models.sha256 ./models.sha256
+# Builders have no granted GPU; hardware execution is checked after build.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/ocr-build/cuda-target \
+    CARGO_TARGET_DIR=/ocr-build/cuda-target cargo build --release --locked --features cuda \
+    && cp cuda-target/release/subforge-ocr /opt/subforge-ocr \
+    && mkdir /opt/native-libs \
+    && find cuda-target -type f -name 'libMNN_Cuda_Main.so' -exec cp {} /opt/native-libs/ \; \
+    && test -s /opt/native-libs/libMNN_Cuda_Main.so
+
 FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS cuda-build
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=1
@@ -12,53 +53,31 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo test --locked --features cuda \
     && cargo build --release --locked --features cuda \
+    && cargo build --release --locked --features cuda,smoke-tests --bin subforge-smoke \
     && cp target/release/subforge /build/subforge \
-    && cp target/release/subforge-worker /build/subforge-worker
+    && cp target/release/subforge-worker /build/subforge-worker \
+    && cp target/release/subforge-smoke /build/subforge-smoke
 
-# Keep the heavy, locked OCR tools independent of the application revision.
-FROM python:3.12.14-slim-bookworm@sha256:d5ae74acb8026b32a2f6deea45003c5bd4e2880700c19c44bda54670ad3eff90 AS cuda-tools
-COPY gpu/requirements.lock /tmp/gpu-requirements.txt
-RUN --mount=type=bind,from=gpu-wheel-cache,target=/wheel-cache \
-    apt-get update && apt-get install -y --no-install-recommends \
-      libglib2.0-0 libgl1 libgomp1 libstdc++6 \
-      libbz2-1.0 libffi8 liblzma5 libncursesw6 libreadline8 libsqlite3-0 libssl3 zlib1g \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3.12 -c 'from pathlib import Path; p=Path("/tmp/gpu-requirements.txt"); w=Path("/wheel-cache/paddlepaddle_gpu-3.2.2-cp312-cp312-linux_x86_64.whl"); s=p.read_text(); p.write_text(s.replace("https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/"+w.name, w.as_uri()) if w.is_file() else s)' \
-    && python3.12 -m pip install --no-cache-dir \
-      --no-deps --require-hashes -r /tmp/gpu-requirements.txt
-
-# Model artifacts are checksum-locked and safely unpacked at build time. The
-# runtime adapter only reads these local, read-only model files.
-COPY gpu/models.sha256 /tmp/models.sha256
-COPY gpu/download_models.py /tmp/download_models.py
-COPY gpu/requirements-runtime.lock /tmp/gpu-runtime-requirements.txt
-RUN --mount=type=bind,from=gpu-model-cache,target=/model-cache \
-    python3.12 -m pip install --no-cache-dir --no-deps --require-hashes -r /tmp/gpu-runtime-requirements.txt \
-    && MODEL_ARCHIVE_CACHE=/model-cache python3.12 /tmp/download_models.py \
-    && rm /tmp/download_models.py /tmp/models.sha256 /tmp/gpu-runtime-requirements.txt \
-    && find /opt/paddle-models -type d -exec chmod 0555 {} + \
-    && find /opt/paddle-models -type f -exec chmod 0444 {} + \
-    && python3.12 -m pip check \
-    && python3.12 -c 'from importlib.metadata import version; print(version("paddlepaddle-gpu"), version("paddleocr"), version("paddlex"))'
-COPY gpu/paddleocr /usr/local/bin/paddleocr
-RUN chmod 0555 /usr/local/bin/paddleocr
-
-FROM homelab-subtitle-converter:0.4.4-cpu AS final
+FROM homelab-subtitle-converter:0.4.4-cpu AS cuda-runtime-app
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      libglib2.0-0 libgl1 libgomp1 libstdc++6 \
-      libbz2-1.0 libffi8 liblzma5 libncursesw6 libreadline8 libsqlite3-0 libssl3 zlib1g \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=cuda-tools /usr/local /usr/local
-COPY --from=cuda-tools /opt/paddle-models /opt/paddle-models
+COPY --from=native-ocr-build /opt/subforge-ocr /usr/local/bin/subforge-ocr
+COPY --from=native-ocr-build /opt/native-libs/ /usr/local/lib/
+COPY --from=cuda-runtime /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcudart.so* /usr/local/lib/
+COPY --from=cuda-runtime /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so* /usr/local/lib/
+COPY --from=cuda-runtime /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublasLt.so* /usr/local/lib/
 COPY --from=cuda-build /build/subforge /usr/local/bin/subforge
 COPY --from=cuda-build /build/subforge-worker /usr/local/bin/subforge-worker
+RUN cp /usr/local/bin/subforge-ocr /usr/local/bin/paddleocr \
+    && chmod 0555 /usr/local/bin/subforge-ocr /usr/local/bin/paddleocr \
+    && ldconfig
 LABEL org.opencontainers.image.version="0.4.4" \
       io.subforge.edition="cuda"
 USER 1000:1000
 ENV CONVERTER_ENABLE_GPU=true \
     CONVERTER_ENABLE_OCR=true \
-    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
-    OMP_NUM_THREADS=1 \
-    OPENBLAS_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1
+    LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/wsl/lib:/usr/local/nvidia/lib64
+
+FROM cuda-runtime-app AS test
+COPY --from=cuda-build /build/subforge-smoke /usr/local/bin/subforge-smoke
+
+FROM cuda-runtime-app AS final

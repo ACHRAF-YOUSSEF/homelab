@@ -1,5 +1,12 @@
 # Subforge revisions
 
+## 0.4.4 — 2026-10-15
+
+- Update locked rustls to 0.23.46, fixing RustSec advisories RUSTSEC-2026-0346 through RUSTSEC-2026-0349 without audit suppressions.
+- Replace Python/Paddle OCR with a native Rust `ocr-rs` 2.4.1 helper using checksum-pinned MNN 3.4.1 source and 25 immutable offline model files; CPU and CUDA runtime/test images no longer include Python.
+- Bound concurrent selected-file jobs by global worker admission while keeping full-library scans and inventory/maintenance work exclusive; expose active jobs while retaining `running` compatibility.
+- Persist and deduplicate validated Bazarr SRT publication receipts, scan after the queue drains, and verify uncertain attempts without blind replay.
+- Publish matching local `0.4.4-cpu` and `0.4.4-cuda` image tags.
 ## 0.4.3 — 2026-10-15
 
 - Prioritize conversion and local worker controls together on Overview, with a compact library summary and actionable failure and OCR counts.

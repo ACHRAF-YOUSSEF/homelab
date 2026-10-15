@@ -297,14 +297,13 @@ fn configure_gpu_environment(command: &mut Command, minimum_free_mib: u32) {
             "LD_LIBRARY_PATH",
             "/usr/lib/wsl/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/lib",
         )
-        .env("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "true")
-        .env("OPENBLAS_NUM_THREADS", "1")
-        .env("MKL_NUM_THREADS", "1")
+        .env("SUBFORGE_OCR_BACKEND", "cuda")
         .env("GPU_MIN_FREE_MIB", minimum_free_mib.min(65536).to_string());
 }
 
 fn configure_tool_environment(command: &mut Command, scratch: &Path) {
     command.env_clear();
+    command.env("SUBFORGE_OCR_BACKEND", "cpu");
     for name in [
         "PATH",
         "SystemRoot",

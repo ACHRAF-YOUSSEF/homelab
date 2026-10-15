@@ -951,6 +951,11 @@ impl Integrations {
         Ok(Value::Array(folders.iter().filter_map(|f|{let f=f.as_object()?; let coll=f.get("CollectionType").and_then(Value::as_str).unwrap_or("").to_lowercase(); let kind=match coll.as_str(){"movies"=>"movies","tvshows"|"tv"=>"series",_=>"other"}; Some(json!({"id":f.get("ItemId").and_then(Value::as_str).unwrap_or(""),"name":f.get("Name").and_then(Value::as_str).unwrap_or("").chars().take(128).collect::<String>(),"type":kind,"locations":f.get("Locations").and_then(Value::as_array).cloned().unwrap_or_default()}))}).collect()))
     }
     pub fn notify(&mut self, paths: &[String]) -> Vec<Value> {
+        self.stage_bazarr(paths);
+        self.notify_other_providers(paths)
+    }
+    /// Queue a deduplicated scan without contacting Bazarr or other services.
+    pub fn stage_bazarr(&mut self, paths: &[String]) {
         for path in paths.iter().take(MAX_ITEMS) {
             if self.bazarr_pending_paths.len() < MAX_ITEMS
                 && path.len() <= 4096
@@ -959,6 +964,8 @@ impl Integrations {
                 self.bazarr_pending_paths.insert(path.clone());
             }
         }
+    }
+    pub fn notify_other_providers(&mut self, paths: &[String]) -> Vec<Value> {
         let mut results = Vec::new();
         for provider in ["sonarr", "radarr", "jellyfin"] {
             let c = self.conf(provider);

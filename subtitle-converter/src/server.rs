@@ -31,6 +31,10 @@ const HTTP_WORKERS: usize = 4;
 const LOG_LIMIT: usize = 200;
 const EXECUTOR_LIMIT: usize = 64;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+// Job coordinators wait for the same global file admission gate. This ceiling
+// bounds coordinator stacks independently of requested slot counts.
+const ACTIVE_JOB_LIMIT: usize = 32;
+const PUBLICATION_JOB_LIMIT: usize = HISTORY_LIMIT + ACTIVE_JOB_LIMIT;
 // Fingerprints bound confirmation state to about 1.3 MiB, even for a large job.
 const INDEX_CONFIRM_LIMIT: usize = 20_000;
 
@@ -283,7 +287,12 @@ type Descriptions = BTreeMap<PathBuf, Result<Option<Value>, String>>;
 
 enum FileFailure {
     Conversion(String),
-    Gpu(&'static str),
+    Published {
+        message: String,
+        gpu: bool,
+        state: Option<Value>,
+        outputs: Vec<String>,
+    },
 }
 
 impl From<String> for FileFailure {
@@ -383,6 +392,7 @@ struct Runtime {
     roots: Vec<PathBuf>,
     languages: Vec<String>,
     running: Option<Value>,
+    active_jobs: BTreeMap<String, ActiveJob>,
     queue: VecDeque<Value>,
     history: VecDeque<Value>,
     logs: VecDeque<Value>,
@@ -397,6 +407,52 @@ struct Runtime {
     pipeline_counts: Value,
     state_revision: u64,
 }
+struct ActiveJob {
+    owner: Option<std::thread::ThreadId>,
+    cancel: Arc<AtomicBool>,
+    job: Value,
+}
+
+impl Runtime {
+    fn current_job(&self) -> Option<&Value> {
+        let owner = std::thread::current().id();
+        self.active_jobs
+            .values()
+            .find(|active| active.owner == Some(owner))
+            .map(|active| &active.job)
+            .or(self.running.as_ref())
+    }
+
+    fn current_job_mut(&mut self) -> Option<&mut Value> {
+        let owner = std::thread::current().id();
+        self.active_jobs
+            .values_mut()
+            .find(|active| active.owner == Some(owner))
+            .map(|active| &mut active.job)
+            .or(self.running.as_mut())
+    }
+
+    fn primary_job(&self) -> Option<&Value> {
+        self.running.as_ref().or_else(|| {
+            self.active_jobs
+                .values()
+                .min_by(|a, b| {
+                    a.job["started"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        .total_cmp(&b.job["started"].as_f64().unwrap_or(0.0))
+                })
+                .map(|active| &active.job)
+        })
+    }
+}
+
+#[derive(Default)]
+struct Publications {
+    paths: std::collections::BTreeSet<String>,
+    jobs: std::collections::BTreeSet<String>,
+    limited: bool,
+}
 pub struct App {
     runtime: Mutex<Runtime>,
     converter: Mutex<Converter>,
@@ -405,6 +461,10 @@ pub struct App {
     workers: Mutex<Workers>,
     remote: Mutex<crate::remote::Coordinator>,
     integrations: Mutex<Integrations>,
+    publications: Mutex<Publications>,
+    dispatch: Mutex<()>,
+    inventory_sync: Mutex<()>,
+    inventory_persist: Mutex<()>,
     public_integrations: Mutex<Value>,
     mounts: Vec<PathBuf>,
     data: PathBuf,
@@ -721,6 +781,10 @@ impl App {
             workers: Mutex::new(workers),
             remote: Mutex::new(remote),
             integrations: Mutex::new(integrations),
+            publications: Mutex::new(Publications::default()),
+            dispatch: Mutex::new(()),
+            inventory_sync: Mutex::new(()),
+            inventory_persist: Mutex::new(()),
             mounts,
             data,
             password,
@@ -735,6 +799,7 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             wake: Condvar::new(),
         });
+        app.restore_publications();
         app.log(
             "INFO",
             "Rust dashboard ready; file workers use bounded allocation",
@@ -747,6 +812,15 @@ impl App {
             &mut runtime,
             json!({"time":now(),"level":log_text(level,16),"message":log_text(message,1024)}),
         );
+    }
+    fn cancellation(&self) -> Arc<AtomicBool> {
+        let owner = std::thread::current().id();
+        lock(&self.runtime)
+            .active_jobs
+            .values()
+            .find(|active| active.owner == Some(owner))
+            .map(|active| Arc::clone(&active.cancel))
+            .unwrap_or_else(|| Arc::clone(&self.cancel))
     }
     fn settings(&self) -> Value {
         let schedule = lock(&self.scheduler).public();
@@ -795,7 +869,7 @@ impl App {
         pipeline["inventory_updated"] = json!(runtime.inventory_updated);
         pipeline["inventory_truncated"] = json!(runtime.inventory_truncated);
         pipeline["inventory_partial"] = json!(runtime.inventory_partial);
-        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"pipeline":pipeline,"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision,"source":runtime.inventory_source,"authority":runtime.inventory_authority},"roots":runtime.cached_roots,"settings":settings})
+        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.primary_job(),"active_jobs":runtime.active_jobs.values().map(|active| &active.job).collect::<Vec<_>>(),"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"pipeline":pipeline,"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision,"source":runtime.inventory_source,"authority":runtime.inventory_authority},"roots":runtime.cached_roots,"settings":settings})
     }
     fn tasks(&self) -> Value {
         let mut value = lock(&self.scheduler).public();
@@ -804,6 +878,7 @@ impl App {
             let active = runtime
                 .running
                 .iter()
+                .chain(runtime.active_jobs.values().map(|active| &active.job))
                 .chain(runtime.queue.iter())
                 .find(|job| job["task_id"] == task["id"]);
             task["job_id"] = active.map(|job| job["id"].clone()).unwrap_or(Value::Null);
@@ -830,7 +905,7 @@ impl App {
         let worker = {
             let runtime = lock(&self.runtime);
             json!({"active":active,
-                "kind":runtime.running.as_ref().map(|job| job["kind"].clone())})
+                "kind":runtime.primary_job().map(|job| job["kind"].clone())})
         };
         usage["worker"] = worker;
         json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"runtime":"rust","os":std::env::consts::OS,"arch":std::env::consts::ARCH,"uptime_seconds":self.started.elapsed().as_secs(),"resource_usage":usage,"resource_policy":{"conversion_workers":limits.cpu_workers,"ocr_threads":1,"ocr_workers":limits.ocr_workers,"gpu_workers":limits.gpu_workers,"metadata_cache_max_bytes":crate::metadata::LIMIT_BYTES,"metadata_cache_max_entries":crate::metadata::MAX_ENTRIES,"discovery_interval_seconds":interval,"ocr_permission":self.ocr_permission,"automatic_ocr_new_or_changed_only":true},"scheduler":{"paused":schedule["paused"]}})
@@ -886,6 +961,7 @@ impl App {
     }
 
     fn persist_inventory(&self) -> Result<(), String> {
+        let _writer = lock(&self.inventory_persist);
         let runtime = lock(&self.runtime);
         let snapshot = json!({"items":runtime.inventory,"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"source":runtime.inventory_source,"authority":runtime.inventory_authority});
         drop(runtime);
@@ -918,7 +994,7 @@ impl App {
         job: &Value,
         probe: bool,
     ) -> Result<Vec<Value>, String> {
-        let inventory = match integrations.bazarr_inventory(&self.cancel) {
+        let inventory = match integrations.bazarr_inventory(&self.cancellation()) {
             Ok(inventory) => inventory,
             Err(error) => {
                 self.bazarr_failure(&error);
@@ -1115,7 +1191,7 @@ impl App {
         }
         let partial = inventory["partial"].as_bool().unwrap_or(false)
             || metadata_pending > 0
-            || self.cancel.load(Ordering::Relaxed);
+            || self.cancellation().load(Ordering::Relaxed);
         let truncated = inventory["truncated"].as_bool().unwrap_or(false)
             || inventory["items"]
                 .as_array()
@@ -1161,16 +1237,55 @@ impl App {
     }
 
     fn execute_bazarr(&self, job: &Value, integrations: &mut Integrations) -> Result<(), String> {
-        let rows = self.sync_bazarr_inventory(integrations, job, true)?;
+        let requested = strings(&job["paths"]);
+        let selected = |row: &Value| {
+            requested.is_empty()
+                || requested.iter().any(|path| row["path"] == *path)
+                || row["coverage"]["available_paths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|path| requested.iter().any(|selected| selected == path))
+        };
+        let rows = {
+            // Inventory refresh/inspection is a single writer. Conversion
+            // coordinators may then consume their selected snapshot in parallel.
+            let _sync = lock(&self.inventory_sync);
+            let existing = {
+                let runtime = lock(&self.runtime);
+                (job["kind"] != "inspect"
+                    && runtime.inventory_source == "bazarr"
+                    && runtime.inventory_updated >= job["created"].as_f64().unwrap_or(f64::MAX)
+                    && ["ready", "refresh_pending"]
+                        .iter()
+                        .any(|status| runtime.inventory_authority["status"] == *status))
+                .then(|| {
+                    runtime
+                        .inventory
+                        .iter()
+                        .filter(|row| selected(row))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            };
+            match existing {
+                Some(rows) => rows,
+                None => self
+                    .sync_bazarr_inventory(integrations, job, true)?
+                    .into_iter()
+                    .filter(selected)
+                    .collect(),
+            }
+        };
         if job["kind"] == "inspect" {
-            if let Some(running) = lock(&self.runtime).running.as_mut() {
+            if let Some(running) = lock(&self.runtime).current_job_mut() {
                 running["total"] = json!(rows.len());
                 running["processed"] = json!(rows.len());
                 running["summary"] = json!({"inspected":rows.len(),"source":"bazarr","covered":rows.iter().filter(|row|row["coverage"]["status"]=="covered").count(),"needed":rows.iter().filter(|row|row["coverage"]["status"]=="needs_conversion").count()});
             }
             return Ok(());
         }
-        let requested = strings(&job["paths"]);
         let roots = strings(&job["root_paths"])
             .into_iter()
             .map(PathBuf::from)
@@ -1181,7 +1296,7 @@ impl App {
         let mut sources_by_path: BTreeMap<PathBuf, Vec<crate::converter::SubtitleSourceHint>> =
             BTreeMap::new();
         let mut skipped = 0_u64;
-        if let Some(running) = lock(&self.runtime).running.as_mut() {
+        if let Some(running) = lock(&self.runtime).current_job_mut() {
             running["processed"] = json!(0);
             running["total"] = json!(rows.len());
         }
@@ -1298,7 +1413,7 @@ impl App {
         let mut summary = self.convert_files(&paths, &execution, workload, integrations)?;
         summary["skipped"] = json!(skipped);
         summary["source"] = json!("bazarr");
-        if let Some(running) = lock(&self.runtime).running.as_mut() {
+        if let Some(running) = lock(&self.runtime).current_job_mut() {
             running["summary"] = summary;
             running["total"] = json!(paths.len() as u64 + skipped);
         }
@@ -1308,8 +1423,7 @@ impl App {
     fn prepare_bazarr_verification(&self) -> Result<(), String> {
         let mut runtime = lock(&self.runtime);
         let Some(job) = runtime
-            .running
-            .as_ref()
+            .current_job()
             .filter(|job| count(&job["published_outputs"]) > 0)
         else {
             return Ok(());
@@ -1343,8 +1457,7 @@ impl App {
         mut reindex: Option<&mut Value>,
     ) -> Result<(), String> {
         let (published, keys, limited) = lock(&self.runtime)
-            .running
-            .as_ref()
+            .current_job()
             .map(|job| {
                 (
                     count(&job["published_outputs"]),
@@ -1357,7 +1470,7 @@ impl App {
             return Ok(());
         }
         self.prepare_bazarr_verification()?;
-        if self.cancel.load(Ordering::Relaxed) {
+        if self.cancellation().load(Ordering::Relaxed) {
             let mut runtime = lock(&self.runtime);
             runtime.inventory_authority["status"] = json!("refresh_pending");
             runtime.inventory_authority["reason"] = json!(
@@ -1444,7 +1557,7 @@ impl App {
     }
     fn widget(&self) -> Value {
         let runtime = lock(&self.runtime);
-        let current=runtime.running.as_ref().map(|job|{let total=count(&job["total"]);let processed=count(&job["processed"]);json!({"kind":job["kind"],"status":job["status"],"processed":processed,"total":total,"progress_percent":if total>0 {Some((processed.saturating_mul(100)/total).min(100))}else{None}})});
+        let current=runtime.primary_job().map(|job|{let total=count(&job["total"]);let processed=count(&job["processed"]);json!({"kind":job["kind"],"status":job["status"],"processed":processed,"total":total,"progress_percent":if total>0 {Some((processed.saturating_mul(100)/total).min(100))}else{None}})});
         let scan = runtime
             .running
             .iter()
@@ -1583,12 +1696,13 @@ impl App {
             && runtime
                 .running
                 .iter()
+                .chain(runtime.active_jobs.values().map(|active| &active.job))
                 .chain(runtime.queue.iter())
                 .any(|job| job["task_id"] == task_id)
         {
             return Err("Task is already queued or running".into());
         }
-        if origin == "schedule" && (runtime.running.is_some() || !runtime.queue.is_empty()) {
+        if origin == "schedule" && (runtime.primary_job().is_some() || !runtime.queue.is_empty()) {
             return Ok(None);
         }
         if runtime.queue.len() >= 32 {
@@ -1707,8 +1821,19 @@ impl App {
     }
     fn cancel(&self, id: &str) -> Result<Value, String> {
         let mut runtime = lock(&self.runtime);
-        if runtime.running.as_ref().is_some_and(|job| job["id"] == id) {
-            self.cancel.store(true, Ordering::Relaxed);
+        let cancellation = runtime
+            .active_jobs
+            .get(id)
+            .map(|active| Arc::clone(&active.cancel))
+            .or_else(|| {
+                runtime
+                    .running
+                    .as_ref()
+                    .filter(|job| job["id"] == id)
+                    .map(|_| Arc::clone(&self.cancel))
+            });
+        if let Some(cancellation) = cancellation {
+            cancellation.store(true, Ordering::Relaxed);
             record_log(
                 &mut runtime,
                 json!({"time":now(),"level":"INFO","message":"Job cancellation requested; waiting for active tools to stop","job_id":id,"status":"cancelling"}),
@@ -1756,7 +1881,7 @@ impl App {
     fn progress(&self, event: Value) {
         let mut runtime = lock(&self.runtime);
         let mut entry = progress_log(&event);
-        if let Some(job) = &runtime.running {
+        if let Some(job) = runtime.current_job() {
             entry["job_id"] = job["id"].clone();
             entry["kind"] = job["kind"].clone();
         }
@@ -1766,7 +1891,7 @@ impl App {
         {
             runtime.converted.insert(path.into());
         }
-        let Some(job) = runtime.running.as_mut() else {
+        let Some(job) = runtime.current_job_mut() else {
             return;
         };
         remember_executor(job, &event);
@@ -1852,7 +1977,7 @@ impl App {
     }
     fn notifications(&self, notifications: Vec<Value>) {
         let mut runtime = lock(&self.runtime);
-        if let Some(job) = runtime.running.as_mut() {
+        if let Some(job) = runtime.current_job_mut() {
             if !job["notifications"].is_array() {
                 job["notifications"] = json!([]);
             }
@@ -1975,7 +2100,7 @@ impl App {
             .enumerate()
             .filter_map(|(index, path)| seen.insert(path).then_some(index))
             .collect();
-        if let Some(running) = lock(&self.runtime).running.as_mut() {
+        if let Some(running) = lock(&self.runtime).current_job_mut() {
             running["total"] = json!(pending.len());
             if matches!(mode, FileMode::Inspect { .. }) {
                 running["processed"] = json!(0);
@@ -1997,8 +2122,10 @@ impl App {
             let mut remote_jobs: BTreeMap<usize, (usize, PathBuf, String)> = BTreeMap::new();
             let mut remote_retries: BTreeMap<usize, u8> = BTreeMap::new();
             while !pending.is_empty() || !handles.is_empty() || !remote_jobs.is_empty() {
-                if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed) {
-                    self.cancel.store(true, Ordering::Relaxed);
+                if self.cancellation().load(Ordering::Relaxed)
+                    || self.shutdown.load(Ordering::Relaxed)
+                {
+                    self.cancellation().store(true, Ordering::Relaxed);
                     pending.clear();
                     let mut remote = lock(&self.remote);
                     for (_, _, ticket) in remote_jobs.values() {
@@ -2010,9 +2137,11 @@ impl App {
                     remote_jobs.clear();
                 }
                 loop {
-                    if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed)
+                    let _dispatch = lock(&self.dispatch);
+                    if self.cancellation().load(Ordering::Relaxed)
+                        || self.shutdown.load(Ordering::Relaxed)
                     {
-                        self.cancel.store(true, Ordering::Relaxed);
+                        self.cancellation().store(true, Ordering::Relaxed);
                         pending.clear();
                         break;
                     }
@@ -2038,6 +2167,7 @@ impl App {
                                     .active
                                     .iter()
                                     .any(|active| crate::workers::conflicts(&active.path, path))
+                                    || remote.path_active(path)
                                     || remote_jobs.values().any(|(_, active, _)| {
                                         crate::workers::conflicts(active, path)
                                     })
@@ -2156,9 +2286,10 @@ impl App {
                                     workers.active.iter().all(|active| {
                                         matches!(mode, FileMode::Inspect { .. })
                                             || !crate::workers::conflicts(&active.path, path)
-                                    }) && remote_jobs.values().all(|(_, active, _)| {
-                                        !crate::workers::conflicts(active, path)
-                                    })
+                                    }) && !lock(&self.remote).path_active(path)
+                                        && remote_jobs.values().all(|(_, active, _)| {
+                                            !crate::workers::conflicts(active, path)
+                                        })
                                 })
                                 .map(|_| (position, resource))
                         });
@@ -2167,8 +2298,9 @@ impl App {
                                 .remove(next)
                                 .and_then(|index| paths.get(index))
                                 .and_then(|path| {
-                                    let id = (0..crate::workers::HARD_TOTAL_LIMIT)
-                                        .find(|id| !handles.contains_key(id))?;
+                                    let id = (0..crate::workers::HARD_TOTAL_LIMIT).find(|id| {
+                                        workers.active.iter().all(|active| active.id != *id)
+                                    })?;
                                     workers.active.push(ActiveWorker {
                                         id,
                                         resource,
@@ -2212,7 +2344,7 @@ impl App {
                     {
                         lock(&self.workers).active.retain(|worker| worker.id != id);
                         failure = Some(error);
-                        self.cancel.store(true, Ordering::Relaxed);
+                        self.cancellation().store(true, Ordering::Relaxed);
                         pending.clear();
                         break;
                     }
@@ -2222,7 +2354,7 @@ impl App {
                         lock(&self.workers).active.retain(|worker| worker.id != id);
                         failure = Some(error);
                         pending.clear();
-                        self.cancel.store(true, Ordering::Relaxed);
+                        self.cancellation().store(true, Ordering::Relaxed);
                         break;
                     }
                     if let Err(error) = worker.set_source_hints(
@@ -2234,19 +2366,20 @@ impl App {
                         lock(&self.workers).active.retain(|worker| worker.id != id);
                         failure = Some(error);
                         pending.clear();
-                        self.cancel.store(true, Ordering::Relaxed);
+                        self.cancellation().store(true, Ordering::Relaxed);
                         break;
                     }
                     if let Err(error) = worker.force_covered_tracks(force) {
                         lock(&self.workers).active.retain(|worker| worker.id != id);
                         failure = Some(error);
                         pending.clear();
-                        self.cancel.store(true, Ordering::Relaxed);
+                        self.cancellation().store(true, Ordering::Relaxed);
                         break;
                     }
-                    if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed)
+                    if self.cancellation().load(Ordering::Relaxed)
+                        || self.shutdown.load(Ordering::Relaxed)
                     {
-                        self.cancel.store(true, Ordering::Relaxed);
+                        self.cancellation().store(true, Ordering::Relaxed);
                         pending.clear();
                         lock(&self.workers).active.retain(|worker| worker.id != id);
                         break;
@@ -2265,6 +2398,7 @@ impl App {
                     let worker_languages = file_languages
                         .get(path.to_string_lossy().as_ref())
                         .unwrap_or(&languages);
+                    let cancellation = self.cancellation();
                     let handle = std::thread::Builder::new()
                         .name(format!("subforge-file-{id}"))
                         .stack_size(2 * 1024 * 1024)
@@ -2274,7 +2408,7 @@ impl App {
                                     if let FileMode::Inspect { cached_only } = mode {
                                         let _ = worker_sender.send(FileEvent::Progress { id, event: json!({"status":"inspecting","path":worker_path}) });
                                         let description = if cached_only { Ok(worker.cached_description(&worker_path)) }
-                                            else { worker.describe_with_stop(&worker_path, &self.cancel).map(Some) };
+                                            else { worker.describe_with_stop(&worker_path, &cancellation).map(Some) };
                                         let (summary, terminal) = match &description {
                                             Ok(Some(_)) => (json!({"inspected":1,"failed":0}), json!({"status":"inspected","path":worker_path})),
                                             Ok(None) => (json!({"metadata_pending":1}), json!({"status":"metadata_pending","path":worker_path})),
@@ -2284,13 +2418,13 @@ impl App {
                                     }
                                     let FileMode::Convert(workload) = mode else { return Err(FileFailure::Conversion("Unsupported file worker operation".into())); };
                                     let mut terminal = None;
-                                    let summary = worker.scan_workload(
+                                    let result = worker.scan_workload(
                                         std::slice::from_ref(&worker_path),
                                         worker_languages,
                                         retry,
                                         workload,
                                         automatic,
-                                        &self.cancel,
+                                        &cancellation,
                                         &mut |event| {
                                             if ["converted", "cached", "failed", "pending"]
                                                 .contains(&event["status"].as_str().unwrap_or(""))
@@ -2302,9 +2436,18 @@ impl App {
                                                     .send(FileEvent::Progress { id, event });
                                             }
                                         },
-                                    )?;
+                                    );
+                                    let outputs = worker.take_published_outputs();
                                     let (gpu_health, gpu_failure) = worker.gpu_status();
-                                    if let Some(error) = gpu_failure { return Err(FileFailure::Gpu(error)); }
+                                    let summary = match (result, gpu_failure) {
+                                        (Err(message), _) => return Err(FileFailure::Published { message, gpu:gpu_failure.is_some(), state:worker.take_file_state(&worker_path), outputs }),
+                                        (_, Some(message)) => return Err(FileFailure::Published { message:message.into(), gpu:true, state:worker.take_file_state(&worker_path), outputs }),
+                                        (Ok(summary), None) => summary,
+                                    };
+                                    if !outputs.is_empty() {
+                                        let event = terminal.get_or_insert_with(|| json!({"status":if cancellation.load(Ordering::Relaxed) {"cancelled"} else {"failed"},"path":worker_path,"error":"SRT published before final conversion state could be completed"}));
+                                        event["new_outputs"] = json!(outputs);
+                                    }
                                     Ok(FileOutcome {
                                         state: worker.take_file_state(&worker_path),
                                         summary,
@@ -2330,7 +2473,7 @@ impl App {
                             lock(&self.workers).active.retain(|worker| worker.id != id);
                             executors.remove(&id);
                             failure = Some("File worker capacity is unavailable".into());
-                            self.cancel.store(true, Ordering::Relaxed);
+                            self.cancellation().store(true, Ordering::Relaxed);
                             pending.clear();
                             break;
                         }
@@ -2339,12 +2482,15 @@ impl App {
                 if pending.is_empty() && handles.is_empty() && remote_jobs.is_empty() {
                     break;
                 }
+                // A completed remote lease stops reserving its output family
+                // in `take`; keep admission closed until its state is merged.
+                let mut remote_commit_guard = Some(lock(&self.dispatch));
                 let remote_event = {
                     let mut completed = None;
                     let mut remote = lock(&self.remote);
                     let ready =
                         remote_jobs.iter().find_map(|(id, (_, path, ticket))| {
-                            match remote.take(ticket, &self.cancel) {
+                            match remote.take(ticket, &self.cancellation()) {
                                 crate::remote::RemotePoll::Pending => None,
                                 crate::remote::RemotePoll::Retry => Some((*id, path.clone(), None)),
                                 crate::remote::RemotePoll::Finished(outcome) => {
@@ -2366,7 +2512,7 @@ impl App {
                                     description: None,
                                 }),
                             });
-                        } else if !self.cancel.load(Ordering::Relaxed)
+                        } else if !self.cancellation().load(Ordering::Relaxed)
                             && let Some((index, _, _)) = entry
                         {
                             let attempts = remote_retries.entry(index).or_default();
@@ -2379,6 +2525,9 @@ impl App {
                     }
                     completed
                 };
+                if remote_event.is_none() {
+                    drop(remote_commit_guard.take());
+                }
                 match remote_event
                     .map(Ok)
                     .unwrap_or_else(|| receiver.recv_timeout(Duration::from_millis(100)))
@@ -2413,7 +2562,6 @@ impl App {
                         if let Some(handle) = handles.remove(&id) {
                             let _ = handle.join();
                         }
-                        lock(&self.workers).active.retain(|worker| worker.id != id);
                         match outcome {
                             Ok(outcome) => {
                                 if let Some(description) = outcome.description {
@@ -2427,11 +2575,13 @@ impl App {
                                     lock(&self.converter).merge_file_state(&path, outcome.state);
                                 if let Err(error) = merged {
                                     failure = Some(error);
-                                    self.cancel.store(true, Ordering::Relaxed);
+                                    self.cancellation().store(true, Ordering::Relaxed);
                                     pending.clear();
                                 } else if changed {
                                     self.refresh_pipeline();
                                 }
+                                lock(&self.workers).active.retain(|worker| worker.id != id);
+                                drop(remote_commit_guard.take());
                                 for &key in if matches!(mode, FileMode::Inspect { .. }) {
                                     &["inspected", "failed", "metadata_pending"][..]
                                 } else {
@@ -2452,39 +2602,41 @@ impl App {
                                         event["summary"] = summary.clone();
                                     }
                                     self.progress(event);
-                                    if failure.is_none() && !outputs.is_empty() {
-                                        let mut runtime = lock(&self.runtime);
-                                        if let Some(job) = runtime.running.as_mut() {
-                                            remember_published_srts(job, &outputs);
-                                            job["published_outputs"] = json!(
-                                                count(&job["published_outputs"])
-                                                    .saturating_add(outputs.len() as u64)
-                                            );
-                                        }
-                                        if integrations.bazarr_enabled() {
-                                            runtime.inventory_authority["status"] =
-                                                json!("refresh_pending");
-                                            runtime.inventory_authority["error"] = Value::Null;
-                                            runtime.inventory_authority["reason"] = json!(
-                                                "SRT files published; waiting for scoped Bazarr reindex and inventory refresh"
-                                            );
-                                        }
-                                        drop(runtime);
-                                        self.notifications(integrations.notify(&outputs));
+                                    if !outputs.is_empty() {
+                                        self.published_outputs(&outputs, integrations);
                                     }
                                 }
                             }
                             Err(error) => {
-                                let error = match error {
-                                    FileFailure::Conversion(error) => error,
-                                    FileFailure::Gpu(error) => {
-                                        lock(&self.workers).gpu.failed();
-                                        failure = Some(error.into());
-                                        self.cancel.store(true, Ordering::Relaxed);
-                                        pending.clear();
-                                        error.into()
+                                let (error, outputs) = match error {
+                                    FileFailure::Conversion(error) => (error, Vec::new()),
+                                    FileFailure::Published {
+                                        message,
+                                        gpu,
+                                        state,
+                                        outputs,
+                                    } => {
+                                        if let Err(error) =
+                                            lock(&self.converter).merge_file_state(&path, state)
+                                        {
+                                            failure = Some(error);
+                                            self.cancellation().store(true, Ordering::Relaxed);
+                                            pending.clear();
+                                        }
+                                        if gpu {
+                                            lock(&self.workers).gpu.failed();
+                                            failure = Some(message.clone());
+                                            self.cancellation().store(true, Ordering::Relaxed);
+                                            pending.clear();
+                                        }
+                                        (message, outputs)
                                     }
                                 };
+                                lock(&self.workers).active.retain(|worker| worker.id != id);
+                                drop(remote_commit_guard.take());
+                                if !outputs.is_empty() {
+                                    self.published_outputs(&outputs, integrations);
+                                }
                                 summary["failed"] = json!(count(&summary["failed"]) + 1);
                                 let mut event = json!({"status":"failed","path":path,"error":error,"summary":summary});
                                 if let Some(executor) = &executor {
@@ -2497,10 +2649,11 @@ impl App {
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         failure = Some("File worker channel is unavailable".into());
-                        self.cancel.store(true, Ordering::Relaxed);
+                        self.cancellation().store(true, Ordering::Relaxed);
                         pending.clear();
                     }
                 }
+                drop(remote_commit_guard);
                 if !pending.is_empty()
                     && handles.is_empty()
                     && remote_jobs.is_empty()
@@ -2583,7 +2736,7 @@ impl App {
         if ["health", "cleanup", "backup"].contains(&job["kind"].as_str().unwrap_or("")) {
             let result = match job["kind"].as_str().unwrap_or("") {
                 "cleanup" => lock(&self.converter).compact_cache()?,
-                "backup" => crate::maintenance::backup(&self.data, &self.cancel)?,
+                "backup" => crate::maintenance::backup(&self.data, &self.cancellation())?,
                 _ => {
                     let unavailable = self
                         .mounts
@@ -2599,7 +2752,7 @@ impl App {
             if job["kind"] == "health" {
                 self.root_folders();
             }
-            if let Some(running) = lock(&self.runtime).running.as_mut() {
+            if let Some(running) = lock(&self.runtime).current_job_mut() {
                 running["results"] = json!([result]);
                 running["summary"] = json!({"processed":1});
                 running["processed"] = json!(1);
@@ -2610,10 +2763,10 @@ impl App {
         if job["kind"] == "refresh" {
             let result = integrations.refresh(
                 job["provider"].as_str().unwrap_or(""),
-                &self.cancel,
+                &self.cancellation(),
                 &mut |event| self.progress(event),
             );
-            if let Some(running) = lock(&self.runtime).running.as_mut() {
+            if let Some(running) = lock(&self.runtime).current_job_mut() {
                 running["results"] = json!([result]);
             }
             return Ok(());
@@ -2628,14 +2781,14 @@ impl App {
         let paths = if job["kind"] == "ocr" {
             lock(&self.converter).ocr_candidates(&roots, job["retry"].as_bool().unwrap_or(false))
         } else if strings(&job["paths"]).is_empty() {
-            Converter::candidates_with_stop(&roots, &self.cancel)
+            Converter::candidates_with_stop(&roots, &self.cancellation())
         } else {
             strings(&job["paths"])
                 .iter()
                 .map(|path| Converter::safe_path(path, &roots))
                 .collect::<Result<Vec<_>, _>>()?
         };
-        if let Some(running) = lock(&self.runtime).running.as_mut() {
+        if let Some(running) = lock(&self.runtime).current_job_mut() {
             running["total"] = json!(paths.len());
         }
         if job["kind"] != "inspect" {
@@ -2649,7 +2802,7 @@ impl App {
                 _ => Workload::Text,
             };
             let summary = self.convert_files(&paths, job, workload, integrations)?;
-            if let Some(running) = lock(&self.runtime).running.as_mut() {
+            if let Some(running) = lock(&self.runtime).current_job_mut() {
                 running["summary"] = summary;
             }
         }
@@ -2676,7 +2829,7 @@ impl App {
             let mut failed = 0_u64;
             let mut metadata_pending = 0_u64;
             for path in paths.iter().take(INVENTORY_LIMIT) {
-                if self.cancel.load(Ordering::Relaxed) {
+                if self.cancellation().load(Ordering::Relaxed) {
                     break;
                 }
                 let Some(result) = descriptions.remove(path) else {
@@ -2711,7 +2864,7 @@ impl App {
                     }
                 };
                 results.push(result);
-                if let Some(running) = lock(&self.runtime).running.as_mut() {
+                if let Some(running) = lock(&self.runtime).current_job_mut() {
                     running["processed"] = json!(inspected + failed + metadata_pending);
                     if job["kind"] == "inspect" {
                         running["summary"] = json!({"inspected":inspected,"failed":failed});
@@ -2723,7 +2876,7 @@ impl App {
                     running["truncated"] = json!(paths.len() > INVENTORY_LIMIT);
                 }
             }
-            let cancelled = self.cancel.load(Ordering::Relaxed);
+            let cancelled = self.cancellation().load(Ordering::Relaxed);
             let partial = cancelled || metadata_pending > 0;
             let keep_previous = cancelled && !lock(&self.runtime).inventory.is_empty();
             if !keep_previous {
@@ -2747,8 +2900,320 @@ impl App {
         lock(&self.converter).persist_metadata()?;
         Ok(())
     }
+    fn finish_job(&self, id: &str) {
+        let mut runtime = lock(&self.runtime);
+        if let Some(active) = runtime.active_jobs.remove(id) {
+            let mut finished = active.job;
+            finished["status"] = json!(if active.cancel.load(Ordering::Relaxed) {
+                "cancelled"
+            } else {
+                completed_status(&finished)
+            });
+            finished["finished"] = json!(now());
+            if let Some(fields) = finished.as_object_mut() {
+                fields.remove("published_srt_keys");
+                fields.remove("published_paths");
+            }
+
+            record_log(
+                &mut runtime,
+                json!({"time":now(),"level":if finished["status"]=="failed" {"ERROR"} else {"INFO"},"message":format!("Job {}: {}; processed {}, failed {}", finished["status"].as_str().unwrap_or("finished"),finished["kind"].as_str().unwrap_or("job"), count(&finished["processed"]),count(&finished["summary"]["failed"])),"job_id":finished["id"],"status":finished["status"]}),
+            );
+            if let Some(id) = finished["task_id"].as_str().filter(|id| !id.is_empty()) {
+                let status = finished["status"].as_str().unwrap_or("failed");
+                let message = finished["error"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}; processed {}, failed {}",
+                            status,
+                            count(&finished["processed"]),
+                            count(&finished["summary"]["failed"])
+                        )
+                    });
+                if lock(&self.scheduler)
+                    .finish(id, now(), status, &message)
+                    .is_err()
+                {
+                    eprintln!("Task result could not be saved");
+                }
+            }
+            if finished["kind"] == "inspect" {
+                finished["results"] = json!([]);
+                for prior in &mut runtime.history {
+                    if prior["kind"] == "inspect" {
+                        prior["results"] = json!([]);
+                    }
+                }
+            }
+            runtime.history.push_back(finished);
+            while runtime.history.len() > HISTORY_LIMIT {
+                runtime.history.pop_front();
+            }
+            self.persist_history(&runtime);
+        }
+        self.wake.notify_all();
+    }
+
+    fn execute_job(&self, job: &Value) {
+        let task_start = job["task_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(|id| lock(&self.scheduler).start(id, now()))
+            .unwrap_or(Ok(()));
+        let mut integrations = lock(&self.integrations).clone();
+        let result = task_start.and_then(|_| self.execute(job, &mut integrations));
+        if let Err(message) = result {
+            if let Some(running) = lock(&self.runtime).current_job_mut() {
+                running["error"] = json!(message);
+            }
+            self.log("ERROR", &format!("Job failed: {}", log_text(&message, 512)));
+        }
+        if integrations.bazarr_enabled()
+            && let Err(error) = self.prepare_bazarr_verification()
+        {
+            self.log(
+                "ERROR",
+                &format!(
+                    "Pending Bazarr verification state could not be saved: {}",
+                    log_text(&error, 256)
+                ),
+            );
+        }
+    }
+
+    fn persist_publications(&self, pending: &Publications, attempted: bool) -> Result<(), String> {
+        crate::util::write_private_limited(
+            &self.data.join("publication-queue.json"),
+            &json!({
+                "paths":pending.paths,"jobs":pending.jobs,"limited":pending.limited,"attempted":attempted
+            }),
+            JSON_LIMIT as u64,
+        )
+    }
+
+    fn restore_publications(&self) {
+        let Ok(saved) = read_json(&self.data.join("publication-queue.json"), JSON_LIMIT) else {
+            return;
+        };
+        if saved["attempted"] == true {
+            self.log("WARNING", "A previous Bazarr scan may have been sent before shutdown; pending indexing is verified by inventory sync, without automatically repeating the scan");
+            return;
+        }
+        let mut pending = lock(&self.publications);
+        let mut bytes = 0_usize;
+        for path in saved["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(INDEX_CONFIRM_LIMIT)
+            .filter_map(Value::as_str)
+        {
+            if srt_index_key(path).is_some()
+                && validate_root(Path::new(path), &self.mounts, false).is_ok()
+                && bytes.saturating_add(path.len()) <= 8 * 1024 * 1024
+            {
+                bytes += path.len();
+                pending.paths.insert(path.to_owned());
+            } else {
+                pending.limited = true;
+            }
+        }
+        pending.jobs.extend(
+            saved["jobs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(PUBLICATION_JOB_LIMIT)
+                .filter_map(Value::as_str)
+                .filter(|id| id.len() <= 64)
+                .map(str::to_owned),
+        );
+        pending.limited |= saved["limited"] == true;
+    }
+
+    fn stage_publications(&self, outputs: &[String]) -> Result<(), String> {
+        let (id, visible_jobs) = {
+            let runtime = lock(&self.runtime);
+            let id = runtime
+                .current_job()
+                .and_then(|job| job["id"].as_str())
+                .map(str::to_owned);
+            let visible = runtime
+                .history
+                .iter()
+                .chain(runtime.running.iter())
+                .chain(runtime.active_jobs.values().map(|active| &active.job))
+                .filter_map(|job| job["id"].as_str().map(str::to_owned))
+                .collect::<HashSet<_>>();
+            (id, visible)
+        };
+        let mut pending = lock(&self.publications);
+        let mut bytes: usize = pending.paths.iter().map(String::len).sum();
+        for path in outputs {
+            if pending.paths.contains(path) {
+                continue;
+            }
+            if pending.paths.len() >= INDEX_CONFIRM_LIMIT
+                || bytes.saturating_add(path.len()) > 8 * 1024 * 1024
+                || srt_index_key(path).is_none()
+                || validate_root(Path::new(path), &self.mounts, false).is_err()
+            {
+                pending.limited = true;
+                continue;
+            }
+            bytes += path.len();
+            pending.paths.insert(path.clone());
+        }
+        pending.jobs.retain(|id| visible_jobs.contains(id));
+        if let Some(id) = id
+            && pending.jobs.len() < PUBLICATION_JOB_LIMIT
+        {
+            pending.jobs.insert(id);
+        }
+        self.persist_publications(&pending, false)?;
+        if pending.limited {
+            Err("Deferred Bazarr publication tracking reached its safety limit; sync inventory after the queue drains to verify all outputs".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn published_outputs(&self, outputs: &[String], integrations: &mut Integrations) {
+        let mut runtime = lock(&self.runtime);
+        if let Some(job) = runtime.current_job_mut() {
+            remember_published_srts(job, outputs);
+            job["published_outputs"] =
+                json!(count(&job["published_outputs"]).saturating_add(outputs.len() as u64));
+        }
+        if integrations.bazarr_enabled() {
+            runtime.inventory_authority["status"] = json!("refresh_pending");
+            runtime.inventory_authority["error"] = Value::Null;
+            runtime.inventory_authority["reason"] = json!(
+                "SRT files published; Bazarr indexing starts after the conversion queue drains"
+            );
+        }
+        drop(runtime);
+        if integrations.bazarr_enabled()
+            && let Err(error) = self.stage_publications(outputs)
+        {
+            self.notifications(vec![
+                json!({"provider":"bazarr","ok":false,"message":error}),
+            ]);
+        }
+        self.notifications(integrations.notify_other_providers(outputs));
+    }
+
+    /// The dispatcher calls this only after every active coordinator joined
+    /// and the queue was observed empty. New submissions wait behind this
+    /// drain boundary; a cancelled file never cancels other jobs' receipts.
+    fn flush_publications(&self) {
+        let mut pending = lock(&self.publications);
+        if pending.paths.is_empty() || self.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut integrations = lock(&self.integrations).clone();
+        if !integrations.bazarr_enabled() {
+            return;
+        }
+        let paths: Vec<_> = pending.paths.iter().cloned().collect();
+        let job = json!({"id":token(8),"kind":"refresh","provider":"bazarr","origin":"queue_drain",
+            "status":"running","started":now(),"root_paths":self.mounts,"languages":["*"],
+            "published_outputs":paths.len(),"published_srt_keys":paths.iter().filter_map(|path|srt_index_key(path)).collect::<Vec<_>>(),
+            "verification_limited":pending.limited});
+        {
+            let mut runtime = lock(&self.runtime);
+            if !runtime.queue.is_empty() || !runtime.active_jobs.is_empty() {
+                return;
+            }
+            runtime.running = Some(job.clone());
+        }
+        self.cancel.store(false, Ordering::Relaxed);
+        // Durably mark the uncertain network boundary before sending a PATCH.
+        // On restart it is never blindly repeated.
+        if let Err(error) = self
+            .prepare_bazarr_verification()
+            .and_then(|()| self.persist_publications(&pending, true))
+        {
+            lock(&self.runtime).running = None;
+            self.log(
+                "ERROR",
+                &format!("Bazarr queue drain deferred: {}", log_text(&error, 256)),
+            );
+            return;
+        }
+        self.log(
+            "INFO",
+            &format!(
+                "Conversion queue drained; updating Bazarr for {} published SRT files",
+                paths.len()
+            ),
+        );
+        integrations.stage_bazarr(&paths);
+        let mut receipt =
+            integrations.flush_bazarr(&self.cancel, &mut |event| self.progress(event));
+        let verification =
+            self.refresh_bazarr_after_publication(&mut integrations, &job, receipt.as_mut());
+        let notice = match (verification, receipt) {
+            (Err(error), _) => {
+                json!({"provider":"bazarr","ok":false,"message":format!("SRT published; Bazarr inventory refresh failed: {}",log_text(&error,256))})
+            }
+            (Ok(()), Some(receipt)) => receipt,
+            _ => {
+                json!({"provider":"bazarr","ok":false,"message":"Bazarr queue-drain scan returned no receipt"})
+            }
+        };
+        let mut runtime = lock(&self.runtime);
+        runtime.running = None;
+        for finished in &mut runtime.history {
+            if finished["id"]
+                .as_str()
+                .is_some_and(|id| pending.jobs.contains(id))
+            {
+                if !finished["notifications"].is_array() {
+                    finished["notifications"] = json!([]);
+                }
+                if let Some(items) = finished["notifications"].as_array_mut() {
+                    items.push(notice.clone());
+                }
+                if ["completed", "completed_with_errors"]
+                    .iter()
+                    .any(|status| finished["status"] == *status)
+                {
+                    finished["status"] = json!(completed_status(finished));
+                }
+            }
+        }
+        self.persist_history(&runtime);
+        drop(runtime);
+        *pending = Publications::default();
+        if self.persist_publications(&pending, false).is_err() {
+            self.log("ERROR", "Bazarr drain receipt could not be saved; pending indexing remains verifiable without repeating the scan");
+        }
+    }
+
+    fn parallel_job(job: &Value) -> bool {
+        ["extract", "ocr", "scan"].contains(&job["kind"].as_str().unwrap_or(""))
+            && job["task_id"] != "discovery"
+            && job["paths"]
+                .as_array()
+                .is_some_and(|paths| !paths.is_empty())
+    }
+
     fn worker(self: Arc<Self>) {
+        let mut handles: BTreeMap<String, std::thread::JoinHandle<()>> = BTreeMap::new();
         while !self.shutdown.load(Ordering::Relaxed) {
+            let finished: Vec<_> = handles
+                .iter()
+                .filter(|(_, handle)| handle.is_finished())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in finished {
+                if let Some(handle) = handles.remove(&id) {
+                    let _ = handle.join();
+                }
+            }
             let due = lock(&self.scheduler).due(now());
             for id in due {
                 let _ = self.enqueue_task(&id, "schedule", false);
@@ -2756,125 +3221,90 @@ impl App {
             let job = {
                 let mut runtime = lock(&self.runtime);
                 let paused = lock(&self.workers).allocation.paused;
-                match if paused {
-                    None
+                let available = !paused
+                    && runtime.active_jobs.len() < ACTIVE_JOB_LIMIT
+                    && runtime.queue.front().is_some_and(|next| {
+                        runtime.active_jobs.is_empty()
+                            || Self::parallel_job(next)
+                                && runtime
+                                    .active_jobs
+                                    .values()
+                                    .all(|active| Self::parallel_job(&active.job))
+                    });
+                if available {
+                    let mut job = runtime.queue.pop_front().expect("checked queue");
+                    job["status"] = json!("running");
+                    job["started"] = json!(now());
+                    runtime.active_jobs.insert(
+                        job["id"].as_str().unwrap_or("").to_owned(),
+                        ActiveJob {
+                            owner: None,
+                            cancel: Arc::new(AtomicBool::new(false)),
+                            job: job.clone(),
+                        },
+                    );
+                    Some(job)
                 } else {
-                    runtime.queue.pop_front()
-                } {
-                    Some(mut job) => {
-                        self.cancel.store(false, Ordering::Relaxed);
-                        job["status"] = json!("running");
-                        job["started"] = json!(now());
-                        runtime.running = Some(job.clone());
-                        Some(job)
-                    }
-                    None => {
-                        let _guard = self.wake.wait_timeout(runtime, Duration::from_secs(1));
-                        None
-                    }
+                    None
                 }
             };
-            let Some(job) = job else { continue };
-            self.log(
-                "INFO",
-                &format!(
-                    "Job started: {} ({})",
-                    job["kind"].as_str().unwrap_or("job"),
-                    job["id"].as_str().unwrap_or("")
-                ),
-            );
-            let task_start = job["task_id"]
-                .as_str()
-                .filter(|id| !id.is_empty())
-                .map(|id| lock(&self.scheduler).start(id, now()))
-                .unwrap_or(Ok(()));
-            let mut integrations = lock(&self.integrations).clone();
-            let result = task_start.and_then(|_| self.execute(&job, &mut integrations));
-            if let Err(message) = result {
-                if let Some(running) = lock(&self.runtime).running.as_mut() {
-                    running["error"] = json!(message);
-                }
-                self.log("ERROR", &format!("Job failed: {}", log_text(&message, 512)));
-            }
-            if integrations.bazarr_enabled()
-                && let Err(error) = self.prepare_bazarr_verification()
-            {
-                self.log(
-                    "ERROR",
-                    &format!(
-                        "Pending Bazarr verification state could not be saved: {}",
-                        log_text(&error, 256)
-                    ),
-                );
-            }
-            let mut bazarr_reindex = None;
-            if ["scan", "extract", "ocr"].contains(&job["kind"].as_str().unwrap_or(""))
-                && let Some(notification) =
-                    integrations.flush_bazarr(&self.cancel, &mut |event| self.progress(event))
-            {
-                bazarr_reindex = Some(notification);
-            }
-            if let Err(error) = self.refresh_bazarr_after_publication(
-                &mut integrations,
-                &job,
-                bazarr_reindex.as_mut(),
-            ) {
-                self.notifications(vec![json!({"provider":"bazarr","ok":false,"message":format!("SRT published; Bazarr inventory refresh failed: {}",log_text(&error,256))})]);
-            }
-            if let Some(notification) = bazarr_reindex {
-                self.notifications(vec![notification]);
-            }
-            let mut runtime = lock(&self.runtime);
-            if let Some(mut finished) = runtime.running.take() {
-                finished["status"] = json!(if self.cancel.load(Ordering::Relaxed) {
-                    "cancelled"
-                } else {
-                    completed_status(&finished)
-                });
-                finished["finished"] = json!(now());
-                if let Some(fields) = finished.as_object_mut() {
-                    fields.remove("published_srt_keys");
-                    fields.remove("published_paths");
-                }
-
-                record_log(
-                    &mut runtime,
-                    json!({"time":now(),"level":if finished["status"]=="failed" {"ERROR"} else {"INFO"},"message":format!("Job {}: {}; processed {}, failed {}", finished["status"].as_str().unwrap_or("finished"),finished["kind"].as_str().unwrap_or("job"), count(&finished["processed"]),count(&finished["summary"]["failed"])),"job_id":finished["id"],"status":finished["status"]}),
-                );
-                if let Some(id) = finished["task_id"].as_str().filter(|id| !id.is_empty()) {
-                    let status = finished["status"].as_str().unwrap_or("failed");
-                    let message = finished["error"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| {
-                            format!(
-                                "{}; processed {}, failed {}",
-                                status,
-                                count(&finished["processed"]),
-                                count(&finished["summary"]["failed"])
-                            )
-                        });
-                    if lock(&self.scheduler)
-                        .finish(id, now(), status, &message)
-                        .is_err()
-                    {
-                        eprintln!("Task result could not be saved");
-                    }
-                }
-                if finished["kind"] == "inspect" {
-                    finished["results"] = json!([]);
-                    for prior in &mut runtime.history {
-                        if prior["kind"] == "inspect" {
-                            prior["results"] = json!([]);
+            if let Some(job) = job {
+                let id = job["id"].as_str().unwrap_or("").to_owned();
+                let runner = Arc::clone(&self);
+                let thread_id = id.clone();
+                match std::thread::Builder::new()
+                    .name("subforge-job".into())
+                    .stack_size(2 * 1024 * 1024)
+                    .spawn(move || {
+                        if let Some(active) = lock(&runner.runtime).active_jobs.get_mut(&thread_id)
+                        {
+                            active.owner = Some(std::thread::current().id());
                         }
+                        runner.log(
+                            "INFO",
+                            &format!(
+                                "Job started: {} ({thread_id})",
+                                job["kind"].as_str().unwrap_or("job")
+                            ),
+                        );
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            runner.execute_job(&job)
+                        }))
+                        .is_err()
+                            && let Some(active) =
+                                lock(&runner.runtime).active_jobs.get_mut(&thread_id)
+                        {
+                            active.job["error"] = json!("Job coordinator failed safely");
+                        }
+                        runner.finish_job(&thread_id);
+                    }) {
+                    Ok(handle) => {
+                        handles.insert(id, handle);
+                    }
+                    Err(_) => {
+                        if let Some(active) = lock(&self.runtime).active_jobs.get_mut(&id) {
+                            active.job["error"] = json!("Job coordinator capacity is unavailable");
+                        }
+                        self.finish_job(&id);
                     }
                 }
-                runtime.history.push_back(finished);
-                while runtime.history.len() > HISTORY_LIMIT {
-                    runtime.history.pop_front();
-                }
-                self.persist_history(&runtime);
+                continue;
             }
+            let drained = {
+                let runtime = lock(&self.runtime);
+                runtime.queue.is_empty() && runtime.active_jobs.is_empty() && handles.is_empty()
+            };
+            if drained {
+                self.flush_publications();
+            }
+            let runtime = lock(&self.runtime);
+            let _guard = self.wake.wait_timeout(runtime, Duration::from_millis(100));
+        }
+        for active in lock(&self.runtime).active_jobs.values() {
+            active.cancel.store(true, Ordering::Relaxed);
+        }
+        for (_, handle) in handles {
+            let _ = handle.join();
         }
     }
 }
@@ -4234,6 +4664,329 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(condition(), "bounded worker fixture must make progress");
+    }
+
+    struct FixtureDispatcher {
+        app: Arc<App>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl FixtureDispatcher {
+        fn start(app: &Arc<App>) -> Self {
+            let runner = Arc::clone(app);
+            Self {
+                app: Arc::clone(app),
+                handle: Some(std::thread::spawn(move || runner.worker())),
+            }
+        }
+    }
+    impl Drop for FixtureDispatcher {
+        fn drop(&mut self) {
+            self.app.shutdown.store(true, Ordering::Relaxed);
+            self.app.wake.notify_all();
+            if let Some(handle) = self.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn separately_queued_jobs_resize_live_and_downscale_without_stopping_files() {
+        let (_temporary, app, paths, gate) = gated_workers_fixture();
+        lock(&app.runtime).running = None;
+        app.update_workers(
+            &json!({"cpu_workers":1,"ocr_workers":0,"gpu_workers":0,"paused":false}),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for number in 0..15 {
+            let path = if let Some(path) = paths.get(number) {
+                path.clone()
+            } else {
+                let path = app.mounts[0].join(format!("extra-{number}.ass"));
+                fs::write(&path, b"Disposable subtitle fixture").unwrap();
+                path
+            };
+            let job = app.enqueue(&json!({"kind":"extract","paths":[path],"include_ocr":false,"languages":["*"],"retry":true}), "manual").unwrap().unwrap();
+            ids.push(job["id"].as_str().unwrap().to_owned());
+        }
+        let _dispatcher = FixtureDispatcher::start(&app);
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 1);
+        app.update_workers(
+            &json!({"cpu_workers":4,"ocr_workers":0,"gpu_workers":0,"paused":false}),
+        )
+        .unwrap();
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 4);
+        assert_eq!(app.workers()["active"]["cpu_workers"], 4);
+        let active_ids = lock(&app.workers)
+            .active
+            .iter()
+            .map(|worker| worker.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            active_ids.len(),
+            4,
+            "IDs are global across jobs, not per coordinator"
+        );
+        app.update_workers(
+            &json!({"cpu_workers":3,"ocr_workers":0,"gpu_workers":0,"paused":false}),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            app.workers()["active"]["cpu_workers"],
+            4,
+            "downscale drains already running files"
+        );
+        assert!(
+            lock(&app.runtime)
+                .active_jobs
+                .values()
+                .all(|active| !active.cancel.load(Ordering::Relaxed))
+        );
+        gate.released_count.store(1, Ordering::Relaxed);
+        wait_for_fixture(|| app.workers()["active"]["cpu_workers"] == 3);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            gate.entered.load(Ordering::Relaxed),
+            4,
+            "no admission while active equals reduced target"
+        );
+        gate.released_count.store(2, Ordering::Relaxed);
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 5);
+        assert_eq!(
+            app.workers()["active"]["cpu_workers"],
+            3,
+            "one slot refills once active falls below target"
+        );
+        gate.released.store(true, Ordering::Relaxed);
+        wait_for_fixture(|| lock(&app.runtime).history.len() == 15);
+        let status = app.status();
+        for id in ids {
+            let job = status["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|job| job["id"] == id)
+                .unwrap();
+            assert_eq!(job["status"], "completed");
+            assert_eq!(
+                job["processed"], 1,
+                "completion belongs to exactly its own job"
+            );
+            assert_eq!(job["executors"][0]["resource"], "cpu");
+        }
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 15);
+        assert!(lock(&app.workers).active.is_empty());
+    }
+
+    #[test]
+    fn concurrent_jobs_do_not_overlap_subtitle_output_families() {
+        let (_temporary, app, paths, gate) = gated_workers_fixture();
+        lock(&app.runtime).running = None;
+        let sibling = paths[0].with_extension("en.ass");
+        fs::write(&sibling, b"Disposable subtitle fixture").unwrap();
+        for path in [&paths[0], &sibling] {
+            app.enqueue(
+                &json!({"kind":"extract","paths":[path],"include_ocr":false}),
+                "manual",
+            )
+            .unwrap();
+        }
+        let _dispatcher = FixtureDispatcher::start(&app);
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 1);
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            app.workers()["active"]["cpu_workers"],
+            1,
+            "a free CPU slot cannot bypass an output-family reservation"
+        );
+        gate.released.store(true, Ordering::Relaxed);
+        wait_for_fixture(|| lock(&app.runtime).history.len() == 2);
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn cancelling_one_concurrent_job_does_not_cancel_another() {
+        let (_temporary, app, paths, gate) = gated_workers_fixture();
+        lock(&app.runtime).running = None;
+        let first = app
+            .enqueue(
+                &json!({"kind":"extract","paths":[paths[0]],"include_ocr":false}),
+                "manual",
+            )
+            .unwrap()
+            .unwrap();
+        let second = app
+            .enqueue(
+                &json!({"kind":"extract","paths":[paths[1]],"include_ocr":false}),
+                "manual",
+            )
+            .unwrap()
+            .unwrap();
+        let _dispatcher = FixtureDispatcher::start(&app);
+        wait_for_fixture(|| gate.entered.load(Ordering::Relaxed) == 2);
+        app.cancel(first["id"].as_str().unwrap()).unwrap();
+        wait_for_fixture(|| {
+            lock(&app.runtime)
+                .history
+                .iter()
+                .any(|job| job["id"] == first["id"])
+        });
+        {
+            let runtime = lock(&app.runtime);
+            assert_eq!(runtime.history.back().unwrap()["status"], "cancelled");
+            assert!(
+                !runtime.active_jobs[second["id"].as_str().unwrap()]
+                    .cancel
+                    .load(Ordering::Relaxed)
+            );
+        }
+        assert_eq!(app.workers()["active"]["cpu_workers"], 1);
+        gate.released.store(true, Ordering::Relaxed);
+        wait_for_fixture(|| lock(&app.runtime).history.len() == 2);
+        let status = app.status();
+        assert_eq!(
+            status["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|job| job["id"] == second["id"])
+                .unwrap()["status"],
+            "completed"
+        );
+    }
+
+    #[test]
+    fn bazarr_notifications_wait_for_queue_and_all_active_jobs_then_deduplicate() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let movie = app.mounts[0].join("film.mkv");
+        fs::write(&movie, b"Disposable media").unwrap();
+        let outputs = [
+            app.mounts[0].join("film.en.srt"),
+            app.mounts[0].join("film.fr.srt"),
+        ];
+        for output in &outputs {
+            target_srt(output);
+        }
+        let fixture = BazarrFixture::new(
+            vec![json!({"radarrId":1,"profileId":1,"path":movie,"subtitles":[]})],
+            &["en", "fr"],
+        );
+        *lock(&app.integrations) = fixture.integration(&app);
+        {
+            let mut runtime = lock(&app.runtime);
+            runtime.running = Some(json!({"id":"finished-with-output"}));
+            runtime.inventory_source = "bazarr".into();
+            runtime.history.push_back(
+                json!({"id":"finished-with-output","kind":"extract","status":"cancelled"}),
+            );
+            runtime.history.push_back(json!({"id":"failed-with-output","kind":"extract","status":"failed","error":"Fixture partial failure"}));
+        }
+        app.stage_publications(&[outputs[0].to_string_lossy().into_owned()])
+            .unwrap();
+        lock(&app.runtime).running = Some(json!({"id":"failed-with-output"}));
+        app.stage_publications(
+            &outputs
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        {
+            let mut runtime = lock(&app.runtime);
+            runtime.running = None;
+            runtime
+                .queue
+                .push_back(json!({"id":"queued","status":"queued"}));
+        }
+        app.flush_publications();
+        assert!(
+            lock(&fixture.requests).is_empty(),
+            "queued work prevents all drain requests"
+        );
+        {
+            let mut runtime = lock(&app.runtime);
+            runtime.queue.clear();
+            runtime.active_jobs.insert(
+                "working".into(),
+                ActiveJob {
+                    owner: None,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    job: json!({"id":"working"}),
+                },
+            );
+        }
+        app.flush_publications();
+        assert!(
+            lock(&fixture.requests).is_empty(),
+            "an empty queue is insufficient while a file job is active"
+        );
+        lock(&app.runtime).active_jobs.clear();
+        app.cancel.store(true, Ordering::Relaxed);
+        app.flush_publications();
+        assert_eq!(
+            lock(&fixture.requests)
+                .iter()
+                .filter(|request| request.starts_with("PATCH "))
+                .count(),
+            1,
+            "same media is scanned once for outputs from multiple jobs"
+        );
+        let status = app.status();
+        for job in status["history"].as_array().unwrap() {
+            assert_eq!(job["notifications"].as_array().unwrap().len(), 1);
+            assert_eq!(job["notifications"][0]["provider"], "bazarr");
+        }
+        assert_eq!(status["history"][0]["status"], "failed");
+        assert_eq!(status["history"][1]["status"], "cancelled");
+        app.flush_publications();
+        assert_eq!(
+            lock(&fixture.requests)
+                .iter()
+                .filter(|request| request.starts_with("PATCH "))
+                .count(),
+            1,
+            "idle polls never repeat an attempted scan"
+        );
+        assert!(lock(&app.publications).paths.is_empty());
+        assert!(
+            read_json(&app.data.join("publication-queue.json"), JSON_LIMIT).unwrap()["paths"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn publication_queue_survives_restart_but_attempted_scans_are_not_replayed() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let output = app.mounts[0].join("film.en.srt");
+        target_srt(&output);
+        app.stage_publications(&[output.to_string_lossy().into_owned()])
+            .unwrap();
+        let restored = App::new(
+            app.mounts.clone(),
+            app.data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        assert_eq!(lock(&restored.publications).paths.len(), 1);
+        restored
+            .persist_publications(&lock(&restored.publications), true)
+            .unwrap();
+        let attempted = App::new(
+            app.mounts.clone(),
+            app.data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        assert!(
+            lock(&attempted.publications).paths.is_empty(),
+            "uncertain PATCH is verified by a read-only sync instead of automatically replayed"
+        );
     }
 
     #[test]
