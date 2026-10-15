@@ -88,3 +88,4 @@ Thumbs.db
 # .github/ and .codex/ project defaults and agent setup guidance are versioned.
 # Rust compiler output and local dependency caches
 subtitle-converter/target/
+glance/live/target/

@@ -195,12 +195,14 @@ services:
       - homelab
       - docker-monitoring
 
-  # Same-origin LAN gateway: proxies Glance and streams sanitized live widget data.
+  # Rust LAN gateway: shared on-demand collectors, bounded streams, no GPU access.
   glance-live:
     build:
       context: ../glance/live
     container_name: glance-live
-    mem_limit: 96m
+    mem_limit: ${GLANCE_LIVE_MEMORY_LIMIT:-96m}
+    cpus: ${GLANCE_LIVE_CPUS:-0.50}
+    pids_limit: 32
     restart: unless-stopped
     read_only: true
     user: "10001:10001"
@@ -214,6 +216,8 @@ services:
       - GLANCE_LIVE_QBITTORRENT_INTERVAL=${GLANCE_LIVE_QBITTORRENT_INTERVAL:-2}
       - GLANCE_LIVE_JELLYFIN_INTERVAL=${GLANCE_LIVE_JELLYFIN_INTERVAL:-5}
       - GLANCE_LIVE_JELLYFIN_WS=${GLANCE_LIVE_JELLYFIN_WS:-true}
+      - GLANCE_LIVE_MAX_CONNECTIONS=${GLANCE_LIVE_MAX_CONNECTIONS:-64}
+      - GLANCE_LIVE_SSE_MAX_SECONDS=${GLANCE_LIVE_SSE_MAX_SECONDS:-900}
       - JELLYFIN_INTERNAL_URL=${JELLYFIN_INTERNAL_URL}
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
       - QBITTORRENT_INTERNAL_URL=${QBITTORRENT_INTERNAL_URL}
@@ -226,7 +230,7 @@ services:
     depends_on:
       - glance
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/live/health', timeout=3).close()"]
+      test: ["CMD", "/usr/local/bin/glance-live", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

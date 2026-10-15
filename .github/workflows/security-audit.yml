@@ -109,7 +109,6 @@ jobs:
             subtitle-converter/converter.py subtitle-converter/server.py \
             subtitle-converter/integrations.py subtitle-converter/http_client.py \
             glance/jellyfin-counts-cache.py \
-            glance/live/server.py \
             .github/scripts/audit_repository.py
 
       - name: Test automatic subtitle conversion with disposable fixtures
@@ -124,18 +123,57 @@ jobs:
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: pip-audit --strict --requirement subtitle-worker/requirements.txt --progress-spinner off
 
-      - name: Install live relay dependencies
-        id: live-deps
-        if: ${{ !cancelled() }}
-        run: python -m pip install --disable-pip-version-check --requirement glance/live/requirements.txt
+  glance-live-rust:
+    name: Glance live Rust checks and dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Test live relay with disposable HTTP and WebSocket fixtures
-        if: ${{ !cancelled() && steps.live-deps.outcome == 'success' }}
-        run: python -m unittest discover -s glance/live -p test_server.py
+      - name: Set up locked Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: 1.90.0
+          components: clippy, rustfmt
+          build-warnings: ''
+          cache: false
 
-      - name: Audit live relay dependencies
-        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
-        run: pip-audit --strict --requirement glance/live/requirements.txt --progress-spinner off
+      - name: Check Rust formatting
+        working-directory: glance/live
+        run: cargo fmt --all -- --check
+
+      - name: Lint and test gateway with disposable HTTP and WebSocket fixtures
+        working-directory: glance/live
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+
+      - name: Install pinned RustSec audit tool
+        run: cargo install --locked cargo-audit --version 0.22.2
+
+      - name: Audit locked Rust dependencies
+        working-directory: glance/live
+        run: cargo audit --file Cargo.lock --deny warnings
+
+      - name: Build and check the unprivileged runtime without network access
+        run: |
+          docker build --tag glance-live-runtime:test glance/live
+          docker run --detach --name glance-live-runtime-test --network none \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --memory 96m --cpus 0.50 --pids-limit 32 glance-live-runtime:test
+          trap 'docker rm --force glance-live-runtime-test >/dev/null' EXIT
+          for attempt in {1..15}; do
+            if docker exec glance-live-runtime-test /usr/local/bin/glance-live --healthcheck; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
 
   subtitle-converter-rust:
     name: Subforge Rust checks and dependency audit

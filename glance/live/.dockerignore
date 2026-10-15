@@ -1,6 +1,8 @@
-.venv/
-__pycache__/
-*.py[cod]
-test_*.py
-.env
-.env.*
+# Only reviewed application sources belong in the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!tests/
+!tests/**

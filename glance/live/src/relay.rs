@@ -1,0 +1,299 @@
+use crate::{Error, config::{Config, endpoint}, model::{QbState, normalize_sessions}};
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use reqwest::{Client, Response, StatusCode, header::{AUTHORIZATION, COOKIE, HeaderValue, SET_COOKIE}};
+use serde_json::{Value, json};
+use std::{sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use tokio::{sync::{OwnedSemaphorePermit, Semaphore, watch}, task::JoinHandle, time::{Instant, sleep, timeout}};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::{Message, client::IntoClientRequest, protocol::WebSocketConfig}};
+
+#[derive(Clone, Copy)]
+pub enum Topic { Jellyfin, Qbittorrent }
+
+impl Topic {
+    pub fn name(self) -> &'static str {
+        match self { Self::Jellyfin => "jellyfin", Self::Qbittorrent => "qbittorrent" }
+    }
+    fn index(self) -> usize { match self { Self::Jellyfin => 0, Self::Qbittorrent => 1 } }
+}
+
+struct Snapshot {
+    data: Option<Bytes>,
+    updated: Option<u128>,
+    source: &'static str,
+    failed: bool,
+    subscribers: usize,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Snapshot {
+    fn frame(&self, topic: Topic) -> Bytes {
+        let status = if self.failed { "stale" } else if self.updated.is_some() { "ok" } else { "warming" };
+        let updated = self.updated.map_or_else(|| "null".to_owned(), |n| n.to_string());
+        let data = self.data.as_deref().unwrap_or(b"null");
+        let mut frame = Vec::with_capacity(data.len() + 160);
+        frame.extend_from_slice(format!("event: {}\ndata: {{\"status\":\"{status}\",\"updatedAt\":{updated},\"source\":\"{}\",\"data\":", topic.name(), self.source).as_bytes());
+        frame.extend_from_slice(data);
+        frame.extend_from_slice(b"}\n\n");
+        frame.into()
+    }
+}
+
+struct Channel {
+    snapshot: Mutex<Snapshot>,
+    tx: watch::Sender<Bytes>,
+}
+
+pub struct Relay {
+    pub config: Arc<Config>,
+    pub http: Client,
+    topics: [Channel; 2],
+    slots: Arc<Semaphore>,
+}
+
+pub struct Subscription {
+    pub rx: watch::Receiver<Bytes>,
+    relay: Arc<Relay>,
+    topic: Topic,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let channel = &self.relay.topics[self.topic.index()];
+        let mut snapshot = channel.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snapshot.subscribers = snapshot.subscribers.saturating_sub(1);
+        if snapshot.subscribers == 0 && let Some(task) = snapshot.task.take() { task.abort(); }
+    }
+}
+
+pub fn http_client() -> Result<Client, Error> {
+    Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(2)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build().map_err(|_| Error::Upstream)
+}
+
+/// Cap before allocation, including responses without Content-Length.
+pub async fn bounded_body(mut response: Response, limit: usize) -> Result<Bytes, Error> {
+    if response.content_length().is_some_and(|n| n > limit as u64) { return Err(Error::Limit); }
+    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
+    while let Some(chunk) = response.chunk().await.map_err(|_| Error::Upstream)? {
+        if chunk.len() > limit.saturating_sub(body.len()) { return Err(Error::Limit); }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
+}
+
+impl Relay {
+    pub fn new(config: Config) -> Result<Arc<Self>, Error> {
+        let topics = [Topic::Jellyfin, Topic::Qbittorrent].map(|topic| {
+            let snapshot = Snapshot { data: None, updated: None, source: "rest", failed: false, subscribers: 0, task: None };
+            let (tx, _) = watch::channel(snapshot.frame(topic));
+            Channel { snapshot: Mutex::new(snapshot), tx }
+        });
+        Ok(Arc::new(Self { slots: Arc::new(Semaphore::new(config.max_connections)), config: Arc::new(config), http: http_client()?, topics }))
+    }
+
+    pub fn subscribe(self: &Arc<Self>, topic: Topic) -> Result<Subscription, Error> {
+        let permit = self.slots.clone().try_acquire_owned().map_err(|_| Error::Limit)?;
+        let channel = &self.topics[topic.index()];
+        let mut snapshot = channel.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        if snapshot.subscribers == 0 {
+            snapshot.failed = snapshot.updated.is_some();
+            channel.tx.send_replace(snapshot.frame(topic));
+            let relay = self.clone();
+            snapshot.task = Some(tokio::spawn(async move {
+                match topic { Topic::Qbittorrent => relay.collect_qb().await, Topic::Jellyfin => relay.collect_jellyfin().await }
+            }));
+        }
+        snapshot.subscribers += 1;
+        Ok(Subscription { rx: channel.tx.subscribe(), relay: self.clone(), topic, _permit: permit })
+    }
+
+    pub fn shutdown(&self) {
+        for topic in &self.topics {
+            if let Some(task) = topic.snapshot.lock().unwrap_or_else(|e| e.into_inner()).task.take() { task.abort(); }
+        }
+    }
+
+    fn publish(&self, topic: Topic, data: Value, source: &'static str) -> Result<(), Error> {
+        let bytes = serde_json::to_vec(&data).map_err(|_| Error::InvalidData)?;
+        if bytes.len() > self.config.snapshot_bytes { return Err(Error::Limit); }
+        let channel = &self.topics[topic.index()];
+        let mut snapshot = channel.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snapshot.data = Some(bytes.into());
+        snapshot.updated = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis());
+        snapshot.failed = false;
+        snapshot.source = source;
+        channel.tx.send_replace(snapshot.frame(topic));
+        Ok(())
+    }
+
+    fn fail(&self, topic: Topic) {
+        let channel = &self.topics[topic.index()];
+        let mut snapshot = channel.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snapshot.failed = true;
+        channel.tx.send_replace(snapshot.frame(topic));
+    }
+
+    async fn qb_login(&self) -> Result<Option<HeaderValue>, Error> {
+        let config = &self.config;
+        if config.qb_username.is_empty() || config.qb_password.is_empty() { return Err(Error::InvalidData); }
+        let response = self.http.post(endpoint(&config.qbittorrent, "/api/v2/auth/login"))
+            .form(&[("username", &config.qb_username), ("password", &config.qb_password)])
+            .send().await.map_err(|_| Error::Upstream)?;
+        let status = response.status();
+        let sid = response.headers().get_all(SET_COOKIE).iter().filter_map(|v| v.to_str().ok())
+            .filter_map(|v| v.split(';').next()).find(|v| v.starts_with("SID=") && v.len() > 4 && v.len() <= 4096)
+            .map(HeaderValue::from_str).transpose().map_err(|_| Error::InvalidData)?;
+        let body = bounded_body(response, 4096).await?;
+        if status != StatusCode::NO_CONTENT && !(status == StatusCode::OK && body.as_ref() == b"Ok.") { return Err(Error::Upstream); }
+        Ok(sid)
+    }
+
+    async fn qb_sync(&self, state: &mut QbState, cookie: Option<&HeaderValue>) -> Result<StatusCode, Error> {
+        let mut request = self.http.get(endpoint(&self.config.qbittorrent, "/api/v2/sync/maindata"))
+            .query(&[("rid", state.rid)]);
+        if let Some(cookie) = cookie { request = request.header(COOKIE, cookie); }
+        let response = request.send().await.map_err(|_| Error::Upstream)?;
+        let status = response.status();
+        if status != StatusCode::OK { return Ok(status); }
+        let bytes = bounded_body(response, self.config.provider_bytes).await?;
+        let data = serde_json::from_slice(&bytes).map_err(|_| Error::InvalidData)?;
+        let data = state.apply(data, self.config.max_torrents)?;
+        self.publish(Topic::Qbittorrent, data, "rest")?;
+        Ok(status)
+    }
+
+    async fn collect_qb(&self) {
+        let auth = !self.config.qb_username.is_empty() || !self.config.qb_password.is_empty();
+        let mut authenticated = !auth;
+        let mut cookie = None;
+        let mut state = QbState::default();
+        let delay = self.config.qb_interval.clamp(Duration::from_millis(500), Duration::from_secs(30));
+        loop {
+            if !authenticated {
+                match self.qb_login().await {
+                    Ok(sid) => { cookie = sid; authenticated = true; state = QbState::default(); }
+                    Err(_) => { self.fail(Topic::Qbittorrent); sleep(delay.min(Duration::from_secs(5))).await; continue; }
+                }
+            }
+            match self.qb_sync(&mut state, cookie.as_ref()).await {
+                Ok(StatusCode::OK) => {}
+                Ok(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) if auth => {
+                    authenticated = false;
+                    cookie = None;
+                    state = QbState::default();
+                    self.fail(Topic::Qbittorrent);
+                }
+                Ok(_) => self.fail(Topic::Qbittorrent),
+                Err(_) => { state = QbState::default(); self.fail(Topic::Qbittorrent); }
+            }
+            sleep(delay).await;
+        }
+    }
+
+    fn jellyfin_authorization(&self) -> Result<HeaderValue, Error> {
+        HeaderValue::from_str(&format!("MediaBrowser Client=\"Glance Live\", Device=\"Server\", DeviceId=\"glance-live\", Version=\"1.0\", Token=\"{}\"", self.config.jellyfin_key))
+            .map_err(|_| Error::InvalidData)
+    }
+
+    async fn reconcile_jellyfin(&self, auth: &HeaderValue) -> Result<(), Error> {
+        let response = self.http.get(endpoint(&self.config.jellyfin, "/Sessions")).header(AUTHORIZATION, auth)
+            .send().await.map_err(|_| Error::Upstream)?;
+        if response.status() != StatusCode::OK { return Err(Error::Upstream); }
+        let body = bounded_body(response, self.config.provider_bytes).await?;
+        let payload = serde_json::from_slice(&body).map_err(|_| Error::InvalidData)?;
+        self.publish(Topic::Jellyfin, normalize_sessions(&payload, self.config.max_sessions)?, "rest")
+    }
+
+    async fn jellyfin_socket(&self, auth: &HeaderValue) -> Result<(), Error> {
+        let mut url = self.config.jellyfin.clone();
+        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+        url.set_scheme(scheme).map_err(|_| Error::InvalidData)?;
+        url.set_path(&format!("{}/socket", url.path().trim_end_matches('/')));
+        let mut request = url.as_str().into_client_request().map_err(|_| Error::InvalidData)?;
+        request.headers_mut().insert(AUTHORIZATION, auth.clone());
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(self.config.provider_bytes))
+            .max_frame_size(Some(self.config.provider_bytes))
+            .write_buffer_size(4096)
+            .max_write_buffer_size(16384);
+        // tungstenite does not follow redirects; credentials stay on this explicit endpoint.
+        let (mut socket, _) = timeout(Duration::from_secs(10), connect_async_with_config(request, Some(ws_config), false))
+            .await.map_err(|_| Error::Upstream)?.map_err(|_| Error::Upstream)?;
+        timeout(Duration::from_secs(10), socket.send(Message::Text(json!({"MessageType":"SessionsStart","Data":"0,2000"}).to_string().into())))
+            .await.map_err(|_| Error::Upstream)?.map_err(|_| Error::Upstream)?;
+        let interval = self.config.jellyfin_interval.clamp(Duration::from_secs(1), Duration::from_secs(60));
+        let mut reconcile_at = Instant::now() + interval;
+        let mut heartbeat = tokio::time::interval_at(Instant::now() + Duration::from_secs(25), Duration::from_secs(25));
+        let mut ping_at = None;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(reconcile_at) => {
+                    if self.reconcile_jellyfin(auth).await.is_err() { self.fail(Topic::Jellyfin); }
+                    reconcile_at = Instant::now() + interval;
+                }
+                _ = heartbeat.tick() => {
+                    if ping_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(25)) { return Err(Error::Upstream); }
+                    timeout(Duration::from_secs(10), socket.send(Message::Ping(Bytes::new()))).await.map_err(|_| Error::Upstream)?.map_err(|_| Error::Upstream)?;
+                    ping_at = Some(Instant::now());
+                }
+                message = socket.next() => {
+                    match message {
+                        Some(Ok(Message::Text(text))) => {
+                            let Ok(payload) = serde_json::from_str::<Value>(&text) else { continue; };
+                            if payload.get("MessageType").and_then(Value::as_str) == Some("Sessions") && let Some(data) = payload.get("Data").filter(|v| v.is_array()) {
+                                self.publish(Topic::Jellyfin, normalize_sessions(data, self.config.max_sessions)?, "websocket")?;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => ping_at = None,
+                        Some(Ok(Message::Ping(_))) => {
+                            timeout(Duration::from_secs(10), socket.flush()).await.map_err(|_| Error::Upstream)?.map_err(|_| Error::Upstream)?;
+                        }
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Err(Error::Upstream),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    async fn collect_jellyfin(&self) {
+        if self.config.jellyfin_key.is_empty() { self.fail(Topic::Jellyfin); return; }
+        let Ok(auth) = self.jellyfin_authorization() else { self.fail(Topic::Jellyfin); return; };
+        let delay = self.config.jellyfin_interval.clamp(Duration::from_secs(1), Duration::from_secs(60));
+        loop {
+            if self.reconcile_jellyfin(&auth).await.is_err() { self.fail(Topic::Jellyfin); }
+            if self.config.jellyfin_ws {
+                // An unavailable optional WS never invalidates a successful REST snapshot.
+                let _ = self.jellyfin_socket(&auth).await;
+            }
+            sleep(delay).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_contract_preserves_last_good_data_on_failure() {
+        let mut snapshot = Snapshot { data: None, updated: None, source: "rest", failed: false, subscribers: 0, task: None };
+        let frame = snapshot.frame(Topic::Jellyfin);
+        assert!(String::from_utf8_lossy(&frame).contains("{\"status\":\"warming\",\"updatedAt\":null,\"source\":\"rest\",\"data\":null}"));
+        snapshot.data = Some(Bytes::from_static(b"{\"sessions\":[]}"));
+        snapshot.updated = Some(123);
+        snapshot.failed = true;
+        let frame = snapshot.frame(Topic::Jellyfin);
+        assert!(String::from_utf8_lossy(&frame).contains("\"status\":\"stale\",\"updatedAt\":123"));
+        assert!(String::from_utf8_lossy(&frame).contains("\"data\":{\"sessions\":[]}"));
+    }
+}

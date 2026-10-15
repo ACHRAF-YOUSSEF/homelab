@@ -4,7 +4,7 @@
 # still default to zero; this override exposes only NVIDIA device 0.
 services:
   subtitle-converter:
-    image: homelab-subtitle-converter:0.4.3-cuda
+    image: homelab-subtitle-converter:0.4.4-cuda
     pull_policy: never
     mem_limit: ${CONVERTER_GPU_MEMORY_LIMIT:-1536m}
     environment:
