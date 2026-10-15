@@ -1,5 +1,21 @@
 # Subforge revisions
 
+## 0.4.3 — 2026-10-15
+
+- Prioritize conversion and local worker controls together on Overview, with a compact library summary and actionable failure and OCR counts.
+- Remove duplicate recent activity, OCR totals, local-node information, and empty idle worker panels from the Overview layout.
+- Keep active jobs and file workers visible while running; group remote nodes, setup, and operation logs in an expandable diagnostics section.
+- Improve responsive spacing, worker steppers, resource meters, pause controls, and readable admission reasons.
+- Publish matching local `0.4.3-cpu` and `0.4.3-cuda` image tags.
+
+## 0.4.2 — 2026-10-15
+
+- Fit Library and Activity tables to the available viewport, with internal row scrolling, fixed pagination, and an adaptive Fit page size.
+- Replace Activity's long job feed with a paginated jobs table and a details drawer for full errors, results, retries, and worker history.
+- Move local worker allocation, active workers, and remote nodes onto Overview; redirect existing Workers settings bookmarks.
+- Preserve table filters and page choices per browser tab and keep mobile controls accessible.
+- Publish matching local `0.4.2-cpu` and `0.4.2-cuda` image tags.
+
 ## 0.4.1 — 2026-10-15
 
 - Include the assigned node, CPU/CPU OCR/GPU OCR resource, and worker ID in extraction phase, completion, failure, and remote retry logs; retain executor details in job history.

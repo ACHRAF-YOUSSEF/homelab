@@ -18,7 +18,12 @@
   state.rootFolders={roots:[],mounts:[]};
   state.folderRequest=0;
   state.inventoryPage=1;
-  state.inventoryPageSize=25;
+  state.inventoryPageSize='auto';
+  state.jobsPage=1;
+  state.jobsPageSize='auto';
+  state.tableAutoSizes={library:10,activity:10};
+  state.tableFrame=0;
+  state.selectedJobId=null;
   state.inventoryTruncated=false;
   state.inventoryUpdated=null;
   state.inventoryLoaded=false;
@@ -100,6 +105,8 @@
     setText(banner,bazarr?({ready:'Bazarr profiles define the wanted languages. Valid SRT coverage is verified before conversion.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:'Subtitles were published; Bazarr indexing or inventory refresh is still pending. Sync Bazarr inventory to check again.',reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(authority.error?` ${authority.error}`:''):'');
     $$('[data-action="inspect"]').forEach(button=>setText(button,bazarr?'Sync Bazarr inventory':'Inspect media'));
     const blocked=bazarr&&status!=='ready';
+    const overviewNotice=$('#overview-inventory-notice');
+    if(overviewNotice){overviewNotice.hidden=!blocked;setText(overviewNotice,blocked?banner.textContent:'');}
     $$('[data-action="scan"],#quick-form button[type="submit"]').forEach(button=>{button.disabled=blocked;button.title=blocked?'Sync Bazarr before starting automatic conversion':'';});
     updateLanguageLabels();
   };
@@ -115,20 +122,21 @@
   const renderPipeline = () => {
     const data=state.status?.pipeline||{},available=data.available||{},running=state.status?.running,queued=(state.status?.queue||[]).length;
     const count=key=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
-    setText($('#pipeline-roots'),count('root_count'));setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));setText($('#pipeline-convert'),count('pending_ocr_files'));
-    setText($('[data-pipeline-stage="convert"] .stage-unit'),'files in conversion state');
-    setText($('#pipeline-status'),state.inventoryUpdated?`${usesBazarr()?'Synced from Bazarr':'Inspected'} ${fmtDate(state.inventoryUpdated)}`:'No inventory yet');
-    setText($('#snapshot-note'),`${usesBazarr()?'Bazarr media inventory and profile requirements. Existing external SRT coverage is shown per file.':'Saved filesystem inventory; inspect media to refresh it.'}${state.inventoryTruncated?' The server reports a bounded partial inventory.':''} Generated subtitles count outputs written by Subforge separately from external SRT coverage.`);
+    setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));
+    const inventoryStatus=$('#pipeline-status');
+    setText(inventoryStatus,state.inventoryUpdated?`${usesBazarr()?'Bazarr sync':'Inspected'} ${fmtDate(state.inventoryUpdated)}${state.inventoryTruncated?' · Partial snapshot':''}`:'No inventory yet');
+    if(inventoryStatus)inventoryStatus.title=usesBazarr()?'Bazarr profiles define the required languages. Open Library for verified SRT coverage.':'Inspect media to update the saved filesystem inventory.';
     setText($('#attention-pending'),count('pending_ocr_files'));setText($('#attention-failed'),count('failed_files'));setText($('#attention-unreachable'),count('unreachable_roots'));
-    setText($('#attention-summary'),'Failures and OCR counts cover saved conversion state. Library results cover the saved inventory snapshot.');
-    for(const [key,value] of [['pending',data.pending_ocr_files],['failed',data.failed_files],['paths',data.unreachable_roots]]){const button=$(`[data-attention="${key}"]`);button.classList.toggle('has-issues',Number(value)>0);button.classList.toggle('is-clear',value===0);}
-    $('#current-work-title').closest('article').classList.toggle('is-idle',!running&&!queued);const progress=$('#pipeline-progress');progress.hidden=!running;
+    for(const [key,value] of [['pending',data.pending_ocr_files],['failed',data.failed_files],['paths',data.unreachable_roots]]){const button=$(`[data-attention="${key}"]`);button.classList.toggle('has-issues',Number(value)>0);button.classList.toggle('is-clear',value===0);button.hidden=key==='paths'&&value===0;button.title=key==='paths'?'Review unavailable media folders':key==='failed'?'Review failures saved in conversion state':'Review files awaiting image subtitle recognition';}
+    const idle=!running&&!queued,currentPanel=$('#current-work-title').closest('article'),idleStatus=$('#overview-work-status');
+    currentPanel.hidden=idle;currentPanel.classList.toggle('is-idle',idle);if(idleStatus){idleStatus.hidden=!idle;setText(idleStatus,'No jobs running');}
+    const progress=$('#pipeline-progress');progress.hidden=!running;
     if(running&&Number(running.total)>0){progress.value=jobPercent(running);progress.setAttribute('aria-label',`${running.processed||0} of ${running.total} files processed`);}else progress.removeAttribute('value');
     const content=$('#current-work-content');content.replaceChildren();
-    setText($('#current-work-summary'),running?`${queued} queued job${queued===1?'':'s'} · ${running.total?`${running.processed||0} / ${running.total} files`: 'Discovering work'}`:queued?`${queued} queued job${queued===1?'':'s'} · waiting for a worker`:'No jobs running');
+    setText($('#current-work-summary'),running?[running.total?`${running.processed||0} / ${running.total} files`:'Discovering work',queued?`${queued} queued job${queued===1?'':'s'}`:''].filter(Boolean).join(' · '):queued?`${queued} queued job${queued===1?'':'s'} · waiting for a worker`:'No jobs running');
     const title=document.createElement('strong'),detail=document.createElement('span');detail.className='muted';
-    title.textContent=running?({scan:'Converting text subtitles',inspect:'Inspecting media',extract:'Converting selected tracks',ocr:'Recognizing image subtitles'})[running.kind]||'Running maintenance':queued?'Work is queued':'Ready for your next conversion';
-    detail.textContent=running?currentLabel(running.current)||'Preparing files':queued?'Open Activity to review the queue and Workers to check admission limits.':'Choose a media folder and languages, or inspect your library first.';
+    title.textContent=running?({scan:'Converting text subtitles',inspect:'Inspecting media',extract:'Converting selected tracks',ocr:'Recognizing image subtitles'})[running.kind]||'Running maintenance':queued?'Work is queued':'';
+    detail.textContent=running?currentLabel(running.current)||'Preparing files':queued?'Review the queue in Activity or check worker capacity below.':'';
     content.append(title,detail);
   };
   const disclosureIcon = () => {
@@ -170,7 +178,7 @@
     const content=document.createElement('div');content.className='job-error-content';const list=document.createElement('ul');
     for(const group of groups){const row=document.createElement('li'),heading=document.createElement('div');heading.className='job-error-heading';const label=document.createElement('strong');label.textContent=group.source==='job'?'Job error':group.source==='conversion'?'Media file failures':`${group.label} · ${group.source==='notification'?'Scan notification':'Refresh result'}`;const repeats=document.createElement('span');repeats.className='job-error-count';repeats.textContent=`${group.count.toLocaleString()}×`;heading.append(label,repeats);const message=document.createElement('p');message.textContent=group.message;row.append(heading,message);
       if(group.examples.length){const examples=document.createElement('p');examples.className='job-error-examples';examples.textContent=`Examples: ${group.examples.join(' · ')}`;row.append(examples);}
-      if(group.provider){const settings=document.createElement('button');settings.type='button';settings.className='text-button';settings.textContent=`Review ${group.label} settings`;settings.dataset.jobFocus=`${key}:${group.source}:${group.provider}:${group.message}`;settings.addEventListener('click',()=>{navigate('settings',group.provider);const card=$(`[data-provider="${group.provider}"]`);if(card?.classList.contains('is-collapsed'))$('.collapse-toggle',card).click();});row.append(settings);}
+      if(group.provider){const settings=document.createElement('button');settings.type='button';settings.className='text-button';settings.textContent=`Review ${group.label} settings`;settings.dataset.jobFocus=`${key}:${group.source}:${group.provider}:${group.message}`;settings.addEventListener('click',()=>{closeDialog($('#job-drawer-backdrop'));navigate('settings',group.provider);const card=$(`[data-provider="${group.provider}"]`);if(card?.classList.contains('is-collapsed'))$('.collapse-toggle',card).click();});row.append(settings);}
       list.append(row);
     }
     content.append(list);
@@ -210,6 +218,35 @@
     const done = Number(summary.converted || 0) + Number(summary.cached || 0) + Number(summary.failed || 0);
     return counts ? Math.round(100 * done / counts) : job.status === 'completed' ? 100 : 0;
   };
+  const jobTitle = job => job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider]||'Integration'} ${job.provider==='bazarr'?'inventory check':'library refresh'}`:({scan:job.include_ocr===true?'Convert missing subtitles':'Scan and convert text',inspect:'Inspect subtitle tracks',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind]||'Converter job';
+  const jobStatus = job => {
+    const pending=job.status==='completed'&&job.notifications?.some(item=>item?.pending===true);
+    return {style:pending?'queued':escStatus(job.status),label:pending?'Converted · indexing pending':({completed_with_errors:'Completed with errors',running:'Running',queued:'Queued',completed:'Completed',failed:'Failed',cancelled:'Cancelled'})[job.status]||job.status||'Queued'};
+  };
+  const fittedPageSize = (page,requested) => {
+    if(requested!=='auto')return requested;
+    const pane=$(page==='library'?'.inventory-table-wrap':'.jobs-table-wrap');
+    if(pane?.clientHeight>0){
+      const table=$('table',pane),header=table?.tHead?.getBoundingClientRect().height||0;
+      const rows=$$('tbody > tr',pane).filter(row=>!$('.table-empty',row));
+      const measured=rows.length?Math.max(...rows.map(row=>row.getBoundingClientRect().height)):0;
+      const fallback=page==='library'?(innerWidth<=800?176:72):(innerWidth<=800?144:64);
+      const height=Math.max(measured,parseFloat(getComputedStyle(pane).getPropertyValue('--table-row-height'))||fallback);
+      state.tableAutoSizes[page]=Math.max(1,Math.min(100,Math.floor((pane.clientHeight-header-2)/height)));
+    }
+    const size=state.tableAutoSizes[page];
+    const option=$(`${page==='library'?'#inventory-page-size':'#jobs-page-size'} option[value="auto"]`);
+    if(option)option.textContent=`Fit (${size})`;
+    return size;
+  };
+  const scheduleTableFit = () => {
+    if(state.tableFrame)return;
+    state.tableFrame=requestAnimationFrame(()=>{
+      state.tableFrame=0;
+      if(state.currentPage==='library'&&state.inventoryPageSize==='auto'&&fittedPageSize('library','auto')!==state.inventoryEffectiveSize)renderInventory();
+      if(state.currentPage==='activity'&&state.jobsPageSize==='auto'&&fittedPageSize('activity','auto')!==state.jobsEffectiveSize)renderJobs();
+    });
+  };
   const renderJobExecutors = (job,compact) => {
     const executors=Array.isArray(job.executors)?job.executors.slice(0,64).filter(executor=>executor&&['cpu','cpu_ocr','gpu'].includes(executor.resource)&&['local','remote'].includes(executor.execution)&&typeof executor.node_name==='string'&&executor.node_name.trim()):[];
     if(!executors.length&&job.executors_truncated!==true)return null;
@@ -236,12 +273,11 @@
     const card = document.createElement('article'); card.className = `job-card${compact ? ' job-card-compact' : ''}`;
     const icon = document.createElement('div'),type=job.kind==='extract'?'convert':job.kind; icon.className = `job-icon job-${escStatus(type)}`; icon.append(iconSvg(type));
     const detail = document.createElement('div'); detail.className = 'job-detail';
-    const title = document.createElement('strong'); title.textContent = job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider] || 'Integration'} ${job.provider==='bazarr'?'inventory check':'library refresh'}`:({scan:job.include_ocr===true?'Convert missing subtitles':'Scan and convert text',inspect:'Inspect subtitle tracks',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind] || 'Converter job';
+    const title = document.createElement('strong'); title.textContent = jobTitle(job);
     const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = currentLabel(job.current) || (job.paths && job.paths.length ? shortPath(job.paths[0]) : job.root_label || 'All scan roots');
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
-    const awaitingIndex=Array.isArray(job.notifications)&&job.notifications.some(item=>item?.pending===true);
-    const pill = document.createElement('span'); pill.className=`status-pill ${awaitingIndex&&job.status==='completed'?'queued':escStatus(job.status)}`; pill.textContent=awaitingIndex&&job.status==='completed'?'Converted · indexing pending':({completed_with_errors:'Completed with errors',running:'Running',queued:'Queued',completed:'Completed',failed:'Failed',cancelled:'Cancelled'})[job.status]||job.status||'Queued';
+    const statusValue=jobStatus(job),pill = document.createElement('span'); pill.className=`status-pill ${statusValue.style}`; pill.textContent=statusValue.label;
     const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.started || job.created);
     status.append(pill,time);
     card.append(icon,detail,status);
@@ -275,11 +311,49 @@
     if(focusKey)$$('[data-job-focus]',container).find(node=>node.dataset.jobFocus===focusKey)?.focus({preventScroll:true});
     for(const details of $$('.job-error',container))$('.job-error-content',details).scrollTop=state.errorViews.get(details.dataset.errorKey)?.scroll || 0;
   };
+  const openJobDetails = job => {
+    state.selectedJobId=job.id;
+    state.selectedJobSnapshot=job;
+    state.modalTrigger=document.activeElement;
+    setText($('#job-drawer-title'),jobTitle(job));
+    updateJobList($('#job-drawer-content'),[job],false);
+    showDialog($('#job-drawer-backdrop'));
+    $('#close-job-drawer').focus();
+  };
+  const renderJobRows = jobs => {
+    const body=$('#jobs-list'),signature=JSON.stringify(jobs);
+    if(body.jobSignature===signature)return;
+    const focus=body.contains(document.activeElement)?document.activeElement.dataset.jobFocus:null;
+    body.jobSignature=signature;body.replaceChildren();
+    if(!jobs.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=6;cell.className='table-empty';cell.textContent='No jobs match these filters.';row.append(cell);body.append(row);return;}
+    for(const job of jobs){
+      const row=document.createElement('tr');row.className='job-row';row.dataset.jobId=job.id;
+      const cell=(name,className)=>{const value=document.createElement('td');value.dataset.label=name;value.className=className;row.append(value);return value;};
+      const name=cell('Job','job-name'),title=document.createElement('strong'),scope=document.createElement('small');title.textContent=jobTitle(job);scope.textContent=job.paths?.length?shortPath(job.paths[0]):job.root_label||'All media folders';scope.title=job.paths?.[0]||job.root_label||'';name.append(title,scope);
+      const status=cell('Status','job-row-status'),value=jobStatus(job),pill=document.createElement('span');pill.className=`status-pill ${value.style}`;pill.textContent=value.label;status.append(pill);
+      const workers=cell('Worker','job-row-workers'),executors=(Array.isArray(job.executors)?job.executors.slice(0,64):[]).filter(item=>item&&['cpu','cpu_ocr','gpu'].includes(item.resource)&&['local','remote'].includes(item.execution)&&typeof item.node_name==='string'&&item.node_name.trim());
+      const workerLabels=executors.map(item=>`${({cpu:'CPU',cpu_ocr:'CPU OCR',gpu:'GPU OCR'})[item.resource]} · ${item.node_name}`);workers.textContent=workerLabels.slice(0,2).join(', ')+(workerLabels.length>2?` +${workerLabels.length-2}`:'')||'—';workers.title=workerLabels.join('\n');
+      const result=cell('Result','job-row-result'),summary=job.summary||{},parts=[];
+      for(const [key,label] of [['converted','converted'],['cached','ready'],['inspected','inspected'],['failed','failed']])if(Number(summary[key]))parts.push(`${Number(summary[key]).toLocaleString()} ${label}`);
+      result.textContent=['running','queued'].includes(job.status)?`${jobPercent(job)}% · ${currentLabel(job.current)||'Waiting to start'}`:parts.join(', ')||((job.notifications||[]).some(item=>item?.pending===true)?'Indexing pending':job.error?'Review error details':'—');result.title=result.textContent;
+      const updated=cell('Updated','job-row-time');updated.textContent=fmtDate(job.finished||job.started||job.created);
+      const actionsCell=cell('Actions','job-row-actions'),actions=document.createElement('div');actions.className='job-actions';actionsCell.append(actions);const details=document.createElement('button');details.className='row-action';details.type='button';details.textContent='Details';details.dataset.viewJob=job.id;details.dataset.jobFocus=`${job.id}:details`;details.setAttribute('aria-label',`Details for ${jobTitle(job)}`);details.addEventListener('click',()=>openJobDetails(job));actions.append(details);
+      if(['running','queued'].includes(job.status)&&job.id){const cancel=document.createElement('button');cancel.type='button';cancel.className='text-button cancel-job';cancel.textContent='Cancel';cancel.dataset.jobId=job.id;cancel.dataset.jobFocus=`${job.id}:cancel`;actions.append(cancel);}
+      body.append(row);
+    }
+    if(focus)$$('[data-job-focus]',body).find(node=>node.dataset.jobFocus===focus)?.focus({preventScroll:true});
+    scheduleTableFit();
+  };
+  const saveJobsView = () => {try{sessionStorage.setItem('subforge.jobs-view',JSON.stringify({page:state.jobsPage,pageSize:state.jobsPageSize,status:$('#activity-status').value,kind:$('#activity-kind').value}));}catch{}};
+  const restoreJobsView = () => {try{const view=JSON.parse(sessionStorage.getItem('subforge.jobs-view')||'{}');state.jobsPage=Number.isInteger(view.page)&&view.page>0?Math.min(view.page,200):1;state.jobsPageSize=[10,25,50].includes(view.pageSize)?view.pageSize:'auto';$('#jobs-page-size').value=String(state.jobsPageSize);if(['all','running','queued','issues','completed','cancelled'].includes(view.status))$('#activity-status').value=view.status;if(['subtitle','all','maintenance'].includes(view.kind))$('#activity-kind').value=view.kind;}catch{}};
   const renderJobs = () => {
     const jobs=jobList(),running=state.status?.running,maintenance=job=>['health','backup','cleanup'].includes(job.kind);
     const status=$('#activity-status').value,kind=$('#activity-kind').value;
     const filtered=jobs.filter(job=>(kind==='all'||(kind==='maintenance')===maintenance(job))&&(status==='all'||status==='issues'&&['failed','completed_with_errors'].includes(job.status)||status===job.status));
-    updateJobList($('#recent-activity'),jobs.filter(job=>!maintenance(job)).slice(0,4),true);updateJobList($('#jobs-list'),filtered,false);
+    const size=fittedPageSize('activity',state.jobsPageSize),pages=Math.max(1,Math.ceil(filtered.length/size));state.jobsEffectiveSize=size;state.jobsPage=Math.max(1,Math.min(state.jobsPage,pages));const start=(state.jobsPage-1)*size,visible=filtered.slice(start,start+size);
+    renderJobRows(visible);
+    setText($('#jobs-range'),filtered.length?`${start+1}–${start+visible.length} of ${filtered.length} jobs`:'0 jobs');setText($('#jobs-page-label'),`Page ${state.jobsPage} of ${pages}`);$('#jobs-previous').disabled=state.jobsPage===1;$('#jobs-next').disabled=state.jobsPage===pages;
+    if(!$('#job-drawer-backdrop').classList.contains('hidden')){const selected=jobs.find(job=>job.id===state.selectedJobId)||state.selectedJobSnapshot;if(selected){setText($('#job-drawer-title'),jobTitle(selected));updateJobList($('#job-drawer-content'),[selected],false);}}
     setText($('#activity-count'),`${filtered.length} of ${jobs.length} jobs`);
     const validKeys=new Set(jobs.flatMap(job=>[errorViewKey(job,true),errorViewKey(job,false)]));for(const views of [state.errorViews,state.executorViews])for(const key of views.keys())if(!validKeys.has(key))views.delete(key);
     const queued=(state.status?.queue||[]).length,badge=$('#activity-badge');badge.textContent=queued?String(queued):'';badge.classList.toggle('hidden',!queued);
@@ -310,11 +384,11 @@
     try {sessionStorage.setItem('subforge.inventory-view',JSON.stringify({page:state.inventoryPage,pageSize:state.inventoryPageSize,search:$('#inventory-search').value,root:$('#inventory-root').value,filter:$('#inventory-filter').value}));}catch{}
   };
   const restoreInventoryView = () => {
-    try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:25;$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','needed','covered','unavailable','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
+    try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:'auto';$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','needed','covered','unavailable','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
   };
   const pollStatus = async () => {
     if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
-    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderPipeline(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateIntegrationDots(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
+    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); renderPipeline(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateIntegrationDots(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
@@ -337,9 +411,10 @@
     if(filter==='ready')rows=rows.filter(row=>coverageState(row)==='covered'||row.processing?.generated_srt_count>0);
     if(filter==='metadata')rows=rows.filter(row=>row.metadata_pending);
     if (query) rows=rows.filter(row=>`${row.name || ''}\n${row.path || ''}`.toLowerCase().includes(query));
-    const count=rows.length, pages=Math.max(1,Math.ceil(count/state.inventoryPageSize));
+    const pageSize=fittedPageSize('library',state.inventoryPageSize);state.inventoryEffectiveSize=pageSize;
+    const count=rows.length, pages=Math.max(1,Math.ceil(count/pageSize));
     if(state.inventoryLoaded)state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
-    const start=(state.inventoryPage-1)*state.inventoryPageSize, visibleRows=rows.slice(start,start+state.inventoryPageSize);
+    const start=(state.inventoryPage-1)*pageSize, visibleRows=rows.slice(start,start+pageSize);
     setText($('#inventory-meta'),`${count.toLocaleString()} ${count===1?'match':'matches'} in ${state.inventory.length.toLocaleString()} ${usesBazarr()?'Bazarr media items':'inspected items'}`);
     const globalCount=filter==='failed'?state.status?.pipeline?.failed_files:filter==='pending'?state.status?.pipeline?.pending_ocr_files:null;
     setText($('#inventory-scope-note'),[state.inventoryTruncated?'The server reports a bounded partial inventory.':'',Number.isFinite(globalCount)?`${count.toLocaleString()} ${count===1?'match':'matches'} in this snapshot; ${globalCount.toLocaleString()} ${filter==='failed'?'failed':'awaiting OCR'} files across saved conversion state.`:'',state.inventoryUpdated?`${usesBazarr()?'Last Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}.`:''].filter(Boolean).join(' '));
@@ -359,12 +434,13 @@
     if (!count) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=5; td.className='table-empty'; td.textContent=emptyMessage; tr.append(td); body.append(tr); return; }
     for (const row of visibleRows) {
       const tr=document.createElement('tr');tr.tabIndex=0;tr.classList.toggle('inventory-row-empty',!row.tracks?.length&&!row.error);tr.setAttribute('aria-label',`Subtitle details: ${row.name||row.path}`);tr.addEventListener('click',()=>openTrackDrawer(row));tr.addEventListener('keydown',event=>{if(event.target===tr&&['Enter',' '].includes(event.key)){event.preventDefault();openTrackDrawer(row);}});const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`;fileIcon.append(iconSvg('file')); const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; const copy=document.createElement('span');copy.className='file-cell-copy';copy.append(filename);const context=document.createElement('small');context.textContent=(row.path||'').replace(/[/\\][^/\\]+$/,'');copy.append(context);const fileContent=document.createElement('div');fileContent.className='file-cell-content';fileContent.append(fileIcon,copy);name.append(fileContent);
-      const type=document.createElement('td');type.className='processing-cell';const badge=document.createElement('span'),processing=row.processing||{},coverage=coverageState(row),failed=coverage!=='covered'&&(!!row.error||!!processing.failed);badge.className=`status-pill ${coverage==='covered'?'completed':failed?'failed':coverage==='needed'?'queued':processing.pending_ocr?'queued':'cancelled'}`;badge.textContent=coverage==='covered'?'Already covered':failed?'Failed':coverage==='needed'?'Missing SRT':coverage==='unavailable'?'No matching source':processing.pending_ocr?'Awaiting OCR':processing.generated_srt_count>0?'Ready':row.metadata_pending?'Needs inspection':'Inspected';type.append(badge);if(row.coverage?.reason){const reason=document.createElement('small');reason.textContent=row.coverage.reason;type.append(reason);}const problem=failureMessage(row);if(failed&&problem){const hint=document.createElement('small');hint.textContent=problem.length>140?`${problem.slice(0,137)}…`:problem;hint.title=problem;type.append(hint);}
+      const type=document.createElement('td');type.className='processing-cell';const badge=document.createElement('span'),processing=row.processing||{},coverage=coverageState(row),failed=coverage!=='covered'&&(!!row.error||!!processing.failed);badge.className=`status-pill ${coverage==='covered'?'completed':failed?'failed':coverage==='needed'?'queued':processing.pending_ocr?'queued':'cancelled'}`;badge.textContent=coverage==='covered'?'Already covered':failed?'Failed':coverage==='needed'?'Missing SRT':coverage==='unavailable'?'No matching source':processing.pending_ocr?'Awaiting OCR':processing.generated_srt_count>0?'Ready':row.metadata_pending?'Needs inspection':'Inspected';type.append(badge);if(row.coverage?.reason){const reason=document.createElement('small');reason.textContent=row.coverage.reason;reason.title=row.coverage.reason;type.append(reason);}const problem=failureMessage(row);if(failed&&problem){const hint=document.createElement('small');hint.textContent=problem.length>140?`${problem.slice(0,137)}…`:problem;hint.title=problem;type.append(hint);}
       const tracks=document.createElement('td');tracks.className='track-count';tracks.textContent=row.error ? row.error : `${(row.tracks || []).length} track${(row.tracks || []).length===1?'':'s'}`;
-      const lang=document.createElement('td'); lang.className='language-tags';for(const target of rowExistingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-existing';pill.textContent=`${targetLabel(target)} · SRT exists`;lang.append(pill);}for(const target of rowMissingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-missing';pill.textContent=`${targetLabel(target)} · SRT missing`;lang.append(pill);}for(const track of (row.tracks||[]).slice(0,3))lang.append(trackBadge(track));if(row.tracks?.length>3){const more=document.createElement('span');more.className='muted';more.textContent=`+${row.tracks.length-3}`;lang.append(more);}if(!lang.childNodes.length)lang.textContent='—';
+      const langCell=document.createElement('td');langCell.className='coverage-cell';const lang=document.createElement('div');lang.className='language-tags';langCell.append(lang);for(const target of rowExistingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-existing';pill.textContent=`${targetLabel(target)} · SRT exists`;lang.append(pill);}for(const target of rowMissingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-missing';pill.textContent=`${targetLabel(target)} · SRT missing`;lang.append(pill);}for(const track of (row.tracks||[]).slice(0,3))lang.append(trackBadge(track));if(row.tracks?.length>3){const more=document.createElement('span');more.className='muted';more.textContent=`+${row.tracks.length-3}`;lang.append(more);}if(!lang.childNodes.length)lang.textContent='—';
       const action=document.createElement('td'),button=document.createElement('button');action.className='file-action';button.type='button';button.className='row-action';button.textContent='Details';button.title='Review tracks and choose which to convert';button.addEventListener('click',event=>{event.stopPropagation();openTrackDrawer(row);});action.append(button);
-      tr.append(name,type,tracks,lang,action); body.append(tr);
+      tr.append(name,type,tracks,langCell,action); body.append(tr);
     }
+    scheduleTableFit();
   };
   const failureMessage = row => {
     if(coverageState(row)==='covered')return '';
@@ -409,7 +485,7 @@
   const updateLanguageCount = () => {setText($('#language-count'),isAll(state.draftLanguages)?'All languages selected':`${state.draftLanguages.length} language${state.draftLanguages.length===1?'':'s'} selected`);$('#apply-languages').disabled=!state.draftLanguages.length;};
   const showDialog = backdrop => {backdrop.classList.remove('hidden');$('.shell').inert=true;document.body.classList.add('modal-open');};
   const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...(target==='settings'?state.defaultLanguages:state.selectedLanguages)];setText($('#apply-languages'),target==='settings'?'Apply default languages':'Use for this conversion'); $('#language-search').value='';showDialog($('#language-modal')); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
-  const closeDialog = backdrop => { if (!backdrop || backdrop.classList.contains('hidden')) return; backdrop.classList.add('hidden');$('.shell').inert=false;document.body.classList.remove('modal-open'); if (state.modalTrigger?.isConnected) state.modalTrigger.focus();else{const heading=$(`#page-${state.currentPage} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} };
+  const closeDialog = backdrop => { if (!backdrop || backdrop.classList.contains('hidden')) return; backdrop.classList.add('hidden');$('.shell').inert=false;document.body.classList.remove('modal-open'); const jobTrigger=backdrop.id==='job-drawer-backdrop'?$$('#jobs-list [data-view-job]').find(button=>button.dataset.viewJob===state.selectedJobId):null;if (state.modalTrigger?.isConnected) state.modalTrigger.focus();else if(jobTrigger)jobTrigger.focus({preventScroll:true});else{const heading=$(`#page-${state.currentPage} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} };
   const addCustomLanguage = () => { const input=$('#custom-language'), code=input.value.trim().toLowerCase(); if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/.test(code)) { notify('Enter a valid ISO language code, such as pl or pt-BR.','error'); return; } languages.push([code,code.toUpperCase()]); state.draftLanguages=isAll(state.draftLanguages)?[code]:[...new Set([...state.draftLanguages,code])]; input.value=''; renderLanguageList(); };
   const buildIntegrationCard = (provider, config={}) => {
     const card=$('#integration-template').content.firstElementChild.cloneNode(true); card.dataset.provider=provider;
@@ -615,11 +691,12 @@
   const renderWorkerNodes = remote => {
     const target=$('#worker-nodes');target.replaceChildren();
     const add=(name,description,status)=>{const row=document.createElement('div');row.className='worker-node';const copy=document.createElement('div'),title=document.createElement('strong'),detail=document.createElement('small'),pill=document.createElement('span');title.textContent=name;detail.textContent=description;pill.className=`status-pill ${status==='online'?'completed':status==='busy'?'running':'cancelled'}`;pill.textContent=status;copy.append(title,detail);row.append(copy,pill);target.append(row);};
-    const data=state.workersInfo||{},allocation=data.allocation||{};add('This node',`${allocation.cpu_workers||0} CPU slots requested · ${allocation.gpu_workers||0} GPU slots requested`,'online');
-    if(!remote){const hint=document.createElement('p');hint.className='muted';hint.textContent='Remote-node status is not available from this server.';target.append(hint);return;}
-    if(!remote.enabled){const hint=document.createElement('p');hint.className='muted';hint.textContent='Remote workers are disabled. Configure a dedicated worker token on the coordinator and each worker to enable registration.';target.append(hint);return;}
-    for(const node of remote.nodes||[]){const status=({working:'busy',idle:'online'})[node.status]||node.status||'online';add(node.name||node.id,`${node.resource||'CPU'} · ${Number(node.active||0)} active · last seen ${node.last_seen_seconds??'—'}s ago`,status);}
-    if(!remote.nodes?.length){const hint=document.createElement('p');hint.className='muted';hint.textContent='No remote workers connected yet. Start a worker with the coordinator URL and mapped shared folders.';target.append(hint);}
+    const summary=$('#worker-nodes-summary');
+    if(!remote){setText(summary,'Node status unavailable');const hint=document.createElement('p');hint.className='muted';hint.textContent='Remote-node status is unavailable. Refresh nodes to retry.';target.append(hint);return;}
+    if(!remote.enabled){setText(summary,'Remote workers disabled');const hint=document.createElement('p');hint.className='muted';hint.textContent='Remote workers are disabled. Expand the setup instructions to connect another machine.';target.append(hint);return;}
+    const nodes=Array.isArray(remote.nodes)?remote.nodes:[];setText(summary,`${nodes.length} remote node${nodes.length===1?'':'s'} · ${Number(remote.active||0)} active`);
+    for(const node of nodes){const status=({working:'busy',idle:'online'})[node.status]||node.status||'online';add(node.name||node.id,`${node.resource==='gpu'?'GPU OCR':node.resource==='cpu_ocr'?'CPU OCR':'CPU'} · ${Number(node.active||0)} active · last seen ${node.last_seen_seconds??'—'}s ago`,status);}
+    if(!nodes.length){const hint=document.createElement('p');hint.className='muted';hint.textContent='No remote workers connected. Expand the setup instructions to add a machine.';target.append(hint);}
   };
   const loadWorkerNodes = async () => {try{renderWorkerNodes(await api('/api/nodes'));}catch(error){notify(`Could not load worker nodes: ${error.message}`,'error');}};
   const reviewConversion = rootIds => {
@@ -629,9 +706,9 @@
     for(const [key,value] of [['Folders',roots.map(root=>root.label||root.path||root.id).join(', ')||'All configured media folders'],['Languages',usesBazarr()&&isAll(state.selectedLanguages)?'Each media item’s Bazarr profile':languageDescription(state.selectedLanguages)],['Operation',usesBazarr()?'Fill missing SRT targets from Bazarr profiles; covered files are skipped':'Convert only languages not already covered by valid SRT files'],['Image subtitles',state.settings?.permissions?.ocr===true?'Run OCR using available CPU or GPU slots':'OCR is disabled by service permissions']]){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=key;dd.textContent=value;scope.append(dt,dd);}
     showDialog($('#conversion-modal'));$('#confirm-conversion').focus();
   };
-  const workersVisible = () => state.currentPage==='settings'&&state.settingsSection==='workers'&&!document.hidden;
+  const workersVisible = () => state.currentPage==='overview'&&!document.hidden;
   const workerFields={cpu_workers:'#worker-cpu-count',ocr_workers:'#worker-ocr-count',gpu_workers:'#worker-gpu-count'};
-  const workerDirty = () => {state.workersDirty=true;$('#save-worker-allocation').disabled=state.workersSaving;setText($('#worker-allocation-note'),'Unsaved allocation. Save to apply it to the next files; running files keep their current resources.');renderWorkerSteppers();};
+  const workerDirty = () => {state.workersDirty=true;$('#save-worker-allocation').disabled=state.workersSaving;setText($('#worker-allocation-note'),'Unsaved changes. Save to apply them to new files.');renderWorkerSteppers();};
   const renderWorkerSteppers = () => {
     const data=state.workersInfo;if(!data)return;
     for(const [kind,selector] of Object.entries(workerFields)){
@@ -651,21 +728,24 @@
     setText($('#worker-pool-state'),paused?'Paused':total?`${total} active`:'Ready');$('#worker-pool-state').className=`status-pill ${paused?'cancelled':total?'running':'completed'}`;
     const allowance=measuredNumber(cpu.effective_cores)??measuredNumber(detected.cpu_allowance_cores);
     setText($('#worker-cpu-allowance'),allowance===null?'Unavailable':`${allowance.toLocaleString()} CPU${allowance===1?'':'s'}`);
-    setText($('#worker-cpu-usage'),measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% of allowance in use`:'Waiting for a CPU sample');
+    setText($('#worker-cpu-usage'),measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% in use`:'Sampling usage…');
     setText($('#worker-ram'),measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
     const meter=$('#worker-memory-meter');meter.value=memory.cgroup_limit_bytes>0?Math.min(1,(memory.cgroup_current_bytes||0)/memory.cgroup_limit_bytes):0;meter.hidden=measuredNumber(memory.cgroup_current_bytes)===null||!(memory.cgroup_limit_bytes>0);
-    setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA runtime checked':'Runtime enabled'):'Unavailable');setText($('#worker-gpu-reason'),detected.gpu_reason||'GPU OCR requires the CUDA edition, an enabled runtime and a granted device.');
-    setText($('#worker-cpu-capacity'),`${allocation.cpu_workers||0} requested · ${active.cpu_workers||0} active · ${effective.cpu_workers??0} execution slots${data.cpu_limit_reason?` · ${data.cpu_limit_reason}`:''}${data.admission?.cpu?.reason?` · ${data.admission.cpu.reason}`:''}`);
-    setText($('#worker-ocr-capacity'),`${allocation.ocr_workers||0} requested · ${active.ocr_workers||0} active · ${effective.ocr_workers??0} execution slots${data.ocr_limit_reason?` · ${data.ocr_limit_reason}`:''}${data.admission?.cpu_ocr?.reason?` · ${data.admission.cpu_ocr.reason}`:''}`);
-    setText($('#worker-gpu-capacity'),`${allocation.gpu_workers||0} requested · ${active.gpu_workers||0} active · ${effective.gpu_workers??0} execution slots${data.gpu_limit_reason?` · ${data.gpu_limit_reason}`:''}${data.admission?.gpu?.reason?` · ${data.admission.gpu.reason}`:''}`);
-    if(!state.workersDirty&&!state.workersSaving)setText($('#worker-allocation-note'),paused?'New file work is paused. Resume and save to continue; running files finish safely.':'Requested slots are saved. Active execution follows admission and memory headroom. Higher counts do not add physical CPUs or GPU memory; text extraction always uses CPU.');
+    setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA checked':'CUDA enabled'):'Unavailable');
+    const gpuReason=$('#worker-gpu-reason');setText(gpuReason,detected.gpu_available?'Verified before each OCR file':detected.gpu_reason||'GPU OCR is unavailable.');gpuReason.title=detected.gpu_reason||'CUDA, VRAM, and offline models are checked before each OCR file.';
+    for(const [kind,resource,selector,limit] of [['cpu_workers','cpu','#worker-cpu-capacity','cpu_limit_reason'],['ocr_workers','cpu_ocr','#worker-ocr-capacity','ocr_limit_reason'],['gpu_workers','gpu','#worker-gpu-capacity','gpu_limit_reason']]){
+      const capacity=$(selector),admission=data.admission?.[resource],limited=Number(effective[kind]??0)<Number(allocation[kind]||0),reason=admission?.allowed===false?admission.reason:limited?data[limit]:'';
+      setText(capacity,`${active[kind]||0} active · ${effective[kind]??0} slots${reason?` · ${reason}`:''}`);capacity.classList.toggle('capacity-blocked',admission?.allowed===false);capacity.title=[`${allocation[kind]||0} requested`,data[limit],admission?.reason].filter(Boolean).join('. ');
+    }
+    if(!state.workersDirty&&!state.workersSaving)setText($('#worker-allocation-note'),paused?'Paused. Resume and save to accept new files.':'Changes apply to new files. Running work keeps its allocation.');
     const body=$('#workers-body');body.replaceChildren();
     for(const worker of (data.workers||[])){
       const row=document.createElement('tr');const elapsed=Math.max(0,Math.floor(Date.now()/1000-Number(worker.started||Date.now()/1000)));
       for(const [label,value] of [['Worker',`#${worker.id}`],['Processor',worker.resource==='gpu'?'GPU OCR':worker.resource==='cpu_ocr'?'CPU OCR':'CPU'],['Media file',shortPath(worker.path||'')],['Status',worker.status||'Processing'],['Elapsed',`${Math.floor(elapsed/60)}m ${elapsed%60}s`]]){const cell=document.createElement('td');cell.dataset.label=label;cell.textContent=value;if(label==='Media file'){cell.className='worker-file';cell.title=worker.path||'';}row.append(cell);}body.append(row);
     }
-    if(!body.children.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.className='table-empty';cell.textContent=paused?'New work is paused. Running files will finish before this pool becomes idle.':'No file workers running. Start a scan, conversion, or inspection to use this pool.';row.append(cell);body.append(row);}
-    setText($('#worker-live-state'),`Live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
+    const hasWorkers=body.children.length>0;$('#active-workers-panel').hidden=!hasWorkers;
+    if(!hasWorkers){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.className='table-empty';cell.textContent='No file workers running.';row.append(cell);body.append(row);}
+    setText($('#worker-live-state'),`${(data.workers||[]).length} active`);
   };
   const loadWorkers = async (quiet=false) => {
     if(!state.csrf||state.workersBusy||state.workersSaving)return;state.workersBusy=true;
@@ -682,7 +762,7 @@
     catch(error){notify(error.message,'error');}
     finally{state.workersSaving=false;$('#save-worker-allocation').disabled=!state.workersDirty;renderWorkers();if(systemVisible())loadSystem(true);}
   };
-  const systemVisible = () => state.currentPage==='settings'&&['status','workers'].includes(state.settingsSection)&&!document.hidden;
+  const systemVisible = () => (state.currentPage==='overview'||state.currentPage==='settings'&&state.settingsSection==='status')&&!document.hidden;
   const measuredNumber = value => typeof value==='number'&&Number.isFinite(value)&&value>=0?value:null;
   const formatBytes = value => {
     const bytes=measuredNumber(value);if(bytes===null)return 'Unavailable';
@@ -734,7 +814,7 @@
       ['Metadata cache budget',`${formatBytes(policy.metadata_cache_max_bytes)} · ${measuredNumber(policy.metadata_cache_max_entries)?.toLocaleString()??'—'} files maximum`]
     ]);
     setText($('#system-sample-state'),`Live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
-    setText($('#system-policy'),`Set parallel file allocations in Settings → Workers. CPU OCR slots share the CPU pool; each tool uses one CPU thread. Docker's CPU and memory limits remain the hard ceiling, while memory admission may reduce simultaneous work. Discovery and import hooks convert text and queue new or changed image tracks for scheduled OCR${policy.ocr_permission?'':'; OCR is disabled by deployment permissions'}. Changing a Docker limit requires recreating the container. Unsupported measurements are shown as unavailable.`);
+    setText($('#system-policy'),`Set parallel file allocations on Overview. CPU OCR slots share the CPU pool; each tool uses one CPU thread. Docker's CPU and memory limits remain the hard ceiling, while memory admission may reduce simultaneous work. Discovery and import hooks convert text and queue new or changed image tracks for scheduled OCR${policy.ocr_permission?'':'; OCR is disabled by deployment permissions'}. Changing a Docker limit requires recreating the container. Unsupported measurements are shown as unavailable.`);
   };
   const loadSystem = async (quiet=false) => {
     if(!state.csrf||state.systemBusy)return;state.systemBusy=true;
@@ -749,12 +829,13 @@
     state.systemTimer=setTimeout(async()=>{await Promise.all([loadSystem(true),workersVisible()?loadWorkers(true):Promise.resolve()]);syncSystemMonitor();},3000);
   };
   const pageNames={overview:'Overview',library:'Library',activity:'Activity',settings:'Settings'};
-  const settingsSections=['general','media','tasks','workers','status','sonarr','radarr','jellyfin','bazarr'];
+  const settingsSections=['general','media','tasks','status','sonarr','radarr','jellyfin','bazarr'];
   state.settingsSection='general';
   const routeHash = (page,section) => `#/${page}${page==='settings'?`/${section}`:''}`;
   const readRoute = () => {
     const parts=location.hash.replace(/^#\/?/,'').replace(/\/+$/,'').split('/');
     const page=parts[0] || 'overview';
+    if(page==='settings'&&parts[1]==='workers'&&parts.length===2)return {page:'overview',section:'general'};
     if(page==='system'&&parts.length<=2&&['tasks','status'].includes(parts[1]||'tasks'))return {page:'settings',section:parts[1]||'tasks'};
     if(!Object.hasOwn(pageNames,page))return {page:'overview',section:'general'};
     if(page==='settings') {
@@ -771,6 +852,7 @@
     const previousPage=document.activeElement.closest('.page');
     const changed=state.currentPage!==page||(page==='settings'&&state.settingsSection!==section);
     state.currentPage=page;
+    $('#workspace-scroll').classList.toggle('has-table-page',['library','activity'].includes(page));
     if(page==='settings')state.settingsSection=section;
     $$('.page').forEach(node=>node.classList.toggle('active',node.id===`page-${page}`));
     $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>{const active=node.dataset.page===page;node.classList.toggle('active',active);if(active)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
@@ -785,8 +867,10 @@
       if(!state.settings)loadSettings();
       if(changed&&section==='media')loadRootFolders();
     }
-    const administration=page==='settings'&&['tasks','workers','status','media'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
-    if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else if(section!=='media'){loadSystem();if(section==='workers')loadWorkers();}}
+    const administration=page==='settings'&&['tasks','status','media'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
+    if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else if(section!=='media')loadSystem();}
+    if(page==='overview'&&state.csrf&&changed){loadSystem();loadWorkers();}
+    if(page==='library')renderInventory();if(page==='activity')renderJobs();scheduleTableFit();
     syncSystemMonitor();
   };
   const restoreRoute = () => {
@@ -813,7 +897,6 @@
     $('#mobile-menu').addEventListener('click',toggleMobileMenu); $('#sidebar-collapse').addEventListener('click',toggleMobileMenu); mobileBackdrop.addEventListener('click',()=>closeMobileMenu(true));
     window.addEventListener('resize',()=>{if(!window.matchMedia('(max-width: 800px)').matches)closeMobileMenu();else syncNavigation();});
     $('#refresh-button').addEventListener('click',()=>{pollStatus();if(systemVisible())loadSystem();if(workersVisible())loadWorkers();if(state.currentPage==='settings'&&state.settingsSection==='tasks')loadTasks();if(state.currentPage==='settings'&&state.settingsSection==='media')loadRootFolders();}); $('#clear-view-button').addEventListener('click',()=>pollStatus());
-    $$('[data-pipeline-stage]').forEach(button=>{button.title=button.dataset.pipelineStage==='scan'?'View configured media folders':'View matching files in the saved inventory';button.addEventListener('click',()=>button.dataset.pipelineStage==='scan'?navigate('settings','media'):filterLibrary(({inspect:'all',convert:'pending',ready:'ready'})[button.dataset.pipelineStage]));});
     $$('[data-attention]').forEach(button=>button.addEventListener('click',()=>button.dataset.attention==='paths'?navigate('settings','media'):filterLibrary(button.dataset.attention)));
     $('#convert-selected-tracks').addEventListener('click',convertDrawerSelection);
     $('#force-covered-tracks').addEventListener('change',()=>{const force=$('#force-covered-tracks').checked;$$('#track-drawer-list input').forEach(input=>{input.disabled=input.dataset.baseDisabled==='true'||input.dataset.covered==='true'&&!force;if(input.disabled&&input.checked){input.checked=false;state.drawerSelection.delete(input.dataset.trackKey==='source'?'source':Number(input.dataset.trackKey));}});syncDrawerSelection();});
@@ -823,13 +906,17 @@
     $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{const root=state.currentPage==='library'?$('#inventory-root').value:$('#quick-root').value;navigate('library');$('#inventory-root').value=root;await inspect();}));
     $('#quick-form').addEventListener('submit',event=>{event.preventDefault();reviewConversion(selectedRootIds('#quick-root'));});
     $('#confirm-conversion').addEventListener('click',async()=>{if(!state.pendingConversion)return;const button=$('#confirm-conversion');button.disabled=true;try{const result=await startJob(state.pendingConversion);if(result){state.pendingConversion=null;closeDialog($('#conversion-modal'));}}finally{button.disabled=false;}});
-    $('#activity-status').addEventListener('change',renderJobs);$('#activity-kind').addEventListener('change',renderJobs);$('#refresh-worker-nodes').addEventListener('click',loadWorkerNodes);
+    const resetJobsPage=()=>{state.jobsPage=1;$('.jobs-table-wrap').scrollTop=0;renderJobs();saveJobsView();};
+    $('#activity-status').addEventListener('change',resetJobsPage);$('#activity-kind').addEventListener('change',resetJobsPage);$('#refresh-worker-nodes').addEventListener('click',loadWorkerNodes);
+    restoreJobsView();
+    $('#jobs-page-size').addEventListener('change',()=>{const size=$('#jobs-page-size').value;state.jobsPageSize=size==='auto'?'auto':Number(size);resetJobsPage();});
+    for(const [selector,delta] of [['#jobs-previous',-1],['#jobs-next',1]])$(selector).addEventListener('click',()=>{state.jobsPage+=delta;$('.jobs-table-wrap').scrollTop=0;renderJobs();saveJobsView();});
     restoreInventoryView();
     const resetInventoryPage=()=>{state.inventoryPage=1;renderInventory();saveInventoryView();};
     $('#inventory-filter').addEventListener('change',resetInventoryPage); $('#inventory-root').addEventListener('change',resetInventoryPage); $('#inventory-search').addEventListener('input',resetInventoryPage);
-    $('#inventory-page-size').addEventListener('change',()=>{state.inventoryPageSize=Number($('#inventory-page-size').value);resetInventoryPage();});
+    $('#inventory-page-size').addEventListener('change',()=>{const size=$('#inventory-page-size').value;state.inventoryPageSize=size==='auto'?'auto':Number(size);resetInventoryPage();});
     $('#inventory-prev').addEventListener('click',()=>{state.inventoryPage--;renderInventory();saveInventoryView();});$('#inventory-next').addEventListener('click',()=>{state.inventoryPage++;renderInventory();saveInventoryView();});$('#inventory-page').addEventListener('change',()=>{state.inventoryPage=Number($('#inventory-page').value);renderInventory();saveInventoryView();});
-    $('#jobs-list').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);}); $('#recent-activity').addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);});
+    for(const selector of ['#jobs-list','#job-drawer-content'])$(selector).addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);});
     $('#save-settings').addEventListener('click',saveSettings); $('#language-search').addEventListener('input',renderLanguageList); $('#add-language').addEventListener('click',addCustomLanguage); $('#custom-language').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addCustomLanguage();}});
     $$('[data-open-languages]').forEach(button=>button.addEventListener('click',()=>openLanguageDialog(button.dataset.openLanguages)));
     $('#apply-languages').addEventListener('click',()=>{if(!state.draftLanguages.length){notify('Select at least one language or choose All languages.','error');return;}if(state.languageTarget==='settings'){state.defaultLanguages=[...state.draftLanguages];state.settingsDirty=true;$('#save-settings').textContent='Save changes •';setText($('#settings-save-note'),'Default languages have unsaved changes. Save changes to persist them.');}else{state.selectedLanguages=[...state.draftLanguages];state.quickLanguagesChanged=true;}updateLanguageLabels();closeDialog($('#language-modal'));});
@@ -847,12 +934,15 @@
     $('#pause-schedules').addEventListener('change',markTasksDirty);
     $('#save-task-schedules').addEventListener('click',saveTasks);
     window.addEventListener('popstate',restoreRoute);window.addEventListener('hashchange',restoreRoute);
+    window.addEventListener('resize',scheduleTableFit);
+    state.tableObserver=new ResizeObserver(scheduleTableFit);
+    for(const pane of $$('.inventory-table-wrap,.jobs-table-wrap'))state.tableObserver.observe(pane);
     window.addEventListener('beforeunload',event=>{if(state.settingsDirty||state.workersDirty||state.tasksDirty){event.preventDefault();event.returnValue='';}});
     document.addEventListener('keydown',event=>{
       const modal=$$('.modal-backdrop').find(item=>!item.classList.contains('hidden'));
       if(event.key==='Escape'){if(modal){event.preventDefault();closeDialog(modal);}else if($('#sidebar').classList.contains('mobile-open')){event.preventDefault();closeMobileMenu(true);}return;}
       if(event.key!=='Tab')return;
-      if(modal){const focusable=$$('button:not(:disabled),input:not(:disabled),select:not(:disabled),[href],[tabindex]:not([tabindex="-1"])',modal).filter(node=>node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}return;}
+      if(modal){const focusable=$$('summary,button:not(:disabled),input:not(:disabled),select:not(:disabled),[href],[tabindex]:not([tabindex="-1"])',modal).filter(node=>node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}return;}
       if($('#sidebar').classList.contains('mobile-open')){const focusable=$$('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled)', $('#sidebar')).filter(node=>!node.closest('[inert]')&&node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}
     });
   };
