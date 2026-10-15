@@ -26,7 +26,7 @@ networking. DNS, tunnel routes, and reverse-proxy hosts are configured separatel
 | [live/server.py](live/server.py) | Internal Glance proxy and SSE relay for qBittorrent and Jellyfin |
 | [live/test_server.py](live/test_server.py) | Offline relay tests using local fake upstream services |
 | [config/assets/subtitle-studio.svg](config/assets/subtitle-studio.svg) | Local Subtitle Studio icon |
-| [config/assets/subforge.svg](config/assets/subforge.svg) | Local Subforge icon used by the Media service monitor |
+| [config/assets/subforge.svg](config/assets/subforge.svg) | Copy of the current blue Subforge icon, used by the Media service monitor; the `v=2` asset query refreshes browser caches |
 | [jellyfin-counts-cache.py](jellyfin-counts-cache.py) | Internal HTTP service caching Jellyfin library counts |
 
 Compose mounts `glance/config` read-only at `/app/config`; assets are served from

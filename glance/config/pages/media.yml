@@ -73,7 +73,7 @@
             - title: Subforge
               url: ${SUBFORGE_PUBLIC_URL}
               check-url: ${GLANCE_SUBFORGE_INTERNAL_URL}/health
-              icon: /assets/subforge.svg
+              icon: /assets/subforge.svg?v=2
             - title: Prowlarr
               url: ${HOMELAB_URL}:9696
               check-url: ${GLANCE_PROWLARR_INTERNAL_URL}
@@ -128,7 +128,7 @@
                 - title: Subforge
                   description: Extract and convert subtitles to SRT
                   url: ${SUBFORGE_PUBLIC_URL}
-                  icon: /assets/subforge.svg
+                  icon: /assets/subforge.svg?v=2
                 - title: Prowlarr
                   url: ${HOMELAB_URL}:9696
                   icon: sh:prowlarr

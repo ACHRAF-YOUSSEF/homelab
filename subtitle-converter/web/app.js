@@ -744,7 +744,7 @@
     $$('.nav-link[data-page],.text-button[data-page]').forEach(node=>{const active=node.dataset.page===page;node.classList.toggle('active',active);if(active)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
     $$('.settings-tab').forEach(node=>{const active=node.dataset.settingTab===state.settingsSection;node.classList.toggle('active',active);if(active)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
     $$('.settings-section').forEach(node=>node.classList.toggle('active',node.id===`settings-${state.settingsSection}`));
-    setText($('#page-crumb'),page==='settings'?`Settings / ${$('.settings-tab.active')?.textContent||'Preferences'}`:pageNames[page]);closeMobileMenu();if(changed)window.scrollTo({top:0,behavior:'instant'});
+    setText($('#page-crumb'),page==='settings'?`Settings / ${$('.settings-tab.active')?.textContent||'Preferences'}`:pageNames[page]);closeMobileMenu();if(changed)$('#workspace-scroll').scrollTo({top:0,behavior:'instant'});
     if(fromMobileMenu||(previousPage&&previousPage.id!==`page-${page}`)) {
       const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
     }

@@ -25,6 +25,25 @@ async function main() {
     browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
     const page = await context.newPage();
+    const assertViewport = async label => {
+      await page.waitForFunction(() => document.documentElement.scrollHeight <= innerHeight && document.body.scrollHeight <= innerHeight, null, { timeout: 2000 });
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const sizes = await page.evaluate(() => {
+        const workspace = document.querySelector('#workspace-scroll');
+        return { height: innerHeight, width: innerWidth, documentHeight: document.documentElement.scrollHeight, documentWidth: document.documentElement.scrollWidth, bodyHeight: document.body.scrollHeight, scrollY, workspaceWidth: workspace.clientWidth, workspaceScrollWidth: workspace.scrollWidth };
+      });
+      assert(sizes.documentHeight <= sizes.height && sizes.bodyHeight <= sizes.height, `${label}: document stays inside the viewport ${JSON.stringify(sizes)}`);
+      assert.equal(sizes.documentWidth, sizes.width, `${label}: no document horizontal scrolling`);
+      assert.equal(sizes.scrollY, 0, `${label}: document never scrolls`);
+      assert(sizes.workspaceScrollWidth <= sizes.workspaceWidth, `${label}: workspace has no clipped horizontal content`);
+    };
+    const assertToggleGlyph = async () => {
+      const visible = await page.locator('#sidebar-collapse').evaluate(button => {
+        const svg = button.querySelector('svg').getBoundingClientRect(), path = button.querySelector('path').getBoundingClientRect();
+        return path.width > 0 && path.height > 0 && path.left >= svg.left - 1 && path.right <= svg.right + 1 && path.top >= svg.top - 1 && path.bottom <= svg.bottom + 1;
+      });
+      assert(visible, 'toggle glyph stays inside its SVG when expanded or collapsed');
+    };
     const errors = [], writes = [];
     page.on('pageerror', error => errors.push(error.message));
     const now = Math.floor(Date.now() / 1000);
@@ -67,10 +86,31 @@ async function main() {
     await page.getByText('Service connected', { exact: true }).waitFor();
     await page.locator('#pipeline-ready').getByText('11,326', { exact: true }).waitFor();
     assert.equal(writes.length, 0, 'initial page must not mutate the backend');
+    await page.setViewportSize({ width: 1440, height: 640 });
+    await assertViewport('short desktop');
+    const headerBefore = await page.locator('.topbar').boundingBox(), footerBefore = await page.locator('.sidebar-bottom').boundingBox();
+    await page.locator('#workspace-scroll').focus();
+    await page.keyboard.press('PageDown');
+    await page.waitForFunction(() => document.querySelector('#workspace-scroll').scrollTop > 0);
+    await assertViewport('desktop after keyboard scrolling');
+    assert.deepEqual(await page.locator('.topbar').boundingBox(), headerBefore, 'header stays fixed while the workspace scrolls');
+    assert.deepEqual(await page.locator('.sidebar-bottom').boundingBox(), footerBefore, 'navigation footer stays fixed');
+    await page.getByRole('button', { name: 'Library', exact: true }).click();
+    assert.equal(await page.locator('#workspace-scroll').evaluate(el => el.scrollTop), 0, 'navigation resets the workspace scroll position');
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await assertToggleGlyph();
     await page.locator('#sidebar-collapse').click();
     assert.equal(await page.locator('#sidebar-collapse').getAttribute('aria-expanded'), 'false');
     assert(await page.locator('#sidebar-collapse').isVisible(), 'collapsed navigation keeps its top-bar toggle');
+    await assertToggleGlyph();
+    if (output) await page.screenshot({ path: path.join(output, 'sidebar-collapsed.png'), style: '.toast { visibility: hidden; }' });
+    await page.reload();
+    await page.locator('#pipeline-ready').getByText('11,326', { exact: true }).waitFor();
+    assert.equal(await page.locator('#sidebar-collapse').getAttribute('aria-expanded'), 'false', 'collapsed state survives reload');
+    await assertToggleGlyph();
     await page.locator('#sidebar-collapse').click();
+    await assertToggleGlyph();
     await page.locator('[data-open-languages="quick"]').last().click();
     await page.locator('#language-list input[value="en"]').check();
     assert.equal(await page.locator('.all-option input').isChecked(), false, 'specific selection clears All visibly');
@@ -140,6 +180,7 @@ async function main() {
     for (const width of [320, 768, 1024, 1920]) {
       await page.setViewportSize({ width, height: 900 });
       assert.equal(await page.evaluate(() => document.body.scrollWidth), width, `library fits ${width}px viewport`);
+      await assertViewport(`library ${width}px`);
     }
     // Bazarr requirements take precedence over historical failures and wildcard tracks.
     const target = (language, forced = false, hi = false) => ({ language, forced, hi });
@@ -212,8 +253,37 @@ async function main() {
     await page.locator('#confirm-conversion').click();
     await page.locator('#conversion-modal').waitFor({ state: 'hidden' });
     assert.equal(writes.at(-1).body.include_ocr, true, 'manual conversion requests available OCR slots');
+    // Long activity and native controls must remain usable inside the fixed shell.
+    jobs.push(...Array.from({ length: 20 }, (_, i) => ({ id: `history-${i}`, kind: 'inspect', status: 'completed', created: now - i * 60, summary: { inspected: 1 } })));
+    await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.locator('#activity-kind').selectOption('all');
+    await page.locator('#refresh-button').click();
+    await page.locator('#jobs-list .job-card').nth(20).waitFor();
+    for (const [width, height] of [[1920, 1080], [1024, 600], [390, 600], [320, 480]]) {
+      await page.setViewportSize({ width, height });
+      await assertViewport(`activity resized to ${width}x${height}`);
+      const header = await page.locator('.topbar').boundingBox();
+      await page.locator('#jobs-list .job-card').last().scrollIntoViewIfNeeded();
+      await assertViewport(`long activity ${width}x${height}`);
+      assert.deepEqual(await page.locator('.topbar').boundingBox(), header, 'scrolling long activity keeps the header visible');
+      const last = await page.locator('#jobs-list .job-card').last().boundingBox();
+      assert(last.y + last.height <= height + 1, 'the final activity row remains reachable');
+    }
+    await page.setViewportSize({ width: 1440, height: 640 });
+    await page.locator('#activity-status').focus();
+    await page.keyboard.press('Home');
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.locator('#activity-status').inputValue(), 'running', 'select retains native keyboard selection');
+    await page.locator('#activity-status').selectOption('all');
+    const selectStyles = await page.locator('#activity-status').evaluate(select => {
+      const css = getComputedStyle(select), option = getComputedStyle(select.options[0]);
+      return { rightPadding: parseFloat(css.paddingRight), arrow: css.backgroundImage, optionBackground: option.backgroundColor, background: css.backgroundColor };
+    });
+    assert(selectStyles.rightPadding >= 32 && selectStyles.arrow !== 'none', 'select text has reserved space for a visible arrow');
+    assert.notEqual(selectStyles.optionBackground, 'rgb(255, 255, 255)', 'select options use the dark palette');
+    if (output) await page.screenshot({ path: path.join(output, 'activity-fixed-viewport.png'), style: '.toast { visibility: hidden; }' });
     assert.deepEqual(errors, [], 'browser must have no uncaught errors');
-    console.log('PASS Subforge isolated desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, keyboard, and Bazarr coverage/authority regressions');
+    console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, keyboard, and Bazarr coverage/authority regressions');
     await context.close();
   } finally {
     if (browser) await browser.close();
