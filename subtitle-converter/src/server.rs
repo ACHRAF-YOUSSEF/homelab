@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 
 const HEADER_LIMIT: usize = 16 * 1024;
 const BODY_LIMIT: usize = 64 * 1024;
-const INVENTORY_LIMIT: usize = 2000;
+const INVENTORY_LIMIT: usize = 20_000;
+const PROBE_LIMIT: usize = 2000;
 const HISTORY_LIMIT: usize = 100;
 const JSON_LIMIT: usize = 32 * 1024 * 1024;
 const HTTP_WORKERS: usize = 4;
@@ -60,6 +61,9 @@ fn progress_log(event: &Value) -> Value {
     if let Some(error) = &error {
         message.push_str(&format!("; {error}"));
     }
+    if let Some(reason) = event["reason"].as_str() {
+        message.push_str(&format!("; {}", log_text(reason, 240)));
+    }
     let mut entry = json!({"time":now(),"level":if status=="failed" {"ERROR"} else {"INFO"},"message":message,"status":status});
     if let Some(name) = name {
         entry["file"] = json!(name);
@@ -80,7 +84,7 @@ fn progress_log(event: &Value) -> Value {
             entry[key] = json!(value);
         }
     }
-    for key in ["backend", "resource", "language"] {
+    for key in ["backend", "resource", "language", "coverage_status"] {
         if let Some(value) = event[key].as_str() {
             entry[key] = json!(log_text(value, 48));
         }
@@ -165,6 +169,37 @@ fn count(value: &Value) -> u64 {
     value.as_u64().unwrap_or(0)
 }
 
+fn available_sidecar(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            [
+                "ass", "ssa", "vtt", "ttml", "dfxp", "smi", "sami", "sbv", "sub", "idx", "sup",
+            ]
+            .iter()
+            .any(|expected| extension.eq_ignore_ascii_case(expected))
+        })
+}
+
+fn coverage_counts(rows: &[Value]) -> Value {
+    let total = |status: &str| {
+        rows.iter()
+            .filter(|row| row["coverage"]["status"] == status)
+            .count()
+    };
+    json!({"covered":total("covered"),"needs_conversion":total("needs_conversion"),"no_convertible_source":total("no_convertible_source"),"unknown":total("unknown")})
+}
+
+fn bazarr_source_hints(row:&Value,mounts:&[PathBuf])->Vec<crate::converter::SubtitleSourceHint> {
+    row["subtitles"].as_array().into_iter().flatten().filter_map(|source| {
+        if source["source"]!="sidecar" {return None;}
+        let language=source["language"].as_str().filter(|language|!["und","unknown","zxx"].contains(language))?;
+        let path=Converter::safe_path(source["path"].as_str()?,mounts).ok()?;
+        Some(crate::converter::SubtitleSourceHint {path,target:crate::converter::SubtitleTarget {language:language.into(),forced:source["forced"].as_bool()?,hi:source["hi"].as_bool()?}})
+    }).take(256).collect()
+}
+
 #[derive(Default)]
 struct Runtime {
     roots: Vec<PathBuf>,
@@ -178,6 +213,8 @@ struct Runtime {
     inventory_updated: f64,
     inventory_truncated: bool,
     inventory_partial: bool,
+    inventory_source: String,
+    inventory_authority: Value,
     cached_roots: Vec<Value>,
     pipeline_counts: Value,
     state_revision: u64,
@@ -298,6 +335,9 @@ fn inventory_rows(value: &Value, mounts: &[PathBuf], roots: &[PathBuf]) -> Vec<V
         let mut result = json!({"path":path,"name":name,"root_id":root_id,"type":if row["type"]=="sidecar" {"sidecar"} else {"video"},"tracks":tracks});
         if row["metadata_pending"] == true { result["metadata_pending"] = json!(true); }
         if let Some(error) = row["error"].as_str() { result["error"] = json!(error.chars().take(256).collect::<String>()); }
+        for key in ["wanted_targets", "missing_targets", "bazarr_missing_targets", "subtitles", "source_hints", "coverage", "kind", "id", "series_id", "profile_id", "missing_srt", "has_convertible_source", "source"] {
+            if let Some(value) = row.get(key).and_then(|value| crate::util::bounded_json_clone(value, 64 * 1024).ok()) { result[key] = value; }
+        }
         Some(result)
     }).collect()
 }
@@ -347,6 +387,13 @@ impl App {
         let mut runtime = Runtime {
             roots: mounts.clone(),
             languages: vec!["*".into()],
+            inventory_source: if integrations.bazarr_enabled() {
+                "bazarr"
+            } else {
+                "filesystem"
+            }
+            .into(),
+            inventory_authority: json!({"status":"not_synced","error":null}),
             ..Runtime::default()
         };
         if data.join("preferences.json").exists() {
@@ -384,11 +431,14 @@ impl App {
                     .cloned(),
             );
         }
-        if let Ok(saved) = read_json(&data.join("inventory.json"), JSON_LIMIT) {
+        if let Ok(saved) = read_json(&data.join("inventory.json"), JSON_LIMIT)
+            && saved["source"].as_str().unwrap_or("filesystem") == runtime.inventory_source
+        {
             runtime.inventory = inventory_rows(&saved["items"], &mounts, &runtime.roots);
             runtime.inventory_updated = saved["updated"].as_f64().unwrap_or(0.0);
             runtime.inventory_truncated = saved["truncated"].as_bool().unwrap_or(false);
             runtime.inventory_partial = saved["partial"].as_bool().unwrap_or(false);
+            runtime.inventory_authority = json!({"status":if runtime.inventory_source == "bazarr" {"stale"} else {"ready"},"error":saved["authority"]["error"],"previous_status":saved["authority"]["status"]});
         }
         // Inventory is stored once, independently of rotating job history.
         runtime.cached_roots = runtime
@@ -559,7 +609,7 @@ impl App {
         pipeline["inventory_updated"] = json!(runtime.inventory_updated);
         pipeline["inventory_truncated"] = json!(runtime.inventory_truncated);
         pipeline["inventory_partial"] = json!(runtime.inventory_partial);
-        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"pipeline":pipeline,"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision},"roots":runtime.cached_roots,"settings":settings})
+        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.running,"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"pipeline":pipeline,"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision,"source":runtime.inventory_source,"authority":runtime.inventory_authority},"roots":runtime.cached_roots,"settings":settings})
     }
     fn tasks(&self) -> Value {
         let mut value = lock(&self.scheduler).public();
@@ -645,7 +695,454 @@ impl App {
         for row in &mut rows {
             row["processing"] = converter.file_processing(row["path"].as_str().unwrap_or(""));
         }
-        json!({"items":rows,"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision})
+        let coverage = coverage_counts(&rows);
+        json!({"items":rows,"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision,"source":runtime.inventory_source,"authority":runtime.inventory_authority,"coverage_counts":coverage,"covered_count":coverage["covered"],"needs_conversion_count":coverage["needs_conversion"]})
+    }
+
+    fn persist_inventory(&self) -> Result<(), String> {
+        let runtime = lock(&self.runtime);
+        let snapshot = json!({"items":runtime.inventory,"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"source":runtime.inventory_source,"authority":runtime.inventory_authority});
+        drop(runtime);
+        crate::util::write_private_limited(
+            &self.data.join("inventory.json"),
+            &snapshot,
+            JSON_LIMIT as u64,
+        )
+    }
+
+    fn bazarr_failure(&self, message: &str) {
+        let mut runtime = lock(&self.runtime);
+        if runtime.inventory_source != "bazarr" {
+            runtime.inventory.clear();
+        }
+        runtime.inventory_source = "bazarr".into();
+        runtime.inventory_partial = true;
+        runtime.inventory_authority = json!({"status":"unavailable","error":log_text(message,512)});
+        runtime.state_revision = runtime.state_revision.saturating_add(1);
+        drop(runtime);
+        let _ = self.persist_inventory();
+        self.log("ERROR", &format!("Bazarr inventory unavailable: {}; conversion remains restricted to explicit requests", log_text(message,512)));
+    }
+
+    /// Bazarr selects the library and target variants. Local probing only
+    /// answers whether those missing variants have a conversion source.
+    fn sync_bazarr_inventory(
+        &self,
+        integrations: &mut Integrations,
+        job: &Value,
+        probe: bool,
+    ) -> Result<Vec<Value>, String> {
+        let inventory = match integrations.bazarr_inventory(&self.cancel) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                self.bazarr_failure(&error);
+                return Err(error);
+            }
+        };
+        let roots = lock(&self.runtime).roots.clone();
+        let mut rows = inventory_rows(&inventory["items"], &self.mounts, &roots);
+        // The profile is authoritative about requirements; a stale index does
+        // not make an absent, empty or malformed local SRT valid coverage.
+        for row in &mut rows {
+            row["bazarr_missing_targets"] = row["missing_targets"].clone();
+            let hints=bazarr_source_hints(row,&self.mounts);
+            row["source_hints"]=json!(hints);
+            let mut coverage_worker=lock(&self.converter).inspection_worker();
+            if let Err(error)=coverage_worker.set_source_hints(hints) {
+                row["source_hints_error"]=json!(true);
+                row["error"]=json!(log_text(&error,256));
+                continue;
+            }
+            let wanted: Vec<crate::converter::SubtitleTarget> =
+                serde_json::from_value(row["wanted_targets"].clone())
+                    .map_err(|_| "Bazarr returned invalid wanted subtitle targets")?;
+            if !wanted.is_empty()
+                && let Some(path) = row["path"].as_str()
+            {
+                match coverage_worker.conversion_coverage(
+                    Path::new(path),
+                    &json!([]),
+                    &wanted,
+                ) {
+                    Ok(coverage) => {
+                        row["missing_targets"] = coverage["missing_targets"].clone();
+                        row["coverage"] = coverage;
+                    }
+                    Err(error) => {
+                        row["error"] = json!(log_text(&error, 256));
+                    }
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        let explicit_inspection = if job["kind"] == "inspect" {
+            strings(&job["paths"])
+        } else {
+            Vec::new()
+        };
+        let requested_paths = strings(&job["paths"]);
+        let scope_roots = strings(&job["root_paths"]);
+        for row in &rows {
+            if row["source_hints_error"]==true {continue;}
+            let row_path = row["path"].as_str().unwrap_or("");
+            if !scope_roots.is_empty()
+                && !scope_roots
+                    .iter()
+                    .any(|root| Path::new(row_path).starts_with(root))
+            {
+                continue;
+            }
+            if !requested_paths.is_empty()
+                && !requested_paths.iter().any(|requested| {
+                    requested == row_path
+                        || row["subtitles"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|subtitle| subtitle["path"] == *requested)
+                })
+            {
+                continue;
+            }
+            let known_sources_cover_targets =
+                row["missing_targets"].as_array().is_some_and(|targets| {
+                    targets.iter().all(|target| {
+                        row["coverage"]["available_targets"]
+                            .as_array()
+                            .is_some_and(|available| available.contains(target))
+                    })
+                });
+            if ((row["missing_targets"]
+                .as_array()
+                .is_some_and(|targets| !targets.is_empty())
+                && !known_sources_cover_targets)
+                || row["path"].as_str().is_some_and(|path| {
+                    explicit_inspection
+                        .iter()
+                        .any(|requested| requested == path)
+                }))
+                && let Some(path) = row["path"].as_str()
+                && let Ok(path) = Converter::safe_path(path, &self.mounts)
+                && paths.len() < PROBE_LIMIT
+            {
+                paths.push(path);
+            }
+        }
+        let (mut descriptions, probe_error) = if probe && !paths.is_empty() {
+            match self.run_files(
+                &paths,
+                job,
+                FileMode::Inspect { cached_only: false },
+                integrations,
+            ) {
+                Ok((_, descriptions)) => (descriptions, None),
+                Err(error) => {
+                    self.log(
+                        "WARNING",
+                        &format!(
+                            "Bazarr candidates could not be probed: {}",
+                            log_text(&error, 256)
+                        ),
+                    );
+                    (BTreeMap::new(), Some(error))
+                }
+            }
+        } else {
+            (BTreeMap::new(), None)
+        };
+        let mut metadata_pending = 0_usize;
+        for row in &mut rows {
+            let targets: Vec<crate::converter::SubtitleTarget> =
+                serde_json::from_value(row["missing_targets"].clone())
+                    .map_err(|_| "Bazarr returned invalid missing subtitle targets")?;
+            row["source"] = json!("bazarr");
+            if row["source_hints_error"]==true {
+                row["coverage"]=json!({"status":"unknown","reason":row["error"],"missing_targets":targets});
+                metadata_pending+=1;
+                continue;
+            }
+            let path = PathBuf::from(row["path"].as_str().unwrap_or(""));
+            let described = descriptions
+                .remove(&path)
+                .unwrap_or_else(|| Ok(lock(&self.converter).cached_description(&path)));
+            if targets.is_empty() {
+                if let Ok(Some(description)) = &described {
+                    row["tracks"] = description.clone();
+                }
+                if row["wanted_targets"]
+                    .as_array()
+                    .is_some_and(|targets| !targets.is_empty())
+                {
+                    row["missing_srt"] = json!(false);
+                    row["coverage"] = json!({"status":"covered","reason":"Valid external SRT already covers every configured Bazarr language and variant","existing_targets":row["wanted_targets"],"missing_targets":[]});
+                } else {
+                    row["missing_srt"] = Value::Null;
+                    row["coverage"] = json!({"status":"unknown","reason":"Bazarr has no resolved language profile targets for this media; automatic conversion is disabled","existing_targets":[],"missing_targets":[]});
+                }
+                continue;
+            }
+            match described {
+                Ok(Some(description)) => {
+                    row["tracks"] = description.clone();
+                    let wanted: Vec<crate::converter::SubtitleTarget> =
+                        serde_json::from_value(row["wanted_targets"].clone())
+                            .map_err(|_| "Bazarr returned invalid wanted subtitle targets")?;
+                    let mut coverage_worker=lock(&self.converter).inspection_worker();
+                    let hints:Vec<crate::converter::SubtitleSourceHint>=serde_json::from_value(row["source_hints"].clone()).map_err(|_|"Invalid Bazarr source hints")?;
+                    coverage_worker.set_source_hints(hints)?;
+                    let coverage=coverage_worker.conversion_coverage(&path, &description, &wanted);
+                    match coverage {
+                        Ok(mut coverage) => {
+                            coverage["status"] =
+                                json!(match coverage["status"].as_str().unwrap_or("") {
+                                    "already_covered" => "covered",
+                                    "needed" => "needs_conversion",
+                                    "no_available_conversion" => "no_convertible_source",
+                                    _ => "unknown",
+                                });
+                            row["missing_srt"] = json!(coverage["status"] != "covered");
+                            row["missing_targets"] = coverage["missing_targets"].clone();
+                            row["coverage"] = coverage;
+                        }
+                        Err(error) => {
+                            row["coverage"] = json!({"status":"unknown","reason":log_text(&error,256),"missing_targets":targets});
+                            row["error"] = json!(log_text(&error, 256));
+                            metadata_pending += 1;
+                        }
+                    }
+                }
+                Ok(None) if !strings(&row["coverage"]["available_paths"]).is_empty() => {
+                    row["coverage"]["status"] = json!("needs_conversion");
+                    row["missing_srt"] = json!(true);
+                }
+                result => {
+                    metadata_pending += 1;
+                    row["metadata_pending"] = json!(true);
+                    let reason = match result { Err(error) => log_text(&error,256), _=>probe_error.as_ref().map(|error|log_text(error,256)).unwrap_or_else(||"Track metadata has not been inspected; only missing Bazarr targets will be probed".into()) };
+                    row["coverage"] =
+                        json!({"status":"unknown","reason":reason,"missing_targets":targets});
+                }
+            }
+        }
+        let partial = inventory["partial"].as_bool().unwrap_or(false)
+            || metadata_pending > 0
+            || self.cancel.load(Ordering::Relaxed);
+        let truncated = inventory["truncated"].as_bool().unwrap_or(false)
+            || inventory["items"]
+                .as_array()
+                .is_some_and(|items| items.len() > INVENTORY_LIMIT);
+        let mut runtime = lock(&self.runtime);
+        runtime.inventory = rows.clone();
+        runtime.inventory_source = "bazarr".into();
+        runtime.inventory_updated = now();
+        runtime.inventory_partial = partial;
+        runtime.inventory_truncated = truncated;
+        runtime.inventory_authority = json!({"status":"ready","error":null,"metadata_pending":metadata_pending,"probe_limit":PROBE_LIMIT,"unmapped_or_unavailable":inventory["items"].as_array().map_or(0,Vec::len).saturating_sub(rows.len())});
+        runtime.state_revision = runtime.state_revision.saturating_add(1);
+        drop(runtime);
+        self.persist_inventory()?;
+        self.log(
+            "INFO",
+            &format!(
+                "Bazarr inventory synchronized: {} media rows; {metadata_pending} pending metadata",
+                rows.len()
+            ),
+        );
+        Ok(rows)
+    }
+
+    fn execute_bazarr(&self, job: &Value, integrations: &mut Integrations) -> Result<(), String> {
+        let rows = self.sync_bazarr_inventory(integrations, job, true)?;
+        if job["kind"] == "inspect" {
+            if let Some(running) = lock(&self.runtime).running.as_mut() {
+                running["total"] = json!(rows.len());
+                running["processed"] = json!(rows.len());
+                running["summary"] = json!({"inspected":rows.len(),"source":"bazarr","covered":rows.iter().filter(|row|row["coverage"]["status"]=="covered").count(),"needed":rows.iter().filter(|row|row["coverage"]["status"]=="needs_conversion").count()});
+            }
+            return Ok(());
+        }
+        let requested = strings(&job["paths"]);
+        let roots = strings(&job["root_paths"])
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let languages = strings(&job["languages"]);
+        let mut targets_by_path: BTreeMap<PathBuf, Vec<crate::converter::SubtitleTarget>> =
+            BTreeMap::new();
+        let mut sources_by_path:BTreeMap<PathBuf,Vec<crate::converter::SubtitleSourceHint>>=BTreeMap::new();
+        let mut skipped = 0_u64;
+        if let Some(running) = lock(&self.runtime).running.as_mut() {
+            running["processed"] = json!(0);
+            running["total"] = json!(rows.len());
+        }
+        for row in &rows {
+            let path = row["path"].as_str().unwrap_or("");
+            if !roots.iter().any(|root| Path::new(path).starts_with(root)) {
+                continue;
+            }
+            let available_paths = strings(&row["coverage"]["available_paths"]);
+            if !requested.is_empty()
+                && !requested
+                    .iter()
+                    .any(|requested| requested == path || available_paths.contains(requested))
+            {
+                continue;
+            }
+            let targets: Vec<crate::converter::SubtitleTarget> =
+                serde_json::from_value(row["missing_targets"].clone())
+                    .map_err(|_| "Bazarr returned invalid subtitle targets")?;
+            let targets = targets
+                .into_iter()
+                .filter(|target| {
+                    languages.iter().any(|language| {
+                        language == "*"
+                            || language == &target.language
+                            || target
+                                .language
+                                .strip_prefix(language)
+                                .is_some_and(|suffix| suffix.starts_with('-'))
+                    })
+                })
+                .collect::<Vec<_>>();
+            if row["coverage"]["status"] != "needs_conversion" || targets.is_empty() {
+                skipped += 1;
+                self.progress(json!({"status":"skipped","file_terminal":true,"path":path,"reason":if targets.is_empty() && row["coverage"]["status"]=="needs_conversion" {"No missing targets match the requested languages"} else {row["coverage"]["reason"].as_str().unwrap_or("No available conversion is required")},"coverage_status":row["coverage"]["status"]}));
+                continue;
+            }
+            let mut candidates = available_paths;
+            candidates.sort_by_key(|candidate| candidate == path);
+            if job.get("track_ids").is_some() {
+                candidates.retain(|candidate| candidate == path);
+            }
+            for candidate in candidates {
+                if !requested.is_empty()
+                    && requested
+                        .iter()
+                        .any(|requested| available_sidecar(requested))
+                    && !requested.contains(&candidate)
+                {
+                    continue;
+                }
+                let candidate = Converter::safe_path(&candidate, &roots)?;
+                if targets_by_path.len() >= INVENTORY_LIMIT
+                    && !targets_by_path.contains_key(&candidate)
+                {
+                    return Err("Bazarr conversion candidates exceed the bounded job limit; select a smaller scope".into());
+                }
+                let allocated = targets_by_path.entry(candidate.clone()).or_default();
+                for target in &targets {
+                    if !allocated.contains(target) {
+                        allocated.push(target.clone());
+                    }
+                }
+                let sources:Vec<crate::converter::SubtitleSourceHint>=serde_json::from_value(row["source_hints"].clone()).map_err(|_|"Invalid Bazarr source hints")?;
+                let allocated=sources_by_path.entry(candidate.clone()).or_default();
+                for source in sources.into_iter().filter(|source|crate::workers::conflicts(&candidate,&source.path)) {
+                    if !allocated.iter().any(|existing|existing.path==source.path && existing.target==source.target) {allocated.push(source);}
+                }
+            }
+        }
+        let mut execution = job.clone();
+        execution["file_targets"] = json!(
+            targets_by_path
+                .iter()
+                .map(|(path, targets)| (path.to_string_lossy().into_owned(), json!(targets)))
+                .collect::<BTreeMap<_, _>>()
+        );
+        execution["file_languages"] = json!(
+            targets_by_path
+                .iter()
+                .map(|(path, targets)| (
+                    path.to_string_lossy().into_owned(),
+                    json!(
+                        targets
+                            .iter()
+                            .map(|target| target.language.clone())
+                            .collect::<HashSet<_>>()
+                    )
+                ))
+                .collect::<BTreeMap<_, _>>()
+        );
+        execution["file_sources"]=json!(sources_by_path.into_iter().map(|(path,sources)|(path.to_string_lossy().into_owned(),sources)).collect::<BTreeMap<_,_>>());
+        let mut paths = targets_by_path.into_keys().collect::<Vec<_>>();
+        paths.sort_by_key(|path| !available_sidecar(&path.to_string_lossy()));
+        let workload = match job["workload"].as_str().unwrap_or("text") {
+            "ocr" => Workload::Ocr,
+            "all" => Workload::All,
+            _ => Workload::Text,
+        };
+        let mut summary = self.convert_files(&paths, &execution, workload, integrations)?;
+        summary["skipped"] = json!(skipped);
+        summary["source"] = json!("bazarr");
+        if let Some(running) = lock(&self.runtime).running.as_mut() {
+            running["summary"] = summary;
+            running["total"] = json!(paths.len() as u64 + skipped);
+        }
+        Ok(())
+    }
+
+    fn refresh_bazarr_after_publication(
+        &self,
+        integrations: &mut Integrations,
+        job: &Value,
+        reindex: Option<&Value>,
+    ) -> Result<(), String> {
+        let (published, paths) = lock(&self.runtime)
+            .running
+            .as_ref()
+            .map(|job| {
+                (
+                    count(&job["published_outputs"]),
+                    strings(&job["published_paths"]),
+                )
+            })
+            .unwrap_or_default();
+        if !integrations.bazarr_enabled() || published == 0 {
+            return Ok(());
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            lock(&self.runtime).inventory_authority = json!({"status":"refresh_pending","error":null,"reason":"SRT files were published before cancellation; inspect media to verify Bazarr coverage"});
+            return self.persist_inventory();
+        }
+        let refreshed = self.sync_bazarr_inventory(integrations, job, false);
+        if reindex.is_none_or(|result| result["ok"] != true || count(&result["triggered"]) == 0) {
+            let error = reindex
+                .and_then(|result| result["message"].as_str())
+                .unwrap_or("Scoped Bazarr reindex did not complete");
+            let mut runtime = lock(&self.runtime);
+            let refresh_error = runtime.inventory_authority["error"].clone();
+            runtime.inventory_authority = json!({"status":"reindex_failed","error":log_text(error,512),"refresh_error":refresh_error,"published_outputs":published});
+            drop(runtime);
+            self.persist_inventory()?;
+            self.log(
+                "WARNING",
+                &format!(
+                    "SRT publication succeeded but Bazarr reindex failed: {}",
+                    log_text(error, 256)
+                ),
+            );
+        } else if refreshed.is_ok() {
+            let mut runtime = lock(&self.runtime);
+            let pending = runtime
+                .inventory
+                .iter()
+                .filter(|row| {
+                    paths.iter().any(|path| {
+                        crate::workers::conflicts(
+                            Path::new(row["path"].as_str().unwrap_or("")),
+                            Path::new(path),
+                        )
+                    }) && row["bazarr_missing_targets"].as_array().map_or(0, Vec::len)
+                        > row["missing_targets"].as_array().map_or(0, Vec::len)
+                })
+                .count();
+            if pending > 0 {
+                runtime.inventory_authority = json!({"status":"refresh_pending","error":null,"reason":"Scoped Bazarr scan was accepted; its inventory still reports targets covered by the newly published SRT files","pending_rows":pending});
+            }
+            drop(runtime);
+            self.persist_inventory()?;
+        }
+        refreshed.map(|_| ())
     }
 
     fn refresh_pipeline(&self) {
@@ -885,15 +1382,27 @@ impl App {
         {
             return Err("Invalid OCR option".into());
         }
-        if kind == "scan" && data["include_ocr"] == true {
-            return Err("Use selected-file extraction or the OCR task to run OCR".into());
+        if data.get("force").is_some_and(|force| !force.is_boolean()) {
+            return Err("Invalid force option".into());
+        }
+        let force = data["force"].as_bool().unwrap_or(false);
+        if force && (kind != "extract" || origin != "manual" || track_ids.is_none()) {
+            return Err("Force requires manual extraction with explicit subtitle track IDs".into());
+        }
+        if kind == "scan" && data["include_ocr"] == true && origin != "manual" {
+            return Err("Scheduled discovery does not grant OCR; use an explicit manual conversion or the OCR task".into());
+        }
+        if kind == "scan" && data["include_ocr"] == true && !self.ocr_permission {
+            return Err("OCR is disabled by deployment permissions".into());
         }
         let include_ocr = kind == "ocr"
+            || (kind == "scan" && origin == "manual" && data["include_ocr"] == true)
             || (kind == "extract"
                 && origin == "manual"
                 && data["include_ocr"].as_bool().unwrap_or(true));
         let job = json!({"id":token(8),"task_id":task_id,"workload":if kind=="ocr" {"ocr"}else if include_ocr {"all"}else{"text"},"include_ocr":include_ocr,"kind":kind,"status":"queued","created":now(),"started":null,"finished":null,"current":null,"summary":{},"error":null,"results":[],"languages":languages,"root_ids":roots.iter().map(|root|root_info(root,&self.mounts)["id"].clone()).collect::<Vec<_>>(),"root_paths":roots,"paths":paths,"retry":data["retry"].as_bool().unwrap_or(false),"origin":origin,"provider":provider,"processed":0,"total":0});
         let mut job = job;
+        job["force"] = json!(force);
         if let Some(track_ids) = track_ids {
             job["track_ids"] = json!(track_ids);
         }
@@ -978,6 +1487,7 @@ impl App {
             "metadata_pending",
         ]
         .contains(&event["status"].as_str().unwrap_or(""))
+            || (event["status"] == "skipped" && event["file_terminal"] == true)
         {
             job["processed"] = json!(count(&job["processed"]) + 1);
         }
@@ -1083,6 +1593,23 @@ impl App {
             return Err("File worker input exceeds its path limit".into());
         }
         let languages = strings(&job["languages"]);
+        let file_targets: BTreeMap<String, Vec<crate::converter::SubtitleTarget>> = job
+            .get("file_targets")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| "Invalid per-file subtitle targets")
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let file_languages: BTreeMap<String, Vec<String>> = job
+            .get("file_languages")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| "Invalid per-file subtitle languages")
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let force = job["force"].as_bool().unwrap_or(false);
         let track_ids = job
             .get("track_ids")
             .map(|ids| {
@@ -1246,7 +1773,9 @@ impl App {
                             };
                             let offered = match lock(&self.remote).offer(
                                 &path,
-                                &languages,
+                                file_languages
+                                    .get(path.to_string_lossy().as_ref())
+                                    .unwrap_or(&languages),
                                 retry,
                                 automatic,
                                 // A CPU text reservation never grants OCR,
@@ -1257,6 +1786,10 @@ impl App {
                                     workload
                                 },
                                 track_ids.as_deref(),
+                                file_targets
+                                    .get(path.to_string_lossy().as_ref())
+                                    .map(Vec::as_slice),
+                                force,
                                 resource,
                                 state,
                             ) {
@@ -1356,6 +1889,22 @@ impl App {
                         pending.clear();
                         break;
                     }
+                    if let Some(targets) = file_targets.get(path.to_string_lossy().as_ref())
+                        && let Err(error) = worker.set_targets(targets.clone())
+                    {
+                        lock(&self.workers).active.retain(|worker| worker.id != id);
+                        failure = Some(error);
+                        pending.clear();
+                        self.cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if let Err(error) = worker.force_covered_tracks(force) {
+                        lock(&self.workers).active.retain(|worker| worker.id != id);
+                        failure = Some(error);
+                        pending.clear();
+                        self.cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     if self.cancel.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed)
                     {
                         self.cancel.store(true, Ordering::Relaxed);
@@ -1369,7 +1918,9 @@ impl App {
                     self.progress(json!({"status":"dispatched","path":path,"worker_id":id,"resource":resource}));
                     let worker_path = path.clone();
                     let worker_sender = sender.clone();
-                    let worker_languages = &languages;
+                    let worker_languages = file_languages
+                        .get(path.to_string_lossy().as_ref())
+                        .unwrap_or(&languages);
                     let handle = std::thread::Builder::new()
                         .name(format!("subforge-file-{id}"))
                         .stack_size(2 * 1024 * 1024)
@@ -1399,6 +1950,7 @@ impl App {
                                         &mut |event| {
                                             if ["converted", "cached", "failed", "pending"]
                                                 .contains(&event["status"].as_str().unwrap_or(""))
+                                                || (event["status"]=="skipped" && event.get("summary").is_some())
                                             {
                                                 terminal = Some(event);
                                             } else {
@@ -1540,12 +2092,39 @@ impl App {
                                     );
                                 }
                                 if let Some(mut event) = outcome.terminal {
+                                    event["file_terminal"] = json!(true);
                                     let outputs = strings(&event["new_outputs"]);
+                                    let published_path = event["path"].as_str().map(str::to_owned);
                                     if !matches!(mode, FileMode::Inspect { cached_only: true }) {
                                         event["summary"] = summary.clone();
                                     }
                                     self.progress(event);
                                     if failure.is_none() && !outputs.is_empty() {
+                                        let mut runtime = lock(&self.runtime);
+                                        if let Some(job) = runtime.running.as_mut() {
+                                            job["published_outputs"] = json!(
+                                                count(&job["published_outputs"])
+                                                    .saturating_add(outputs.len() as u64)
+                                            );
+                                            if let Some(path) = published_path {
+                                                if !job["published_paths"].is_array() {
+                                                    job["published_paths"] = json!([]);
+                                                }
+                                                if let Some(paths) =
+                                                    job["published_paths"].as_array_mut()
+                                                    && paths.len() < INVENTORY_LIMIT
+                                                    && !paths
+                                                        .iter()
+                                                        .any(|existing| existing == &path)
+                                                {
+                                                    paths.push(json!(path));
+                                                }
+                                            }
+                                        }
+                                        if integrations.bazarr_enabled() {
+                                            runtime.inventory_authority = json!({"status":"refresh_pending","error":null,"reason":"SRT files published; waiting for scoped Bazarr reindex and inventory refresh"});
+                                        }
+                                        drop(runtime);
                                         self.notifications(integrations.notify(&outputs));
                                     }
                                 }
@@ -1690,6 +2269,9 @@ impl App {
             }
             return Ok(());
         }
+        if integrations.bazarr_enabled() && job["force"] != true {
+            return self.execute_bazarr(job, integrations);
+        }
         let roots = strings(&job["root_paths"])
             .iter()
             .map(|path| validate_root(Path::new(path), &self.mounts, false))
@@ -1807,6 +2389,10 @@ impl App {
                 runtime.inventory_updated = updated;
                 runtime.inventory_truncated = truncated;
                 runtime.inventory_partial = partial;
+                runtime.inventory_source = "filesystem".into();
+                runtime.inventory_authority = json!({"status":"ready","error":null});
+                drop(runtime);
+                self.persist_inventory()?;
             }
         }
         lock(&self.converter).persist_metadata()?;
@@ -1861,11 +2447,20 @@ impl App {
                 }
                 self.log("ERROR", &format!("Job failed: {}", log_text(&message, 512)));
             }
+            let mut bazarr_reindex = None;
             if ["scan", "extract", "ocr"].contains(&job["kind"].as_str().unwrap_or(""))
                 && let Some(notification) =
                     integrations.flush_bazarr(&self.cancel, &mut |event| self.progress(event))
             {
+                bazarr_reindex = Some(notification.clone());
                 self.notifications(vec![notification]);
+            }
+            if let Err(error) = self.refresh_bazarr_after_publication(
+                &mut integrations,
+                &job,
+                bazarr_reindex.as_ref(),
+            ) {
+                self.notifications(vec![json!({"provider":"bazarr","ok":false,"message":format!("SRT published; Bazarr inventory refresh failed: {}",log_text(&error,256))})]);
             }
             let mut runtime = lock(&self.runtime);
             if let Some(mut finished) = runtime.running.take() {
@@ -2204,6 +2799,7 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/api/workers" => Reply::json(200, app.workers()),
             "/api/nodes" => Reply::json(200, lock(&app.remote).public()),
             "/api/inventory" => Reply::json(200, app.inventory()),
+            "/api/bazarr/inventory" => Reply::json(200, app.inventory()),
             "/api/widget" => Reply::json(200, app.widget()),
             "/api/settings" => Reply::json(200, app.settings()),
             "/api/root-folders" => Reply::json(200, app.root_folders()),
@@ -2496,6 +3092,290 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BazarrFixture {
+        url: String,
+        movies: Arc<Mutex<Vec<Value>>>,
+        fail: Arc<AtomicBool>,
+        scanned: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl BazarrFixture {
+        fn new(movies: Vec<Value>, languages: &[&str]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let movies = Arc::new(Mutex::new(movies));
+            let fail = Arc::new(AtomicBool::new(false));
+            let scanned = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let profile = json!([{"profileId":1,"items":languages.iter().map(|language|json!({"language":language,"forced":"False","hi":"False"})).collect::<Vec<_>>()}]);
+            let (server_movies, server_fail, server_scanned, server_requests, server_stop) = (
+                Arc::clone(&movies),
+                Arc::clone(&fail),
+                Arc::clone(&scanned),
+                Arc::clone(&requests),
+                Arc::clone(&stop),
+            );
+            let thread = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(socket) => socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    let _ = socket.set_nonblocking(false);
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+                    let Ok(request) = read_request(&mut socket) else {
+                        continue;
+                    };
+                    lock(&server_requests).push(format!("{} {}", request.method, request.target));
+                    let response = if server_fail.load(Ordering::Relaxed) {
+                        Reply::json(503, json!({"error":"Fixture service unavailable"}))
+                    } else if request.method == "PATCH" {
+                        server_scanned.store(true, Ordering::Relaxed);
+                        Reply::json(200, json!({}))
+                    } else if request.target == "/api/system/languages/profiles" {
+                        Reply::json(200, profile.clone())
+                    } else if request.target.starts_with("/api/movies?") {
+                        let query = request.target.split_once('?').unwrap().1;
+                        let start = url::form_urlencoded::parse(query.as_bytes())
+                            .find(|(key, _)| key == "start")
+                            .and_then(|(_, value)| value.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let movies = lock(&server_movies);
+                        Reply::json(
+                            200,
+                            json!({"data":movies.iter().skip(start).take(200).cloned().collect::<Vec<_>>(),"total":movies.len()}),
+                        )
+                    } else {
+                        Reply::json(200, json!({"data":[],"total":0}))
+                    };
+                    let _ = send(&mut socket, response);
+                }
+            });
+            Self {
+                url,
+                movies,
+                fail,
+                scanned,
+                requests,
+                stop,
+                thread: Some(thread),
+            }
+        }
+        fn integration(&self, app: &App) -> Integrations {
+            let mut integrations =
+                Integrations::new(app.data.join("fixture-integrations.json")).unwrap();
+            integrations.update(&json!({"bazarr":{"enabled":true,"url":self.url,"api_key":"disposable-fixture"}})).unwrap();
+            integrations
+        }
+    }
+    impl Drop for BazarrFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn target_srt(path: &Path) {
+        fs::write(
+            path,
+            b"1\n00:00:01,000 --> 00:00:02,000\nDisposable fixture\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bazarr_covered_profile_skips_probe_and_ocr_and_survives_restart() {
+        let (_temporary, app, _paths, gate) = gated_workers_fixture();
+        let movie = app.mounts[0].join("film.mkv");
+        fs::write(&movie, b"disposable media").unwrap();
+        let subtitles = ["en", "fr", "ar"]
+            .iter()
+            .map(|language| {
+                let path = app.mounts[0].join(format!("film.{language}.srt"));
+                target_srt(&path);
+                json!({"code2":language,"path":path,"file_size":50,"forced":"False","hi":"False"})
+            })
+            .collect::<Vec<_>>();
+        let fixture = BazarrFixture::new(
+            vec![json!({"radarrId":1,"profileId":1,"path":movie,"subtitles":subtitles})],
+            &["en", "fr", "ar"],
+        );
+        let mut integrations = fixture.integration(&app);
+        let job = json!({"kind":"scan","workload":"all","languages":["*"],"root_paths":app.mounts,"paths":[]});
+        lock(&app.runtime).running = Some(job.clone());
+        app.execute(&job, &mut integrations).unwrap();
+        let inventory = app.inventory();
+        assert_eq!(inventory["source"], "bazarr");
+        assert_eq!(inventory["covered_count"], 1);
+        assert_eq!(inventory["items"][0]["coverage"]["status"], "covered");
+        assert_eq!(
+            inventory["items"][0]["coverage"]["existing_targets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            gate.entered.load(Ordering::Relaxed),
+            0,
+            "covered files must never enter conversion workers"
+        );
+        assert!(
+            !lock(&app.runtime)
+                .logs
+                .iter()
+                .any(|entry| entry["status"] == "inspecting")
+        );
+        let saved = read_json(&app.data.join("inventory.json"), JSON_LIMIT).unwrap();
+        assert_eq!(saved["source"], "bazarr");
+        write_private(
+            &app.data.join("settings.json"),
+            &read_json(&app.data.join("fixture-integrations.json"), 64 * 1024).unwrap(),
+        )
+        .unwrap();
+        let restarted = App::new(
+            app.mounts.clone(),
+            app.data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        assert_eq!(restarted.inventory()["items"].as_array().unwrap().len(), 1);
+        assert_eq!(restarted.inventory()["authority"]["status"], "stale");
+    }
+
+    #[test]
+    fn enabled_bazarr_failure_never_falls_back_to_filesystem_conversion() {
+        let (_temporary, app, _paths, gate) = gated_workers_fixture();
+        let fixture = BazarrFixture::new(Vec::new(), &["en"]);
+        fixture.fail.store(true, Ordering::Relaxed);
+        let mut integrations = fixture.integration(&app);
+        let job = json!({"kind":"scan","workload":"all","languages":["*"],"root_paths":app.mounts,"paths":[]});
+        lock(&app.runtime).running = Some(job.clone());
+        assert!(app.execute(&job, &mut integrations).is_err());
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 0);
+        assert_eq!(app.inventory()["source"], "bazarr");
+        assert_eq!(app.inventory()["authority"]["status"], "unavailable");
+        assert_eq!(lock(&fixture.requests).len(), 1);
+    }
+
+    #[test]
+    fn selected_bazarr_with_missing_credentials_never_admits_filesystem_workers() {
+        let (_temporary, app, _paths, gate) = gated_workers_fixture();
+        let fixture = BazarrFixture::new(Vec::new(), &["en"]);
+        let job = json!({"kind":"scan","workload":"all","languages":["*"],"root_paths":app.mounts,"paths":[]});
+        for update in [
+            json!({"bazarr":{"enabled":true,"url":"","clear_api_key":true}}),
+            json!({"bazarr":{"clear_api_key":true}}),
+            json!({"bazarr":{"url":format!("{}/changed",fixture.url)}}),
+        ] {
+            let mut integrations = fixture.integration(&app);
+            integrations.update(&update).unwrap();
+            assert!(
+                integrations.bazarr_enabled(),
+                "the selected authority remains Bazarr when its connection is incomplete"
+            );
+            lock(&app.runtime).running = Some(job.clone());
+            assert!(app.execute(&job, &mut integrations).is_err());
+            assert_eq!(gate.entered.load(Ordering::Relaxed), 0);
+            assert!(lock(&app.workers).active.is_empty());
+            assert_eq!(app.workers()["remote"]["active"], 0);
+            assert_eq!(app.inventory()["source"], "bazarr");
+            assert_eq!(app.inventory()["authority"]["status"], "unavailable");
+        }
+        assert!(
+            lock(&fixture.requests).is_empty(),
+            "missing connection fields fail before network dispatch"
+        );
+    }
+
+    #[test]
+    fn bazarr_inventory_retains_more_than_two_thousand_authoritative_rows() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let rows=(1..=2253).map(|id|json!({"radarrId":id,"profileId":null,"path":app.mounts[0].join(format!("film-{id}.mkv")),"subtitles":[]})).collect();
+        let fixture = BazarrFixture::new(rows, &["en"]);
+        let mut integrations = fixture.integration(&app);
+        app.sync_bazarr_inventory(
+            &mut integrations,
+            &json!({"kind":"inspect","languages":["*"]}),
+            false,
+        )
+        .unwrap();
+        let inventory = app.inventory();
+        assert_eq!(inventory["items"].as_array().unwrap().len(), 2253);
+        assert_eq!(inventory["truncated"], false);
+        assert_eq!(inventory["source"], "bazarr");
+    }
+
+    #[test]
+    fn bazarr_publication_reindexes_then_refetches_and_persists_coverage() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let movie = app.mounts[0].join("film.mkv");
+        fs::write(&movie, b"disposable media").unwrap();
+        let fixture = BazarrFixture::new(
+            vec![json!({"radarrId":1,"profileId":1,"path":movie,"subtitles":[]})],
+            &["en"],
+        );
+        let mut integrations = fixture.integration(&app);
+        let job = json!({"kind":"extract","root_paths":app.mounts,"languages":["en"]});
+        lock(&app.runtime).running =
+            Some(json!({"kind":"extract","published_outputs":1,"published_paths":[movie]}));
+        let output = app.mounts[0].join("film.en.srt");
+        target_srt(&output);
+        integrations.notify(&[output.to_string_lossy().into_owned()]);
+        let reindex = integrations.flush_bazarr(&app.cancel, &mut |_| {}).unwrap();
+        assert_eq!(reindex["triggered"], 1);
+        assert!(fixture.scanned.load(Ordering::Relaxed));
+        lock(&fixture.movies)[0]["subtitles"] =
+            json!([{"code2":"en","path":output,"file_size":50,"forced":"False","hi":"False"}]);
+        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&reindex))
+            .unwrap();
+        assert_eq!(app.inventory()["items"][0]["coverage"]["status"], "covered");
+        assert_eq!(app.inventory()["authority"]["status"], "ready");
+        let calls = lock(&fixture.requests);
+        let patch = calls
+            .iter()
+            .position(|request| request == "PATCH /api/movies")
+            .unwrap();
+        assert!(
+            calls
+                .iter()
+                .skip(patch + 1)
+                .any(|request| request == "GET /api/system/languages/profiles")
+        );
+        assert!(!calls.iter().any(|request| request.contains("system/tasks")));
+        drop(calls);
+        assert_eq!(
+            read_json(&app.data.join("inventory.json"), JSON_LIMIT).unwrap()["items"][0]["coverage"]
+                ["status"],
+            "covered"
+        );
+        app.refresh_bazarr_after_publication(
+            &mut integrations,
+            &job,
+            Some(&json!({"ok":false,"triggered":0,"message":"Fixture scoped reindex failed"})),
+        )
+        .unwrap();
+        assert_eq!(app.inventory()["authority"]["status"], "reindex_failed");
+        assert_eq!(
+            app.inventory()["items"][0]["coverage"]["status"],
+            "covered",
+            "valid published output stays visible after notification failure"
+        );
+    }
 
     #[test]
     fn operational_logs_are_bounded_single_line_records_with_explicit_fields() {

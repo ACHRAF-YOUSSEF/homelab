@@ -33,9 +33,12 @@ const MAX_SELECTED_TRACKS: usize = 64;
 const MAX_TRACK_LABEL: usize = 32;
 // Bump only when a converter fix or new diagnostics should retry cached
 // failures immediately. Successful fingerprint caches are independent.
-const ERROR_CACHE_REVISION: u64 = 2;
+const ERROR_CACHE_REVISION: u64 = 3;
 const MAX_CANDIDATES: usize = 20_000;
 const MAX_TRACKED_OUTPUTS: usize = 20_000;
+const MAX_COVERAGE_ENTRIES: usize = 4096;
+const MAX_COVERAGE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_COVERAGE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -62,6 +65,42 @@ pub enum Workload {
     Ocr,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct SubtitleTarget {
+    pub language: String,
+    pub forced: bool,
+    pub hi: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubtitleSourceHint {
+    pub path: PathBuf,
+    pub target: SubtitleTarget,
+}
+
+impl SubtitleTarget {
+    fn matches(&self, available: &Self) -> bool {
+        self.forced == available.forced
+            && self.hi == available.hi
+            && (self.language == available.language
+                || (!self.language.contains('-')
+                    && available.language.split('-').next() == Some(self.language.as_str())))
+    }
+}
+
+struct ExistingCoverage {
+    targets: Vec<SubtitleTarget>,
+    sidecars: Vec<(SubtitleTarget, PathBuf)>,
+}
+
+impl ExistingCoverage {
+    fn covers(&self, target: &SubtitleTarget) -> bool {
+        self.targets.iter().any(|existing| target.matches(existing))
+    }
+}
+
 type ConversionJob = (
     PathBuf,
     String,
@@ -71,6 +110,7 @@ type ConversionJob = (
     bool,
     String,
     String,
+    SubtitleTarget,
 );
 
 pub struct Converter {
@@ -91,6 +131,9 @@ pub struct Converter {
     persist_state: bool,
     state_dirty: bool,
     selected_tracks: Option<Vec<u64>>,
+    targets: Option<Vec<SubtitleTarget>>,
+    source_hints: Vec<SubtitleSourceHint>,
+    force_covered: bool,
     gpu_ocr: Option<u32>,
     gpu_health: Mutex<Option<crate::gpu::Health>>,
     gpu_failure: Mutex<Option<&'static str>>,
@@ -135,6 +178,9 @@ impl Converter {
             persist_state: true,
             state_dirty: false,
             selected_tracks: None,
+            targets: None,
+            source_hints: Vec::new(),
+            force_covered: false,
             gpu_ocr: None,
             gpu_health: Mutex::new(None),
             gpu_failure: Mutex::new(None),
@@ -167,7 +213,7 @@ impl Converter {
             if !valid_language_code(&code) {
                 return Err("Invalid subtitle language selection".into());
             }
-            result.insert(short_language(&code, &aliases));
+            result.insert(target_language(&code, &aliases));
         }
         Ok(result.into_iter().collect())
     }
@@ -298,10 +344,11 @@ impl Converter {
                 ));
             }
         }
+        let target=self.source_target(&path).unwrap_or(SubtitleTarget{language:"und".into(),forced:false,hi:false});
         Ok(
-            json!([{"number": null, "language": filename_language(&path, &self.language_aliases),
-            "forced": path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().contains(".forced"),
-            "hi": path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().contains(".hi"),
+            json!([{"number": null, "language":target.language,
+            "forced":target.forced,
+            "hi":target.hi,
             "format": extension(&path).unwrap_or_default().to_ascii_uppercase()}]),
         )
     }
@@ -390,6 +437,23 @@ impl Converter {
                 continue;
             }
             let key = path.to_string_lossy().to_string();
+            if !self.force_covered
+                && let Some(targets) = &self.targets
+            {
+                let existing = self.existing_coverage(&path)?;
+                if targets.iter().all(|target| existing.covers(target)) {
+                    let coverage = json!({"status":"already_covered","reason":if targets.is_empty() {"No subtitle targets are required by the inventory authority"} else {"Valid SRT files already cover every requested language and variant"},"existing_targets":existing.targets,"missing_targets":[]});
+                    let mut entry = self.state.get(&key).cloned().unwrap_or_else(|| json!({}));
+                    entry["coverage"] = coverage.clone();
+                    self.set_state_entry(&key, entry);
+                    self.persist_state()?;
+                    bump(&mut summary, "cached");
+                    progress(
+                        json!({"status":"skipped","path":path,"reason":coverage["reason"],"coverage":coverage,"summary":summary}),
+                    );
+                    continue;
+                }
+            }
             let selection_coverage = if let Some(ids) = &self.selected_tracks {
                 let description = self.describe_with_stop(&path, stop)?;
                 validate_track_ids(&description, ids)?;
@@ -447,7 +511,11 @@ impl Converter {
                     .iter()
                     .all(|name| path.parent().unwrap_or(Path::new("/")).join(name).is_file());
                 if previous.get("ok").and_then(Value::as_bool) == Some(true)
+                    && self.targets.is_none()
+                    && !self.force_covered
                     && coverage
+                    && (!languages.iter().any(|language| language == "und")
+                        || previous["unknown_complete"] == true)
                     && ocr_covered
                     && text_covered
                     && outputs_exist
@@ -472,15 +540,29 @@ impl Converter {
                     progress(json!({"status":"cached","path":path,"summary":summary}));
                     continue;
                 }
-                if unchanged_failure_deferred(&previous, retry, workload, automatic)
-                    || failure_retry_delayed(&previous, retry, epoch_seconds(), self.retry_interval)
+                if !self.force_covered
+                    && (self.targets.is_none() || previous["targets"] == json!(self.targets))
+                    && (unchanged_failure_deferred(&previous, retry, workload, automatic)
+                        || failure_retry_delayed(
+                            &previous,
+                            retry,
+                            epoch_seconds(),
+                            self.retry_interval,
+                        ))
                 {
                     bump(&mut summary, "pending");
                     progress(json!({"status":"pending","path":path,"summary":summary}));
                     continue;
                 }
             }
-            match self.convert(&path, &languages, workload, stop, progress) {
+            let mut skip_reason = None;
+            let mut conversion_progress = |event: Value| {
+                if event["status"] == "skipped" {
+                    skip_reason = event["reason"].as_str().map(str::to_owned);
+                }
+                progress(event);
+            };
+            match self.convert(&path, &languages, workload, stop, &mut conversion_progress) {
                 Ok((outputs, ocr_pending, published)) => {
                     let after = match fingerprint(&path) {
                         Ok(v) => v,
@@ -517,7 +599,17 @@ impl Converter {
                     let ocr_complete = (workload != Workload::Text && self.enable_ocr)
                         || (unchanged
                             && previous["ocr"].as_bool().unwrap_or(previous["ok"] == true));
-                    self.set_scoped_state_entry(&key, scope.as_deref(), json!({"fingerprint":fingerprint_json(&before),"outputs":output_names,"ok":true,"languages":completed_languages,"ocr":ocr_complete,"ocr_pending":ocr_pending && !ocr_complete,"text_complete":text_complete,"selection_coverage":selection_coverage}))?;
+                    let existing = self.existing_coverage(&path)?;
+                    let missing: Vec<_> = self
+                        .targets
+                        .iter()
+                        .flatten()
+                        .filter(|target| !existing.covers(target))
+                        .cloned()
+                        .collect();
+                    let coverage = json!({"status":if self.targets.is_some() && missing.is_empty() {"already_covered"} else if published.is_empty() && skip_reason.is_some() {"skipped"} else {"converted"},
+                        "reason":skip_reason.unwrap_or_else(||"Requested subtitle conversion completed".into()),"existing_targets":existing.targets,"missing_targets":missing});
+                    self.set_scoped_state_entry(&key, scope.as_deref(), json!({"fingerprint":fingerprint_json(&before),"outputs":output_names,"ok":true,"languages":completed_languages,"ocr":ocr_complete,"ocr_pending":ocr_pending && !ocr_complete,"text_complete":text_complete,"selection_coverage":selection_coverage,"coverage":coverage,"targets":self.targets,"unknown_complete":languages.iter().any(|language|language=="und")}))?;
                     if self.persist_state().is_err() {
                         bump(&mut summary, "failed");
                         continue;
@@ -544,7 +636,7 @@ impl Converter {
                     bump(&mut summary, "failed");
                     let safe = bounded_message(&message);
                     progress(json!({"status":"failed","path":path,"error":safe,"summary":summary}));
-                    self.set_scoped_state_entry(&key, scope.as_deref(), json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION,"ocr_pending":workload==Workload::Ocr || previous["ocr_pending"]==true,"text_complete":previous["text_complete"].as_bool().unwrap_or(previous["ok"]==true),"outputs":previous_outputs,"selection_coverage":selection_coverage}))?;
+                    self.set_scoped_state_entry(&key, scope.as_deref(), json!({"fingerprint":fingerprint_json(&before),"ok":false,"attempt":epoch_seconds(),"error":safe,"error_revision":ERROR_CACHE_REVISION,"ocr_pending":workload==Workload::Ocr || previous["ocr_pending"]==true,"text_complete":previous["text_complete"].as_bool().unwrap_or(previous["ok"]==true),"outputs":previous_outputs,"selection_coverage":selection_coverage,"targets":self.targets}))?;
                     let _ = self.persist_state();
                 }
             }
@@ -596,6 +688,184 @@ impl Converter {
         }
         self.selected_tracks = Some(ids);
         Ok(())
+    }
+
+    /// Per-file requirements supplied by the inventory authority. An explicit
+    /// empty list means no subtitle is needed; it never expands to all tracks.
+    pub fn set_targets(&mut self, targets: Vec<SubtitleTarget>) -> Result<(), String> {
+        if targets.len() > MAX_SELECTED_TRACKS {
+            return Err("Too many subtitle language requirements".into());
+        }
+        let mut normalized = BTreeSet::new();
+        for target in targets {
+            if !valid_language_code(&target.language) {
+                return Err("Invalid subtitle language requirement".into());
+            }
+            normalized.insert(SubtitleTarget {
+                language: target_language(&target.language, &self.language_aliases),
+                ..target
+            });
+        }
+        self.targets = Some(normalized.into_iter().collect());
+        Ok(())
+    }
+
+    pub fn targets(&self) -> Option<&[SubtitleTarget]> {
+        self.targets.as_deref()
+    }
+
+    /// Accept explicit inventory metadata only for existing local sidecars.
+    /// Language and variant guesses are never inferred from wanted targets.
+    pub fn set_source_hints(&mut self, hints: Vec<SubtitleSourceHint>) -> Result<(), String> {
+        if hints.len() > MAX_TRACKS {
+            return Err("Too many subtitle source metadata hints".into());
+        }
+        let mut normalized = BTreeMap::new();
+        for hint in hints {
+            let path = Self::safe_path(&hint.path.to_string_lossy(), &self.roots)?;
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|_| "Subtitle source metadata path is unavailable")?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || !extension(&path).is_some_and(|extension| {
+                    extension == "srt" || SIDECAR_EXTENSIONS.contains(&extension.as_str())
+                })
+                || !valid_language_code(&hint.target.language)
+            {
+                return Err(
+                    "Subtitle source metadata requires a safe local sidecar and language".into(),
+                );
+            }
+            let target = SubtitleTarget {
+                language: target_language(&hint.target.language, &self.language_aliases),
+                ..hint.target
+            };
+            let (_, filename) = subtitle_name(&path, &self.language_aliases)
+                .ok_or("Subtitle source filename is unavailable")?;
+            if (filename.language != "und"
+                && !same_language_family(&target.language, &filename.language))
+                || (filename.forced && !target.forced)
+                || (filename.hi && !target.hi)
+            {
+                return Err("Subtitle source metadata conflicts with the explicit filename language or variant".into());
+            }
+            if normalized
+                .get(&path)
+                .is_some_and(|previous| previous != &target)
+            {
+                return Err("Subtitle source metadata contains conflicting entries".into());
+            }
+            normalized.insert(path, target);
+        }
+        self.source_hints = normalized
+            .into_iter()
+            .map(|(path, target)| SubtitleSourceHint { path, target })
+            .collect();
+        Ok(())
+    }
+
+    pub fn source_hints(&self) -> &[SubtitleSourceHint] {
+        &self.source_hints
+    }
+
+    fn source_target(&self, path: &Path) -> Option<SubtitleTarget> {
+        self.source_hints
+            .iter()
+            .find(|hint| same_local_path(&hint.path, path))
+            .map(|hint| hint.target.clone())
+            .or_else(|| subtitle_name(path, &self.language_aliases).map(|(_, target)| target))
+    }
+
+    fn existing_coverage(&self, path: &Path) -> Result<ExistingCoverage, String> {
+        existing_coverage_with_hints(path, &self.language_aliases, &self.source_hints)
+    }
+
+    pub fn force_covered_tracks(&mut self, force: bool) -> Result<(), String> {
+        if force && self.selected_tracks.is_none() {
+            return Err("Forcing covered subtitles requires an explicit track selection".into());
+        }
+        self.force_covered = force;
+        Ok(())
+    }
+
+    pub fn force_covered(&self) -> bool {
+        self.force_covered
+    }
+
+    /// Uses only bounded sibling inspection and metadata supplied by the caller.
+    /// No media probe or OCR subprocess is started to calculate this plan.
+    pub fn conversion_coverage(
+        &self,
+        path: &Path,
+        description: &Value,
+        targets: &[SubtitleTarget],
+    ) -> Result<Value, String> {
+        let path = Self::safe_path(&path.to_string_lossy(), &self.roots)?;
+        let existing = self.existing_coverage(&path)?;
+        let mut normalized = BTreeSet::new();
+        if targets.len() > MAX_SELECTED_TRACKS {
+            return Err("Too many subtitle language requirements".into());
+        }
+        for target in targets {
+            if !valid_language_code(&target.language) {
+                return Err("Invalid subtitle language requirement".into());
+            }
+            normalized.insert(SubtitleTarget {
+                language: target_language(&target.language, &self.language_aliases),
+                forced: target.forced,
+                hi: target.hi,
+            });
+        }
+        let missing: Vec<_> = normalized
+            .into_iter()
+            .filter(|target| !existing.covers(target))
+            .collect();
+        let tracks = description
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(MAX_TRACKS);
+        let mut available: Vec<_> = existing
+            .sidecars
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect();
+        let mut paths = BTreeSet::new();
+        for (target, source) in &existing.sidecars {
+            if missing.iter().any(|wanted| wanted.matches(target)) {
+                paths.insert(source.clone());
+            }
+        }
+        let mut unknown = 0usize;
+        for track in tracks {
+            let language = target_language(
+                track["language"].as_str().unwrap_or("und"),
+                &self.language_aliases,
+            );
+            if language == "und" {
+                unknown += 1;
+                continue;
+            }
+            let target = SubtitleTarget {
+                language,
+                forced: track["forced"].as_bool().unwrap_or(false),
+                hi: track["hi"].as_bool().unwrap_or(false),
+            };
+            if missing.iter().any(|wanted| wanted.matches(&target)) {
+                paths.insert(path.clone());
+            }
+            available.push(target);
+        }
+        let needed: Vec<_> = missing
+            .iter()
+            .filter(|target| available.iter().any(|candidate| target.matches(candidate)))
+            .cloned()
+            .collect();
+        Ok(
+            json!({"status":if missing.is_empty() {"already_covered"} else if needed.is_empty() {"no_available_conversion"} else {"needed"},
+            "reason":if missing.is_empty() {"Valid SRT files already cover every requested language and variant"} else if needed.is_empty() {"No matching embedded or sidecar subtitle can supply the missing targets"} else {"Matching subtitles can supply the missing language and variant targets"},
+            "existing_targets":existing.targets,"missing_targets":missing,"available_targets":needed,"available_paths":paths,"unknown_tracks_skipped":unknown}),
+        )
     }
 
     fn selection_key(&self) -> Option<String> {
@@ -719,7 +989,7 @@ impl Converter {
 
     pub fn file_processing(&self, path: &str) -> Value {
         let Some(entry) = self.state.get(path) else {
-            return json!({"pending_ocr":false,"failed":false,"generated_srt_count":0,"last_error":null});
+            return json!({"pending_ocr":false,"failed":false,"generated_srt_count":0,"last_error":null,"coverage":null});
         };
         let mut outputs = BTreeSet::new();
         let mut available = true;
@@ -767,7 +1037,13 @@ impl Converter {
                 }
             }
         }
-        json!({"pending_ocr":pending,"failed":failed,"generated_srt_count":if available {Some(outputs.len())}else{None},"last_error":latest_error.map(|(_, error)|error)})
+        let coverage = entry.get("coverage").cloned().unwrap_or(Value::Null);
+        if coverage["status"] == "already_covered" {
+            pending = false;
+            failed = false;
+            latest_error = None;
+        }
+        json!({"pending_ocr":pending,"failed":failed,"generated_srt_count":if available {Some(outputs.len())}else{None},"last_error":latest_error.map(|(_, error)|error),"coverage":coverage})
     }
 
     fn worker_with_state(&self, state: Value) -> Self {
@@ -789,6 +1065,9 @@ impl Converter {
             persist_state: false,
             state_dirty: false,
             selected_tracks: None,
+            targets: None,
+            source_hints: Vec::new(),
+            force_covered: false,
             gpu_ocr: None,
             gpu_health: Mutex::new(None),
             gpu_failure: Mutex::new(None),
@@ -1092,6 +1371,16 @@ impl Converter {
     ) -> Result<(Vec<String>, bool, Vec<String>), String> {
         let before = fingerprint(path)?;
         let parent = path.parent().ok_or("Media path has no parent directory")?;
+        let existing = self.existing_coverage(path)?;
+        if !self.force_covered
+            && let Some(targets) = &self.targets
+            && targets.iter().all(|target| existing.covers(target))
+        {
+            progress(
+                json!({"status":"skipped","path":path,"reason":"Requested subtitle languages and variants are already covered"}),
+            );
+            return Ok((Vec::new(), false, Vec::new()));
+        }
         if let Some(directory) = &self.remote_staging
             && (directory.parent() != Some(parent)
                 || has_symlink_component(directory)?
@@ -1107,7 +1396,7 @@ impl Converter {
             .prefix(".subforge-")
             .tempdir_in(parent)
             .map_err(|_| "Could not create a private staging directory")?;
-        let tracks = if is_video(path) {
+        let mut tracks = if is_video(path) {
             self.tracks(path, stop)?
         } else {
             Vec::new()
@@ -1117,11 +1406,14 @@ impl Converter {
         {
             validate_selected_tracks(&tracks, ids)?;
         }
+        if self.selected_tracks.is_none() {
+            tracks.sort_by_key(|track| is_image_format(&track.format));
+        }
         let mut counts: BTreeMap<(String, bool, bool), usize> = BTreeMap::new();
         for track in &tracks {
             *counts
                 .entry((
-                    short_language(&track.language, &self.language_aliases),
+                    target_language(&track.language, &self.language_aliases),
                     track.forced,
                     track.hi,
                 ))
@@ -1129,13 +1421,32 @@ impl Converter {
         }
         let mut jobs: Vec<ConversionJob> = Vec::new();
         let mut ocr_pending = false;
+        let mut planned_targets = BTreeSet::new();
         if is_video(path) {
             for track in tracks {
-                let lang = short_language(&track.language, &self.language_aliases);
+                let lang = target_language(&track.language, &self.language_aliases);
                 if self.selected_tracks.as_ref().map_or_else(
                     || !wants(&track.language, languages, &self.language_aliases),
                     |ids| !track.number.as_u64().is_some_and(|id| ids.contains(&id)),
                 ) {
+                    continue;
+                }
+                let target = SubtitleTarget {
+                    language: lang.clone(),
+                    forced: track.forced,
+                    hi: track.hi,
+                };
+                if let Some(reason) = self.skip_target(&target, languages, &existing) {
+                    progress(
+                        json!({"status":"skipped","path":path,"track":track.stream_index,"language":lang,"reason":reason}),
+                    );
+                    continue;
+                }
+                let planning_target = self.planning_target(&target);
+                if self.selected_tracks.is_none() && planned_targets.contains(&planning_target) {
+                    progress(
+                        json!({"status":"skipped","path":path,"track":track.stream_index,"language":lang,"reason":"Another track already supplies this language and variant"}),
+                    );
                     continue;
                 }
                 let mut stem = path
@@ -1143,11 +1454,12 @@ impl Converter {
                     .and_then(|s| s.to_str())
                     .unwrap_or("subtitle")
                     .to_owned();
-                if counts
-                    .get(&(lang.clone(), track.forced, track.hi))
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
+                if (self.selected_tracks.is_some()
+                    && counts
+                        .get(&(lang.clone(), track.forced, track.hi))
+                        .copied()
+                        .unwrap_or(0)
+                        > 1)
                     || lang == "und"
                 {
                     stem.push_str(&format!(
@@ -1179,6 +1491,7 @@ impl Converter {
                 let stream_index = track
                     .stream_index
                     .ok_or("Subtitle stream index is unavailable")?;
+                planned_targets.insert(planning_target);
                 jobs.push((
                     path.to_path_buf(),
                     format!("{stem}.srt"),
@@ -1188,6 +1501,7 @@ impl Converter {
                     false,
                     ocr_lang,
                     track.language,
+                    target,
                 ));
             }
         } else if matches!(extension(path).as_deref(), Some("idx" | "sub")) {
@@ -1215,34 +1529,54 @@ impl Converter {
                     ) {
                         continue;
                     }
+                    let variant =
+                        subtitle_name(path, &self.language_aliases).map(|(_, target)| target);
+                    let target = SubtitleTarget {
+                        language: target_language(&lang, &self.language_aliases),
+                        forced: variant.as_ref().is_some_and(|target| target.forced),
+                        hi: variant.as_ref().is_some_and(|target| target.hi),
+                    };
+                    if let Some(reason) = self.skip_target(&target, languages, &existing) {
+                        progress(
+                            json!({"status":"skipped","path":path,"track":track_id,"language":target.language,"reason":reason}),
+                        );
+                        continue;
+                    }
+                    let planning_target = self.planning_target(&target);
+                    if self.selected_tracks.is_none() && planned_targets.contains(&planning_target)
+                    {
+                        continue;
+                    }
                     if workload == Workload::Text || !self.enable_ocr {
                         ocr_pending = true;
                         continue;
                     }
-                    let label = short_language(&lang, &self.language_aliases);
-                    let mut stem = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("subtitle")
-                        .to_owned();
-                    if caps
-                        .iter()
-                        .filter(|capture| {
-                            short_language(
-                                &bounded_track_language(&capture[1]),
-                                &self.language_aliases,
-                            ) == label
-                        })
-                        .count()
-                        > 1
+                    let label = target.language.clone();
+                    let mut stem = media_stem(path, &self.language_aliases)
+                        .unwrap_or_else(|| "subtitle".into());
+                    if self.selected_tracks.is_some()
+                        && caps
+                            .iter()
+                            .filter(|capture| {
+                                short_language(
+                                    &bounded_track_language(&capture[1]),
+                                    &self.language_aliases,
+                                ) == label
+                            })
+                            .count()
+                            > 1
                     {
                         stem.push_str(&format!(
                             ".track{}",
                             track_id.ok_or("VobSub track ID is invalid")?
                         ));
                     }
-                    if filename_language(path, &self.language_aliases) != label {
-                        stem.push_str(&format!(".{label}"));
+                    stem.push_str(&format!(".{label}"));
+                    if target.forced {
+                        stem.push_str(".forced");
+                    }
+                    if target.hi {
+                        stem.push_str(".hi");
                     }
                     let staged_idx = staging.path().join(format!("vobsub{n}.idx"));
                     let payload = idx.with_extension("sub");
@@ -1266,6 +1600,7 @@ impl Converter {
                     let body = body_re.replace(&text[section_start..section_end], "$1 0");
                     fs::write(&staged_idx, format!("{prefix}{body}"))
                         .map_err(|_| "VobSub staging failed")?;
+                    planned_targets.insert(planning_target);
                     jobs.push((
                         staged_idx,
                         format!("{stem}.srt"),
@@ -1275,15 +1610,30 @@ impl Converter {
                         false,
                         self.ocr_for(&lang),
                         lang,
+                        target,
                     ));
                 }
             }
         } else if wants(
-            &filename_language(path, &self.language_aliases),
+            &self
+                .source_target(path)
+                .map(|target| target.language)
+                .unwrap_or_else(|| "und".into()),
             languages,
             &self.language_aliases,
         ) {
             let fmt = extension(path).unwrap_or_default();
+            let target = self.source_target(path).unwrap_or(SubtitleTarget {
+                language: "und".into(),
+                forced: false,
+                hi: false,
+            });
+            if let Some(reason) = self.skip_target(&target, languages, &existing) {
+                progress(
+                    json!({"status":"skipped","path":path,"language":target.language,"reason":reason}),
+                );
+                return Ok((Vec::new(), false, Vec::new()));
+            }
             let image = matches!(fmt.as_str(), "sup" | "sub" | "idx");
             let seconv = matches!(fmt.as_str(), "ttml" | "sbv");
             if image && (workload == Workload::Text || !self.enable_ocr) {
@@ -1292,31 +1642,61 @@ impl Converter {
             if (image && self.enable_ocr && workload != Workload::Text)
                 || (!image && workload != Workload::Ocr)
             {
-                jobs.push((
-                    path.to_path_buf(),
+                let name = if self
+                    .source_hints
+                    .iter()
+                    .any(|hint| same_local_path(&hint.path, path))
+                {
+                    let mut stem = media_stem(path, &self.language_aliases)
+                        .ok_or("Subtitle source filename is unavailable")?;
+                    stem.push('.');
+                    stem.push_str(&target.language);
+                    if target.forced {
+                        stem.push_str(".forced");
+                    }
+                    if target.hi {
+                        stem.push_str(".hi");
+                    }
+                    format!("{stem}.srt")
+                } else {
                     format!(
                         "{}.srt",
                         path.file_stem()
-                            .and_then(|s| s.to_str())
+                            .and_then(|stem| stem.to_str())
                             .unwrap_or("subtitle")
-                    ),
+                    )
+                };
+                jobs.push((
+                    path.to_path_buf(),
+                    name,
                     None,
                     None,
                     image,
                     seconv,
-                    self.ocr_for(&filename_language(path, &self.language_aliases)),
-                    filename_language(path, &self.language_aliases),
+                    self.ocr_for(&target.language),
+                    target.language.clone(),
+                    target,
                 ));
             }
         }
         let mut outputs = Vec::new();
         let mut destinations = HashSet::new();
-        for (source, name, stream, native_track, image, seconv, ocr_lang, language) in jobs {
+        for (source, name, stream, native_track, image, seconv, ocr_lang, language, target) in jobs
+        {
             if !destinations.insert(name.clone()) {
                 continue;
             }
             let destination = parent.join(&name);
             if destination.exists() || destination.is_symlink() {
+                progress(
+                    json!({"status":"skipped","path":path,"track":stream,"language":target.language,"reason":"The existing output filename is preserved and will not be overwritten"}),
+                );
+                continue;
+            }
+            if !self.force_covered && self.existing_coverage(path)?.covers(&target) {
+                progress(
+                    json!({"status":"skipped","path":path,"track":stream,"language":target.language,"reason":"A valid SRT already covers this language and variant"}),
+                );
                 continue;
             }
             let backend = if image && self.gpu_ocr.is_some() {
@@ -1466,10 +1846,21 @@ impl Converter {
             return Err("Source changed or conversion was cancelled".into());
         }
         let mut published = Vec::new();
+        let mut retained = Vec::new();
         for name in &outputs {
             let staged = staging.path().join(name);
+            if !self.force_covered
+                && let Some((_, target)) = subtitle_name(Path::new(name), &self.language_aliases)
+                && self.existing_coverage(path)?.covers(&target)
+            {
+                progress(
+                    json!({"status":"skipped","path":path,"language":target.language,"reason":"A valid SRT appeared before publication and now covers this target"}),
+                );
+                continue;
+            }
             let destination = self.remote_staging.as_deref().unwrap_or(parent).join(name);
             if publish_noclobber(&staged, &destination)? {
+                retained.push(name.clone());
                 published.push(name.clone());
                 if self.remote_staging.is_some() {
                     self.staged_outputs
@@ -1479,7 +1870,7 @@ impl Converter {
                 }
             }
         }
-        Ok((outputs, ocr_pending, published))
+        Ok((retained, ocr_pending, published))
     }
 
     fn extract_text(
@@ -1511,6 +1902,48 @@ impl Converter {
         } else {
             self.language_aliases.get(&code).cloned().unwrap_or(code)
         }
+    }
+
+    fn skip_target(
+        &self,
+        target: &SubtitleTarget,
+        languages: &[String],
+        existing: &ExistingCoverage,
+    ) -> Option<&'static str> {
+        if self.force_covered {
+            return None;
+        }
+        if target.language == "und"
+            && self.selected_tracks.is_none()
+            && !languages.iter().any(|language| language == "und")
+            && !self
+                .targets
+                .as_ref()
+                .is_some_and(|targets| targets.iter().any(|target| target.language == "und"))
+        {
+            return Some(
+                "Unknown-language tracks require an explicit track or und language selection",
+            );
+        }
+        if self
+            .targets
+            .as_ref()
+            .is_some_and(|targets| !targets.iter().any(|wanted| wanted.matches(target)))
+        {
+            return Some("This language and variant is not required by the inventory authority");
+        }
+        if existing.covers(target) {
+            return Some("A valid SRT already covers this language and variant");
+        }
+        None
+    }
+
+    fn planning_target(&self, target: &SubtitleTarget) -> SubtitleTarget {
+        self.targets
+            .as_ref()
+            .and_then(|targets| targets.iter().find(|wanted| wanted.matches(target)))
+            .unwrap_or(target)
+            .clone()
     }
 }
 
@@ -1575,6 +2008,11 @@ fn valid_language_code(code: &str) -> bool {
         && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 fn language_aliases() -> BTreeMap<String, String> {
+    static ALIASES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    ALIASES.get_or_init(load_language_aliases).clone()
+}
+
+fn load_language_aliases() -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     for (a, b) in [
         ("en", "eng"),
@@ -1587,6 +2025,20 @@ fn language_aliases() -> BTreeMap<String, String> {
         ("es", "spa"),
         ("zh", "zho"),
         ("chi", "zho"),
+        ("pt", "por"),
+        ("it", "ita"),
+        ("ru", "rus"),
+        ("ko", "kor"),
+        ("nl", "nld"),
+        ("dut", "nld"),
+        ("pl", "pol"),
+        ("sv", "swe"),
+        ("da", "dan"),
+        ("fi", "fin"),
+        ("no", "nor"),
+        ("tr", "tur"),
+        ("hi", "hin"),
+        ("uk", "ukr"),
         ("und", "und"),
     ] {
         m.insert(a.into(), b.into());
@@ -1673,30 +2125,218 @@ fn matching_native_tracks(native_data: Option<&Value>, stream_count: usize) -> V
     }
 }
 fn filename_language(path: &Path, aliases: &BTreeMap<String, String>) -> String {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let mut parts: Vec<_> = stem
-        .to_ascii_lowercase()
-        .split('.')
-        .map(str::to_owned)
-        .collect();
-    while parts
-        .last()
-        .is_some_and(|s| ["forced", "hi", "sdh", "cc"].contains(&s.as_str()))
-    {
-        parts.pop();
+    subtitle_name(path, aliases)
+        .map(|(_, target)| target.language)
+        .unwrap_or_else(|| "und".into())
+}
+fn target_language(language: &str, aliases: &BTreeMap<String, String>) -> String {
+    let normalized = language.to_ascii_lowercase();
+    match normalized.as_str() {
+        "pb" | "pob" => return "pt-br".into(),
+        "zt" | "zht" => return "zh-tw".into(),
+        "ea" | "spl" => return "es-mx".into(),
+        _ => {}
     }
-    if parts.len() > 1 {
-        short_language(parts.last().unwrap(), aliases)
+    if !valid_language_code(&normalized) {
+        return "und".into();
+    }
+    let (primary, suffix) = normalized.split_once('-').unwrap_or((&normalized, ""));
+    let primary = short_language(primary, aliases);
+    if suffix.is_empty() {
+        primary
     } else {
-        "und".into()
+        format!("{primary}-{suffix}")
     }
 }
+
+fn subtitle_name(
+    path: &Path,
+    aliases: &BTreeMap<String, String>,
+) -> Option<(String, SubtitleTarget)> {
+    let stem = path.file_stem()?.to_str()?;
+    let mut parts: Vec<_> = stem.split('.').collect();
+    let mut forced = false;
+    let mut hi = false;
+    while let Some(part) = parts.last() {
+        if part.eq_ignore_ascii_case("forced") {
+            forced = true;
+        } else if ["sdh", "cc"]
+            .iter()
+            .any(|flag| part.eq_ignore_ascii_case(flag))
+            || part.eq_ignore_ascii_case("hi")
+                && parts.len() > 2
+                && parts[..parts.len() - 1]
+                    .iter()
+                    .rev()
+                    .find(|prior| {
+                        !["forced", "sdh", "cc"]
+                            .iter()
+                            .any(|flag| prior.eq_ignore_ascii_case(flag))
+                    })
+                    .is_some_and(|prior| valid_language_code(prior))
+        {
+            hi = true;
+        } else {
+            break;
+        }
+        parts.pop();
+    }
+    let mut language = "und".to_owned();
+    if parts.len() > 1
+        && let Some(part) = parts.last()
+        && valid_language_code(part)
+    {
+        language = target_language(part, aliases);
+        parts.pop();
+        if parts.last().is_some_and(|part| {
+            part.get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("track"))
+                && part.get(5..).is_some_and(|id| {
+                    !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        }) {
+            parts.pop();
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some((
+        parts.join("."),
+        SubtitleTarget {
+            language,
+            forced,
+            hi,
+        },
+    ))
+}
+
+fn media_stem(path: &Path, aliases: &BTreeMap<String, String>) -> Option<String> {
+    if is_video(path) {
+        Some(path.file_stem()?.to_str()?.to_owned())
+    } else {
+        subtitle_name(path, aliases).map(|(stem, _)| stem)
+    }
+}
+
+fn same_language_family(left: &str, right: &str) -> bool {
+    left == right
+        || (!left.contains('-') && right.split('-').next() == Some(left))
+        || (!right.contains('-') && left.split('-').next() == Some(right))
+}
+
+fn same_local_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+#[cfg(test)]
+fn existing_coverage(
+    path: &Path,
+    aliases: &BTreeMap<String, String>,
+) -> Result<ExistingCoverage, String> {
+    existing_coverage_with_hints(path, aliases, &[])
+}
+
+fn existing_coverage_with_hints(
+    path: &Path,
+    aliases: &BTreeMap<String, String>,
+    hints: &[SubtitleSourceHint],
+) -> Result<ExistingCoverage, String> {
+    let parent = path.parent().ok_or("Media path has no parent directory")?;
+    let stem = media_stem(path, aliases).ok_or("Media filename is unavailable")?;
+    let mut targets = BTreeSet::new();
+    let mut sidecars = BTreeSet::new();
+    let mut bytes = 0u64;
+    for (ordinal, entry) in fs::read_dir(parent)
+        .map_err(|_| "Subtitle coverage directory is unavailable")?
+        .enumerate()
+    {
+        if ordinal >= MAX_COVERAGE_ENTRIES {
+            return Err("Subtitle coverage directory exceeds the safe entry limit".into());
+        }
+        let entry = entry.map_err(|_| "Subtitle coverage directory could not be inspected")?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| "Subtitle coverage file could not be inspected")?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let candidate = entry.path();
+        let Some(extension) = extension(&candidate) else {
+            continue;
+        };
+        if extension != "srt" && !SIDECAR_EXTENSIONS.contains(&extension.as_str()) {
+            continue;
+        }
+        let Some((candidate_stem, mut target)) = subtitle_name(&candidate, aliases) else {
+            continue;
+        };
+        if let Some(hint) = hints
+            .iter()
+            .find(|hint| same_local_path(&hint.path, &candidate))
+        {
+            target = hint.target.clone();
+        }
+        #[cfg(windows)]
+        let matching = candidate_stem.eq_ignore_ascii_case(&stem);
+        #[cfg(not(windows))]
+        let matching = candidate_stem == stem;
+        if !matching {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&candidate)
+            .map_err(|_| "Subtitle coverage file is unavailable")?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+        if extension != "srt" {
+            sidecars.insert((target, candidate));
+            if sidecars.len() > MAX_TRACKS {
+                return Err("Subtitle coverage contains too many matching sidecars".into());
+            }
+            continue;
+        }
+        if metadata.len() > MAX_COVERAGE_FILE_BYTES {
+            continue;
+        }
+        bytes = bytes.saturating_add(metadata.len());
+        if bytes > MAX_COVERAGE_TOTAL_BYTES {
+            return Err("Subtitle coverage inspection exceeds the safe byte limit".into());
+        }
+        if validate_srt(&candidate).is_ok()
+            && fs::symlink_metadata(&candidate).is_ok_and(|after| {
+                after.is_file()
+                    && !after.file_type().is_symlink()
+                    && after.len() == metadata.len()
+                    && after.modified().ok() == metadata.modified().ok()
+            })
+        {
+            targets.insert(target);
+            if targets.len() > MAX_TRACKS {
+                return Err("Subtitle coverage contains too many language variants".into());
+            }
+        }
+    }
+    Ok(ExistingCoverage {
+        targets: targets.into_iter().collect(),
+        sidecars: sidecars.into_iter().collect(),
+    })
+}
+
 fn wants(language: &str, selected: &[String], aliases: &BTreeMap<String, String>) -> bool {
+    let actual=target_language(language,aliases);
     selected.iter().any(|v| {
-        v == "*"
-            || short_language(language, aliases) == *v
-            || (!v.contains('-')
-                && short_language(language, aliases).split('-').next() == Some(v.as_str()))
+        if v=="*" {return true;}
+        let requested=target_language(v,aliases);
+        actual==requested || (!requested.contains('-') && actual.split('-').next()==Some(requested.as_str()))
     })
 }
 pub(crate) fn is_image_format(format: &str) -> bool {
@@ -2253,6 +2893,428 @@ fn remove_empty_cues(path: &Path) -> Result<usize, String> {
 mod tests {
     use super::*;
 
+    const COVERAGE_SRT: &[u8] = b"1\n00:00:00,000 --> 00:00:01,000\nDisposable subtitle fixture\n";
+
+    fn target(language: &str, forced: bool, hi: bool) -> SubtitleTarget {
+        SubtitleTarget {
+            language: language.into(),
+            forced,
+            hi,
+        }
+    }
+
+    fn coverage_fixture(directory: &Path, tracks: Vec<Track>) -> (Converter, PathBuf) {
+        let media = directory.join("movie.mkv");
+        fs::write(&media, b"disposable media").unwrap();
+        let mut converter =
+            Converter::new(vec![directory.to_path_buf()], directory.join("state.json")).unwrap();
+        converter.min_age = Duration::ZERO;
+        converter.enable_ocr = true;
+        converter.ffprobe = directory.join("must-not-probe");
+        converter.mkvmerge = directory.join("must-not-identify");
+        converter.seconv = directory.join("must-not-ocr");
+        converter.text_fixture = Some(COVERAGE_SRT);
+        let media = Converter::safe_path(&media.to_string_lossy(), &converter.roots).unwrap();
+        converter.metadata.lock().unwrap().insert(
+            &media.to_string_lossy(),
+            fingerprint_json(&fingerprint(&media).unwrap()),
+            json!(tracks),
+        );
+        (converter, media)
+    }
+
+    fn fixture_track(number: u64, language: &str, image: bool, forced: bool, hi: bool) -> Track {
+        Track {
+            number: json!(number),
+            native_number: Some(number.to_string()),
+            stream_index: Some(number),
+            language: language.into(),
+            format: if image { "VobSub".into() } else { "ASS".into() },
+            forced,
+            hi,
+        }
+    }
+
+    #[test]
+    fn existing_en_fr_ar_and_unknown_outputs_skip_authoritative_targets_before_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut converter, media) = coverage_fixture(dir.path(), Vec::new());
+        for language in ["en", "fr", "ar"] {
+            fs::write(
+                dir.path().join(format!("movie.{language}.srt")),
+                COVERAGE_SRT,
+            )
+            .unwrap();
+        }
+        for number in 1..=30 {
+            fs::write(
+                dir.path().join(format!("movie.track{number}.und.srt")),
+                COVERAGE_SRT,
+            )
+            .unwrap();
+        }
+        converter.metadata.lock().unwrap().compact(|_| false);
+        converter
+            .set_targets(vec![
+                target("eng", false, false),
+                target("fre", false, false),
+                target("ara", false, false),
+            ])
+            .unwrap();
+        let mut events = Vec::new();
+        let result = converter
+            .scan_workload(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                Workload::All,
+                true,
+                &AtomicBool::new(false),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert_eq!(result["cached"], 1);
+        assert_eq!(result["failed"], 0);
+        assert!(events.iter().any(|event| event["status"] == "skipped"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["status"] == "ocr" || event["status"] == "extracting")
+        );
+        assert_eq!(
+            converter.file_processing(&media.to_string_lossy())["coverage"]["status"],
+            "already_covered"
+        );
+        assert_eq!(converter.pipeline_counts()["generated_srt_count"], 0);
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| extension(&entry.path()).as_deref() == Some("srt"))
+                .count(),
+            33
+        );
+        converter.set_targets(Vec::new()).unwrap();
+        assert_eq!(
+            converter
+                .scan(
+                    std::slice::from_ref(&media),
+                    &["*".into()],
+                    false,
+                    &AtomicBool::new(false),
+                    &mut |_| {}
+                )
+                .unwrap()["cached"],
+            1
+        );
+    }
+
+    #[test]
+    fn coverage_is_variant_region_alias_and_movie_specific() {
+        let dir = tempfile::tempdir().unwrap();
+        let (converter, media) = coverage_fixture(dir.path(), Vec::new());
+        for name in [
+            "movie.ENG-US.SRT",
+            "movie.fre.forced.srt",
+            "movie.ar.SDH.srt",
+            "movie.pt-PT.srt",
+            "movie2.de.srt",
+            "movie.track30.und.srt",
+        ] {
+            fs::write(dir.path().join(name), COVERAGE_SRT).unwrap();
+        }
+        fs::write(dir.path().join("movie.ja.srt"), b"").unwrap();
+        fs::write(dir.path().join("movie.de.srt"), b"invalid subtitle").unwrap();
+        let requested = vec![
+            target("en", false, false),
+            target("fr", false, false),
+            target("fr", true, false),
+            target("ar", false, false),
+            target("ar", false, true),
+            target("por-BR", false, false),
+            target("de", false, false),
+            target("ja", false, false),
+        ];
+        let plan = converter
+            .conversion_coverage(&media, &json!([]), &requested)
+            .unwrap();
+        let missing: Vec<SubtitleTarget> =
+            serde_json::from_value(plan["missing_targets"].clone()).unwrap();
+        assert!(!missing.contains(&target("en", false, false)));
+        assert!(!missing.contains(&target("fr", true, false)));
+        assert!(!missing.contains(&target("ar", false, true)));
+        for expected in [
+            target("fr", false, false),
+            target("ar", false, false),
+            target("pt-br", false, false),
+            target("de", false, false),
+            target("ja", false, false),
+        ] {
+            assert!(missing.contains(&expected));
+        }
+        assert_eq!(plan["status"], "no_available_conversion");
+    }
+
+    #[test]
+    fn wildcard_unknown_tracks_are_skipped_but_explicit_unknown_language_remains_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracks = (1..=30)
+            .map(|number| fixture_track(number, "und", false, false, false))
+            .collect();
+        let (mut converter, media) = coverage_fixture(dir.path(), tracks);
+        let mut events = Vec::new();
+        let result = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert_eq!(result["failed"], 0);
+        assert!(!events.iter().any(|event| event["status"] == "extracting"));
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| extension(&entry.path()).as_deref() == Some("srt"))
+                .count(),
+            0
+        );
+        let result = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["und".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(result["converted"], 1);
+        assert!(dir.path().join("movie.track1.und.srt").is_file());
+        assert!(!dir.path().join("movie.track2.und.srt").exists());
+    }
+
+    #[test]
+    fn missing_language_uses_one_text_track_and_preserves_forced_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracks = vec![
+            fixture_track(1, "eng", true, false, false),
+            fixture_track(2, "eng", false, false, false),
+            fixture_track(3, "eng", false, false, false),
+            fixture_track(4, "eng", false, true, false),
+        ];
+        let (mut converter, media) = coverage_fixture(dir.path(), tracks);
+        converter
+            .set_targets(vec![target("en", false, false), target("en", true, false)])
+            .unwrap();
+        let mut events = Vec::new();
+        let result = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["en".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert_eq!(result["failed"], 0);
+        assert!(dir.path().join("movie.en.srt").is_file());
+        assert!(dir.path().join("movie.en.forced.srt").is_file());
+        assert!(!dir.path().join("movie.track2.en.srt").exists());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["status"] == "extracting")
+                .count(),
+            2
+        );
+        assert!(!events.iter().any(|event| event["status"] == "ocr"));
+    }
+
+    #[test]
+    fn hindi_language_is_distinct_from_the_hearing_impaired_suffix() {
+        let aliases = language_aliases();
+        for (name, language, hi, forced) in [
+            ("movie.hi.srt", "hi", false, false),
+            ("movie.hi.forced.srt", "hi", false, true),
+            ("movie.hi.hi.srt", "hi", true, false),
+            ("movie.en.hi.srt", "en", true, false),
+            ("movie.en.forced.hi.srt", "en", true, true),
+        ] {
+            let (_, parsed) = subtitle_name(Path::new(name), &aliases).unwrap();
+            assert_eq!(parsed, target(language, forced, hi), "{name}");
+            assert_eq!(filename_language(Path::new(name), &aliases), language);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (converter, media) = coverage_fixture(dir.path(), Vec::new());
+        fs::write(dir.path().join("movie.hi.ass"), "Hindi source").unwrap();
+        let plan = converter
+            .conversion_coverage(&media, &json!([]), &[target("hi", false, false)])
+            .unwrap();
+        assert_eq!(plan["status"], "needed");
+        fs::write(dir.path().join("movie.hi.srt"), COVERAGE_SRT).unwrap();
+        let plan = converter
+            .conversion_coverage(&media, &json!([]), &[target("hi", false, false)])
+            .unwrap();
+        assert_eq!(plan["status"], "already_covered");
+    }
+
+    #[test]
+    fn bazarr_regional_filename_aliases_supply_and_cover_profile_targets() {
+        for (alias, language) in [
+            ("pb", "pt-br"),
+            ("pob", "pt-br"),
+            ("zt", "zh-tw"),
+            ("zht", "zh-tw"),
+            ("ea", "es-mx"),
+            ("spl", "es-mx"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (converter, media) = coverage_fixture(dir.path(), Vec::new());
+            fs::write(
+                dir.path().join(format!("movie.{alias}.ass")),
+                "Regional source",
+            )
+            .unwrap();
+            let wanted = [target(language, false, false)];
+            let plan = converter
+                .conversion_coverage(&media, &json!([]), &wanted)
+                .unwrap();
+            assert_eq!(plan["status"], "needed", "{alias}");
+            fs::write(dir.path().join(format!("movie.{alias}.srt")), COVERAGE_SRT).unwrap();
+            let plan = converter
+                .conversion_coverage(&media, &json!([]), &wanted)
+                .unwrap();
+            assert_eq!(plan["status"], "already_covered", "{alias}");
+        }
+    }
+
+    #[test]
+    fn sidecar_coverage_and_available_paths_use_matching_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut converter, media) = coverage_fixture(dir.path(), Vec::new());
+        let source = dir.path().join("movie.fre.ASS");
+        fs::write(&source, b"disposable ASS source").unwrap();
+        fs::write(dir.path().join("othermovie.en.ass"), b"unrelated").unwrap();
+        let plan = converter
+            .conversion_coverage(&media, &json!([]), &[target("fr", false, false)])
+            .unwrap();
+        assert_eq!(plan["status"], "needed");
+        assert_eq!(plan["available_paths"].as_array().unwrap().len(), 1);
+        fs::write(dir.path().join("movie.fr.srt"), COVERAGE_SRT).unwrap();
+        converter
+            .set_targets(vec![target("fr", false, false)])
+            .unwrap();
+        let result = converter
+            .scan(
+                &[source],
+                &["fr".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(result["cached"], 1);
+        assert!(!dir.path().join("movie.fre.srt").exists());
+    }
+
+    #[test]
+    fn coverage_rechecks_before_ocr_and_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracks = vec![
+            fixture_track(1, "eng", false, false, false),
+            fixture_track(2, "fra", true, false, false),
+        ];
+        let (mut converter, media) = coverage_fixture(dir.path(), tracks);
+        converter
+            .set_targets(vec![target("en", false, false), target("fr", false, false)])
+            .unwrap();
+        let mut events = Vec::new();
+        let result = converter
+            .scan(
+                std::slice::from_ref(&media),
+                &["*".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |event| {
+                    if event["status"] == "track_complete" {
+                        fs::write(dir.path().join("movie.eng.srt"), COVERAGE_SRT).unwrap();
+                        fs::write(dir.path().join("movie.fra.srt"), COVERAGE_SRT).unwrap();
+                    }
+                    events.push(event);
+                },
+            )
+            .unwrap();
+        assert_eq!(result["failed"], 0);
+        assert!(!events.iter().any(|event| event["status"] == "ocr"));
+        assert!(!dir.path().join("movie.en.srt").exists());
+        assert!(!dir.path().join("movie.fr.srt").exists());
+        assert_eq!(converter.pipeline_counts()["generated_srt_count"], 0);
+    }
+
+    #[test]
+    fn force_requires_explicit_tracks_and_file_workers_do_not_inherit_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut converter, media) = coverage_fixture(
+            dir.path(),
+            vec![fixture_track(1, "eng", false, false, false)],
+        );
+        assert!(converter.force_covered_tracks(true).is_err());
+        converter
+            .set_targets(vec![target("por-BR", false, false)])
+            .unwrap();
+        assert_eq!(
+            converter.targets().unwrap(),
+            &[target("pt-br", false, false)]
+        );
+        let worker = converter.file_worker(&media).unwrap();
+        assert!(worker.targets().is_none());
+        assert!(!worker.force_covered());
+    }
+
+    #[test]
+    fn coverage_rejects_symlinks_and_enforces_directory_and_byte_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (converter, media) = coverage_fixture(dir.path(), Vec::new());
+        let other = dir.path().join("other.en.srt");
+        fs::write(&other, COVERAGE_SRT).unwrap();
+        let link = dir.path().join("movie.en.srt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&other, &link).is_ok();
+        #[cfg(unix)]
+        let linked = true;
+        if linked {
+            assert!(
+                !existing_coverage(&media, &converter.language_aliases)
+                    .unwrap()
+                    .covers(&target("en", false, false))
+            );
+        }
+        let huge = dir.path().join("movie.fr.srt");
+        fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_COVERAGE_FILE_BYTES + 1)
+            .unwrap();
+        assert!(
+            !existing_coverage(&media, &converter.language_aliases)
+                .unwrap()
+                .covers(&target("fr", false, false))
+        );
+        for number in 0..MAX_COVERAGE_ENTRIES {
+            fs::write(dir.path().join(format!("unrelated-{number}.fixture")), b"").unwrap();
+        }
+        assert!(
+            existing_coverage(&media, &converter.language_aliases)
+                .err()
+                .unwrap()
+                .contains("entry limit")
+        );
+    }
+
     #[test]
     fn language_normalization_handles_all_aliases_and_rejects_invalid_codes() {
         assert_eq!(
@@ -2570,6 +3632,7 @@ mod tests {
             .unwrap();
         assert_eq!(second["cached"], 1);
         converter.select_tracks(vec![3]).unwrap();
+        converter.force_covered_tracks(true).unwrap();
         let third = converter
             .scan(
                 std::slice::from_ref(&media),
@@ -2583,6 +3646,7 @@ mod tests {
         assert!(dir.path().join("selected.track3.en.srt").is_file());
         assert_eq!(converter.pipeline_counts()["generated_srt_count"], 2);
         converter.selected_tracks = None;
+        converter.force_covered_tracks(false).unwrap();
         let legacy = converter
             .scan(
                 std::slice::from_ref(&media),

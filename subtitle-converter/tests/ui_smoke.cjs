@@ -29,7 +29,7 @@ async function main() {
     page.on('pageerror', error => errors.push(error.message));
     const now = Math.floor(Date.now() / 1000);
     const roots = [{ id: 'movies', label: 'Movies', path: '/media/movies' }, { id: 'tv', label: 'Television', path: '/media/tv' }];
-    const items = [
+    let items = [
       { name: 'Example movie.mkv', path: '/media/movies/Example movie.mkv', root_id: 'movies', type: 'video', tracks: [{ id: 3, language: 'en', codec: 'SubStationAlpha' }, { id: 4, language: 'fr', codec: 'PGS', image: true }], processing: { failed: true, last_error: 'Track 3: output has an invalid timestamp', pending_ocr: true } },
       { name: 'Example show S01E01.mkv', path: '/media/tv/Example show S01E01.mkv', root_id: 'tv', type: 'video', tracks: [{ id: 2, language: 'en', codec: 'SRT' }], processing: { generated_srt_count: 1 } }
     ];
@@ -37,6 +37,7 @@ async function main() {
       { id: 'failed-1', kind: 'extract', status: 'completed_with_errors', created: now, finished: now, paths: [items[0].path], summary: { failed: 1 }, file_errors: [{ message: items[0].processing.last_error, count: 1, examples: [items[0].name] }], failed_paths: [items[0].path] },
       { id: 'backup-1', kind: 'backup', status: 'completed', created: now - 60, summary: {} }
     ];
+    let inventorySource = 'filesystem', inventoryAuthority = { status: 'ready' }, revision = 1;
     let settings = { languages: ['*'], permissions: { ocr: true }, integrations: {} };
     let allocation = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1, paused: false };
     const remote = { enabled: true, nodes: [{ id: 'node-1', name: 'Studio GPU', resource: 'gpu', last_seen_seconds: 2, active: 1, status: 'busy' }], pending: 0, active: 1 };
@@ -50,8 +51,8 @@ async function main() {
         if (endpoint === '/api/settings') settings = { ...settings, ...body };
       }
       if (endpoint === '/api/session') value = { csrf_token: 'disposable-ui-fixture' };
-      else if (endpoint === '/api/status') value = { edition: 'cuda', version: 'fixture', roots, running: null, queue: [], history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: 1, partial: true }, pipeline: { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true } };
-      else if (endpoint === '/api/inventory') value = { items, updated: now, state_revision: 1, truncated: true };
+      else if (endpoint === '/api/status') value = { edition: 'cuda', version: 'fixture', roots, running: null, queue: [], history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline: { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true } };
+      else if (endpoint === '/api/inventory') value = { items, updated: now, state_revision: revision, truncated: inventorySource !== 'bazarr', source: inventorySource, authority: inventoryAuthority };
       else if (endpoint === '/api/settings') value = settings;
       else if (endpoint === '/api/workers') value = workerData();
       else if (endpoint === '/api/nodes') value = remote;
@@ -140,8 +141,79 @@ async function main() {
       await page.setViewportSize({ width, height: 900 });
       assert.equal(await page.evaluate(() => document.body.scrollWidth), width, `library fits ${width}px viewport`);
     }
+    // Bazarr requirements take precedence over historical failures and wildcard tracks.
+    const target = (language, forced = false, hi = false) => ({ language, forced, hi });
+    const wanted = [target('en'), target('fr'), target('ar')];
+    const covered = {
+      name: 'Covered movie.mkv', path: '/media/movies/Covered movie.mkv', root_id: 'movies', type: 'video',
+      wanted_targets: wanted, missing_targets: [], missing_srt: false,
+      coverage: { status: 'covered', reason: 'Valid SRT already covers every wanted language', existing_targets: wanted, missing_targets: [] },
+      tracks: [{ id: 3, language: 'en', codec: 'PGS', image: true }, ...Array.from({ length: 27 }, (_, i) => ({ id: i + 4, language: 'und', codec: 'PGS', image: true }))],
+      processing: { failed: true, pending_ocr: true, last_error: 'Historical extraction failure' }
+    };
+    const needed = {
+      name: 'Missing French.mkv', path: '/media/movies/Missing French.mkv', root_id: 'movies', type: 'video',
+      wanted_targets: wanted, missing_targets: [target('fr')], missing_srt: true,
+      coverage: { status: 'needs_conversion', reason: 'French SRT is missing', existing_targets: [target('en'), target('ar')], missing_targets: [target('fr')] },
+      tracks: [{ id: 2, language: 'en', codec: 'SRT' }, { id: 3, language: 'fr', codec: 'ASS' }, { id: 4, language: 'fr', codec: 'ASS', forced: true }, { id: 5, language: 'und', codec: 'PGS', image: true }]
+    };
+    items = [covered, needed]; inventorySource = 'bazarr'; revision++;
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-source').getByText('Bazarr', { exact: true }).waitFor();
+    await page.locator('#inventory-filter').selectOption('covered');
+    assert.equal(await page.locator('#inventory-body tr').count(), 1);
+    assert.match(await page.locator('#inventory-body').innerText(), /Already covered/);
+    assert.doesNotMatch(await page.locator('#inventory-body').innerText(), /Historical extraction failure/);
+    await page.locator('#inventory-body .row-action').first().click();
+    assert.equal(await page.locator('#track-drawer-list input:checked').count(), 0);
+    assert.match(await page.locator('#track-drawer-hint').innerText(), /No extraction needed/);
+    assert(await page.locator('#convert-selected-tracks').isDisabled());
+    assert(await page.locator('#track-drawer-list input').first().isDisabled());
+    await page.locator('#force-covered-tracks').check();
+    await page.locator('#track-drawer-list input').first().check();
+    await page.locator('#convert-selected-tracks').click();
+    await page.locator('#track-drawer-backdrop').waitFor({ state: 'hidden' });
+    assert.equal(writes.at(-1).body.force, true);
+    assert.deepEqual(writes.at(-1).body.track_ids, [3], 'force targets one deliberate track');
+    await page.locator('#inventory-filter').selectOption('needed');
+    await page.locator('#inventory-body .row-action').first().click();
+    // One-job English selection from earlier must be reset to profile requirements.
+    assert.equal(await page.locator('#track-drawer-list input:checked').count(), 0);
+    await page.getByRole('button', { name: 'Close track details' }).click();
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
+    await page.locator('[data-open-languages="quick"]').last().click();
+    await page.locator('.all-option input').check();
+    await page.locator('#apply-languages').click();
+    await page.getByRole('button', { name: 'Library', exact: true }).click();
+    await page.locator('#inventory-body .row-action').first().click();
+    assert.equal(await page.locator('#track-drawer-list input:checked').count(), 1, 'only missing full French target selected');
+    assert(await page.locator('#track-drawer-list input').nth(1).isChecked());
+    assert(!(await page.locator('#track-drawer-list input').nth(2).isChecked()), 'forced French does not cover full French');
+    assert(!(await page.locator('#track-drawer-list input').nth(3).isChecked()), 'untagged track not selected automatically');
+    await page.getByRole('button', { name: 'Close track details' }).click();
+    await page.locator('#inventory-filter').selectOption('all');
+    if (output) await page.screenshot({ path: path.join(output, 'bazarr-library-desktop.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
+    inventoryAuthority = { status: 'refresh_pending' }; revision++;
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-authority').getByText(/indexing or inventory refresh is still pending/).waitFor();
+    assert(await page.locator('[data-action="scan"]').first().isDisabled());
+    assert(await page.locator('[data-action="inspect"]').first().isEnabled(), 'sync remains available');
+    inventoryAuthority = { status: 'ready' }; revision++;
+    needed.missing_targets = []; needed.missing_srt = false;
+    needed.coverage = { status: 'covered', reason: 'Bazarr confirms the new SRT', existing_targets: wanted, missing_targets: [] };
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-filter').selectOption('covered');
+    await page.waitForFunction(() => document.querySelectorAll('#inventory-body tr').length === 2);
+    assert(await page.locator('[data-action="scan"]').first().isEnabled());
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
+    await page.locator('#quick-form').getByRole('button', { name: 'Review conversion' }).click();
+    assert.match(await page.locator('#conversion-scope').innerText(), /Bazarr profile/);
+    await page.locator('#confirm-conversion').click();
+    await page.locator('#conversion-modal').waitFor({ state: 'hidden' });
+    assert.equal(writes.at(-1).body.include_ocr, true, 'manual conversion requests available OCR slots');
     assert.deepEqual(errors, [], 'browser must have no uncaught errors');
-    console.log('PASS Subforge isolated desktop/mobile UI, language isolation, scope review, failure triage, workers, remote-node rendering, and keyboard regressions');
+    console.log('PASS Subforge isolated desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, keyboard, and Bazarr coverage/authority regressions');
     await context.close();
   } finally {
     if (browser) await browser.close();

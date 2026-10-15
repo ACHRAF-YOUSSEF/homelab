@@ -590,6 +590,11 @@ h2 { font-size: 17px; }
 .inventory-scope-note:empty { display: none; }
 .inventory-table td { padding: 13px 16px; font-size: 13px; }
 .inventory-table .file-name { white-space: normal; overflow-wrap: anywhere; }
+@media (min-width: 1100px) {
+  .inventory-table .file-cell { width: 28%; }
+  .inventory-table .processing-cell { width: 20%; }
+  .inventory-table .track-count { width: 10%; }
+}
 .file-cell-copy { display: grid; min-width: 0; gap: 4px; }
 .file-cell-copy small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .processing-cell { min-width: 132px; }
@@ -683,3 +688,10 @@ h2 { font-size: 17px; }
 .root-dot { background: var(--accent); box-shadow: 0 0 0 3px #203551; }
 .attention-list button[data-attention="pending"].has-issues { background: #302D25; }
 .attention-list button[data-attention="pending"].has-issues strong { color: #F8D18D; }
+
+.inventory-source { display: inline-flex; margin-left: 8px; padding: 3px 7px; border-radius: 5px; background: var(--surface-raised); color: var(--muted); font-size: 12px; font-weight: 500; }
+.inventory-authority { margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 13px; line-height: 1.6; }
+.inventory-authority.authority-error { border-color: #805665; color: #FFD0D9; background: #322431; }
+.coverage-existing { color: #91E9B4 !important; background: #15362C; border-color: #34644C; }
+.coverage-missing { color: #F8D18D !important; background: #302D25; border-color: #695B3A; }
+.drawer-override { margin: 0; padding: 12px 18px; border-bottom: 1px solid var(--line); font-size: 13px; }

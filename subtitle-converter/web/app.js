@@ -7,6 +7,8 @@
     ['af','Afrikaans'],['sq','Albanian'],['am','Amharic'],['hy','Armenian'],['az','Azerbaijani'],['eu','Basque'],['bn','Bengali'],['bs','Bosnian'],['bg','Bulgarian'],['my','Burmese'],['ca','Catalan'],['hr','Croatian'],['cs','Czech'],['da','Danish'],['et','Estonian'],['fi','Finnish'],['el','Greek'],['he','Hebrew'],['hi','Hindi'],['hu','Hungarian'],['id','Indonesian'],['ga','Irish'],['is','Icelandic'],['kk','Kazakh'],['km','Khmer'],['lo','Lao'],['lv','Latvian'],['lt','Lithuanian'],['mk','Macedonian'],['ms','Malay'],['no','Norwegian'],['fa','Persian'],['pl','Polish'],['ro','Romanian'],['sr','Serbian'],['sk','Slovak'],['sl','Slovenian'],['sw','Swahili'],['sv','Swedish'],['th','Thai'],['uk','Ukrainian'],['ur','Urdu'],['vi','Vietnamese']
   ];
   const state = { csrf: '', status: null, settings: null, selectedLanguages: ['*'], draftLanguages: ['*'], languageTarget: 'quick', inventory: [], selectedFile: null, currentPage: 'overview', lastToast: 0, pollBusy: false };
+  state.inventorySource='filesystem';
+  state.inventoryAuthority={status:'ready'};
   state.defaultLanguages=['*'];
   state.quickLanguagesChanged=false;
   state.settingsDirty=false;
@@ -73,6 +75,33 @@
     const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');
     const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d',paths[type]||paths.file);svg.append(path);return svg;
   };
+  const usesBazarr = () => state.inventorySource==='bazarr'||state.settings?.integrations?.bazarr?.enabled===true;
+  const targetMatches = (wanted, candidate) => {
+    const a=languageCode(wanted.language),b=languageCode(candidate.language);
+    return (a===b||!a.includes('-')&&a===b.split('-')[0])&&!!wanted.forced===!!candidate.forced&&!!wanted.hi===!!candidate.hi;
+  };
+  const coverageState = row => {
+    const value=row.coverage?.status;
+    if(['covered','already_covered'].includes(value))return 'covered';
+    if(['needs_conversion','needed'].includes(value))return 'needed';
+    if(['no_convertible_source','no_available_conversion'].includes(value))return 'unavailable';
+    if(!value&&row.missing_srt===false&&row.wanted_targets?.length)return 'covered';
+    return 'unknown';
+  };
+  const rowMissingTargets = row => row.coverage?.missing_targets||row.missing_targets||[];
+  const rowExistingTargets = row => row.coverage?.existing_targets||row.existing_targets||[];
+  const targetLabel = target => `${languageCode(target.language).toUpperCase()}${target.forced?' forced':''}${target.hi?' SDH':''}`;
+  const renderInventoryAuthority = () => {
+    const bazarr=usesBazarr(),authority=state.inventoryAuthority||{},status=bazarr&&state.inventorySource!=='bazarr'?'stale':authority.status||'ready';
+    setText($('#inventory-source'),bazarr?'Bazarr':'Filesystem');
+    const banner=$('#inventory-authority');banner.classList.toggle('hidden',!bazarr);
+    banner.classList.toggle('authority-error',status!=='ready');
+    setText(banner,bazarr?({ready:'Bazarr profiles define the wanted languages. Valid SRT coverage is verified before conversion.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:'Subtitles were published; Bazarr indexing or inventory refresh is still pending.',reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(authority.error?` ${authority.error}`:''):'');
+    $$('[data-action="inspect"]').forEach(button=>setText(button,bazarr?'Sync Bazarr inventory':'Inspect media'));
+    const blocked=bazarr&&status!=='ready';
+    $$('[data-action="scan"],#quick-form button[type="submit"]').forEach(button=>{button.disabled=blocked;button.title=blocked?'Sync Bazarr before starting automatic conversion':'';});
+    updateLanguageLabels();
+  };
   const trackFormat = track => {
     const codec=String(track.codec||track.codec_id||track.format||'').toLowerCase();
     if(/pgs|hdmv|sup|vobsub|dvd|dvb/.test(codec)||track.image===true||track.kind==='image')return {label:/pgs|hdmv|sup/.test(codec)?'PGS (img)':'VobSub (img)',style:'image',image:true};
@@ -87,8 +116,8 @@
     const count=key=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
     setText($('#pipeline-roots'),count('root_count'));setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));setText($('#pipeline-convert'),count('pending_ocr_files'));
     setText($('[data-pipeline-stage="convert"] .stage-unit'),'files in conversion state');
-    setText($('#pipeline-status'),state.inventoryUpdated?`Inspected ${fmtDate(state.inventoryUpdated)}`:'No inventory yet');
-    setText($('#snapshot-note'),`${state.inventoryTruncated?'Partial inventory: first 2,000 media items. Inspect a smaller folder for more coverage.':'Saved inventory; inspect media to refresh it.'} Generated subtitles count tracked SRT outputs across conversion state, excluding external SRT files.`);
+    setText($('#pipeline-status'),state.inventoryUpdated?`${usesBazarr()?'Synced from Bazarr':'Inspected'} ${fmtDate(state.inventoryUpdated)}`:'No inventory yet');
+    setText($('#snapshot-note'),`${usesBazarr()?'Bazarr media inventory and profile requirements. Existing external SRT coverage is shown per file.':'Saved filesystem inventory; inspect media to refresh it.'}${state.inventoryTruncated?' The server reports a bounded partial inventory.':''} Generated subtitles count outputs written by Subforge separately from external SRT coverage.`);
     setText($('#attention-pending'),count('pending_ocr_files'));setText($('#attention-failed'),count('failed_files'));setText($('#attention-unreachable'),count('unreachable_roots'));
     setText($('#attention-summary'),'Failures and OCR counts cover saved conversion state. Library results cover the saved inventory snapshot.');
     for(const [key,value] of [['pending',data.pending_ocr_files],['failed',data.failed_files],['paths',data.unreachable_roots]]){const button=$(`[data-attention="${key}"]`);button.classList.toggle('has-issues',Number(value)>0);button.classList.toggle('is-clear',value===0);}
@@ -167,7 +196,7 @@
     setText($('#stat-roots'),(roots || []).length);
   };
   const updateLanguageLabels = () => {
-    setText($('#quick-languages'),languageDescription(state.selectedLanguages));
+    setText($('#quick-languages'),usesBazarr()&&isAll(state.selectedLanguages)?'Bazarr profile languages':languageDescription(state.selectedLanguages));
     setText($('#settings-languages'),languageDescription(state.defaultLanguages));
     setText($('#stat-languages'),isAll(state.selectedLanguages)?'All':state.selectedLanguages.length);
   };
@@ -239,9 +268,9 @@
   };
   const setConnection = good => { $('#connection-dot').classList.toggle('offline',!good); setText($('#connection-text'),good ? 'Service connected' : 'Service unavailable'); };
   const loadInventory = async summary => {
-    if(state.inventoryBusy || state.inventoryLoaded && state.inventoryUpdated===summary?.updated&&state.inventoryRevision===summary?.state_revision)return;
+    if(state.inventoryBusy)return;if(summary?.authority)state.inventoryAuthority=summary.authority;if(summary?.source)state.inventorySource=summary.source;renderInventoryAuthority();if(state.inventoryLoaded&&state.inventoryUpdated===summary?.updated&&state.inventoryRevision===summary?.state_revision)return;
     state.inventoryBusy=true;
-    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryRevision=data.state_revision;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;renderInventory();}
+    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryRevision=data.state_revision;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;state.inventorySource=data.source||'filesystem';state.inventoryAuthority=data.authority||{status:'ready'};renderInventoryAuthority();renderInventory();}
     catch(error){notify(`Could not load library inventory: ${error.message}`,'error');}
     finally{state.inventoryBusy=false;}
   };
@@ -249,7 +278,7 @@
     try {sessionStorage.setItem('subforge.inventory-view',JSON.stringify({page:state.inventoryPage,pageSize:state.inventoryPageSize,search:$('#inventory-search').value,root:$('#inventory-root').value,filter:$('#inventory-filter').value}));}catch{}
   };
   const restoreInventoryView = () => {
-    try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:25;$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
+    try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:25;$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','needed','covered','unavailable','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
   };
   const pollStatus = async () => {
     if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
@@ -257,8 +286,8 @@
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
-  const startJob = async ({kind,rootIds=[],paths=[],languages: selected=state.selectedLanguages,retry=false,trackIds,includeOcr}) => {
-    const payload={kind,root_ids:rootIds,paths,languages:selected,retry};if(trackIds!==undefined)payload.track_ids=trackIds;if(includeOcr!==undefined)payload.include_ocr=includeOcr;
+  const startJob = async ({kind,rootIds=[],paths=[],languages: selected=state.selectedLanguages,retry=false,trackIds,includeOcr,force=false}) => {
+    const payload={kind,root_ids:rootIds,paths,languages:selected,retry};if(trackIds!==undefined)payload.track_ids=trackIds;if(includeOcr!==undefined)payload.include_ocr=includeOcr;if(force)payload.force=true;
     try { const result=await api('/api/jobs',{method:'POST',body:JSON.stringify(payload)}); notify(result.message || 'Job queued.'); await pollStatus(); return result; }
     catch (error) { notify(error.message,'error'); return null; }
   };
@@ -267,29 +296,30 @@
     const body=$('#inventory-body');
     const filter=$('#inventory-filter').value, root=$('#inventory-root').value, query=$('#inventory-search').value.trim().toLowerCase();
     let rows=state.inventory.filter(row=>!root || row.root_id===root);
+    if(['needed','covered','unavailable'].includes(filter))rows=rows.filter(row=>coverageState(row)===filter);
     if (filter==='video'||filter==='sidecar') rows=rows.filter(row=>row.type===filter);
-    if (filter==='issues') rows=rows.filter(row=>row.error || row.processing?.failed || row.processing?.pending_ocr || row.type==='video' && !(row.tracks || []).length);
+    if (filter==='issues') rows=rows.filter(row=>coverageState(row)!=='covered'&&(row.error || row.processing?.failed || row.processing?.pending_ocr || row.type==='video' && !(row.tracks || []).length));
     if(filter==='has_tracks')rows=rows.filter(row=>row.tracks?.length);
-    if(filter==='pending')rows=rows.filter(row=>row.processing?.pending_ocr);
-    if(filter==='failed')rows=rows.filter(row=>row.processing?.failed||row.error);
-    if(filter==='ready')rows=rows.filter(row=>row.processing?.generated_srt_count>0);
+    if(filter==='pending')rows=rows.filter(row=>coverageState(row)!=='covered'&&row.processing?.pending_ocr);
+    if(filter==='failed')rows=rows.filter(row=>coverageState(row)!=='covered'&&(row.processing?.failed||row.error));
+    if(filter==='ready')rows=rows.filter(row=>coverageState(row)==='covered'||row.processing?.generated_srt_count>0);
     if(filter==='metadata')rows=rows.filter(row=>row.metadata_pending);
     if (query) rows=rows.filter(row=>`${row.name || ''}\n${row.path || ''}`.toLowerCase().includes(query));
     const count=rows.length, pages=Math.max(1,Math.ceil(count/state.inventoryPageSize));
     if(state.inventoryLoaded)state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
     const start=(state.inventoryPage-1)*state.inventoryPageSize, visibleRows=rows.slice(start,start+state.inventoryPageSize);
-    setText($('#inventory-meta'),`${count.toLocaleString()} ${count===1?'match':'matches'} in ${state.inventory.length.toLocaleString()} inspected items`);
+    setText($('#inventory-meta'),`${count.toLocaleString()} ${count===1?'match':'matches'} in ${state.inventory.length.toLocaleString()} ${usesBazarr()?'Bazarr media items':'inspected items'}`);
     const globalCount=filter==='failed'?state.status?.pipeline?.failed_files:filter==='pending'?state.status?.pipeline?.pending_ocr_files:null;
-    setText($('#inventory-scope-note'),[state.inventoryTruncated?'Partial inventory: first 2,000 items. Inspect a smaller media folder to see other files.':'',Number.isFinite(globalCount)?`${count.toLocaleString()} ${count===1?'match':'matches'} in this snapshot; ${globalCount.toLocaleString()} ${filter==='failed'?'failed':'awaiting OCR'} files across saved conversion state.`:'',state.inventoryUpdated?`Last inspection: ${fmtDate(state.inventoryUpdated)}.`:''].filter(Boolean).join(' '));
+    setText($('#inventory-scope-note'),[state.inventoryTruncated?'The server reports a bounded partial inventory.':'',Number.isFinite(globalCount)?`${count.toLocaleString()} ${count===1?'match':'matches'} in this snapshot; ${globalCount.toLocaleString()} ${filter==='failed'?'failed':'awaiting OCR'} files across saved conversion state.`:'',state.inventoryUpdated?`${usesBazarr()?'Last Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}.`:''].filter(Boolean).join(' '));
     const range=count?`${(start+1).toLocaleString()}–${(start+visibleRows.length).toLocaleString()} of ${count.toLocaleString()} items`:'0 items';
     if ($('#inventory-range').textContent!==range) setText($('#inventory-range'),range);
     const pageSelect=$('#inventory-page');
     if (pageSelect.options.length!==pages) { pageSelect.replaceChildren();for(let page=1;page<=pages;page++)pageSelect.add(new Option(`Page ${page} of ${pages}`,String(page))); }
     pageSelect.value=String(state.inventoryPage);pageSelect.disabled=!count;
     $('#inventory-prev').disabled=state.inventoryPage===1;$('#inventory-next').disabled=state.inventoryPage===pages;
-    $('#inventory-limit-note').classList.toggle('hidden',!state.inventoryTruncated);
+    $('#inventory-limit-note').classList.toggle('hidden',!state.inventoryTruncated);setText($('#inventory-limit-note'),usesBazarr()?'Bazarr returned a bounded partial inventory. Resolve the reported limit before a complete conversion pass.':'This inspection shows the first 2,000 files. Inspect a smaller media folder to see other files.');
     const refreshing=state.status?.running?.kind==='inspect'||(state.status?.queue||[]).some(job=>job.kind==='inspect');
-    setText($('#inventory-snapshot-note'),state.inventoryUpdated?`${refreshing?'Refreshing… Showing the saved inventory. ':''}Last inspection: ${fmtDate(state.inventoryUpdated)}${state.status?.inventory?.partial?' · Partial inventory':''}`:refreshing?'Building your first inventory…':'');
+    setText($('#inventory-snapshot-note'),state.inventoryUpdated?`${refreshing?'Refreshing… Showing the saved inventory. ':''}${usesBazarr()?'Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}${state.status?.inventory?.partial?' · Partial inventory':''}`:refreshing?'Building your first inventory…':'');
     const emptyMessage=state.inventory.length?'No files match your search or filters.':'No inventory yet. Choose Inspect library to read available subtitle tracks.';
     const viewKey=JSON.stringify([visibleRows,visibleRows.length?'':emptyMessage]);
     if (viewKey===state.inventoryViewKey) return;
@@ -297,14 +327,15 @@
     if (!count) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=5; td.className='table-empty'; td.textContent=emptyMessage; tr.append(td); body.append(tr); return; }
     for (const row of visibleRows) {
       const tr=document.createElement('tr');tr.tabIndex=0;tr.classList.toggle('inventory-row-empty',!row.tracks?.length&&!row.error);tr.setAttribute('aria-label',`Subtitle details: ${row.name||row.path}`);tr.addEventListener('click',()=>openTrackDrawer(row));tr.addEventListener('keydown',event=>{if(event.target===tr&&['Enter',' '].includes(event.key)){event.preventDefault();openTrackDrawer(row);}});const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`;fileIcon.append(iconSvg('file')); const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; const copy=document.createElement('span');copy.className='file-cell-copy';copy.append(filename);const context=document.createElement('small');context.textContent=(row.path||'').replace(/[/\\][^/\\]+$/,'');copy.append(context);const fileContent=document.createElement('div');fileContent.className='file-cell-content';fileContent.append(fileIcon,copy);name.append(fileContent);
-      const type=document.createElement('td');type.className='processing-cell';const badge=document.createElement('span'),processing=row.processing||{},failed=!!row.error||!!processing.failed;badge.className=`status-pill ${failed?'failed':processing.pending_ocr?'queued':processing.generated_srt_count>0?'completed':'cancelled'}`;badge.textContent=failed?'Failed':processing.pending_ocr?'Awaiting OCR':processing.generated_srt_count>0?'Ready':row.metadata_pending?'Needs inspection':'Inspected';type.append(badge);const problem=failureMessage(row);if(failed&&problem){const hint=document.createElement('small');hint.textContent=problem.length>140?`${problem.slice(0,137)}…`:problem;hint.title=problem;type.append(hint);}
+      const type=document.createElement('td');type.className='processing-cell';const badge=document.createElement('span'),processing=row.processing||{},coverage=coverageState(row),failed=coverage!=='covered'&&(!!row.error||!!processing.failed);badge.className=`status-pill ${coverage==='covered'?'completed':failed?'failed':coverage==='needed'?'queued':processing.pending_ocr?'queued':'cancelled'}`;badge.textContent=coverage==='covered'?'Already covered':failed?'Failed':coverage==='needed'?'Missing SRT':coverage==='unavailable'?'No matching source':processing.pending_ocr?'Awaiting OCR':processing.generated_srt_count>0?'Ready':row.metadata_pending?'Needs inspection':'Inspected';type.append(badge);if(row.coverage?.reason){const reason=document.createElement('small');reason.textContent=row.coverage.reason;type.append(reason);}const problem=failureMessage(row);if(failed&&problem){const hint=document.createElement('small');hint.textContent=problem.length>140?`${problem.slice(0,137)}…`:problem;hint.title=problem;type.append(hint);}
       const tracks=document.createElement('td');tracks.className='track-count';tracks.textContent=row.error ? row.error : `${(row.tracks || []).length} track${(row.tracks || []).length===1?'':'s'}`;
-      const lang=document.createElement('td'); lang.className='language-tags';for(const track of (row.tracks||[]).slice(0,3))lang.append(trackBadge(track));if(row.tracks?.length>3){const more=document.createElement('span');more.className='muted';more.textContent=`+${row.tracks.length-3}`;lang.append(more);}if(!lang.childNodes.length)lang.textContent='—';
+      const lang=document.createElement('td'); lang.className='language-tags';for(const target of rowExistingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-existing';pill.textContent=`${targetLabel(target)} · SRT exists`;lang.append(pill);}for(const target of rowMissingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-missing';pill.textContent=`${targetLabel(target)} · SRT missing`;lang.append(pill);}for(const track of (row.tracks||[]).slice(0,3))lang.append(trackBadge(track));if(row.tracks?.length>3){const more=document.createElement('span');more.className='muted';more.textContent=`+${row.tracks.length-3}`;lang.append(more);}if(!lang.childNodes.length)lang.textContent='—';
       const action=document.createElement('td'),button=document.createElement('button');action.className='file-action';button.type='button';button.className='row-action';button.textContent='Details';button.title='Review tracks and choose which to convert';button.addEventListener('click',event=>{event.stopPropagation();openTrackDrawer(row);});action.append(button);
       tr.append(name,type,tracks,lang,action); body.append(tr);
     }
   };
   const failureMessage = row => {
+    if(coverageState(row)==='covered')return '';
     const value=row.error||row.processing?.last_error||row.processing?.error||row.processing?.error_detail;
     return typeof value==='string'?value:row.processing?.failed?'A conversion failed. Open Activity to review the recorded track errors.':'';
   };
@@ -312,16 +343,16 @@
     const count=state.drawerSelection.size;$('#convert-selected-tracks').disabled=!count||count>64;
     setText($('#convert-selected-tracks'),`Convert ${count} track${count===1?'':'s'}`);
     const selected=$$('#track-drawer-list input:checked'),image=selected.some(input=>input.dataset.image==='true');
-    setText($('#track-drawer-hint'),count>64?'Select up to 64 tracks per conversion.':`${count} selected · ${image?'Image tracks use the configured OCR backend; text tracks use CPU extraction.':'Text tracks use CPU extraction.'}`);
+    setText($('#track-drawer-hint'),count>64?'Select up to 64 tracks per conversion.':!count&&coverageState(state.selectedFile||{})==='covered'?'No extraction needed: valid SRT files already cover the wanted languages.':`${count} selected · ${image?'Image tracks use the configured OCR backend; text tracks use CPU extraction.':'Text tracks use CPU extraction.'}`);
   };
   const openTrackDrawer = row => {
-    state.selectedFile=row;state.modalTrigger=document.activeElement;state.drawerSelection=new Set();const list=$('#track-drawer-list');list.replaceChildren();
+    state.selectedFile=row;$('#force-covered-tracks').checked=false;state.modalTrigger=document.activeElement;state.drawerSelection=new Set();const list=$('#track-drawer-list');list.replaceChildren();
     setText($('#track-drawer-title'),row.name||'Subtitle tracks');setText($('#track-drawer-path'),row.path);const failure=$('#track-drawer-failure'),message=failureMessage(row);failure.replaceChildren();failure.classList.toggle('hidden',!message);if(message){const text=document.createElement('p');text.textContent=message;const activity=document.createElement('button');activity.className='text-button';activity.type='button';activity.textContent='Review errors in Activity';activity.addEventListener('click',()=>{closeDialog($('#track-drawer-backdrop'));$('#activity-status').value='issues';$('#activity-kind').value='subtitle';renderJobs();navigate('activity');});failure.append(text,activity);}
     const tracks=row.tracks||[],counts=new Map();for(const track of tracks){const id=track.id??track.number;if(Number.isSafeInteger(id))counts.set(id,(counts.get(id)||0)+1);}
     tracks.forEach((track,index)=>{const id=track.id??track.number,format=trackFormat(track),single=tracks.length===1&&row.type==='sidecar'&&id==null,key=single?'source':id;
       const supported=single||Number.isSafeInteger(id)&&counts.get(id)===1,permitted=!format.image||state.settings?.permissions?.ocr===true;
-      const label=document.createElement('label');label.className='track-choice';const input=document.createElement('input');input.type='checkbox';input.disabled=!supported||!permitted||!!row.error;input.dataset.image=String(format.image);input.checked=!input.disabled&&(isAll(state.selectedLanguages)||state.selectedLanguages.some(code=>languageCode(code)===languageCode(track.language)||languageCode(code)===languageCode(track.language).split('-')[0]));if(input.checked)state.drawerSelection.add(key);input.dataset.trackKey=String(key);input.setAttribute('aria-label',`Convert track ${id??index+1}, ${langLabel(track.language||'und')}, ${format.label}`);input.addEventListener('change',()=>{if(input.checked)state.drawerSelection.add(key);else state.drawerSelection.delete(key);syncDrawerSelection();});
-      const copy=document.createElement('span'),title=document.createElement('strong'),source=document.createElement('small');title.textContent=`Track ${id??index+1} · ${langLabel(track.language||'und')}`;source.className='track-source';source.textContent=`${track.codec||track.codec_id||track.format||format.label} · ${row.type==='sidecar'?'Sidecar':'Embedded'}${!supported?' · Inspect again to obtain an unambiguous track ID':!permitted?' · OCR permission locked':''}`;copy.append(title,source);
+      const label=document.createElement('label');label.className='track-choice';const input=document.createElement('input');input.type='checkbox';const target={language:track.language||'und',forced:!!track.forced,hi:!!(track.hi||track.sdh||track.hearing_impaired)},covered=rowExistingTargets(row).some(existing=>targetMatches(target,existing)),needed=usesBazarr()?rowMissingTargets(row).some(wanted=>targetMatches(wanted,target)):true;input.dataset.baseDisabled=String(!supported||!permitted||!!row.error);input.dataset.covered=String(covered);input.disabled=!supported||!permitted||!!row.error||covered;input.dataset.image=String(format.image);input.checked=!input.disabled&&needed&&languageCode(track.language)!=='und'&&(isAll(state.selectedLanguages)||state.selectedLanguages.some(code=>languageCode(code)===languageCode(track.language)||languageCode(code)===languageCode(track.language).split('-')[0]));if(input.checked)state.drawerSelection.add(key);input.dataset.trackKey=String(key);input.setAttribute('aria-label',`Convert track ${id??index+1}, ${langLabel(track.language||'und')}, ${format.label}`);input.addEventListener('change',()=>{if(input.checked)state.drawerSelection.add(key);else state.drawerSelection.delete(key);syncDrawerSelection();});
+      const copy=document.createElement('span'),title=document.createElement('strong'),source=document.createElement('small');title.textContent=`Track ${id??index+1} · ${langLabel(track.language||'und')}`;source.className='track-source';source.textContent=`${covered?'SRT already covers this target · ':''}${track.codec||track.codec_id||track.format||format.label} · ${row.type==='sidecar'?'Sidecar':'Embedded'}${!supported?' · Inspect again to obtain an unambiguous track ID':!permitted?' · OCR permission locked':''}`;copy.append(title,source);
       const flags=document.createElement('span');flags.className='track-flags';flags.append(trackBadge(track));for(const [key,text] of [['forced','Forced'],['hi','SDH'],['sdh','SDH'],['hearing_impaired','SDH']])if(track[key]&&!(text==='SDH'&&flags.textContent.includes('SDH'))){const flag=document.createElement('span');flag.className='type-badge';flag.textContent=text;flags.append(flag);}label.append(input,copy,flags);list.append(label);
     });
     if(!tracks.length){const empty=document.createElement('p');empty.className='muted';empty.textContent=row.metadata_pending?'Track metadata is pending. Inspect this file to read its tracks.':'No subtitle tracks are recorded for this file.';list.append(empty);}
@@ -329,13 +360,13 @@
   };
   const convertDrawerSelection = async () => {
     const row=state.selectedFile;if(!row||!state.drawerSelection.size)return;const button=$('#convert-selected-tracks');button.disabled=true;
-    const trackIds=state.drawerSelection.has('source')?undefined:[...state.drawerSelection];const result=await startJob({kind:'extract',paths:[row.path],rootIds:row.root_id?[row.root_id]:[],languages:['*'],trackIds,retry:row.processing?.failed===true});
+    const trackIds=state.drawerSelection.has('source')?undefined:[...state.drawerSelection];const result=await startJob({kind:'extract',paths:[row.path],rootIds:row.root_id?[row.root_id]:[],languages:['*'],trackIds,retry:row.processing?.failed===true,force:$('#force-covered-tracks').checked});
     if(result)closeDialog($('#track-drawer-backdrop'));else syncDrawerSelection();
   };
   const inspect = async () => { const result=await startJob({kind:'inspect',rootIds:selectedRootIds('#inventory-root')}); if (!result) return; if (Array.isArray(result.results)) { state.inventory=result.results; state.inventoryTruncated=!!result.truncated; renderInventory(); } };
   const renderLanguageList = () => {
     const list=$('#language-list'), term=$('#language-search').value.trim().toLowerCase(); list.replaceChildren();
-    const allLabel=document.createElement('label'); allLabel.className='language-option all-option'; const all=document.createElement('input'); all.type='checkbox'; all.checked=isAll(state.draftLanguages); all.addEventListener('change',()=>{state.draftLanguages=all.checked?['*']:[];renderLanguageList();}); const allCopy=document.createElement('span'); const allTitle=document.createElement('strong'); allTitle.textContent='All languages'; const allHint=document.createElement('small'); allHint.textContent='Convert every supported subtitle track'; allCopy.append(allTitle,allHint); allLabel.append(all,allCopy); list.append(allLabel);
+    const allLabel=document.createElement('label'); allLabel.className='language-option all-option'; const all=document.createElement('input'); all.type='checkbox'; all.checked=isAll(state.draftLanguages); all.addEventListener('change',()=>{state.draftLanguages=all.checked?['*']:[];renderLanguageList();}); const allCopy=document.createElement('span'); const allTitle=document.createElement('strong'); allTitle.textContent=usesBazarr()?'Bazarr profile languages':'All tagged languages'; const allHint=document.createElement('small'); allHint.textContent=usesBazarr()?'Fill only missing SRT targets from each media profile':'Use tagged tracks; untagged tracks require explicit selection'; allCopy.append(allTitle,allHint); allLabel.append(all,allCopy); list.append(allLabel);
     const codes=new Set(languages.map(x=>x[0].toLowerCase())); for (const code of state.draftLanguages) if (code!=='*' && !codes.has(code.toLowerCase())) languages.push([code,`${langLabel(code)} · ${code.toUpperCase()}`]);
     for (const [code,name] of languages) {
       if (term && !`${name} ${code}`.toLowerCase().includes(term)) continue;
@@ -454,7 +485,7 @@
       setText($('#ocr-permission-state'),ocrEnabled?'Enabled':'Locked');
       setText($('#ocr-permission-note'),ocrEnabled?'Image subtitle conversion is enabled for this service.':'Text subtitles are enabled. To include image subtitles, enable CONVERTER_ENABLE_OCR and use a 1536 MiB memory limit.');
       for (const provider of ['sonarr','radarr','jellyfin','bazarr']) { const node=$(`#${provider}-settings`); node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})})); }
-      updateLanguageLabels(); updateHookStates(); updateIntegrationUsage();updateIntegrationDots();
+      updateLanguageLabels();renderInventoryAuthority(); updateHookStates(); updateIntegrationUsage();updateIntegrationDots();
     } catch(error) { notify(`Could not load settings: ${error.message}`,'error'); }
   };
   const gatherSettings = () => {
@@ -560,10 +591,10 @@
   };
   const loadWorkerNodes = async () => {try{renderWorkerNodes(await api('/api/nodes'));}catch(error){notify(`Could not load worker nodes: ${error.message}`,'error');}};
   const reviewConversion = rootIds => {
-    state.pendingConversion={kind:'scan',rootIds,languages:[...state.selectedLanguages]};state.modalTrigger=document.activeElement;
+    state.pendingConversion={kind:'scan',rootIds,languages:[...state.selectedLanguages],includeOcr:state.settings?.permissions?.ocr===true};state.modalTrigger=document.activeElement;
     const scope=$('#conversion-scope');scope.replaceChildren();
     const roots=(state.status?.roots||[]).filter(root=>!rootIds.length||rootIds.includes(root.id));
-    for(const [key,value] of [['Folders',roots.map(root=>root.label||root.path||root.id).join(', ')||'All configured media folders'],['Languages',languageDescription(state.selectedLanguages)],['Operation','Discover media and convert supported text tracks']]){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=key;dd.textContent=value;scope.append(dt,dd);}
+    for(const [key,value] of [['Folders',roots.map(root=>root.label||root.path||root.id).join(', ')||'All configured media folders'],['Languages',usesBazarr()&&isAll(state.selectedLanguages)?'Each media item’s Bazarr profile':languageDescription(state.selectedLanguages)],['Operation',usesBazarr()?'Fill missing SRT targets from Bazarr profiles; covered files are skipped':'Convert only languages not already covered by valid SRT files'],['Image subtitles',state.settings?.permissions?.ocr===true?'Run OCR using available CPU or GPU slots':'OCR is disabled by service permissions']]){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=key;dd.textContent=value;scope.append(dt,dd);}
     showDialog($('#conversion-modal'));$('#confirm-conversion').focus();
   };
   const workersVisible = () => state.currentPage==='settings'&&state.settingsSection==='workers'&&!document.hidden;
@@ -753,6 +784,7 @@
     $$('[data-pipeline-stage]').forEach(button=>{button.title=button.dataset.pipelineStage==='scan'?'View configured media folders':'View matching files in the saved inventory';button.addEventListener('click',()=>button.dataset.pipelineStage==='scan'?navigate('settings','media'):filterLibrary(({inspect:'all',convert:'pending',ready:'ready'})[button.dataset.pipelineStage]));});
     $$('[data-attention]').forEach(button=>button.addEventListener('click',()=>button.dataset.attention==='paths'?navigate('settings','media'):filterLibrary(button.dataset.attention)));
     $('#convert-selected-tracks').addEventListener('click',convertDrawerSelection);
+    $('#force-covered-tracks').addEventListener('change',()=>{const force=$('#force-covered-tracks').checked;$$('#track-drawer-list input').forEach(input=>{input.disabled=input.dataset.baseDisabled==='true'||input.dataset.covered==='true'&&!force;if(input.disabled&&input.checked){input.checked=false;state.drawerSelection.delete(input.dataset.trackKey==='source'?'source':Number(input.dataset.trackKey));}});syncDrawerSelection();});
     for(const [selector,checked] of [['#select-all-tracks',true],['#select-no-tracks',false]])$(selector).addEventListener('click',()=>{$$('#track-drawer-list input:not(:disabled)').forEach(input=>{if(input.checked!==checked){input.checked=checked;input.dispatchEvent(new Event('change'));}});});
     $('#inspect-drawer-file').addEventListener('click',async()=>{const row=state.selectedFile;if(!row)return;const result=await startJob({kind:'inspect',paths:[row.path],rootIds:row.root_id?[row.root_id]:[]});if(result)closeDialog($('#track-drawer-backdrop'));});
     $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>reviewConversion(selectedRootIds(state.currentPage==='library'?'#inventory-root':'#quick-root'))));

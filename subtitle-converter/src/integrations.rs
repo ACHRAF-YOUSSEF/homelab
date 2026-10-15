@@ -2,6 +2,8 @@
 //! providers start disabled, URLs are explicitly validated, and this module
 //! only emits the small set of methods and endpoints used by the app.
 
+mod bazarr;
+
 use serde::Deserialize;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
@@ -218,20 +220,16 @@ fn allowed_route(method: &str, path: &str) -> bool {
                 "/api/system/status",
                 "/System/Info",
                 "/Library/VirtualFolders",
-                "/api/system/tasks",
+                "/api/system/languages/profiles",
             ]
             .contains(&path)
                 || path.starts_with("/api/series?start=")
                 || path.starts_with("/api/movies?start=")
+                || path.starts_with("/api/episodes?seriesid%5B%5D=")
                 || path.starts_with("/Items?ParentId=")
         }
         "POST" => {
-            [
-                "/api/v3/command",
-                "/api/system/tasks",
-                "/Library/Media/Updated",
-            ]
-            .contains(&path)
+            ["/api/v3/command", "/Library/Media/Updated"].contains(&path)
                 || (path.starts_with("/Items/")
                     && path.contains("/Refresh?")
                     && !path.contains('#'))
@@ -1243,47 +1241,22 @@ impl Integrations {
         }
     }
     fn bazarr_refresh(&self, stop: &AtomicBool, progress: &mut dyn FnMut(Value)) -> Value {
-        let response = match self.api("bazarr", "/api/system/tasks", "GET", None, None) {
-            Ok(v) => v,
-            Err(e) => {
-                return json!({"provider":"bazarr","ok":false,"message":e.message("Scan request failed")});
+        progress(json!({"status":"refreshing","path":"Bazarr inventory"}));
+        match self.bazarr_inventory(stop) {
+            Ok(inventory) => {
+                let items = inventory["items"].as_array();
+                let count = items.map_or(0, Vec::len);
+                let missing = items.map_or(0, |items| {
+                    items
+                        .iter()
+                        .filter(|item| item["missing_srt"] == true)
+                        .count()
+                });
+                json!({"provider":"bazarr","ok":true,"source":"bazarr","inventory_count":count,"missing_srt_count":missing,"message":format!("Read {count} Bazarr media items; {missing} need external SRT subtitles")})
             }
-        };
-        let tasks = response
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let wanted = [
-            "update_series",
-            "update_movies",
-            "series_full_scan_subtitles",
-            "movies_full_scan_subtitles",
-        ];
-        let mut queued = 0;
-        for id in wanted {
-            if stop.load(Ordering::Relaxed) {
-                return json!({"provider":"bazarr","ok":true,"message":"Bazarr refresh cancelled before all tasks were queued"});
+            Err(message) => {
+                json!({"provider":"bazarr","ok":false,"source":"bazarr","message":message})
             }
-            let Some(task) = tasks.iter().find(|v| get_str(v, "job_id") == id) else {
-                continue;
-            };
-            if task.get("job_running").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            progress(
-                json!({"status":"refreshing","path":format!("Bazarr · {}",get_str(task,"name"))}),
-            );
-            let form = [("taskid", id.to_owned())];
-            if let Err(e) = self.api("bazarr", "/api/system/tasks", "POST", None, Some(&form)) {
-                return json!({"provider":"bazarr","ok":false,"message":e.message("Bazarr scan failed")});
-            }
-            queued += 1;
-        }
-        if queued == 0 {
-            json!({"provider":"bazarr","ok":true,"message":"Bazarr sync and subtitle-index tasks are already running"})
-        } else {
-            json!({"provider":"bazarr","ok":true,"message":format!("Queued {queued} Bazarr sync and subtitle-index task(s)")})
         }
     }
     pub fn flush_bazarr(
@@ -1309,111 +1282,7 @@ impl Integrations {
                 json!({"provider":"bazarr","ok":true,"triggered":0,"message":"Bazarr scan cancelled"}),
             );
         }
-        let result = (|| -> Result<usize, String> {
-            let mut series_ids = BTreeSet::new();
-            let mut movie_ids = BTreeSet::new();
-            for (kind, endpoint) in [("series", "/api/series"), ("movie", "/api/movies")] {
-                let mut start = 0;
-                let mut records = Vec::new();
-                while start < MAX_ITEMS {
-                    if stop.load(Ordering::Relaxed) {
-                        return Ok(0);
-                    }
-                    let path = format!("{endpoint}?start={start}&length=200");
-                    let page = self
-                        .api("bazarr", &path, "GET", None, None)
-                        .map_err(|e| e.message("Bazarr scan failed"))?;
-                    let data = page
-                        .get("data")
-                        .and_then(Value::as_array)
-                        .ok_or("Bazarr returned invalid media data")?;
-                    records.extend(data.iter().take(MAX_ITEMS - records.len()).cloned());
-                    let total = page.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    if records.len() >= total || data.len() < 200 {
-                        break;
-                    }
-                    start += data.len();
-                }
-                if records.len() >= MAX_ITEMS {
-                    return Err("Bazarr media list exceeds the configured scan limit".into());
-                }
-                for path in &paths {
-                    let remote = self
-                        .remote_path("bazarr", path)
-                        .unwrap_or_else(|| path.clone());
-                    let Some(norm) = norm_path(&remote) else {
-                        continue;
-                    };
-                    if kind == "movie" {
-                        for movie in &records {
-                            let Some(id) = movie.get("radarrId").and_then(Value::as_i64) else {
-                                continue;
-                            };
-                            let Some(mp) = movie
-                                .get("path")
-                                .and_then(Value::as_str)
-                                .and_then(norm_path)
-                            else {
-                                continue;
-                            };
-                            if path_case_eq(
-                                &path_stem(&norm.value),
-                                &path_stem(&mp.value),
-                                mp.flavor,
-                            ) && parent(&norm)
-                                .zip(parent(&mp))
-                                .is_some_and(|(a, b)| path_eq(&a, &b))
-                            {
-                                movie_ids.insert(id);
-                            }
-                        }
-                    } else {
-                        let mut best: Option<(usize, i64)> = None;
-                        for s in &records {
-                            let Some(id) = s.get("sonarrSeriesId").and_then(Value::as_i64) else {
-                                continue;
-                            };
-                            let Some(root) =
-                                s.get("path").and_then(Value::as_str).and_then(norm_path)
-                            else {
-                                continue;
-                            };
-                            if under(&norm, &root)
-                                && best.as_ref().is_none_or(|(n, _)| root.value.len() > *n)
-                            {
-                                best = Some((root.value.len(), id));
-                            }
-                        }
-                        if let Some((_, id)) = best {
-                            series_ids.insert(id);
-                        }
-                    }
-                }
-            }
-            let mut count = 0;
-            for (kind, id) in series_ids
-                .iter()
-                .map(|id| ("series", id))
-                .chain(movie_ids.iter().map(|id| ("movie", id)))
-            {
-                if stop.load(Ordering::Relaxed) {
-                    return Ok(count);
-                }
-                progress(json!({"status":"refreshing","path":format!("Bazarr · {kind} {id}")}));
-                let (endpoint, field) = if kind == "series" {
-                    ("/api/series", "seriesid")
-                } else {
-                    ("/api/movies", "radarrid")
-                };
-                for action in ["sync", "scan-disk"] {
-                    let fields = [(field, id.to_string()), ("action", action.to_owned())];
-                    self.api("bazarr", endpoint, "PATCH", None, Some(&fields))
-                        .map_err(|e| e.message("Bazarr scan failed"))?;
-                }
-                count += 1;
-            }
-            Ok(count)
-        })();
+        let result = self.bazarr_scan_paths(&paths, stop, progress);
         Some(match result {
             Ok(count) => {
                 json!({"provider":"bazarr","ok":true,"triggered":count,"message":if count>0{format!("Scanned {count} Bazarr item(s)")}else{"No matching Bazarr media item".into()}})
@@ -1750,7 +1619,7 @@ mod tests {
     fn bazarr_batch_uses_authenticated_scoped_form_patches_and_clears_batch() {
         let (_d, p) = temp();
         let mut i = Integrations::new(p).unwrap();
-        let (url, requests, server) = fixture_sequence(4);
+        let (url, requests, server) = fixture_sequence(3);
         i.update(&json!({"bazarr":{"enabled":true,"url":url,"api_key":"secret"}}))
             .unwrap();
         i.notify(&["/tv/Show/S01/ep.en.srt".into()]);
@@ -1760,22 +1629,26 @@ mod tests {
         assert!(i.bazarr_pending_paths.is_empty());
         server.join().unwrap();
         let calls = requests.lock().unwrap();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 3);
         assert!(calls[0].starts_with("GET /api/series?start=0&length=200 HTTP/1.1"));
         assert!(calls[1].starts_with("GET /api/movies?start=0&length=200 HTTP/1.1"));
         let patches: Vec<&String> = calls
             .iter()
             .filter(|call| call.starts_with("PATCH "))
             .collect();
-        assert_eq!(patches.len(), 2);
+        assert_eq!(patches.len(), 1);
         assert!(patches[0].starts_with("PATCH /api/series HTTP/1.1"));
         assert!(
             patches[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: secret")
         );
-        assert!(patches[0].ends_with("seriesid=12&action=sync"));
-        assert!(patches[1].ends_with("seriesid=12&action=scan-disk"));
+        assert!(patches[0].ends_with("seriesid=12&action=scan-disk"));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.contains("search-") || call.contains("action=sync"))
+        );
     }
     #[test]
     fn bazarr_cancel_consumes_queued_batch_before_any_network_request() {
@@ -1795,7 +1668,7 @@ mod tests {
     fn bazarr_movie_matching_preserves_posix_case() {
         let (_d, p) = temp();
         let mut i = Integrations::new(p).unwrap();
-        let (url, requests, server) = fixture_sequence(4);
+        let (url, requests, server) = fixture_sequence(3);
         i.update(&json!({"bazarr":{"enabled":true,"url":url,"api_key":"secret"}}))
             .unwrap();
         i.notify(&["/movies/Film.en.srt".into()]);
@@ -1808,9 +1681,8 @@ mod tests {
             .iter()
             .filter(|call| call.starts_with("PATCH "))
             .collect();
-        assert_eq!(patches.len(), 2);
-        assert!(patches[0].ends_with("radarrid=34&action=sync"));
-        assert!(patches[1].ends_with("radarrid=34&action=scan-disk"));
+        assert_eq!(patches.len(), 1);
+        assert!(patches[0].ends_with("radarrid=34&action=scan-disk"));
     }
     #[test]
     fn jellyfin_async_sidecar_refresh_posts_once_per_library_and_stops() {

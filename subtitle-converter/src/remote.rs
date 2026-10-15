@@ -3,7 +3,7 @@
 //! A worker token grants conversion access to configured shared roots; keep it
 //! separate from dashboard credentials and use TLS across untrusted networks.
 
-use crate::converter::{Converter, Workload};
+use crate::converter::{Converter, SubtitleSourceHint, SubtitleTarget, Workload};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -159,6 +159,9 @@ impl Coordinator {
         automatic: bool,
         workload: Workload,
         selected: Option<&[u64]>,
+        targets: Option<&[SubtitleTarget]>,
+        sources: &[SubtitleSourceHint],
+        force: bool,
         resource: &str,
         state: Option<Value>,
     ) -> Result<Option<String>, String> {
@@ -188,7 +191,12 @@ impl Coordinator {
         else {
             return Ok(None);
         };
-        if languages.len() > 64 || selected.is_some_and(|ids| ids.len() > 64) {
+        if languages.len() > 64
+            || selected.is_some_and(|ids| ids.len() > 64)
+            || targets.is_some_and(|targets| targets.len() > 64)
+            || sources.len() > 256
+            || force && selected.is_none_or(|ids| ids.is_empty())
+        {
             return Err("Remote selection exceeds its limit".into());
         }
         let state = match state
@@ -213,10 +221,20 @@ impl Coordinator {
         } else {
             workload
         };
+        let sources = sources
+            .iter()
+            .map(|hint| {
+                let source = Converter::safe_path(&hint.path.to_string_lossy(), &self.mounts)?;
+                if source.parent() != path.parent() {
+                    return Err("Remote subtitle hint must share the media directory".to_owned());
+                }
+                Ok(json!({"path":relative_name(root, &source)?,"target":hint.target}))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let request = json!({"lease":ticket,"root":root_name,"path":relative_name(root, &path)?,
             "staging":relative_name(root, staging.path())?,"languages":languages,"retry":retry,"automatic":automatic,
             "workload":match workload {Workload::All=>"all",Workload::Text=>"text",Workload::Ocr=>"ocr"},
-            "selected":selected,"resource":resource,"state":state});
+            "selected":selected,"targets":targets,"sources":sources,"force":force,"resource":resource,"state":state});
         crate::util::bounded_json_clone(&request, REQUEST_LIMIT)?;
         self.leases.insert(
             ticket.clone(),
@@ -683,6 +701,11 @@ struct Assignment {
     automatic: bool,
     workload: String,
     selected: Option<Vec<u64>>,
+    targets: Option<Vec<SubtitleTarget>>,
+    #[serde(default)]
+    sources: Vec<SubtitleSourceHint>,
+    #[serde(default)]
+    force: bool,
     resource: String,
     state: Option<Value>,
 }
@@ -1042,6 +1065,40 @@ fn execute_assignment(
             .select_tracks(selected)
             .map_err(|_| RemoteError("Invalid remote subtitle selection"))?;
     }
+    if let Some(targets) = assignment.targets {
+        worker
+            .set_targets(targets)
+            .map_err(|_| RemoteError("Invalid remote subtitle targets"))?;
+    }
+    if assignment.sources.len() > 256 {
+        return Err(RemoteError("Remote subtitle hints exceed their limit"));
+    }
+    let sources = assignment
+        .sources
+        .into_iter()
+        .map(|hint| {
+            let relative = hint
+                .path
+                .to_str()
+                .ok_or(RemoteError("Invalid remote subtitle hint path"))?;
+            let source = mapped_path(mapping, relative)?;
+            if source.parent() != path.parent() {
+                return Err(RemoteError(
+                    "Remote subtitle hint must share the media directory",
+                ));
+            }
+            Ok(SubtitleSourceHint {
+                path: source,
+                target: hint.target,
+            })
+        })
+        .collect::<Result<Vec<_>, RemoteError>>()?;
+    worker
+        .set_source_hints(sources)
+        .map_err(|_| RemoteError("Invalid remote subtitle hints"))?;
+    worker
+        .force_covered_tracks(assignment.force)
+        .map_err(|_| RemoteError("Remote coverage override requires explicit track selection"))?;
     worker
         .enable_remote_staging(staging)
         .map_err(|_| RemoteError("Cannot enable remote staging"))?;
@@ -1200,6 +1257,9 @@ mod tests {
                     false,
                     Workload::Text,
                     None,
+                    None,
+                    &[],
+                    false,
                     "cpu",
                     None,
                 )
@@ -1224,6 +1284,95 @@ mod tests {
             json!({"node":self.node,"lease":ticket,"fingerprint":fingerprint,"state":{"fingerprint":fingerprint,"processing_fingerprint":fingerprint,"ok":true,"outputs":["movie.en.srt"]},
                 "summary":{"converted":1,"cached":0,"pending":0,"failed":0,"planned":0},"terminal":{"status":"converted","path":"untrusted-client-path"},"outputs":["movie.en.srt"]})
         }
+    }
+
+    #[test]
+    fn leases_preserve_exact_targets_and_require_explicit_tracks_for_force() {
+        let mut fixture = Fixture::new();
+        let targets = vec![SubtitleTarget {
+            language: "fr".into(),
+            forced: true,
+            hi: false,
+        }];
+        assert!(
+            fixture
+                .coordinator
+                .offer(
+                    &fixture.path,
+                    &["*".into()],
+                    false,
+                    false,
+                    Workload::Text,
+                    None,
+                    Some(&targets),
+                    &[],
+                    true,
+                    "cpu",
+                    None,
+                )
+                .is_err()
+        );
+        let ticket = fixture
+            .coordinator
+            .offer(
+                &fixture.path,
+                &["*".into()],
+                false,
+                false,
+                Workload::Text,
+                Some(&[3]),
+                Some(&targets),
+                &[SubtitleSourceHint {
+                    path: fixture.path.clone(),
+                    target: targets[0].clone(),
+                }],
+                true,
+                "cpu",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let value = fixture
+            .coordinator
+            .handle("/api/remote/lease", &json!({"node":fixture.node}))
+            .unwrap();
+        let assignment: Assignment = serde_json::from_value(value).unwrap();
+        assert_eq!(assignment.lease, ticket);
+        assert_eq!(assignment.sources.len(), 1);
+        assert_eq!(assignment.sources[0].path, Path::new("movie.ass"));
+        assert_eq!(assignment.sources[0].target, targets[0]);
+        assert_eq!(assignment.targets, Some(targets));
+        assert_eq!(assignment.selected, Some(vec![3]));
+        assert!(assignment.force);
+    }
+
+    #[test]
+    fn an_empty_target_list_is_not_an_unrestricted_remote_assignment() {
+        let mut fixture = Fixture::new();
+        fixture
+            .coordinator
+            .offer(
+                &fixture.path,
+                &["*".into()],
+                false,
+                false,
+                Workload::Text,
+                None,
+                Some(&[]),
+                &[],
+                false,
+                "cpu",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let value = fixture
+            .coordinator
+            .handle("/api/remote/lease", &json!({"node":fixture.node}))
+            .unwrap();
+        let assignment: Assignment = serde_json::from_value(value).unwrap();
+        assert_eq!(assignment.targets, Some(vec![]));
+        assert!(!assignment.force);
     }
 
     #[test]
@@ -1544,6 +1693,9 @@ mod tests {
                 false,
                 Workload::Text,
                 None,
+                None,
+                &[],
+                false,
                 "cpu",
                 Some(state),
             )
@@ -1570,6 +1722,9 @@ mod tests {
                 false,
                 Workload::All,
                 None,
+                None,
+                &[],
+                false,
                 "cpu",
                 None,
             )
