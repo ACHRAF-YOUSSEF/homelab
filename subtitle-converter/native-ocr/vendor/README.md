@@ -10,7 +10,9 @@ changes are in `Cargo.toml` and `Cargo.toml.orig`: remove the unused AVIF encode
 feature from `default-formats`, and remove the optional `ravif` and `rgb` encoder
 dependencies and their feature links. Subforge only decodes subtitle images, so
 these APIs were unused. No codec source, decoder, or algorithm is changed; the
-AVIF decoder feature remains available through `avif-native`.
+AVIF decoder feature remains available through `avif-native`. Four trailing-space
+blank lines in the upstream AVIF YCgCo codec source were normalized for clean
+diff checks; this is whitespace-only and does not change codec behavior.
 
 This narrow patch removes the inactive lockfile chain through `ravif` → `rav1e`
 → `paste`, which strict `cargo audit --deny warnings` checks even when Cargo does
