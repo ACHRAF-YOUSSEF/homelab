@@ -19,3 +19,9 @@ tempfile = "=3.23.0"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+# Keep the upstream OCR implementation while dropping unused font parsers and
+# updating imageproc's unmaintained matrix macro dependency. See vendor/README.md.
+[patch.crates-io]
+ocr-rs = { path = "vendor/ocr-rs" }
+image = { path = "vendor/image" }

@@ -1,5 +1,6 @@
 # Native CUDA inference; source, SDK, models and Rust dependencies are pinned.
 FROM scratch AS native-source-cache
+FROM scratch AS cuda-source-cache
 FROM nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97 AS cuda-sdk
 FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04@sha256:4a801ef9232d2b05e69df4eb8aa054dbbe2824e5499e1e6e857320bb01ac41a9 AS cuda-runtime
 
@@ -21,7 +22,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* \
     && rustup component add clippy
 COPY --from=cuda-sdk /usr/local/cuda-12.8 /usr/local/cuda
+RUN --mount=type=bind,from=cuda-source-cache,target=/cuda-source-cache \
+    if [ -f /cuda-source-cache/cutlass-319a389f42b776fae5701afcb943fc03be5b5c25.tar.gz ]; then \
+      cp /cuda-source-cache/cutlass-319a389f42b776fae5701afcb943fc03be5b5c25.tar.gz /tmp/cutlass.tar.gz; \
+    else curl --fail --location --retry 3 \
+      https://codeload.github.com/NVIDIA/cutlass/tar.gz/319a389f42b776fae5701afcb943fc03be5b5c25 \
+      --output /tmp/cutlass.tar.gz; fi \
+    && echo '1d1eac5bcbcced5c1a7f3de433143c0ab269f07551865ba9aa0fcb8618e988c4  /tmp/cutlass.tar.gz' | sha256sum --check --strict \
+    && mkdir -p /opt/mnn/3rd_party/cutlass/v2.9.0 \
+    && tar -xzf /tmp/cutlass.tar.gz --strip-components=1 -C /opt/mnn/3rd_party/cutlass/v2.9.0 \
+    && rm /tmp/cutlass.tar.gz \
+    && printf 'set(FETCHCONTENT_SOURCE_DIR_CUTLASS "/opt/mnn/3rd_party/cutlass/v2.9.0" CACHE PATH "" FORCE)\n' > /opt/subforge-cuda-toolchain.cmake
 ENV MNN_SOURCE_DIR=/opt/mnn \
+    CMAKE_TOOLCHAIN_FILE=/opt/subforge-cuda-toolchain.cmake \
     CUDA_HOME=/usr/local/cuda \
     CUDACXX=/usr/local/cuda/bin/nvcc \
     PATH=/usr/local/cuda/bin:$PATH \
@@ -33,9 +46,12 @@ WORKDIR /ocr-build
 COPY native-ocr/Cargo.toml native-ocr/Cargo.lock ./
 COPY native-ocr/src/ ./src/
 COPY native-ocr/models.sha256 ./models.sha256
+COPY native-ocr/vendor/ ./vendor/
 # Builders have no granted GPU; hardware execution is checked after build.
+# The driver stub is used only for linking; the host supplies libcuda at runtime.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/ocr-build/cuda-target \
+    LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/targets/x86_64-linux/lib/stubs \
     CARGO_TARGET_DIR=/ocr-build/cuda-target cargo build --release --locked --features cuda \
     && cp cuda-target/release/subforge-ocr /opt/subforge-ocr \
     && mkdir /opt/native-libs \

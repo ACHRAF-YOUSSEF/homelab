@@ -1,9 +1,13 @@
 # Subforge revisions
 
-## 0.4.4 — 2026-10-15
+## 0.4.4 — 2026-10-16
 
 - Update locked rustls to 0.23.46, fixing RustSec advisories RUSTSEC-2026-0346 through RUSTSEC-2026-0349 without audit suppressions.
 - Replace Python/Paddle OCR with a native Rust `ocr-rs` 2.4.1 helper using checksum-pinned MNN 3.4.1 source and 25 immutable offline model files; CPU and CUDA runtime/test images no longer include Python.
+- Pin the CUDA build's CUTLASS source archive by commit and SHA-256, with an optional `cuda-source-cache` build context and a CMake source override that avoids cloning Git history.
+- Correct Arabic OCR's visual-to-logical character order while preserving left-to-right runs and combining marks; isolate backend-health child output so it cannot contaminate JSON.
+- Verify direct CPU helper recognition against exact English, French, and Arabic fixture phrases and pass all 11 helper tests with strict Clippy; the full CPU SUP-to-SRT pipeline now passes for all three languages and preserves existing SRT files.
+- Pass 512 MiB text/resource and 1.5 GiB OCR resource fixtures. GPU sessions require successful CUDA admission checks, though MNN can still execute unsupported individual operators on CPU; CUDA hardware validation remains pending.
 - Bound concurrent selected-file jobs by global worker admission while keeping full-library scans and inventory/maintenance work exclusive; expose active jobs while retaining `running` compatibility.
 - Persist and deduplicate validated Bazarr SRT publication receipts, scan after the queue drains, and verify uncertain attempts without blind replay.
 - Publish matching local `0.4.4-cpu` and `0.4.4-cuda` image tags.
@@ -55,7 +59,7 @@
 - Keep per-tool CPU threads limited to one and preserve cancellation, source files, and existing SRT outputs.
 - Add optional NVIDIA GPU OCR using a separate linux/amd64 image, one explicitly granted device, and a default-zero GPU worker allocation.
 - Lock 81 Python dependency pins across two files, verify all 15 bundled model archives against their SHA-256 manifest, and allow optional hash-verified wheel and model-archive BuildKit caches without adding cache payload to the runtime image.
-- Validate GPU OCR with a 200-distinct-cue synthetic SUP fixture on one RTX 3060: one GPU worker observed, source preserved, cached repeat confirmed, 9.32 seconds including startup and repeat, and 1,097,826,304 bytes (about 1,047 MiB) peak container memory under a 1536 MiB ceiling. This does not establish full-library peaks or results on other GPUs/drivers.
+- Historical PaddleOCR validation for 0.3.0 only: a 200-distinct-cue synthetic SUP fixture on one RTX 3060 observed one GPU worker, preserved the source, confirmed a cached repeat, took 9.32 seconds including startup and repeat, and used 1,097,826,304 bytes (about 1,047 MiB) peak container memory under a 1536 MiB ceiling. These Python/PaddleOCR measurements do not describe the native `ocr-rs`/MNN implementation introduced in 0.4.4 and do not establish full-library peaks or results on other GPUs/drivers.
 
 ## 0.2.4
 

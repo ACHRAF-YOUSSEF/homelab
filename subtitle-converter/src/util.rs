@@ -219,7 +219,18 @@ fn run_process(
     if stop.load(Ordering::Relaxed) {
         return Err("Conversion was cancelled before tool dispatch".into());
     }
-    let temporary = tempfile::tempdir().map_err(|_| "Cannot create tool scratch space")?;
+    // The OCR bridge inherits this directory. Request its permissions at
+    // creation rather than relying on the process umask.
+    #[cfg(unix)]
+    let temporary = {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    };
+    #[cfg(not(unix))]
+    let temporary = tempfile::tempdir();
+    let temporary = temporary.map_err(|_| "Cannot create tool scratch space")?;
     let mut stdout = tempfile::tempfile().map_err(|_| "Cannot create tool output buffer")?;
     let stderr = tempfile::tempfile().map_err(|_| "Cannot create tool error buffer")?;
     configure_tool_environment(command, temporary.path());

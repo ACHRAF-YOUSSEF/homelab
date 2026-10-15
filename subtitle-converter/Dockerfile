@@ -27,6 +27,7 @@ WORKDIR /ocr-build
 COPY native-ocr/Cargo.toml native-ocr/Cargo.lock ./
 COPY native-ocr/src/ ./src/
 COPY native-ocr/models.sha256 ./models.sha256
+COPY native-ocr/vendor/ ./vendor/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/ocr-build/target \
     cargo clippy --release --locked --all-targets -- -D warnings \
@@ -36,12 +37,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM native-tools AS ocr-models
 COPY native-ocr/models.sha256 /opt/ocr-models/models.sha256
-RUN cd /opt/ocr-models \
+RUN --mount=type=bind,from=native-source-cache,target=/native-source-cache \
+    cd /opt/ocr-models \
     && while read -r checksum filename; do \
       [ -n "$filename" ] || continue; \
-      curl --fail --location --retry 3 \
+      if [ -f "/native-source-cache/models/$filename" ]; then \
+        cp "/native-source-cache/models/$filename" "$filename"; \
+      else curl --fail --location --retry 3 \
         "https://raw.githubusercontent.com/zibo-chen/ocr-rs/8ee8c7e606094951b7a5c072f44e76b8c5ab8a27/models/$filename" \
-        --output "$filename"; \
+        --output "$filename"; fi; \
     done < models.sha256 \
     && sha256sum --check --strict models.sha256 \
     && find . -type d -exec chmod 0555 {} + \
@@ -63,7 +67,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/subforge-worker /build/subforge-worker \
     && cp target/release/subforge-smoke /build/subforge-smoke
 
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime-tools
 
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -94,6 +98,8 @@ RUN groupadd --gid 1000 converter \
     && mkdir /data \
     && chown converter:converter /data
 WORKDIR /app
+
+FROM runtime-tools AS runtime
 COPY --from=build /build/subforge /usr/local/bin/subforge
 COPY --from=build /build/subforge-worker /usr/local/bin/subforge-worker
 COPY --from=native-ocr-build /opt/subforge-ocr /usr/local/bin/subforge-ocr

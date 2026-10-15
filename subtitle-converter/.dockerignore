@@ -19,3 +19,5 @@
 !native-ocr/models.sha256
 !native-ocr/src/
 !native-ocr/src/**
+!native-ocr/vendor/
+!native-ocr/vendor/**

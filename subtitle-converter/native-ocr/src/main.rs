@@ -2,11 +2,13 @@
 
 use image::{DynamicImage, ImageReader, Limits};
 use ocr_rs::{Backend, DetOptions, OcrEngine, OcrEngineConfig};
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -355,6 +357,59 @@ fn model_files(family: ModelFamily) -> (&'static str, &'static str) {
     }
 }
 
+fn is_arabic_mark(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x0610..=0x061A
+            | 0x064B..=0x065F
+            | 0x0670
+            | 0x06D6..=0x06ED
+            | 0x08D3..=0x08FF
+    )
+}
+
+fn is_ltr_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, ' ' | ':' | '*' | '.' | '/' | '%' | '+' | '-')
+}
+
+fn postprocess_text(text: &str, family: ModelFamily) -> String {
+    if family != ModelFamily::Arabic {
+        return text.to_owned();
+    }
+
+    // MNN's Arabic recognizer returns visual-order characters. Reverse whole
+    // Arabic graphemes to logical order, then restore the direction inside
+    // contiguous Latin, numeric, and punctuation runs.
+    let mut clusters: Vec<String> = Vec::new();
+    for character in text.chars() {
+        if is_arabic_mark(character) {
+            if let Some(previous) = clusters.last_mut() {
+                previous.push(character);
+            } else {
+                clusters.push(character.to_string());
+            }
+        } else {
+            clusters.push(character.to_string());
+        }
+    }
+    clusters.reverse();
+
+    let mut index = 0;
+    while index < clusters.len() {
+        if clusters[index].chars().all(is_ltr_character) {
+            let start = index;
+            while index < clusters.len() && clusters[index].chars().all(is_ltr_character) {
+                index += 1;
+            }
+            clusters[start..index].reverse();
+        } else {
+            index += 1;
+        }
+    }
+    clusters.concat()
+}
+
 fn expected_digests() -> Result<BTreeMap<&'static str, &'static str>, &'static str> {
     let pinned = include_str!("../models.sha256");
     let mut entries = BTreeMap::new();
@@ -546,17 +601,55 @@ fn engine(family: ModelFamily, backend: Backend) -> Result<OcrEngine, &'static s
         .with_threads(1)
         .with_parallel(false)
         .with_det_options(DetOptions::new().with_max_side_len(960));
-    OcrEngine::new(
-        &detector.to_string_lossy(),
-        &recognizer.to_string_lossy(),
-        &charset.to_string_lossy(),
-        Some(config),
-    )
-    .map_err(|_| "OCR engine initialization failed")
+    OcrEngine::new(&detector, &recognizer, &charset, Some(config))
+        .map_err(|_| "OCR engine initialization failed")
 }
 
 fn backend_available(backend: Backend) -> bool {
     backend.is_available()
+}
+
+fn is_backend_check_request(args: &[String]) -> bool {
+    args == ["--backend-check-cuda"]
+}
+
+fn cuda_backend_check_child_exit() -> bool {
+    cfg!(feature = "cuda") && backend_available(Backend::CUDA)
+}
+
+fn cuda_backend_available_isolated() -> bool {
+    if !cfg!(feature = "cuda") {
+        return false;
+    }
+    let Ok(executable) = env::current_exe() else {
+        return false;
+    };
+    let Ok(mut child) = Command::new(executable)
+        .arg("--backend-check-cuda")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+        }
+    }
 }
 
 fn gpu_min_free_mib() -> Result<u32, &'static str> {
@@ -596,7 +689,7 @@ fn nvidia_metrics() -> Option<(u32, u64, u64)> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
+    let stdout = child.stdout.take()?;
     let reader = thread::spawn(move || {
         let mut bytes = Vec::with_capacity(MAX_CUDA_HEALTH_BYTES + 1);
         let _ = stdout
@@ -634,7 +727,7 @@ fn nvidia_metrics() -> Option<(u32, u64, u64)> {
 }
 
 fn health() -> i32 {
-    let cuda_backend = cfg!(feature = "cuda") && backend_available(Backend::CUDA);
+    let cuda_backend = cuda_backend_available_isolated();
     let metrics = nvidia_metrics();
     let threshold = gpu_min_free_mib().unwrap_or(MAX_GPU_MIN_FREE_MIB + 1) as u64 * 1024 * 1024;
     let (devices, free, total) = metrics.unwrap_or((0, 0, 0));
@@ -686,6 +779,7 @@ fn result_json(
     path: &Path,
     image: &DynamicImage,
     engine: &OcrEngine,
+    family: ModelFamily,
 ) -> Result<Vec<u8>, &'static str> {
     let results = engine
         .recognize(image)
@@ -744,7 +838,7 @@ fn result_json(
         let bottom = (rect.top().max(0) as u32)
             .saturating_add(rect.height())
             .min(image.height());
-        texts.push(result.text);
+        texts.push(postprocess_text(&result.text, family));
         scores.push(result.confidence);
         polygons.push(points);
         boxes.push([left, top, right, bottom]);
@@ -819,7 +913,7 @@ fn run(cli: Cli) -> Result<(), &'static str> {
     let mut total = 0u64;
     for image_path in images {
         let image = load_bounded(&image_path)?;
-        let bytes = result_json(&image_path, &image, &engine)?;
+        let bytes = result_json(&image_path, &image, &engine, family)?;
         total = total
             .checked_add(bytes.len() as u64)
             .ok_or("OCR output size overflow")?;
@@ -836,8 +930,15 @@ fn main() {
     if args.as_slice() == ["--health-json"] {
         std::process::exit(health());
     }
-    let cli = parse_cli(&args).unwrap_or_else(error);
-    run(cli).unwrap_or_else(error);
+    if is_backend_check_request(&args) {
+        std::process::exit(if cuda_backend_check_child_exit() {
+            0
+        } else {
+            1
+        });
+    }
+    let cli = parse_cli(&args).unwrap_or_else(|message| error(message));
+    run(cli).unwrap_or_else(|message| error(message));
 }
 
 #[cfg(test)]
@@ -976,7 +1077,7 @@ mod tests {
         .unwrap();
         let one: Value = serde_json::from_slice(&one).unwrap();
         assert_eq!(one["rec_texts"][0], "hello");
-        assert_eq!(one["rec_scores"][0], 0.9);
+        assert!((one["rec_scores"][0].as_f64().unwrap() - 0.9).abs() < 1e-6);
         assert_eq!(one["rec_polys"][0], one["dt_polys"][0]);
         assert_eq!(one["rec_boxes"][0], json!([1, 2, 3, 4]));
         assert!(
@@ -1037,5 +1138,86 @@ mod tests {
             model_files(ModelFamily::ChineseJapanese),
             ("PP-OCRv5_mobile_rec_fp16.mnn", "ppocr_keys_v5.txt")
         );
+    }
+
+    #[test]
+    fn primary_subtitle_languages_use_bundled_offline_models() {
+        let manifest = expected_digests().unwrap();
+        let cases = [
+            (
+                "en",
+                ModelFamily::English,
+                "en_PP-OCRv5_mobile_rec_infer.mnn",
+                "ppocr_keys_en.txt",
+            ),
+            (
+                "fr",
+                ModelFamily::Latin,
+                "latin_PP-OCRv5_mobile_rec_infer.mnn",
+                "ppocr_keys_latin.txt",
+            ),
+            (
+                "ar",
+                ModelFamily::Arabic,
+                "arabic_PP-OCRv5_mobile_rec_infer.mnn",
+                "ppocr_keys_arabic.txt",
+            ),
+        ];
+        for (language, family, recognizer, charset) in cases {
+            assert_eq!(language_family(language), Ok(family), "language {language}");
+            assert_eq!(model_files(family), (recognizer, charset));
+            assert!(
+                manifest.contains_key(recognizer),
+                "missing model for {language}"
+            );
+            assert!(
+                manifest.contains_key(charset),
+                "missing charset for {language}"
+            );
+        }
+        assert_eq!(language_family("fr-FR"), Ok(ModelFamily::Latin));
+        assert_eq!(language_family("ar-SA"), Ok(ModelFamily::Arabic));
+    }
+
+    #[test]
+    fn arabic_visual_order_is_restored_without_reversing_ltr_runs_or_marks() {
+        assert_eq!(
+            postprocess_text("ملاعلاب ابحرم", ModelFamily::Arabic),
+            "مرحبا بالعالم"
+        );
+        assert_eq!(
+            postprocess_text("ملاعلاب 123 ABC ابحرم", ModelFamily::Arabic),
+            "مرحبا 123 ABC بالعالم"
+        );
+        assert_eq!(postprocess_text("ابًحَرْمَ", ModelFamily::Arabic), "مَرْحَبًا");
+        assert_eq!(
+            postprocess_text("L'ÉTÉ À PARIS", ModelFamily::Latin),
+            "L'ÉTÉ À PARIS"
+        );
+        assert_eq!(
+            postprocess_text("HELLO WORLD 123", ModelFamily::English),
+            "HELLO WORLD 123"
+        );
+    }
+
+    #[test]
+    fn isolated_cuda_check_accepts_only_its_exact_internal_command() {
+        assert!(is_backend_check_request(&["--backend-check-cuda".into()]));
+        for args in [
+            vec![],
+            vec!["--backend-check-cuda".into(), "extra".into()],
+            vec!["prefix--backend-check-cuda".into()],
+            vec!["--health-json".into()],
+            vec!["--backend-check-cpu".into()],
+        ] {
+            assert!(!is_backend_check_request(&args));
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cpu_edition_rejects_the_cuda_backend_probe_without_loading_it() {
+        assert!(!cuda_backend_check_child_exit());
+        assert!(!cuda_backend_available_isolated());
     }
 }

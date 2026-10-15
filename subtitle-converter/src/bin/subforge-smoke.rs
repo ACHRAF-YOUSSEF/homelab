@@ -136,7 +136,12 @@ fn api(port: u16, method: &str, path: &str, body: Option<&Value>, csrf: &str) ->
         .position(|part| part == b"\r\n\r\n")
         .unwrap_or_else(|| fail("invalid HTTP response"));
     let headers = String::from_utf8_lossy(&response[..split]);
-    if !headers.starts_with("HTTP/1.1 200 ") {
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok());
+    if !status.is_some_and(|code| (200..300).contains(&code)) {
         fail(format!(
             "API request {method} {path} returned {}",
             headers.lines().next().unwrap_or("unknown status")
@@ -184,10 +189,8 @@ fn start_server(port: u16, root: &Path, data: &Path, ocr: bool, gpu: bool) -> Ch
             Duration::from_millis(250),
         ) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = stream.write_all(
-                format!("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
-            );
+            let _ = stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut response = String::new();
             if stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200 ")
             {
@@ -263,6 +266,90 @@ fn assert_file(path: &Path, expected: &str) {
     }
 }
 
+fn generate_sup_fixture(workspace: &Path, media: &Path, language: &str, text: &str) -> PathBuf {
+    let source = workspace.join(format!("ocr-source-{language}.srt"));
+    let generated = workspace.join(format!("ocr-generated-{language}"));
+    fs::create_dir(&generated).unwrap_or_else(|error| fail(error));
+    write(
+        &source,
+        &format!("1\n00:00:01,000 --> 00:00:04,000\n{text}\n"),
+    );
+    let source_s = source.to_string_lossy().into_owned();
+    let generated_s = generated.to_string_lossy().into_owned();
+    command(
+        "seconv",
+        &[
+            &source_s,
+            "bluraysup",
+            "--resolution:1280x720",
+            "--font-name:DejaVu Sans",
+            "--font-size:44",
+            "--overwrite",
+            "--json",
+            &format!("--output-folder:{generated_s}"),
+        ],
+        Duration::from_secs(45),
+    );
+    let sup = fs::read_dir(&generated)
+        .unwrap_or_else(|error| fail(error))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sup"))
+        .unwrap_or_else(|| fail(format!("Subtitle Edit produced no {language} OCR fixture")));
+    let target = media.join(format!("OCR.{language}.sup"));
+    fs::copy(sup, &target).unwrap_or_else(|error| fail(error));
+    target
+}
+
+fn assert_language_ocr(path: &Path, language: &str) {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|_| fail(format!("{language} OCR output is missing")))
+        .to_lowercase();
+    let recognized = text
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>();
+    let valid = match language {
+        "en" => recognized.contains("hello") && recognized.contains("world"),
+        "fr" => {
+            recognized.contains("paris")
+                && text
+                    .chars()
+                    .any(|character| matches!(character, 'é' | 'è' | 'ê' | 'à' | 'ç'))
+        }
+        "ar" => {
+            recognized
+                .chars()
+                .any(|character| ('\u{0600}'..='\u{06ff}').contains(&character))
+                && (recognized.contains("مرحبا") || recognized.contains("بالعالم"))
+        }
+        _ => false,
+    };
+    if !valid {
+        fail(format!(
+            "{language} OCR did not recognize its expected script and fixture words: {text:?}"
+        ));
+    }
+}
+
+fn primary_language_fixtures(workspace: &Path, media: &Path) -> Vec<PathBuf> {
+    [
+        ("en", "HELLO WORLD"),
+        ("fr", "L'ÉTÉ À PARIS"),
+        ("ar", "مرحبا بالعالم"),
+    ]
+    .into_iter()
+    .map(|(language, phrase)| generate_sup_fixture(workspace, media, language, phrase))
+    .collect()
+}
+
+fn secondary_language_fixtures(workspace: &Path, media: &Path) -> Vec<PathBuf> {
+    [("fr", "L'ÉTÉ À PARIS"), ("ar", "مرحبا بالعالم")]
+        .into_iter()
+        .map(|(language, phrase)| generate_sup_fixture(workspace, media, language, phrase))
+        .collect()
+}
+
 fn extraction(text_only: bool) {
     let workspace = TempDir::new("subforge-smoke");
     let media = workspace.0.join("media");
@@ -323,38 +410,7 @@ fn extraction(text_only: bool) {
     );
     let mut paths = vec![vtt, vtt_es, ass, ttml, sbv, mkv];
     if !text_only {
-        let ocr_srt = workspace.0.join("ocr-source.en.srt");
-        write(
-            &ocr_srt,
-            "1\n00:00:01,000 --> 00:00:02,000\nOCR fixture line\n",
-        );
-        let generated = workspace.0.join("ocr-generated");
-        fs::create_dir(&generated).unwrap_or_else(|error| fail(error));
-        let source_s = ocr_srt.to_string_lossy().into_owned();
-        let generated_s = generated.to_string_lossy().into_owned();
-        command(
-            "seconv",
-            &[
-                &source_s,
-                "bluraysup",
-                "--resolution:640x480",
-                "--font-name:DejaVu Sans",
-                "--font-size:32",
-                "--overwrite",
-                "--json",
-                &format!("--output-folder:{generated_s}"),
-            ],
-            Duration::from_secs(45),
-        );
-        let sup = fs::read_dir(&generated)
-            .unwrap_or_else(|error| fail(error))
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "sup"))
-            .unwrap_or_else(|| fail("Subtitle Edit produced no OCR fixture"));
-        let target = media.join("OCR.en.sup");
-        fs::copy(sup, &target).unwrap_or_else(|error| fail(error));
-        paths.push(target);
+        paths.extend(primary_language_fixtures(&workspace.0, &media));
     }
     let port = free_port();
     let server = start_server(port, &media, &data, !text_only, false);
@@ -383,7 +439,9 @@ fn extraction(text_only: bool) {
         assert_file(&media.join(filename), expected);
     }
     if !text_only {
-        assert_file(&media.join("OCR.en.srt"), "OCR fixture line");
+        for language in ["en", "fr", "ar"] {
+            assert_language_ocr(&media.join(format!("OCR.{language}.srt")), language);
+        }
     }
     stop_server(server);
     println!(
@@ -560,6 +618,8 @@ fn gpu_smoke(cues: usize) {
     if hash(&target) != expected_hash {
         fail("copy changed synthetic SUP fixture");
     }
+    let mut gpu_paths = vec![target.clone()];
+    gpu_paths.extend(secondary_language_fixtures(&workspace.0, &media));
     let port = free_port();
     let server = start_server(port, &media, &data, true, true);
     let token = csrf(port);
@@ -587,7 +647,9 @@ fn gpu_smoke(cues: usize) {
     {
         use std::os::unix::fs::PermissionsExt;
         let config = data.join("workers.conf");
-        if fs::metadata(&config).map(|m| m.permissions().mode() & 0o777) != Ok(0o600) {
+        if !fs::metadata(&config)
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+        {
             stop_server(server);
             fail("workers.conf permissions are not private");
         }
@@ -599,7 +661,7 @@ fn gpu_smoke(cues: usize) {
         Some(&json!({"cpu_workers":1,"ocr_workers":0,"gpu_workers":1,"paused":false})),
         &token,
     );
-    let id = job(port, &token, "extract", std::slice::from_ref(&target));
+    let id = job(port, &token, "extract", &gpu_paths);
     let deadline = Instant::now() + Duration::from_secs(300);
     let mut gpu_seen = false;
     let result;
@@ -608,14 +670,13 @@ fn gpu_smoke(cues: usize) {
         if let Some(item) = status["history"]
             .as_array()
             .and_then(|rows| rows.iter().find(|item| item["id"] == id))
-        {
-            if matches!(
+            && matches!(
                 item["status"].as_str(),
                 Some("completed" | "failed" | "cancelled")
-            ) {
-                result = item.clone();
-                break;
-            }
+            )
+        {
+            result = item.clone();
+            break;
         }
         let current = api(port, "GET", "/api/workers", None, &token);
         gpu_seen |= current["active"]["gpu_workers"].as_u64().unwrap_or(0) > 0
@@ -636,12 +697,15 @@ fn gpu_smoke(cues: usize) {
         ));
     }
     let output = media.join("OCR.en.srt");
-    let recognized = fs::read_to_string(&output).unwrap_or_else(|_| fail("GPU OCR output is missing"));
+    let recognized =
+        fs::read_to_string(&output).unwrap_or_else(|_| fail("GPU OCR output is missing"));
     let recognized = recognized.to_ascii_lowercase();
     if !recognized.contains("gpu") || !recognized.contains("fixture") {
         stop_server(server);
         fail("GPU OCR output did not contain fixture text");
     }
+    assert_language_ocr(&media.join("OCR.fr.srt"), "fr");
+    assert_language_ocr(&media.join("OCR.ar.srt"), "ar");
     if hash(&target) != expected_hash {
         stop_server(server);
         fail("OCR changed synthetic SUP source");

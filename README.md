@@ -75,7 +75,7 @@ Replace the example domain, LAN address, timezone, credentials, and media folder
 - **Self-hosted cloud** - [Nextcloud All-in-One](https://github.com/nextcloud/all-in-one) manages the Nextcloud deployment.
 - **Automation** - [n8n](https://github.com/n8n-io/n8n) for workflow automation.
 - **Local subtitles** - Subtitle Studio transcribes media with Faster Whisper, translates and optionally reviews subtitles through LM Studio, and provides a browser UI with resumable jobs.
-- **Subforge subtitle conversion** - An authenticated, responsive Rust dashboard and watcher export embedded tracks and supported subtitle sidecars as UTF-8 SRT files next to their sources; FFmpeg converts common text tracks, Subtitle Edit handles TTML/SBV text fallback, and image-track OCR is optional.
+- **Subforge subtitle conversion** - An authenticated Rust dashboard and watcher export embedded tracks and supported sidecars as UTF-8 SRT. Image-track OCR uses the native Rust `ocr-rs`/MNN helper with bundled English (`en`), French (`fr`), and Arabic (`ar`) recognition models; the `0.4.4` CPU and CUDA images contain no Python or PaddlePaddle runtime.
 - **Remote access** - Self-hosted [RustDesk](https://github.com/rustdesk/rustdesk) relay/rendezvous server.
 - **Self-hosted PDF tools** - [Stirling PDF](https://github.com/Stirling-Tools/Stirling-PDF) for PDF management, OCR, conversion, and automated pipeline processing.
 

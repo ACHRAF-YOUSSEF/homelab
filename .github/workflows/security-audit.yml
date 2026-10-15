@@ -161,7 +161,7 @@ jobs:
             --read-only --cap-drop ALL --security-opt no-new-privileges \
             --memory 96m --cpus 0.50 --pids-limit 32 glance-live-runtime:test
           trap 'docker rm --force glance-live-runtime-test >/dev/null' EXIT
-          for attempt in {1..15}; do
+          for _ in {1..15}; do
             if docker exec glance-live-runtime-test /usr/local/bin/glance-live --healthcheck; then
               exit 0
             fi

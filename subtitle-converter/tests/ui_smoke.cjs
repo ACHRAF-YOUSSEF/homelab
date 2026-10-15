@@ -280,7 +280,7 @@ async function main() {
     assert.deepEqual(await executorCard.locator('.job-executors > li:not(.job-executors-more):not(.job-executors-truncated)').allTextContents(),['CPU · Local','GPU OCR · Studio GPU (remote)','CPU OCR · Local','GPU OCR · Studio GPU (remote)']);
     assert.equal(await executorCard.locator('.job-executors-more summary').textContent(),'2 more workers');
     await executorCard.locator('.job-executors-more summary').click();
-    jobs[1].summary.converted++;
+    jobs.find(job => job.id === 'executors-1').summary.converted++;
     await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
     await executorCard.locator('.job-summary').getByText('7 converted', { exact: true }).waitFor();
     assert.equal(await executorCard.locator('.job-executors-more details').evaluate(details=>details.open),true,'worker disclosure remains open after a status update');
@@ -486,7 +486,7 @@ async function main() {
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.locator('#activity-kind').selectOption('all');
     await page.locator('#refresh-button').click();
-    await page.waitForFunction(() => document.querySelector('#jobs-range').textContent.includes('of 24 jobs'));
+    await page.waitForFunction(() => document.querySelector('#jobs-range').textContent.includes('of 25 jobs'));
     await page.locator('#jobs-page-size').selectOption('10');
     assert.match(await page.locator('#jobs-range').textContent(), /^1–10 of/);
     assert.equal(await page.locator('#jobs-list .job-row').count(),10);
@@ -528,7 +528,7 @@ async function main() {
     assert.notEqual(selectStyles.optionBackground, 'rgb(255, 255, 255)', 'select options use the dark palette');
     await page.locator('#jobs-page-size').selectOption('auto');
     await page.locator('#jobs-page-size').selectOption('25');
-    assert.equal(await page.locator('#jobs-list .job-row').count(),24,'manual page size shows all 24 fixture rows');
+    assert.equal(await page.locator('#jobs-list .job-row').count(),25,'manual page size shows all 25 fixture rows');
     await page.locator('#jobs-page-size').selectOption('auto');
     await page.setViewportSize({ width: 1440, height: 960 });
     if (output) await page.screenshot({ path: path.join(output, 'activity-table-desktop.png'), style: '.toast { visibility: hidden; }' });
