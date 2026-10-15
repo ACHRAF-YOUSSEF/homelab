@@ -15,6 +15,66 @@ const MAX_SUBTITLES: usize = 256;
 const MAX_INVENTORY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REQUESTS: usize = 1024;
 const FETCH_DEADLINE: Duration = Duration::from_secs(90);
+const NOTIFICATION_DEADLINE: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ScanReceipt {
+    attempted: usize,
+    acknowledged: usize,
+}
+
+#[derive(Debug)]
+pub(super) enum ScanOutcome {
+    Complete(ScanReceipt),
+    Uncertain(ScanReceipt, ScanUncertainty),
+}
+
+#[derive(Debug)]
+pub(super) enum ScanUncertainty {
+    Timeout,
+    Response,
+}
+
+#[derive(Debug)]
+pub(super) struct ScanFailure {
+    receipt: ScanReceipt,
+    message: String,
+}
+
+impl From<String> for ScanFailure {
+    fn from(message: String) -> Self {
+        Self {
+            receipt: ScanReceipt::default(),
+            message,
+        }
+    }
+}
+impl ScanOutcome {
+    pub(super) fn notification(self) -> Value {
+        let (receipt, pending, message) = match self {
+            Self::Complete(receipt) => (
+                receipt,
+                false,
+                if receipt.acknowledged > 0 {
+                    format!("Scanned {} Bazarr item(s)", receipt.acknowledged)
+                } else {
+                    "No matching Bazarr media item".into()
+                },
+            ),
+            Self::Uncertain(receipt,reason) => (
+                receipt,
+                true,
+                match reason { ScanUncertainty::Timeout=>"Bazarr response timed out; scan completion not yet confirmed",ScanUncertainty::Response=>"Bazarr scan response could not be validated; scan completion not yet confirmed"}.into(),
+            ),
+        };
+        json!({"provider":"bazarr","ok":!pending,"pending":pending,"uncertain":pending,"attempted":receipt.attempted,"acknowledged":receipt.acknowledged,"triggered":receipt.acknowledged,"message":message})
+    }
+}
+impl ScanFailure {
+    pub(super) fn notification(self) -> Value {
+        json!({"provider":"bazarr","ok":false,"pending":false,"uncertain":false,"attempted":self.receipt.attempted,"acknowledged":self.receipt.acknowledged,"triggered":self.receipt.acknowledged,"message":self.message})
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct Target {
@@ -308,7 +368,22 @@ impl Integrations {
         paths: &[String],
         stop: &AtomicBool,
         progress: &mut dyn FnMut(Value),
-    ) -> Result<usize, String> {
+    ) -> Result<ScanOutcome, ScanFailure> {
+        self.bazarr_scan_paths_until(
+            paths,
+            stop,
+            progress,
+            Instant::now() + NOTIFICATION_DEADLINE,
+        )
+    }
+
+    fn bazarr_scan_paths_until(
+        &self,
+        paths: &[String],
+        stop: &AtomicBool,
+        progress: &mut dyn FnMut(Value),
+        deadline: Instant,
+    ) -> Result<ScanOutcome, ScanFailure> {
         let remotes: Vec<NormPath> = paths
             .iter()
             .filter_map(|path| {
@@ -317,6 +392,7 @@ impl Integrations {
             })
             .collect();
         let mut budget = FetchBudget::new();
+        budget.deadline = budget.deadline.min(deadline);
         let mut series_matches: Vec<Option<(usize, i64)>> = vec![None; remotes.len()];
         let mut movie_ids = BTreeSet::new();
         self.bazarr_pages("/api/series", &mut budget, stop, |row| {
@@ -360,7 +436,7 @@ impl Integrations {
             }
             Ok(())
         })?;
-        let mut count = 0;
+        let mut receipt = ScanReceipt::default();
         let series_ids = series_matches
             .into_iter()
             .flatten()
@@ -372,11 +448,16 @@ impl Integrations {
             .chain(movie_ids.into_iter().map(|id| ("movie", id)))
         {
             if stop.load(Ordering::Relaxed) {
-                return Ok(count);
+                return Ok(ScanOutcome::Complete(receipt));
             }
-            if count >= 1024 || budget.requests >= MAX_REQUESTS || Instant::now() >= budget.deadline
+            if receipt.attempted >= 1024
+                || budget.requests >= MAX_REQUESTS
+                || Instant::now() >= deadline
             {
-                return Err("Bazarr notification exceeds its scoped request or time limit".into());
+                return Err(ScanFailure {
+                    receipt,
+                    message: "Bazarr notification exceeds its scoped request or time limit".into(),
+                });
             }
             budget.requests += 1;
             progress(json!({"status":"refreshing","path":format!("Bazarr · {kind} {id}")}));
@@ -388,11 +469,44 @@ impl Integrations {
             // sync may update manager state; search-* may download subtitles.
             // Only this documented action reindexes already published files.
             let fields = [(field, id.to_string()), ("action", "scan-disk".to_owned())];
-            self.api("bazarr", endpoint, "PATCH", None, Some(&fields))
-                .map_err(|error| error.message("Bazarr scoped subtitle rescan failed"))?;
-            count += 1;
+            receipt.attempted += 1;
+            let conf = self.conf("bazarr");
+            let result = request_response_bounded(
+                get_str(conf, "url"),
+                endpoint,
+                "PATCH",
+                get_str(conf, "api_key"),
+                Auth::ApiKey,
+                None,
+                Some(&fields),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+            match result {
+                Ok(response) => match response_json(response) {
+                    Ok(_) => receipt.acknowledged += 1,
+                    Err(error) => {
+                        return Ok(ScanOutcome::Uncertain(
+                            receipt,
+                            if error.category == "timeout" {
+                                ScanUncertainty::Timeout
+                            } else {
+                                ScanUncertainty::Response
+                            },
+                        ));
+                    }
+                },
+                Err(error) if error.category == "timeout" => {
+                    return Ok(ScanOutcome::Uncertain(receipt, ScanUncertainty::Timeout));
+                }
+                Err(error) => {
+                    return Err(ScanFailure {
+                        receipt,
+                        message: error.message("Bazarr scoped subtitle rescan failed"),
+                    });
+                }
+            }
         }
-        Ok(count)
+        Ok(ScanOutcome::Complete(receipt))
     }
 
     fn bazarr_pages(
@@ -647,13 +761,45 @@ mod tests {
             .unwrap()
     }
     fn fixture(replies: Vec<(String, Value)>) -> (String, thread::JoinHandle<Vec<String>>) {
+        fixture_responses(
+            replies
+                .into_iter()
+                .map(|(path, body)| (path, body, 200, Duration::ZERO))
+                .collect(),
+        )
+    }
+    fn fixture_responses(
+        replies: Vec<(String, Value, u16, Duration)>,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        fixture_wire(
+            replies
+                .into_iter()
+                .map(|(path, body, status, delay)| {
+                    (
+                        path,
+                        if status == 204 {
+                            String::new()
+                        } else {
+                            body.to_string()
+                        },
+                        status,
+                        delay,
+                        None,
+                    )
+                })
+                .collect(),
+        )
+    }
+    fn fixture_wire(
+        replies: Vec<(String, String, u16, Duration, Option<usize>)>,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut requests = Vec::new();
-            for (expected, body) in replies {
+            for (expected, body, status, delay, declared_length) in replies {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(connection) => break connection,
@@ -703,12 +849,12 @@ mod tests {
                     "Unexpected Bazarr fixture API route"
                 );
                 requests.push(request);
-                let body = body.to_string();
+                thread::sleep(delay);
                 let reply = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    declared_length.unwrap_or(body.len())
                 );
-                stream.write_all(reply.as_bytes()).unwrap();
+                let _ = stream.write_all(reply.as_bytes());
             }
             requests
         });
@@ -1001,7 +1147,7 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap();
-        assert_eq!(triggered, 1);
+        assert_eq!(triggered.notification()["triggered"], 1);
         let requests = server.join().unwrap();
         assert!(
             requests
@@ -1040,5 +1186,237 @@ mod tests {
         );
         assert!(!allowed_route("GET", "/api/system/tasks"));
         assert!(!allowed_route("POST", "/api/system/tasks"));
+    }
+
+    #[test]
+    fn scoped_scan_waits_longer_than_the_general_eight_second_timeout() {
+        let (_temporary, mut integration) = integration();
+        let (endpoint, server) = fixture_responses(vec![
+            (
+                "GET /api/series?start=0&length=200 ".into(),
+                json!({"data":[{"sonarrSeriesId":47,"path":"/tv/Fixture"}],"total":1}),
+                200,
+                Duration::ZERO,
+            ),
+            (
+                "GET /api/movies?start=0&length=200 ".into(),
+                json!({"data":[],"total":0}),
+                200,
+                Duration::ZERO,
+            ),
+            (
+                "PATCH /api/series ".into(),
+                Value::Null,
+                204,
+                Duration::from_secs(9),
+            ),
+        ]);
+        integration
+            .update(&json!({"bazarr":{"enabled":true,"url":endpoint,"api_key":"fixture-key"}}))
+            .unwrap();
+        integration.notify(&["/tv/Fixture/Episode.en.srt".into()]);
+        let started = Instant::now();
+        let result = integration
+            .flush_bazarr(&AtomicBool::new(false), &mut |_| {})
+            .unwrap();
+        assert!(started.elapsed() > HTTP_TIMEOUT);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["pending"], false);
+        assert_eq!(result["attempted"], 1);
+        assert_eq!(result["acknowledged"], 1);
+        assert_eq!(server.join().unwrap().len(), 3, "scan must be sent once");
+    }
+
+    fn partial_receipt_fixture(
+        status: u16,
+        delay: Duration,
+    ) -> (
+        tempfile::TempDir,
+        Integrations,
+        thread::JoinHandle<Vec<String>>,
+    ) {
+        let (temporary, mut integration) = integration();
+        let series: Vec<_> = (1..=3)
+            .map(|id| json!({"sonarrSeriesId":id,"path":format!("/tv/Fixture{id}")}))
+            .collect();
+        let (endpoint, server) = fixture_responses(vec![
+            (
+                "GET /api/series?start=0&length=200 ".into(),
+                json!({"data":series,"total":3}),
+                200,
+                Duration::ZERO,
+            ),
+            (
+                "GET /api/movies?start=0&length=200 ".into(),
+                json!({"data":[],"total":0}),
+                200,
+                Duration::ZERO,
+            ),
+            (
+                "PATCH /api/series ".into(),
+                Value::Null,
+                204,
+                Duration::ZERO,
+            ),
+            ("PATCH /api/series ".into(), json!({}), status, delay),
+        ]);
+        integration
+            .update(&json!({"bazarr":{"enabled":true,"url":endpoint,"api_key":"fixture-key"}}))
+            .unwrap();
+        (temporary, integration, server)
+    }
+
+    #[test]
+    fn scan_timeout_preserves_partial_receipts_and_never_retries() {
+        let (_temporary, integration, server) =
+            partial_receipt_fixture(204, Duration::from_millis(1200));
+        let paths: Vec<_> = (1..=3)
+            .map(|id| format!("/tv/Fixture{id}/Episode.en.srt"))
+            .collect();
+        let result = integration
+            .bazarr_scan_paths_until(
+                &paths,
+                &AtomicBool::new(false),
+                &mut |_| {},
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap()
+            .notification();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["pending"], true);
+        assert_eq!(result["uncertain"], true);
+        assert_eq!(result["attempted"], 2);
+        assert_eq!(result["acknowledged"], 1);
+        assert_eq!(result["triggered"], 1);
+        assert_eq!(
+            result["message"],
+            "Bazarr response timed out; scan completion not yet confirmed"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].ends_with("seriesid=1&action=scan-disk"));
+        assert!(requests[3].ends_with("seriesid=2&action=scan-disk"));
+    }
+
+    #[test]
+    fn explicit_scan_http_failure_retains_acknowledged_count_without_uncertainty() {
+        let (_temporary, integration, server) = partial_receipt_fixture(500, Duration::ZERO);
+        let paths: Vec<_> = (1..=3)
+            .map(|id| format!("/tv/Fixture{id}/Episode.en.srt"))
+            .collect();
+        let result = integration
+            .bazarr_scan_paths(&paths, &AtomicBool::new(false), &mut |_| {})
+            .unwrap_err()
+            .notification();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["pending"], false);
+        assert_eq!(result["uncertain"], false);
+        assert_eq!(result["attempted"], 2);
+        assert_eq!(result["acknowledged"], 1);
+        assert_eq!(result["triggered"], 1);
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn incomplete_or_invalid_success_response_is_uncertain_not_a_failed_scan() {
+        for (body, length) in [("{}", Some(100)), ("invalid JSON", None)] {
+            let (_temporary, mut integration) = integration();
+            let (endpoint, server) = fixture_wire(vec![
+                (
+                    "GET /api/series?start=0&length=200 ".into(),
+                    json!({"data":[{"sonarrSeriesId":1,"path":"/tv/Fixture"}],"total":1})
+                        .to_string(),
+                    200,
+                    Duration::ZERO,
+                    None,
+                ),
+                (
+                    "GET /api/movies?start=0&length=200 ".into(),
+                    json!({"data":[],"total":0}).to_string(),
+                    200,
+                    Duration::ZERO,
+                    None,
+                ),
+                (
+                    "PATCH /api/series ".into(),
+                    body.into(),
+                    200,
+                    Duration::ZERO,
+                    length,
+                ),
+            ]);
+            integration
+                .update(&json!({"bazarr":{"enabled":true,"url":endpoint,"api_key":"fixture-key"}}))
+                .unwrap();
+            integration.notify(&["/tv/Fixture/Episode.en.srt".into()]);
+            let result = integration
+                .flush_bazarr(&AtomicBool::new(false), &mut |_| {})
+                .unwrap();
+            assert_eq!(result["pending"], true);
+            assert_eq!(result["uncertain"], true);
+            assert_eq!(result["attempted"], 1);
+            assert_eq!(result["acknowledged"], 0);
+            assert_eq!(
+                result["message"],
+                "Bazarr scan response could not be validated; scan completion not yet confirmed"
+            );
+            assert!(
+                integration.bazarr_pending_paths.is_empty(),
+                "no automatic retry may be queued"
+            );
+            assert_eq!(server.join().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn extended_timeout_requires_the_exact_scoped_scan_method_route_and_form() {
+        let series = [
+            ("seriesid", "47".to_owned()),
+            ("action", "scan-disk".to_owned()),
+        ];
+        let movie = [
+            ("radarrid", "12".to_owned()),
+            ("action", "scan-disk".to_owned()),
+        ];
+        assert_eq!(
+            request_timeout("/api/series", "PATCH", Some(&series)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            request_timeout("/api/movies", "PATCH", Some(&movie)),
+            Duration::from_secs(120)
+        );
+        for (path, method, fields) in [
+            ("/api/series", "GET", Some(series.as_slice())),
+            ("/api/series", "POST", Some(series.as_slice())),
+            ("/api/series?seriesid=47", "PATCH", Some(series.as_slice())),
+            ("/api/episodes", "PATCH", Some(series.as_slice())),
+            ("/api/v3/command", "POST", Some(series.as_slice())),
+            ("/api/series", "PATCH", Some(movie.as_slice())),
+            ("/api/series", "PATCH", None),
+        ] {
+            assert_eq!(
+                request_timeout(path, method, fields),
+                Duration::from_secs(8)
+            );
+        }
+        for form in [
+            vec![
+                ("seriesid", "47".into()),
+                ("action", "search-missing".into()),
+            ],
+            vec![("seriesid", "0".into()), ("action", "scan-disk".into())],
+            vec![("seriesid", "-1".into()), ("action", "scan-disk".into())],
+            vec![
+                ("seriesid", "47".into()),
+                ("action", "scan-disk".into()),
+                ("episodeid", "1".into()),
+            ],
+        ] {
+            assert_eq!(
+                request_timeout("/api/series", "PATCH", Some(&form)),
+                Duration::from_secs(8)
+            );
+        }
     }
 }

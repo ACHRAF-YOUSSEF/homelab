@@ -253,7 +253,36 @@ async function main() {
     await page.locator('#confirm-conversion').click();
     await page.locator('#conversion-modal').waitFor({ state: 'hidden' });
     assert.equal(writes.at(-1).body.include_ocr, true, 'manual conversion requests available OCR slots');
+    // A timed-out rescan is uncertain, while the actual conversion is complete.
+    const pendingNotice = { provider: 'bazarr', ok: false, pending: true, uncertain: true, message: 'Bazarr response timed out; scan completion not yet confirmed' };
+    jobs.unshift({ id: 'index-pending', kind: 'extract', status: 'completed', created: now, finished: now, summary: { converted: 1 }, notifications: [pendingNotice] });
+    await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.locator('#activity-kind').selectOption('all');
+    await page.locator('#refresh-button').click();
+    const pendingCard = page.locator('#jobs-list .job-card').first();
+    await pendingCard.getByText('Converted · indexing pending', { exact: true }).waitFor();
+    assert.equal(await pendingCard.locator('.job-error').count(), 0, 'pending confirmation is not a reported conversion error');
+    assert(await pendingCard.locator('.result-pending').isVisible());
+    const writesBeforeCheck = writes.length;
+    await pendingCard.getByRole('button', { name: 'Check Bazarr indexing' }).click();
+    assert.equal(writes.length, writesBeforeCheck + 1);
+    assert.equal(writes.at(-1).endpoint, '/api/jobs');
+    assert.equal(writes.at(-1).body.kind, 'inspect', 'verification queues an inventory read, not another extraction or rescan');
+    for (const width of [1440, 320]) {
+      await page.setViewportSize({ width, height: 640 });
+      await pendingCard.scrollIntoViewIfNeeded();
+      await assertViewport(`pending indexing ${width}px`);
+      assert(await pendingCard.getByRole('button', { name: 'Check Bazarr indexing' }).isVisible());
+      if (output) await page.screenshot({ path: path.join(output, `bazarr-indexing-pending-${width}.png`), style: '.toast { visibility: hidden; }' });
+    }
+    pendingNotice.ok = true; pendingNotice.pending = false; pendingNotice.uncertain = false;
+    pendingNotice.message = 'Published SRT files confirmed by a later Bazarr inventory sync';
+    await page.locator('#refresh-button').click();
+    await pendingCard.getByText(pendingNotice.message, { exact: true }).waitFor();
+    assert.equal(await pendingCard.locator('.result-pending, .job-error').count(), 0);
+    await pendingCard.getByText('Completed', { exact: true }).waitFor();
     // Long activity and native controls must remain usable inside the fixed shell.
+    await page.setViewportSize({ width: 1440, height: 1000 });
     jobs.push(...Array.from({ length: 20 }, (_, i) => ({ id: `history-${i}`, kind: 'inspect', status: 'completed', created: now - i * 60, summary: { inspected: 1 } })));
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.locator('#activity-kind').selectOption('all');
@@ -283,7 +312,7 @@ async function main() {
     assert.notEqual(selectStyles.optionBackground, 'rgb(255, 255, 255)', 'select options use the dark palette');
     if (output) await page.screenshot({ path: path.join(output, 'activity-fixed-viewport.png'), style: '.toast { visibility: hidden; }' });
     assert.deepEqual(errors, [], 'browser must have no uncaught errors');
-    console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, keyboard, and Bazarr coverage/authority regressions');
+    console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, keyboard, Bazarr coverage/authority, and pending indexing confirmation regressions');
     await context.close();
   } finally {
     if (browser) await browser.close();

@@ -404,6 +404,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .integration-result.result-success { color: #4ADE80; background: #10271a; border-color: #24543a; }
 .integration-result.result-error { color: #FF4D6A; background: #3B1119; border-color: #6f2031; }
 .integration-result.result-pending { color: #FFC857; background: #451A03; border-color: #74410f; }
+.job-result.result-pending { display: flex; flex-wrap: wrap; gap: 8px 16px; justify-content: space-between; }
 .library-check > span { display: grid; gap: 3px; padding: 5px 0; min-width: 0; }
 .library-check strong { font-size: 13px; font-weight: 600; }
 .library-id { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }

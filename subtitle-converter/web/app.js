@@ -96,7 +96,7 @@
     setText($('#inventory-source'),bazarr?'Bazarr':'Filesystem');
     const banner=$('#inventory-authority');banner.classList.toggle('hidden',!bazarr);
     banner.classList.toggle('authority-error',status!=='ready');
-    setText(banner,bazarr?({ready:'Bazarr profiles define the wanted languages. Valid SRT coverage is verified before conversion.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:'Subtitles were published; Bazarr indexing or inventory refresh is still pending.',reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(authority.error?` ${authority.error}`:''):'');
+    setText(banner,bazarr?({ready:'Bazarr profiles define the wanted languages. Valid SRT coverage is verified before conversion.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:'Subtitles were published; Bazarr indexing or inventory refresh is still pending. Sync Bazarr inventory to check again.',reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(authority.error?` ${authority.error}`:''):'');
     $$('[data-action="inspect"]').forEach(button=>setText(button,bazarr?'Sync Bazarr inventory':'Inspect media'));
     const blocked=bazarr&&status!=='ready';
     $$('[data-action="scan"],#quick-form button[type="submit"]').forEach(button=>{button.disabled=blocked;button.title=blocked?'Sync Bazarr before starting automatic conversion':'';});
@@ -156,8 +156,8 @@
     if(Number(job.other_file_errors)>0)add('conversion',{message:'Additional file failures',count:job.other_file_errors});
     const reported=[...groups.values()].filter(group=>group.source==='conversion').reduce((sum,group)=>sum+group.count,0),missing=Number(job.summary?.failed||0)-reported;
     if(missing>0)add('conversion',{message:'Detailed causes are unavailable for this older job. Run a new scan to collect file diagnostics.',count:missing});
-    for(const item of Array.isArray(job.notifications)?job.notifications:[])if(item?.ok===false)add('notification',item);
-    for(const item of Array.isArray(job.results)?job.results:[])if(item?.ok===false)add('result',item);
+    for(const item of Array.isArray(job.notifications)?job.notifications:[])if(item?.ok===false&&!item.pending)add('notification',item);
+    for(const item of Array.isArray(job.results)?job.results:[])if(item?.ok===false&&!item.pending)add('result',item);
     return [...groups.values()];
   };
   const renderErrors = (job,compact) => {
@@ -217,7 +217,8 @@
     const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = currentLabel(job.current) || (job.paths && job.paths.length ? shortPath(job.paths[0]) : job.root_label || 'All scan roots');
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
-    const pill = document.createElement('span'); pill.className=`status-pill ${escStatus(job.status)}`; pill.textContent=({completed_with_errors:'Completed with errors',running:'Running',queued:'Queued',completed:'Completed',failed:'Failed',cancelled:'Cancelled'})[job.status]||job.status||'Queued';
+    const awaitingIndex=Array.isArray(job.notifications)&&job.notifications.some(item=>item?.pending===true);
+    const pill = document.createElement('span'); pill.className=`status-pill ${awaitingIndex&&job.status==='completed'?'queued':escStatus(job.status)}`; pill.textContent=awaitingIndex&&job.status==='completed'?'Converted · indexing pending':({completed_with_errors:'Completed with errors',running:'Running',queued:'Queued',completed:'Completed',failed:'Failed',cancelled:'Cancelled'})[job.status]||job.status||'Queued';
     const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.started || job.created);
     status.append(pill,time);
     card.append(icon,detail,status);
@@ -231,6 +232,12 @@
     }
     const successfulResults=[...(job.kind==='refresh'&&Array.isArray(job.results)?job.results:[]),...(Array.isArray(job.notifications)?job.notifications.filter(item=>item?.provider==='bazarr'):[])].filter(item=>item?.ok===true&&typeof item.message==='string');
     for(const item of successfulResults){const result=document.createElement('p');result.className='job-result';result.textContent=item.message;card.append(result);}
+    for(const item of Array.isArray(job.notifications)?job.notifications.filter(item=>item?.pending===true):[]) {
+      const notice=document.createElement('div');notice.className='job-result integration-result result-pending';
+      const message=document.createElement('span');message.textContent=item.message||'Bazarr indexing has not been confirmed yet.';
+      const check=document.createElement('button');check.type='button';check.className='text-button';check.textContent='Check Bazarr indexing';check.dataset.jobFocus=`${errorViewKey(job,compact)}:indexing`;
+      check.addEventListener('click',()=>startJob({kind:'inspect',rootIds:[],languages:['*']}));notice.append(message,check);card.append(notice);
+    }
     const errors=renderErrors(job,compact);if(errors)card.append(errors);
     return card;
   };

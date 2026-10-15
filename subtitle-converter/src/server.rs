@@ -30,6 +30,80 @@ const JSON_LIMIT: usize = 32 * 1024 * 1024;
 const HTTP_WORKERS: usize = 4;
 const LOG_LIMIT: usize = 200;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+// Fingerprints bound confirmation state to about 1.3 MiB, even for a large job.
+const INDEX_CONFIRM_LIMIT: usize = 20_000;
+
+fn srt_index_key(value: &str) -> Option<String> {
+    let path = Path::new(value);
+    if value.len() > 4096
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        || !path.extension()?.to_str()?.eq_ignore_ascii_case("srt")
+    {
+        return None;
+    }
+    let normalized = path
+        .components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    Some(format!("{:x}", Sha256::digest(normalized.as_bytes())))
+}
+
+fn index_keys(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(INDEX_CONFIRM_LIMIT)
+        .filter_map(Value::as_str)
+        .filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn unconfirmed_index_keys(rows: &[Value], expected: &[String]) -> Vec<String> {
+    let mut pending: HashSet<String> = expected.iter().cloned().collect();
+    for row in rows {
+        for subtitle in row["subtitles"].as_array().into_iter().flatten().take(256) {
+            if subtitle["source"] == "sidecar"
+                && let Some(key) = subtitle["path"].as_str().and_then(srt_index_key)
+            {
+                pending.remove(&key);
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+    }
+    let mut pending: Vec<_> = pending.into_iter().collect();
+    pending.sort();
+    pending
+}
+
+fn remember_published_srts(job: &mut Value, outputs: &[String]) {
+    if !job["published_srt_keys"].is_array() {
+        job["published_srt_keys"] = json!([]);
+    }
+    for output in outputs {
+        let Some(key) = srt_index_key(output) else {
+            job["verification_limited"] = json!(true);
+            continue;
+        };
+        let entries = job["published_srt_keys"]
+            .as_array_mut()
+            .expect("initialized array");
+        if entries.len() >= INDEX_CONFIRM_LIMIT {
+            job["verification_limited"] = json!(true);
+            break;
+        }
+        entries.push(json!(key));
+    }
+}
 
 fn log_text(value: &str, limit: usize) -> String {
     value
@@ -319,16 +393,20 @@ fn completed_status(job: &Value) -> &'static str {
         .as_str()
         .is_some_and(|message| !message.is_empty())
         || (job["kind"] == "refresh"
-            && job["results"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item["ok"] == false)))
+            && job["results"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["ok"] == false && item["pending"] != true)
+            }))
     {
         return "failed";
     }
     if count(&job["summary"]["failed"]) > 0
-        || job["notifications"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["ok"] == false))
+        || job["notifications"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["ok"] == false && item["pending"] != true)
+        })
     {
         "completed_with_errors"
     } else {
@@ -458,7 +536,7 @@ impl App {
             runtime.inventory_updated = saved["updated"].as_f64().unwrap_or(0.0);
             runtime.inventory_truncated = saved["truncated"].as_bool().unwrap_or(false);
             runtime.inventory_partial = saved["partial"].as_bool().unwrap_or(false);
-            runtime.inventory_authority = json!({"status":if runtime.inventory_source == "bazarr" {"stale"} else {"ready"},"error":saved["authority"]["error"],"previous_status":saved["authority"]["status"]});
+            runtime.inventory_authority = json!({"status":if runtime.inventory_source == "bazarr" {"stale"} else {"ready"},"error":saved["authority"]["error"],"previous_status":saved["authority"]["status"],"pending_srt_keys":index_keys(&saved["authority"]["pending_srt_keys"]),"verification_limited":saved["authority"]["verification_limited"]==true});
         }
         // Inventory is stored once, independently of rotating job history.
         runtime.cached_roots = runtime
@@ -468,6 +546,10 @@ impl App {
             .collect();
         runtime.pipeline_counts = converter.pipeline_counts();
         for job in &mut runtime.history {
+            if let Some(fields) = job.as_object_mut() {
+                fields.remove("published_paths");
+                fields.remove("published_srt_keys");
+            }
             if job["kind"] == "inspect" {
                 job["results"] = json!([]);
             }
@@ -737,7 +819,7 @@ impl App {
         }
         runtime.inventory_source = "bazarr".into();
         runtime.inventory_partial = true;
-        runtime.inventory_authority = json!({"status":"unavailable","error":log_text(message,512)});
+        runtime.inventory_authority = json!({"status":"unavailable","error":log_text(message,512),"pending_srt_keys":index_keys(&runtime.inventory_authority["pending_srt_keys"]),"verification_limited":runtime.inventory_authority["verification_limited"]==true});
         runtime.state_revision = runtime.state_revision.saturating_add(1);
         drop(runtime);
         let _ = self.persist_inventory();
@@ -960,7 +1042,27 @@ impl App {
         runtime.inventory_updated = now();
         runtime.inventory_partial = partial;
         runtime.inventory_truncated = truncated;
-        runtime.inventory_authority = json!({"status":"ready","error":null,"metadata_pending":metadata_pending,"probe_limit":PROBE_LIMIT,"unmapped_or_unavailable":inventory["items"].as_array().map_or(0,Vec::len).saturating_sub(rows.len())});
+        let previous_keys = index_keys(&runtime.inventory_authority["pending_srt_keys"]);
+        let limited = runtime.inventory_authority["verification_limited"] == true;
+        let unconfirmed = unconfirmed_index_keys(&rows, &previous_keys);
+        runtime.inventory_authority = json!({"status":if !unconfirmed.is_empty() || limited {"refresh_pending"} else {"ready"},"error":null,"metadata_pending":metadata_pending,"probe_limit":PROBE_LIMIT,"unmapped_or_unavailable":inventory["items"].as_array().map_or(0,Vec::len).saturating_sub(rows.len()),"pending_srt_keys":unconfirmed,"verification_limited":limited});
+        if !previous_keys.is_empty() && runtime.inventory_authority["status"] == "ready" {
+            for history in &mut runtime.history {
+                if let Some(notices) = history["notifications"].as_array_mut() {
+                    for notice in notices.iter_mut().filter(|notice| {
+                        notice["provider"] == "bazarr" && notice["pending"] == true
+                    }) {
+                        notice["ok"] = json!(true);
+                        notice["pending"] = json!(false);
+                        notice["uncertain"] = json!(false);
+                        notice["verified"] = json!(true);
+                        notice["message"] =
+                            json!("Published SRT files confirmed by a later Bazarr inventory sync");
+                    }
+                }
+            }
+            self.persist_history(&runtime);
+        }
         runtime.state_revision = runtime.state_revision.saturating_add(1);
         drop(runtime);
         self.persist_inventory()?;
@@ -1119,37 +1221,124 @@ impl App {
         Ok(())
     }
 
+    fn prepare_bazarr_verification(&self) -> Result<(), String> {
+        let mut runtime = lock(&self.runtime);
+        let Some(job) = runtime
+            .running
+            .as_ref()
+            .filter(|job| count(&job["published_outputs"]) > 0)
+        else {
+            return Ok(());
+        };
+        let job_keys = index_keys(&job["published_srt_keys"]);
+        let mut limited = job_keys.is_empty()
+            || job["verification_limited"] == true
+            || runtime.inventory_authority["verification_limited"] == true;
+        let mut keys: HashSet<_> = index_keys(&runtime.inventory_authority["pending_srt_keys"])
+            .into_iter()
+            .collect();
+        for key in job_keys {
+            if keys.len() >= INDEX_CONFIRM_LIMIT && !keys.contains(&key) {
+                limited = true;
+                break;
+            }
+            keys.insert(key);
+        }
+        let mut keys: Vec<_> = keys.into_iter().collect();
+        keys.sort();
+        runtime.inventory_authority["pending_srt_keys"] = json!(keys);
+        runtime.inventory_authority["verification_limited"] = json!(limited);
+        drop(runtime);
+        self.persist_inventory()
+    }
+
     fn refresh_bazarr_after_publication(
         &self,
         integrations: &mut Integrations,
         job: &Value,
-        reindex: Option<&Value>,
+        mut reindex: Option<&mut Value>,
     ) -> Result<(), String> {
-        let (published, paths) = lock(&self.runtime)
+        let (published, keys, limited) = lock(&self.runtime)
             .running
             .as_ref()
             .map(|job| {
                 (
                     count(&job["published_outputs"]),
-                    strings(&job["published_paths"]),
+                    index_keys(&job["published_srt_keys"]),
+                    job["verification_limited"] == true,
                 )
             })
             .unwrap_or_default();
         if !integrations.bazarr_enabled() || published == 0 {
             return Ok(());
         }
+        self.prepare_bazarr_verification()?;
         if self.cancel.load(Ordering::Relaxed) {
-            lock(&self.runtime).inventory_authority = json!({"status":"refresh_pending","error":null,"reason":"SRT files were published before cancellation; inspect media to verify Bazarr coverage"});
+            let mut runtime = lock(&self.runtime);
+            runtime.inventory_authority["status"] = json!("refresh_pending");
+            runtime.inventory_authority["reason"] = json!(
+                "SRT files were published before cancellation; sync Bazarr inventory to verify indexing"
+            );
+            drop(runtime);
             return self.persist_inventory();
         }
         let refreshed = self.sync_bazarr_inventory(integrations, job, false);
-        if reindex.is_none_or(|result| result["ok"] != true || count(&result["triggered"]) == 0) {
+        let uncertain = reindex
+            .as_ref()
+            .is_some_and(|result| result["pending"] == true || result["uncertain"] == true);
+        let verified = !keys.is_empty()
+            && !limited
+            && refreshed
+                .as_ref()
+                .is_ok_and(|rows| unconfirmed_index_keys(rows, &keys).is_empty());
+        if uncertain && verified {
+            if let Some(result) = reindex.as_mut() {
+                result["ok"] = json!(true);
+                result["pending"] = json!(false);
+                result["uncertain"] = json!(false);
+                result["verified"] = json!(true);
+                result["verified_outputs"] = json!(keys.len());
+                result["message"] = json!(format!(
+                    "{} published SRT file(s) confirmed in Bazarr inventory after an unconfirmed scan response",
+                    keys.len()
+                ));
+            }
+            self.log(
+                "INFO",
+                &format!(
+                    "Fresh Bazarr inventory contains all {} published SRT files",
+                    keys.len()
+                ),
+            );
+        } else if uncertain {
+            let mut runtime = lock(&self.runtime);
+            if refreshed.is_ok() {
+                runtime.inventory_authority["status"] = json!("refresh_pending");
+            }
+            runtime.inventory_authority["reason"] = json!(
+                "Bazarr scan completion is not yet confirmed. Sync Bazarr inventory to check again; the rescan is not automatically repeated."
+            );
+            if keys.is_empty() || limited {
+                runtime.inventory_authority["verification_limited"] = json!(true);
+            }
+            drop(runtime);
+            self.persist_inventory()?;
+            self.log("WARNING", "Bazarr scan response is unconfirmed; published SRT files remain safe and no automatic rescan retry was sent");
+            // A failed verification read cannot turn an uncertain scan into a
+            // definite scan failure. Its diagnostic is retained in authority.
+            return Ok(());
+        } else if reindex
+            .as_ref()
+            .is_none_or(|result| result["ok"] != true || count(&result["triggered"]) == 0)
+        {
             let error = reindex
+                .as_ref()
                 .and_then(|result| result["message"].as_str())
                 .unwrap_or("Scoped Bazarr reindex did not complete");
             let mut runtime = lock(&self.runtime);
-            let refresh_error = runtime.inventory_authority["error"].clone();
-            runtime.inventory_authority = json!({"status":"reindex_failed","error":log_text(error,512),"refresh_error":refresh_error,"published_outputs":published});
+            runtime.inventory_authority["status"] = json!("reindex_failed");
+            runtime.inventory_authority["error"] = json!(log_text(error, 512));
+            runtime.inventory_authority["published_outputs"] = json!(published);
             drop(runtime);
             self.persist_inventory()?;
             self.log(
@@ -1159,26 +1348,6 @@ impl App {
                     log_text(error, 256)
                 ),
             );
-        } else if refreshed.is_ok() {
-            let mut runtime = lock(&self.runtime);
-            let pending = runtime
-                .inventory
-                .iter()
-                .filter(|row| {
-                    paths.iter().any(|path| {
-                        crate::workers::conflicts(
-                            Path::new(row["path"].as_str().unwrap_or("")),
-                            Path::new(path),
-                        )
-                    }) && row["bazarr_missing_targets"].as_array().map_or(0, Vec::len)
-                        > row["missing_targets"].as_array().map_or(0, Vec::len)
-                })
-                .count();
-            if pending > 0 {
-                runtime.inventory_authority = json!({"status":"refresh_pending","error":null,"reason":"Scoped Bazarr scan was accepted; its inventory still reports targets covered by the newly published SRT files","pending_rows":pending});
-            }
-            drop(runtime);
-            self.persist_inventory()?;
         }
         refreshed.map(|_| ())
     }
@@ -1486,6 +1655,10 @@ impl App {
             .iter()
             .map(|job| {
                 let mut job = job.clone();
+                if let Some(fields) = job.as_object_mut() {
+                    fields.remove("published_paths");
+                    fields.remove("published_srt_keys");
+                }
                 if job["kind"] == "inspect" {
                     job["results"] = json!([]);
                 }
@@ -2156,7 +2329,6 @@ impl App {
                                 if let Some(mut event) = outcome.terminal {
                                     event["file_terminal"] = json!(true);
                                     let outputs = strings(&event["new_outputs"]);
-                                    let published_path = event["path"].as_str().map(str::to_owned);
                                     if !matches!(mode, FileMode::Inspect { cached_only: true }) {
                                         event["summary"] = summary.clone();
                                     }
@@ -2164,27 +2336,19 @@ impl App {
                                     if failure.is_none() && !outputs.is_empty() {
                                         let mut runtime = lock(&self.runtime);
                                         if let Some(job) = runtime.running.as_mut() {
+                                            remember_published_srts(job, &outputs);
                                             job["published_outputs"] = json!(
                                                 count(&job["published_outputs"])
                                                     .saturating_add(outputs.len() as u64)
                                             );
-                                            if let Some(path) = published_path {
-                                                if !job["published_paths"].is_array() {
-                                                    job["published_paths"] = json!([]);
-                                                }
-                                                if let Some(paths) =
-                                                    job["published_paths"].as_array_mut()
-                                                    && paths.len() < INVENTORY_LIMIT
-                                                    && !paths
-                                                        .iter()
-                                                        .any(|existing| existing == &path)
-                                                {
-                                                    paths.push(json!(path));
-                                                }
-                                            }
                                         }
                                         if integrations.bazarr_enabled() {
-                                            runtime.inventory_authority = json!({"status":"refresh_pending","error":null,"reason":"SRT files published; waiting for scoped Bazarr reindex and inventory refresh"});
+                                            runtime.inventory_authority["status"] =
+                                                json!("refresh_pending");
+                                            runtime.inventory_authority["error"] = Value::Null;
+                                            runtime.inventory_authority["reason"] = json!(
+                                                "SRT files published; waiting for scoped Bazarr reindex and inventory refresh"
+                                            );
                                         }
                                         drop(runtime);
                                         self.notifications(integrations.notify(&outputs));
@@ -2509,20 +2673,33 @@ impl App {
                 }
                 self.log("ERROR", &format!("Job failed: {}", log_text(&message, 512)));
             }
+            if integrations.bazarr_enabled()
+                && let Err(error) = self.prepare_bazarr_verification()
+            {
+                self.log(
+                    "ERROR",
+                    &format!(
+                        "Pending Bazarr verification state could not be saved: {}",
+                        log_text(&error, 256)
+                    ),
+                );
+            }
             let mut bazarr_reindex = None;
             if ["scan", "extract", "ocr"].contains(&job["kind"].as_str().unwrap_or(""))
                 && let Some(notification) =
                     integrations.flush_bazarr(&self.cancel, &mut |event| self.progress(event))
             {
-                bazarr_reindex = Some(notification.clone());
-                self.notifications(vec![notification]);
+                bazarr_reindex = Some(notification);
             }
             if let Err(error) = self.refresh_bazarr_after_publication(
                 &mut integrations,
                 &job,
-                bazarr_reindex.as_ref(),
+                bazarr_reindex.as_mut(),
             ) {
                 self.notifications(vec![json!({"provider":"bazarr","ok":false,"message":format!("SRT published; Bazarr inventory refresh failed: {}",log_text(&error,256))})]);
+            }
+            if let Some(notification) = bazarr_reindex {
+                self.notifications(vec![notification]);
             }
             let mut runtime = lock(&self.runtime);
             if let Some(mut finished) = runtime.running.take() {
@@ -2532,6 +2709,11 @@ impl App {
                     completed_status(&finished)
                 });
                 finished["finished"] = json!(now());
+                if let Some(fields) = finished.as_object_mut() {
+                    fields.remove("published_srt_keys");
+                    fields.remove("published_paths");
+                }
+
                 record_log(
                     &mut runtime,
                     json!({"time":now(),"level":if finished["status"]=="failed" {"ERROR"} else {"INFO"},"message":format!("Job {}: {}; processed {}, failed {}", finished["status"].as_str().unwrap_or("finished"),finished["kind"].as_str().unwrap_or("job"), count(&finished["processed"]),count(&finished["summary"]["failed"])),"job_id":finished["id"],"status":finished["status"]}),
@@ -3421,17 +3603,16 @@ mod tests {
         );
         let mut integrations = fixture.integration(&app);
         let job = json!({"kind":"extract","root_paths":app.mounts,"languages":["en"]});
-        lock(&app.runtime).running =
-            Some(json!({"kind":"extract","published_outputs":1,"published_paths":[movie]}));
         let output = app.mounts[0].join("film.en.srt");
         target_srt(&output);
+        published_job(&app, std::slice::from_ref(&output));
         integrations.notify(&[output.to_string_lossy().into_owned()]);
-        let reindex = integrations.flush_bazarr(&app.cancel, &mut |_| {}).unwrap();
+        let mut reindex = integrations.flush_bazarr(&app.cancel, &mut |_| {}).unwrap();
         assert_eq!(reindex["triggered"], 1);
         assert!(fixture.scanned.load(Ordering::Relaxed));
         lock(&fixture.movies)[0]["subtitles"] =
             json!([{"code2":"en","path":output,"file_size":50,"forced":"False","hi":"False"}]);
-        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&reindex))
+        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&mut reindex))
             .unwrap();
         assert_eq!(app.inventory()["items"][0]["coverage"]["status"], "covered");
         assert_eq!(app.inventory()["authority"]["status"], "ready");
@@ -3456,7 +3637,7 @@ mod tests {
         app.refresh_bazarr_after_publication(
             &mut integrations,
             &job,
-            Some(&json!({"ok":false,"triggered":0,"message":"Fixture scoped reindex failed"})),
+            Some(&mut json!({"ok":false,"triggered":0,"message":"Fixture scoped reindex failed"})),
         )
         .unwrap();
         assert_eq!(app.inventory()["authority"]["status"], "reindex_failed");
@@ -3465,6 +3646,283 @@ mod tests {
             "covered",
             "valid published output stays visible after notification failure"
         );
+    }
+
+    fn published_job(app: &App, outputs: &[PathBuf]) -> Value {
+        fs::write(app.mounts[0].join("film.mkv"), b"disposable media").unwrap();
+        let mut job = json!({"kind":"extract","published_outputs":outputs.len(),"root_paths":app.mounts,"languages":["*"]});
+        remember_published_srts(
+            &mut job,
+            &outputs
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        );
+        let mut runtime = lock(&app.runtime);
+        runtime.inventory_source = "bazarr".into();
+        runtime.running = Some(job.clone());
+        job
+    }
+
+    fn pending_scan() -> Value {
+        json!({"provider":"bazarr","ok":false,"pending":true,"uncertain":true,"attempted":1,"acknowledged":0,"triggered":0,"message":"Bazarr response timed out; scan completion not yet confirmed"})
+    }
+
+    #[test]
+    fn bazarr_confirmation_requires_exact_external_srt_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("film.en.srt");
+        let expected = vec![srt_index_key(output.to_str().unwrap()).unwrap()];
+        for row in [
+            json!({"subtitles":[{"source":"sidecar","path":temporary.path().join("other.en.srt") }]}),
+            json!({"subtitles":[{"source":"embedded","path":output}]}),
+            json!({"subtitles":[{"source":"sidecar","path":temporary.path().join("film.en.forced.srt") }]}),
+            json!({"coverage":{"status":"covered"},"subtitles":[]}),
+        ] {
+            assert_eq!(unconfirmed_index_keys(&[row], &expected), expected);
+        }
+        assert!(
+            unconfirmed_index_keys(
+                &[json!({"subtitles":[{"source":"sidecar","path":output}]})],
+                &expected
+            )
+            .is_empty()
+        );
+        assert!(srt_index_key("relative.en.srt").is_none());
+        assert!(srt_index_key(temporary.path().join("../film.en.srt").to_str().unwrap()).is_none());
+        assert!(srt_index_key(temporary.path().join("film.en.ass").to_str().unwrap()).is_none());
+        #[cfg(not(windows))]
+        assert_ne!(
+            srt_index_key(output.to_str().unwrap()),
+            srt_index_key(temporary.path().join("Film.en.srt").to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn bazarr_uncertain_scan_is_successful_when_every_output_is_in_fresh_inventory() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let outputs: Vec<_> = ["en", "fr", "ar"]
+            .iter()
+            .map(|language| app.mounts[0].join(format!("film.{language}.srt")))
+            .collect();
+        for output in &outputs {
+            target_srt(output);
+        }
+        let subtitles: Vec<_> = ["en", "fr", "ar"].iter().zip(&outputs).map(|(language, output)| json!({"code2":language,"path":output,"forced":false,"hi":false})).collect();
+        let fixture = BazarrFixture::new(
+            vec![
+                json!({"radarrId":1,"profileId":1,"path":app.mounts[0].join("film.mkv"),"subtitles":subtitles}),
+            ],
+            &["en", "fr", "ar"],
+        );
+        let mut integrations = fixture.integration(&app);
+        let job = published_job(&app, &outputs);
+        let mut receipt = pending_scan();
+        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&mut receipt))
+            .unwrap();
+        assert_eq!(receipt["ok"], true);
+        assert_eq!(receipt["pending"], false);
+        assert_eq!(receipt["verified_outputs"], 3);
+        assert_eq!(
+            receipt["acknowledged"], 0,
+            "inventory confirmation does not invent a PATCH acknowledgment"
+        );
+        assert_eq!(app.inventory()["authority"]["status"], "ready");
+        assert!(index_keys(&app.inventory()["authority"]["pending_srt_keys"]).is_empty());
+        assert!(
+            lock(&fixture.requests)
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+    }
+
+    #[test]
+    fn bazarr_partial_index_stays_pending_even_when_local_files_cover_languages() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let outputs = vec![
+            app.mounts[0].join("film.en.srt"),
+            app.mounts[0].join("film.fr.srt"),
+        ];
+        for output in &outputs {
+            target_srt(output);
+        }
+        let fixture = BazarrFixture::new(
+            vec![
+                json!({"radarrId":1,"profileId":1,"path":app.mounts[0].join("film.mkv"),"subtitles":[{"code2":"en","path":outputs[0],"forced":false,"hi":false}]}),
+            ],
+            &["en", "fr"],
+        );
+        let mut integrations = fixture.integration(&app);
+        let job = published_job(&app, &outputs);
+        let mut receipt = pending_scan();
+        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&mut receipt))
+            .unwrap();
+        assert_eq!(receipt["pending"], true);
+        assert_eq!(
+            app.inventory()["items"][0]["coverage"]["status"],
+            "covered",
+            "local coverage is distinct from Bazarr indexing"
+        );
+        assert_eq!(app.inventory()["authority"]["status"], "refresh_pending");
+        assert_eq!(
+            index_keys(&app.inventory()["authority"]["pending_srt_keys"]),
+            vec![srt_index_key(outputs[1].to_str().unwrap()).unwrap()]
+        );
+        assert_eq!(
+            completed_status(&json!({"kind":"extract","notifications":[receipt]})),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn bazarr_failed_verification_read_keeps_scan_uncertain_and_keys_persisted() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let fixture = BazarrFixture::new(Vec::new(), &["en"]);
+        fixture.fail.store(true, Ordering::Relaxed);
+        let mut integrations = fixture.integration(&app);
+        let job = published_job(&app, &[app.mounts[0].join("film.en.srt")]);
+        let mut receipt = pending_scan();
+        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&mut receipt))
+            .unwrap();
+        assert_eq!(receipt["pending"], true);
+        assert_eq!(receipt["ok"], false);
+        assert_eq!(
+            completed_status(&json!({"kind":"extract","notifications":[receipt]})),
+            "completed"
+        );
+        let authority = &app.inventory()["authority"];
+        assert_eq!(authority["status"], "unavailable");
+        assert!(authority["error"].is_string());
+        assert_eq!(index_keys(&authority["pending_srt_keys"]).len(), 1);
+        assert_eq!(
+            read_json(&app.data.join("inventory.json"), JSON_LIMIT).unwrap()["authority"]["pending_srt_keys"],
+            authority["pending_srt_keys"]
+        );
+        assert_eq!(lock(&fixture.requests).len(), 1);
+    }
+
+    #[test]
+    fn bazarr_untrackable_outputs_cannot_be_vacuously_confirmed() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let fixture = BazarrFixture::new(Vec::new(), &["en"]);
+        let mut integrations = fixture.integration(&app);
+        for limited in [false, true] {
+            lock(&app.runtime).running = Some(
+                json!({"kind":"extract","published_outputs":1,"verification_limited":limited}),
+            );
+            let mut receipt = pending_scan();
+            app.refresh_bazarr_after_publication(
+                &mut integrations,
+                &json!({"kind":"extract"}),
+                Some(&mut receipt),
+            )
+            .unwrap();
+            assert_eq!(receipt["pending"], true);
+            assert_eq!(app.inventory()["authority"]["verification_limited"], true);
+            assert_eq!(app.inventory()["authority"]["status"], "refresh_pending");
+        }
+        let output = app.mounts[0].join("film.en.srt");
+        target_srt(&output);
+        lock(&fixture.movies).push(json!({"radarrId":1,"profileId":1,"path":app.mounts[0].join("film.mkv"),"subtitles":[{"code2":"en","path":output,"forced":false,"hi":false}]}));
+        let job = published_job(&app, std::slice::from_ref(&output));
+        lock(&app.runtime).running.as_mut().unwrap()["verification_limited"] = json!(true);
+        let mut receipt = pending_scan();
+        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&mut receipt))
+            .unwrap();
+        assert_eq!(
+            receipt["pending"], true,
+            "visible known paths cannot confirm outputs omitted by the tracking limit"
+        );
+        assert_eq!(app.inventory()["authority"]["verification_limited"], true);
+    }
+
+    #[test]
+    fn bazarr_pending_verification_survives_cancel_restart_and_later_read_only_sync() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let output = app.mounts[0].join("film.en.srt");
+        target_srt(&output);
+        let fixture = BazarrFixture::new(
+            vec![
+                json!({"radarrId":1,"profileId":1,"path":app.mounts[0].join("film.mkv"),"subtitles":[]}),
+            ],
+            &["en"],
+        );
+        let mut integrations = fixture.integration(&app);
+        let job = published_job(&app, std::slice::from_ref(&output));
+        app.cancel.store(true, Ordering::Relaxed);
+        app.refresh_bazarr_after_publication(&mut integrations, &job, Some(&mut pending_scan()))
+            .unwrap();
+        assert!(
+            lock(&fixture.requests).is_empty(),
+            "cancellation preserves state without dispatching more requests"
+        );
+        let mut history = json!({"kind":"extract","status":"completed","notifications":[pending_scan()],"published_paths":[output],"published_srt_keys":["old"]});
+        history["published_outputs"] = json!(1);
+        {
+            let mut runtime = lock(&app.runtime);
+            runtime.history.push_back(history);
+            app.persist_history(&runtime);
+        }
+        let saved = read_json(&app.data.join("jobs.json"), JSON_LIMIT).unwrap();
+        assert!(saved[0].get("published_paths").is_none());
+        assert!(saved[0].get("published_srt_keys").is_none());
+        write_private(
+            &app.data.join("settings.json"),
+            &read_json(&app.data.join("fixture-integrations.json"), 64 * 1024).unwrap(),
+        )
+        .unwrap();
+        let restarted = App::new(
+            app.mounts.clone(),
+            app.data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            index_keys(&restarted.inventory()["authority"]["pending_srt_keys"]).len(),
+            1
+        );
+        lock(&fixture.movies)[0]["subtitles"] =
+            json!([{"code2":"en","path":output,"forced":false,"hi":false}]);
+        restarted
+            .sync_bazarr_inventory(
+                &mut integrations,
+                &json!({"kind":"inspect","languages":["*"]}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(restarted.inventory()["authority"]["status"], "ready");
+        let notice = &restarted.status()["history"][0]["notifications"][0];
+        assert_eq!(notice["pending"], false);
+        assert_eq!(notice["verified"], true);
+        assert_eq!(notice["ok"], true);
+        assert!(
+            lock(&fixture.requests)
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+    }
+
+    #[test]
+    fn bazarr_confirmation_tracking_is_bounded_and_overflow_remains_unconfirmed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let outputs: Vec<_> = (0..INDEX_CONFIRM_LIMIT + 1)
+            .map(|index| {
+                temporary
+                    .path()
+                    .join(format!("{index}.en.srt"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let mut job = json!({});
+        remember_published_srts(&mut job, &outputs);
+        assert_eq!(
+            index_keys(&job["published_srt_keys"]).len(),
+            INDEX_CONFIRM_LIMIT
+        );
+        assert_eq!(job["verification_limited"], true);
+        assert!(serde_json::to_vec(&job).unwrap().len() < 2 * 1024 * 1024);
     }
 
     #[test]

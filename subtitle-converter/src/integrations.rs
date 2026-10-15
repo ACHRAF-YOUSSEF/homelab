@@ -135,9 +135,12 @@ impl HttpFailure {
     }
 }
 
-fn http_agent() -> Agent {
+const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+const BAZARR_SCAN_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn http_agent(timeout: Duration) -> Agent {
     let config: Config = Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(8)))
+        .timeout_global(Some(timeout))
         .max_redirects(0)
         .proxy(None)
         .build();
@@ -248,16 +251,33 @@ fn request(
     body: Option<&Value>,
     form: Option<&[(&str, String)]>,
 ) -> Result<Value, HttpFailure> {
-    let mut response = request_response(base, path, method, key, auth, body, form)?;
+    response_json(request_response(base, path, method, key, auth, body, form)?)
+}
+
+fn response_json(mut response: ureq::http::Response<ureq::Body>) -> Result<Value, HttpFailure> {
     let mut bytes = Vec::new();
     response
         .body_mut()
         .as_reader()
         .take((MAX_RESPONSE + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| HttpFailure {
-            category: "unreachable",
-            status: None,
+        .map_err(|error| {
+            if let Some(error) = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ureq::Error>())
+            {
+                safe_error(error)
+            } else {
+                HttpFailure {
+                    category: if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+                    {
+                        "timeout"
+                    } else {
+                        "unreachable"
+                    },
+                    status: None,
+                }
+            }
         })?;
     if bytes.len() > MAX_RESPONSE {
         return Err(HttpFailure {
@@ -282,6 +302,57 @@ fn request_response(
     auth: Auth,
     body: Option<&Value>,
     form: Option<&[(&str, String)]>,
+) -> Result<ureq::http::Response<ureq::Body>, HttpFailure> {
+    request_response_bounded(
+        base,
+        path,
+        method,
+        key,
+        auth,
+        body,
+        form,
+        BAZARR_SCAN_TIMEOUT,
+    )
+}
+
+fn request_timeout(path: &str, method: &str, form: Option<&[(&str, String)]>) -> Duration {
+    let field = match path {
+        "/api/series" => "seriesid",
+        "/api/movies" => "radarrid",
+        _ => return HTTP_TIMEOUT,
+    };
+    let Some(fields) = form else {
+        return HTTP_TIMEOUT;
+    };
+    if method == "PATCH"
+        && fields.len() == 2
+        && fields
+            .iter()
+            .filter(|(name, value)| *name == "action" && value == "scan-disk")
+            .count()
+            == 1
+        && fields
+            .iter()
+            .filter(|(name, value)| *name == field && value.parse::<i64>().is_ok_and(|id| id > 0))
+            .count()
+            == 1
+    {
+        BAZARR_SCAN_TIMEOUT
+    } else {
+        HTTP_TIMEOUT
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_response_bounded(
+    base: &str,
+    path: &str,
+    method: &str,
+    key: &str,
+    auth: Auth,
+    body: Option<&Value>,
+    form: Option<&[(&str, String)]>,
+    remaining: Duration,
 ) -> Result<ureq::http::Response<ureq::Body>, HttpFailure> {
     if !matches!(method, "GET" | "POST" | "PATCH")
         || !path.starts_with('/')
@@ -341,7 +412,14 @@ fn request_response(
         category: "invalid_json",
         status: None,
     })?;
-    let result = http_agent().run(request);
+    let timeout = request_timeout(path, method, form).min(remaining);
+    if timeout.is_zero() {
+        return Err(HttpFailure {
+            category: "timeout",
+            status: None,
+        });
+    }
+    let result = http_agent(timeout).run(request);
     let response = result.map_err(|e| safe_error(&e))?;
     if !(200..300).contains(&response.status().as_u16()) {
         return Err(HttpFailure {
@@ -1271,23 +1349,25 @@ impl Integrations {
             return None;
         }
         let conf = self.conf("bazarr");
-        if !enabled(conf) || get_str(conf, "url").is_empty() || get_str(conf, "api_key").is_empty()
-        {
+        if !enabled(conf) {
             return Some(
-                json!({"provider":"bazarr","ok":true,"triggered":0,"message":"Bazarr integration is disabled"}),
+                json!({"provider":"bazarr","ok":true,"pending":false,"uncertain":false,"attempted":0,"acknowledged":0,"triggered":0,"message":"Bazarr integration is disabled"}),
+            );
+        }
+        if get_str(conf, "url").is_empty() || get_str(conf, "api_key").is_empty() {
+            return Some(
+                json!({"provider":"bazarr","ok":false,"pending":false,"uncertain":false,"attempted":0,"acknowledged":0,"triggered":0,"message":"Bazarr is enabled but its server URL or API key is missing"}),
             );
         }
         if stop.load(Ordering::Relaxed) {
             return Some(
-                json!({"provider":"bazarr","ok":true,"triggered":0,"message":"Bazarr scan cancelled"}),
+                json!({"provider":"bazarr","ok":true,"pending":false,"uncertain":false,"attempted":0,"acknowledged":0,"triggered":0,"message":"Bazarr scan cancelled"}),
             );
         }
         let result = self.bazarr_scan_paths(&paths, stop, progress);
         Some(match result {
-            Ok(count) => {
-                json!({"provider":"bazarr","ok":true,"triggered":count,"message":if count>0{format!("Scanned {count} Bazarr item(s)")}else{"No matching Bazarr media item".into()}})
-            }
-            Err(message) => json!({"provider":"bazarr","ok":false,"triggered":0,"message":message}),
+            Ok(outcome) => outcome.notification(),
+            Err(failure) => failure.notification(),
         })
     }
 }
