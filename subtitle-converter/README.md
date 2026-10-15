@@ -9,13 +9,13 @@ Compose requires the ignored root `.env` for interpolation. Create it from `.env
 Build the selected edition locally before starting it. Compose only starts a prebuilt tag: it neither builds nor pulls Subforge, and startup fails if the selected local tag is missing.
 
 ```shell
-docker build --target final --tag homelab-subtitle-converter:0.4.0-cpu subtitle-converter
+docker build --target final --tag homelab-subtitle-converter:0.4.1-cpu subtitle-converter
 ```
 
 PowerShell uses the same local build command:
 
 ```powershell
-docker build --target final --tag homelab-subtitle-converter:0.4.0-cpu subtitle-converter
+docker build --target final --tag homelab-subtitle-converter:0.4.1-cpu subtitle-converter
 ```
 
 Then start the prebuilt CPU image from the repository root:
@@ -208,7 +208,7 @@ Run the `subforge-worker` binary from the locally built CPU or CUDA image, or fr
 The default Compose service and CPU image expose no GPU devices. The optional path uses a separate `linux/amd64` image built with `Dockerfile.cuda`, a `cuda` Rust feature, and the PaddleOCR helper with packaged language-specific mobile OCR models. The CUDA-tools stage pins Python 3.12, PaddleOCR/PaddleX 3.7.0, and Paddle GPU 3.2.2 for CUDA 11.8, separately from the Rust CUDA build stage. The GPU stack has 80 full-hash-locked dependencies plus a separate setuptools 84.0.0 runtime-packaging lock (81 pins across two files); the final image passes `pip check`, and 15 model archives are checksum-verified at build time. A normal build uses the pinned upstream wheel and model sources and needs network access. Optional BuildKit wheel and model-archive caches can avoid downloading matching artifacts without adding cache payload to the runtime image. From the repository root, build the CPU edition first. To reuse the Paddle GPU wheel, place `paddlepaddle_gpu-3.2.2-cp312-cp312-linux_x86_64.whl` in `output/gpu-cache/wheels`; place any desired model archives in `output/gpu-cache/models`.
 
 ```shell
-docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --build-context gpu-wheel-cache=output/gpu-cache/wheels --build-context gpu-model-cache=output/gpu-cache/models --tag homelab-subtitle-converter:0.4.0-cuda subtitle-converter
+docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --build-context gpu-wheel-cache=output/gpu-cache/wheels --build-context gpu-model-cache=output/gpu-cache/models --tag homelab-subtitle-converter:0.4.1-cuda subtitle-converter
 ```
 
 The wheel and model cache contexts are optional; the build works with empty contexts and downloads from the pinned sources. It verifies cached files against their locked hashes, caps model archives at 128 MiB, and mounts both caches read-only at build time. The model layer runs before the helper is copied, so helper-only edits do not force model downloads again.
@@ -220,15 +220,15 @@ This configuration is provided for compatible NVIDIA-enabled Docker hosts on Lin
 The CPU and CUDA images are built separately; Compose never builds or pulls these local tags. Build CPU first because the CUDA Dockerfile reuses its runtime base, then build CUDA:
 
 ```shell
-docker build --target final --tag homelab-subtitle-converter:0.4.0-cpu subtitle-converter
-docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.4.0-cuda subtitle-converter
+docker build --target final --tag homelab-subtitle-converter:0.4.1-cpu subtitle-converter
+docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.4.1-cuda subtitle-converter
 ```
 
 The same commands work in Windows PowerShell:
 
 ```powershell
-docker build --target final --tag homelab-subtitle-converter:0.4.0-cpu subtitle-converter
-docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.4.0-cuda subtitle-converter
+docker build --target final --tag homelab-subtitle-converter:0.4.1-cpu subtitle-converter
+docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.4.1-cuda subtitle-converter
 ```
 
 Create the ignored root `.env` from `.env.example`, set the four host media directories, and start the CUDA edition with its override:
@@ -330,7 +330,7 @@ docker run --rm --gpus device=0 --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges --memory 1536m --cpus 2 \
   --tmpfs /tmp:rw,nosuid,nodev,size=512m \
   --mount type=bind,source=./subtitle-converter/tests,target=/tests,readonly \
-  --entrypoint python3.12 homelab-subtitle-converter:0.4.0-cuda \
+  --entrypoint python3.12 homelab-subtitle-converter:0.4.1-cuda \
   /tests/gpu_smoke.py --cues 200
 ```
 

@@ -57,6 +57,7 @@ async function main() {
       { id: 'executors-1', kind: 'extract', status: 'completed', created: now - 30, finished: now - 30, paths: ['/media/movies/executors-fixture.mkv'], summary: { converted: 6 }, executors: [{ node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu_ocr', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }], executors_truncated: true },
       { id: 'backup-1', kind: 'backup', status: 'completed', created: now - 60, summary: {} }
     ];
+    jobs[0].executors=[null,{resource:'unknown',node_name:'Invalid',execution:'remote'},{resource:'cpu',node_name:'',execution:'local'}];
     let inventorySource = 'filesystem', inventoryAuthority = { status: 'ready' }, revision = 1;
     let settings = { languages: ['*'], permissions: { ocr: true }, integrations: {} };
     let allocation = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1, paused: false };
@@ -144,6 +145,9 @@ async function main() {
     assert.deepEqual(await executorCard.locator('.job-executors > li:not(.job-executors-more):not(.job-executors-truncated)').allTextContents(),['CPU · Local','GPU OCR · Studio GPU (remote)','CPU OCR · Local','GPU OCR · Studio GPU (remote)']);
     assert.equal(await executorCard.locator('.job-executors-more summary').textContent(),'2 more workers');
     await executorCard.locator('.job-executors-more summary').click();
+    jobs[1].summary.converted++;
+    await page.locator('#refresh-button').click();
+    assert.equal(await executorCard.locator('.job-executors-more details').evaluate(details=>details.open),true,'worker disclosure remains open after a status update');
     assert.deepEqual(await executorCard.locator('.job-executors-more ul li').allTextContents(),['CPU · Local','GPU OCR · Studio GPU (remote)']);
     assert.match(await executorCard.locator('.job-executors').innerText(),/Additional workers not shown/);
     const legacyCard=page.locator('#jobs-list .job-card').filter({ hasText: 'Example movie.mkv' });

@@ -55,7 +55,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
 # Container listener; Compose publishes only the configured host interface.
 CMD ["/usr/local/bin/subforge", "--host", "0.0.0.0"]
 LABEL org.opencontainers.image.title="Subforge" \
-      org.opencontainers.image.version="0.4.0" \
+      org.opencontainers.image.version="0.4.1" \
       io.subforge.edition="cpu"
 
 # Python is a test harness dependency only, excluded from the final app image.

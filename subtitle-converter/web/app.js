@@ -29,6 +29,7 @@
   state.inventoryRestoreRoot=null;
   state.collapsedPanels=new Set();
   state.errorViews=new Map();
+  state.executorViews=new Map();
   state.tasks=null;
   state.systemInfo=null;
   state.systemBusy=false;
@@ -209,13 +210,13 @@
     const done = Number(summary.converted || 0) + Number(summary.cached || 0) + Number(summary.failed || 0);
     return counts ? Math.round(100 * done / counts) : job.status === 'completed' ? 100 : 0;
   };
-  const renderJobExecutors = job => {
-    const executors=Array.isArray(job.executors)?job.executors.slice(0,64):[];
+  const renderJobExecutors = (job,compact) => {
+    const executors=Array.isArray(job.executors)?job.executors.slice(0,64).filter(executor=>executor&&['cpu','cpu_ocr','gpu'].includes(executor.resource)&&['local','remote'].includes(executor.execution)&&typeof executor.node_name==='string'&&executor.node_name.trim()):[];
     if(!executors.length&&job.executors_truncated!==true)return null;
     const list=document.createElement('ul');list.className='job-executors';list.setAttribute('aria-label','Job executors');
     const label=executor=>{
-      const resource=({cpu:'CPU',cpu_ocr:'CPU OCR',gpu:'GPU OCR'})[executor.resource]||'Worker';
-      const node=typeof executor.node_name==='string'&&executor.node_name.trim()?executor.node_name.trim():executor.execution==='remote'?'Remote worker':'Local';
+      const resource=({cpu:'CPU',cpu_ocr:'CPU OCR',gpu:'GPU OCR'})[executor.resource];
+      const node=executor.node_name.trim();
       return `${resource} · ${node}${executor.execution==='remote'?' (remote)':''}`;
     };
     const addItem=(parent,text,className='')=>{const item=document.createElement('li');if(className)item.className=className;item.textContent=text;parent.append(item);return item;};
@@ -223,6 +224,8 @@
     if(executors.length>4){
       const item=document.createElement('li');item.className='job-executors-more';
       const details=document.createElement('details'),summary=document.createElement('summary');summary.textContent=`${executors.length-4} more workers`;
+      const key=errorViewKey(job,compact);details.dataset.executorKey=key;details.open=state.executorViews.get(key)===true;summary.dataset.jobFocus=`${key}:executors`;
+      details.addEventListener('toggle',()=>{if(details.isConnected)state.executorViews.set(key,details.open);});
       const remaining=document.createElement('ul');executors.slice(4).forEach(executor=>addItem(remaining,label(executor)));
       details.append(summary,remaining);item.append(details);list.append(item);
     }
@@ -242,7 +245,7 @@
     const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.started || job.created);
     status.append(pill,time);
     card.append(icon,detail,status);
-    const executors=renderJobExecutors(job);if(executors)card.append(executors);
+    const executors=renderJobExecutors(job,compact);if(executors)card.append(executors);
     if (job.status === 'running' || job.status === 'queued') {
       const progress = document.createElement('div'); progress.className='job-progress'; const bar=document.createElement('span'); bar.style.width=`${jobPercent(job)}%`; progress.append(bar); card.append(progress);
       if (job.id) { const cancel=document.createElement('button'); cancel.className='text-button cancel-job'; cancel.textContent='Cancel'; cancel.dataset.jobId=job.id; cancel.dataset.jobFocus=`${errorViewKey(job,compact)}:cancel`; status.append(cancel); }
@@ -266,6 +269,7 @@
     const signature=JSON.stringify(jobs);if(container.jobSignature===signature)return;
     const focusKey=container.contains(document.activeElement)?document.activeElement.dataset.jobFocus:null;
     for(const details of $$('.job-error',container))state.errorViews.set(details.dataset.errorKey,{open:details.open,scroll:$('.job-error-content',details).scrollTop});
+    for(const details of $$('[data-executor-key]',container))state.executorViews.set(details.dataset.executorKey,details.open);
     container.jobSignature=signature;container.replaceChildren();for(const job of jobs)container.append(renderJobCard(job,compact));
     if(!jobs.length){const empty=document.createElement('div');empty.className=`empty-state${compact?' compact':''}`;const icon=document.createElement('span');icon.className='empty-icon';icon.textContent='◷';const title=document.createElement('strong');title.textContent=compact?'No activity yet':'No jobs yet';const hint=document.createElement('span');hint.textContent=compact?'Start a scan to see progress here.':'Start a scan or conversion to see it here.';empty.append(icon,title,hint);container.append(empty);}
     if(focusKey)$$('[data-job-focus]',container).find(node=>node.dataset.jobFocus===focusKey)?.focus({preventScroll:true});
@@ -277,7 +281,7 @@
     const filtered=jobs.filter(job=>(kind==='all'||(kind==='maintenance')===maintenance(job))&&(status==='all'||status==='issues'&&['failed','completed_with_errors'].includes(job.status)||status===job.status));
     updateJobList($('#recent-activity'),jobs.filter(job=>!maintenance(job)).slice(0,4),true);updateJobList($('#jobs-list'),filtered,false);
     setText($('#activity-count'),`${filtered.length} of ${jobs.length} jobs`);
-    const validKeys=new Set(jobs.flatMap(job=>[errorViewKey(job,true),errorViewKey(job,false)]));for(const key of state.errorViews.keys())if(!validKeys.has(key))state.errorViews.delete(key);
+    const validKeys=new Set(jobs.flatMap(job=>[errorViewKey(job,true),errorViewKey(job,false)]));for(const views of [state.errorViews,state.executorViews])for(const key of views.keys())if(!validKeys.has(key))views.delete(key);
     const queued=(state.status?.queue||[]).length,badge=$('#activity-badge');badge.textContent=queued?String(queued):'';badge.classList.toggle('hidden',!queued);
     setText($('#stat-running'),running?'Running':'Idle');
   };

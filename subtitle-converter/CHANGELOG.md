@@ -1,5 +1,12 @@
 # Subforge revisions
 
+## 0.4.1 — 2026-10-15
+
+- Include the assigned node, CPU/CPU OCR/GPU OCR resource, and worker ID in extraction phase, completion, failure, and remote retry logs; retain executor details in job history.
+- Confirm published SRTs against Bazarr inventory after uncertain scan responses, allow longer scoped scans, and show pending indexing without repeating extraction.
+- Identify Subforge by its current name and blue icon in Glance's Overview Docker list.
+- Publish matching local `0.4.1-cpu` and `0.4.1-cuda` image tags.
+
 ## 0.4.0
 
 - Refresh the dashboard with an ember-accented dark palette, compact pipeline summary, and clickable stage filters.
