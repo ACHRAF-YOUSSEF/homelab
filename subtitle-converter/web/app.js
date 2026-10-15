@@ -213,7 +213,7 @@
     const card = document.createElement('article'); card.className = `job-card${compact ? ' job-card-compact' : ''}`;
     const icon = document.createElement('div'),type=job.kind==='extract'?'convert':job.kind; icon.className = `job-icon job-${escStatus(type)}`; icon.append(iconSvg(type));
     const detail = document.createElement('div'); detail.className = 'job-detail';
-    const title = document.createElement('strong'); title.textContent = job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider] || 'Integration'} ${job.provider==='bazarr'?'sync and scan':'library refresh'}`:({scan:'Scan and convert text',inspect:'Inspect subtitle tracks',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind] || 'Converter job';
+    const title = document.createElement('strong'); title.textContent = job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider] || 'Integration'} ${job.provider==='bazarr'?'inventory check':'library refresh'}`:({scan:job.include_ocr===true?'Convert missing subtitles':'Scan and convert text',inspect:'Inspect subtitle tracks',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind] || 'Converter job';
     const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = currentLabel(job.current) || (job.paths && job.paths.length ? shortPath(job.paths[0]) : job.root_label || 'All scan roots');
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
@@ -385,7 +385,7 @@
     setText($('.integration-title',card),title); setText($('.integration-description',card),description);
     const usage=document.createElement('div');usage.className='path-map-field';
     const usageTitle=document.createElement('strong');usageTitle.textContent='How this integration is used';
-    const usageCopy=document.createElement('p');usageCopy.className='field-explainer';usageCopy.textContent={sonarr:'An optional Sonarr Connect webhook starts conversion when episodes are imported or renamed. New SRT files trigger a rescan of the matching series.',radarr:'An optional Radarr Connect webhook starts conversion when movies are imported or renamed. New SRT files trigger a rescan of the matching movie.',jellyfin:'New SRT files trigger metadata refreshes within your selected movie and series libraries. Refresh selected libraries runs a broader manual refresh.',bazarr:'Changed movies and episodes are synchronized and their subtitles indexed after the conversion batch. Sync and scan library runs the broader manual tasks.'}[provider];
+    const usageCopy=document.createElement('p');usageCopy.className='field-explainer';usageCopy.textContent={sonarr:'An optional Sonarr Connect webhook starts conversion when episodes are imported or renamed. New SRT files trigger a rescan of the matching series.',radarr:'An optional Radarr Connect webhook starts conversion when movies are imported or renamed. New SRT files trigger a rescan of the matching movie.',jellyfin:'New SRT files trigger metadata refreshes within your selected movie and series libraries. Refresh selected libraries runs a broader manual refresh.',bazarr:'Profiles define the wanted subtitle languages and variants. New SRT files trigger a scan of matching media and an inventory refresh. Check inventory reads Bazarr and reports its current media counts.'}[provider];
     const last=document.createElement('p');last.className='field-explainer integration-last-result';last.textContent='No conversion notification recorded yet.';usage.append(usageTitle,usageCopy,last);$('.integration-fields',card).append(usage);
     $('.integration-enabled',card).checked=!!config.enabled; $('.integration-url',card).value=config.url || '';
     $('.integration-key',card).value=config.api_key || ''; setText($('.api-key-hint',card),config.api_key_set?'A key is saved. Leave blank to keep it.':'');
@@ -404,7 +404,7 @@
     } else {
       $('.integration-url',card).placeholder={sonarr:'http://sonarr:8989',radarr:'http://radarr:7878',bazarr:'http://bazarr:6767'}[provider];
       $('.integration-key',card).placeholder='API key'; renderMappings(card,(state.settings?.path_mappings || []).filter(item=>!item.provider || item.provider===provider));
-      if(provider==='bazarr')$('.refresh-integration',card).textContent='Sync and scan library';
+      if(provider==='bazarr')$('.refresh-integration',card).textContent='Check inventory';
     }
     $('.test-integration',card).addEventListener('click',()=>testIntegration(provider,card));
     $('.refresh-integration',card).addEventListener('click',()=>refreshIntegration(provider,card));

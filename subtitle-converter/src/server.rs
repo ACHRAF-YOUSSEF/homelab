@@ -191,13 +191,33 @@ fn coverage_counts(rows: &[Value]) -> Value {
     json!({"covered":total("covered"),"needs_conversion":total("needs_conversion"),"no_convertible_source":total("no_convertible_source"),"unknown":total("unknown")})
 }
 
-fn bazarr_source_hints(row:&Value,mounts:&[PathBuf])->Vec<crate::converter::SubtitleSourceHint> {
-    row["subtitles"].as_array().into_iter().flatten().filter_map(|source| {
-        if source["source"]!="sidecar" {return None;}
-        let language=source["language"].as_str().filter(|language|!["und","unknown","zxx"].contains(language))?;
-        let path=Converter::safe_path(source["path"].as_str()?,mounts).ok()?;
-        Some(crate::converter::SubtitleSourceHint {path,target:crate::converter::SubtitleTarget {language:language.into(),forced:source["forced"].as_bool()?,hi:source["hi"].as_bool()?}})
-    }).take(256).collect()
+fn bazarr_source_hints(
+    row: &Value,
+    mounts: &[PathBuf],
+) -> Vec<crate::converter::SubtitleSourceHint> {
+    row["subtitles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|source| {
+            if source["source"] != "sidecar" {
+                return None;
+            }
+            let language = source["language"]
+                .as_str()
+                .filter(|language| !["und", "unknown", "zxx"].contains(language))?;
+            let path = Converter::safe_path(source["path"].as_str()?, mounts).ok()?;
+            Some(crate::converter::SubtitleSourceHint {
+                path,
+                target: crate::converter::SubtitleTarget {
+                    language: language.into(),
+                    forced: source["forced"].as_bool()?,
+                    hi: source["hi"].as_bool()?,
+                },
+            })
+        })
+        .take(256)
+        .collect()
 }
 
 #[derive(Default)]
@@ -745,12 +765,12 @@ impl App {
         // not make an absent, empty or malformed local SRT valid coverage.
         for row in &mut rows {
             row["bazarr_missing_targets"] = row["missing_targets"].clone();
-            let hints=bazarr_source_hints(row,&self.mounts);
-            row["source_hints"]=json!(hints);
-            let mut coverage_worker=lock(&self.converter).inspection_worker();
-            if let Err(error)=coverage_worker.set_source_hints(hints) {
-                row["source_hints_error"]=json!(true);
-                row["error"]=json!(log_text(&error,256));
+            let hints = bazarr_source_hints(row, &self.mounts);
+            row["source_hints"] = json!(hints);
+            let mut coverage_worker = lock(&self.converter).inspection_worker();
+            if let Err(error) = coverage_worker.set_source_hints(hints) {
+                row["source_hints_error"] = json!(true);
+                row["error"] = json!(log_text(&error, 256));
                 continue;
             }
             let wanted: Vec<crate::converter::SubtitleTarget> =
@@ -759,16 +779,13 @@ impl App {
             if !wanted.is_empty()
                 && let Some(path) = row["path"].as_str()
             {
-                match coverage_worker.conversion_coverage(
-                    Path::new(path),
-                    &json!([]),
-                    &wanted,
-                ) {
+                match coverage_worker.conversion_coverage(Path::new(path), &json!([]), &wanted) {
                     Ok(coverage) => {
                         row["missing_targets"] = coverage["missing_targets"].clone();
                         row["coverage"] = coverage;
                     }
                     Err(error) => {
+                        row["source_hints_error"] = json!(true);
                         row["error"] = json!(log_text(&error, 256));
                     }
                 }
@@ -783,7 +800,9 @@ impl App {
         let requested_paths = strings(&job["paths"]);
         let scope_roots = strings(&job["root_paths"]);
         for row in &rows {
-            if row["source_hints_error"]==true {continue;}
+            if row["source_hints_error"] == true {
+                continue;
+            }
             let row_path = row["path"].as_str().unwrap_or("");
             if !scope_roots.is_empty()
                 && !scope_roots
@@ -856,9 +875,10 @@ impl App {
                 serde_json::from_value(row["missing_targets"].clone())
                     .map_err(|_| "Bazarr returned invalid missing subtitle targets")?;
             row["source"] = json!("bazarr");
-            if row["source_hints_error"]==true {
-                row["coverage"]=json!({"status":"unknown","reason":row["error"],"missing_targets":targets});
-                metadata_pending+=1;
+            if row["source_hints_error"] == true {
+                row["coverage"] =
+                    json!({"status":"unknown","reason":row["error"],"missing_targets":targets});
+                metadata_pending += 1;
                 continue;
             }
             let path = PathBuf::from(row["path"].as_str().unwrap_or(""));
@@ -887,10 +907,13 @@ impl App {
                     let wanted: Vec<crate::converter::SubtitleTarget> =
                         serde_json::from_value(row["wanted_targets"].clone())
                             .map_err(|_| "Bazarr returned invalid wanted subtitle targets")?;
-                    let mut coverage_worker=lock(&self.converter).inspection_worker();
-                    let hints:Vec<crate::converter::SubtitleSourceHint>=serde_json::from_value(row["source_hints"].clone()).map_err(|_|"Invalid Bazarr source hints")?;
+                    let mut coverage_worker = lock(&self.converter).inspection_worker();
+                    let hints: Vec<crate::converter::SubtitleSourceHint> =
+                        serde_json::from_value(row["source_hints"].clone())
+                            .map_err(|_| "Invalid Bazarr source hints")?;
                     coverage_worker.set_source_hints(hints)?;
-                    let coverage=coverage_worker.conversion_coverage(&path, &description, &wanted);
+                    let coverage =
+                        coverage_worker.conversion_coverage(&path, &description, &wanted);
                     match coverage {
                         Ok(mut coverage) => {
                             coverage["status"] =
@@ -969,7 +992,8 @@ impl App {
         let languages = strings(&job["languages"]);
         let mut targets_by_path: BTreeMap<PathBuf, Vec<crate::converter::SubtitleTarget>> =
             BTreeMap::new();
-        let mut sources_by_path:BTreeMap<PathBuf,Vec<crate::converter::SubtitleSourceHint>>=BTreeMap::new();
+        let mut sources_by_path: BTreeMap<PathBuf, Vec<crate::converter::SubtitleSourceHint>> =
+            BTreeMap::new();
         let mut skipped = 0_u64;
         if let Some(running) = lock(&self.runtime).running.as_mut() {
             running["processed"] = json!(0);
@@ -1035,10 +1059,19 @@ impl App {
                         allocated.push(target.clone());
                     }
                 }
-                let sources:Vec<crate::converter::SubtitleSourceHint>=serde_json::from_value(row["source_hints"].clone()).map_err(|_|"Invalid Bazarr source hints")?;
-                let allocated=sources_by_path.entry(candidate.clone()).or_default();
-                for source in sources.into_iter().filter(|source|crate::workers::conflicts(&candidate,&source.path)) {
-                    if !allocated.iter().any(|existing|existing.path==source.path && existing.target==source.target) {allocated.push(source);}
+                let sources: Vec<crate::converter::SubtitleSourceHint> =
+                    serde_json::from_value(row["source_hints"].clone())
+                        .map_err(|_| "Invalid Bazarr source hints")?;
+                let allocated = sources_by_path.entry(candidate.clone()).or_default();
+                for source in sources
+                    .into_iter()
+                    .filter(|source| crate::workers::conflicts(&candidate, &source.path))
+                {
+                    if !allocated.iter().any(|existing| {
+                        existing.path == source.path && existing.target == source.target
+                    }) {
+                        allocated.push(source);
+                    }
                 }
             }
         }
@@ -1063,7 +1096,12 @@ impl App {
                 ))
                 .collect::<BTreeMap<_, _>>()
         );
-        execution["file_sources"]=json!(sources_by_path.into_iter().map(|(path,sources)|(path.to_string_lossy().into_owned(),sources)).collect::<BTreeMap<_,_>>());
+        execution["file_sources"] = json!(
+            sources_by_path
+                .into_iter()
+                .map(|(path, sources)| (path.to_string_lossy().into_owned(), sources))
+                .collect::<BTreeMap<_, _>>()
+        );
         let mut paths = targets_by_path.into_keys().collect::<Vec<_>>();
         paths.sort_by_key(|path| !available_sidecar(&path.to_string_lossy()));
         let workload = match job["workload"].as_str().unwrap_or("text") {
@@ -1609,6 +1647,14 @@ impl App {
             })
             .transpose()?
             .unwrap_or_default();
+        let file_sources: BTreeMap<String, Vec<crate::converter::SubtitleSourceHint>> = job
+            .get("file_sources")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| "Invalid per-file subtitle source metadata")
+            })
+            .transpose()?
+            .unwrap_or_default();
         let force = job["force"].as_bool().unwrap_or(false);
         let track_ids = job
             .get("track_ids")
@@ -1789,6 +1835,10 @@ impl App {
                                 file_targets
                                     .get(path.to_string_lossy().as_ref())
                                     .map(Vec::as_slice),
+                                file_sources
+                                    .get(path.to_string_lossy().as_ref())
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
                                 force,
                                 resource,
                                 state,
@@ -1892,6 +1942,18 @@ impl App {
                     if let Some(targets) = file_targets.get(path.to_string_lossy().as_ref())
                         && let Err(error) = worker.set_targets(targets.clone())
                     {
+                        lock(&self.workers).active.retain(|worker| worker.id != id);
+                        failure = Some(error);
+                        pending.clear();
+                        self.cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if let Err(error) = worker.set_source_hints(
+                        file_sources
+                            .get(path.to_string_lossy().as_ref())
+                            .cloned()
+                            .unwrap_or_default(),
+                    ) {
                         lock(&self.workers).active.retain(|worker| worker.id != id);
                         failure = Some(error);
                         pending.clear();
@@ -3194,6 +3256,34 @@ mod tests {
             b"1\n00:00:01,000 --> 00:00:02,000\nDisposable fixture\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn bazarr_language_metadata_identifies_an_untagged_external_source_without_probing() {
+        let (_temporary, app, _paths, gate) = gated_workers_fixture();
+        let movie = app.mounts[0].join("film.mkv");
+        let source = app.mounts[0].join("film.ass");
+        fs::write(&movie, b"Disposable media").unwrap();
+        fs::write(&source, b"Disposable subtitle").unwrap();
+        let fixture = BazarrFixture::new(
+            vec![
+                json!({"radarrId":1,"profileId":1,"path":movie,"subtitles":[{"code2":"fr","path":source,"forced":false,"hi":false}]}),
+            ],
+            &["fr"],
+        );
+        let mut integrations = fixture.integration(&app);
+        let rows = app
+            .sync_bazarr_inventory(
+                &mut integrations,
+                &json!({"kind":"inspect","languages":["*"]}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(rows[0]["coverage"]["status"], "needs_conversion");
+        assert_eq!(rows[0]["coverage"]["available_paths"], json!([source]));
+        assert_eq!(rows[0]["source_hints"][0]["target"]["language"], "fr");
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 0);
+        assert!(lock(&app.workers).active.is_empty());
     }
 
     #[test]

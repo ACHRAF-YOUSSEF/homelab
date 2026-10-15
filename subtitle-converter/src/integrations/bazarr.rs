@@ -185,9 +185,7 @@ fn uncached_language(raw: &str) -> Option<String> {
         .into_iter()
         .next()
         .filter(|language| !["und", "unknown", "zxx"].contains(&language.as_str()))?;
-    Some(raw.split_once('-').map_or(primary.clone(), |(_, suffix)| {
-        format!("{primary}-{}", suffix.to_ascii_lowercase())
-    }))
+    Some(primary)
 }
 fn subtitle_language(code2: Option<&str>, code3: Option<&str>) -> Option<String> {
     code2

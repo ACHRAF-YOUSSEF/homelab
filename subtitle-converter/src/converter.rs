@@ -344,13 +344,15 @@ impl Converter {
                 ));
             }
         }
-        let target=self.source_target(&path).unwrap_or(SubtitleTarget{language:"und".into(),forced:false,hi:false});
-        Ok(
-            json!([{"number": null, "language":target.language,
+        let target = self.source_target(&path).unwrap_or(SubtitleTarget {
+            language: "und".into(),
+            forced: false,
+            hi: false,
+        });
+        Ok(json!([{"number": null, "language":target.language,
             "forced":target.forced,
             "hi":target.hi,
-            "format": extension(&path).unwrap_or_default().to_ascii_uppercase()}]),
-        )
+            "format": extension(&path).unwrap_or_default().to_ascii_uppercase()}]))
     }
 
     pub fn scan(
@@ -2124,11 +2126,6 @@ fn matching_native_tracks(native_data: Option<&Value>, stream_count: usize) -> V
         Vec::new()
     }
 }
-fn filename_language(path: &Path, aliases: &BTreeMap<String, String>) -> String {
-    subtitle_name(path, aliases)
-        .map(|(_, target)| target.language)
-        .unwrap_or_else(|| "und".into())
-}
 fn target_language(language: &str, aliases: &BTreeMap<String, String>) -> String {
     let normalized = language.to_ascii_lowercase();
     match normalized.as_str() {
@@ -2332,11 +2329,14 @@ fn existing_coverage_with_hints(
 }
 
 fn wants(language: &str, selected: &[String], aliases: &BTreeMap<String, String>) -> bool {
-    let actual=target_language(language,aliases);
+    let actual = target_language(language, aliases);
     selected.iter().any(|v| {
-        if v=="*" {return true;}
-        let requested=target_language(v,aliases);
-        actual==requested || (!requested.contains('-') && actual.split('-').next()==Some(requested.as_str()))
+        if v == "*" {
+            return true;
+        }
+        let requested = target_language(v, aliases);
+        actual == requested
+            || (!requested.contains('-') && actual.split('-').next() == Some(requested.as_str()))
     })
 }
 pub(crate) fn is_image_format(format: &str) -> bool {
@@ -3145,7 +3145,6 @@ mod tests {
         ] {
             let (_, parsed) = subtitle_name(Path::new(name), &aliases).unwrap();
             assert_eq!(parsed, target(language, forced, hi), "{name}");
-            assert_eq!(filename_language(Path::new(name), &aliases), language);
         }
         let dir = tempfile::tempdir().unwrap();
         let (converter, media) = coverage_fixture(dir.path(), Vec::new());
@@ -3189,6 +3188,109 @@ mod tests {
                 .unwrap();
             assert_eq!(plan["status"], "already_covered", "{alias}");
         }
+    }
+
+    #[test]
+    fn explicit_inventory_metadata_converts_an_untagged_sidecar_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut converter, media) = coverage_fixture(dir.path(), Vec::new());
+        let source = dir.path().join("movie.ass");
+        fs::write(&source, b"Disposable source fixture").unwrap();
+        let wanted = vec![target("fr", false, false)];
+        assert_eq!(
+            converter
+                .conversion_coverage(&media, &json!([]), &wanted)
+                .unwrap()["status"],
+            "no_available_conversion"
+        );
+        converter
+            .set_source_hints(vec![SubtitleSourceHint {
+                path: source.clone(),
+                target: wanted[0].clone(),
+            }])
+            .unwrap();
+        assert_eq!(
+            converter
+                .conversion_coverage(&media, &json!([]), &wanted)
+                .unwrap()["status"],
+            "needed"
+        );
+        let mut worker = converter.file_worker(&source).unwrap();
+        assert!(
+            worker.source_hints().is_empty(),
+            "hints do not leak between file workers"
+        );
+        worker
+            .set_source_hints(converter.source_hints().to_vec())
+            .unwrap();
+        worker.set_targets(wanted.clone()).unwrap();
+        let result = worker
+            .scan(
+                std::slice::from_ref(&source),
+                &["*".into()],
+                false,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(result["converted"], 1);
+        assert!(dir.path().join("movie.fr.srt").is_file());
+        assert!(!dir.path().join("movie.srt").exists());
+        assert!(!dir.path().join("movie.und.srt").exists());
+        assert_eq!(
+            converter
+                .conversion_coverage(&media, &json!([]), &wanted)
+                .unwrap()["status"],
+            "already_covered"
+        );
+        assert!(
+            converter
+                .set_source_hints(vec![
+                    SubtitleSourceHint {
+                        path: source.clone(),
+                        target: target("fr", false, false)
+                    },
+                    SubtitleSourceHint {
+                        path: source,
+                        target: target("en", false, false)
+                    }
+                ])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn source_metadata_cannot_relabel_a_conflicting_filename_or_another_movie() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut converter, media) = coverage_fixture(dir.path(), Vec::new());
+        let named = dir.path().join("movie.en.ass");
+        fs::write(&named, "Disposable source").unwrap();
+        assert!(
+            converter
+                .set_source_hints(vec![SubtitleSourceHint {
+                    path: named,
+                    target: target("fr", false, false)
+                }])
+                .is_err()
+        );
+        let other = dir.path().join("other.ass");
+        fs::write(&other, "Unrelated source").unwrap();
+        converter
+            .set_source_hints(vec![SubtitleSourceHint {
+                path: other,
+                target: target("fr", false, false),
+            }])
+            .unwrap();
+        assert_eq!(
+            converter
+                .conversion_coverage(&media, &json!([]), &[target("fr", false, false)])
+                .unwrap()["status"],
+            "no_available_conversion"
+        );
+        assert_eq!(
+            Converter::normalize_languages(&json!(["por-BR", "pob", "zht", "spl"])).unwrap(),
+            vec!["es-mx", "pt-br", "zh-tw"]
+        );
     }
 
     #[test]

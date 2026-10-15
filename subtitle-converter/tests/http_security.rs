@@ -444,7 +444,7 @@ fn dashboard_http_auth_csrf_host_widget_and_webhook_boundaries() {
     assert_eq!(selected_language.status, 200);
     assert_eq!(
         selected_language.body["languages"],
-        json!(["en", "fr", "pt"])
+        json!(["en", "fr", "pt-br"])
     );
 
     let widget = server
