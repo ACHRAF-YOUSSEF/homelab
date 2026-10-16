@@ -43,10 +43,14 @@ collectors stopped after disconnects. This did not exercise the real Glance,
 Jellyfin, qBittorrent, TLS, or sustained WebSocket deployment workload. No CPU
 speedup is claimed from these samples; the gateway has no GPU access.
 
-The reusable [load probe](../scripts/benchmark_glance_live.py) uses only Python's
-standard library and fake loopback services. The [Rust CI job](../.github/workflows/security-audit.yml)
-shows the disposable runtime/fixture commands. Python is used by this test
-helper; the production Rust image contains no Python interpreter.
+The reusable [Rust load probe](../glance/live/src/bin/glance-live-probe.rs)
+uses fake loopback services and the gateway's existing locked dependencies.
+The [Rust CI job](../.github/workflows/security-audit.yml) shows the disposable
+runtime/fixture commands. Build the separate Docker `probe` target or use
+`cargo run --locked --features fixture-probe --bin glance-live-probe -- --seconds 10`
+from `glance/live` beside an isolated gateway configured as shown in CI.
+The probe is excluded from the default production image. The gateway and its
+test tooling require no Python interpreter.
 
 ## Example application ceilings
 

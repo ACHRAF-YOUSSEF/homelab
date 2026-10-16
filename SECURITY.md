@@ -33,4 +33,9 @@ including collector cleanup and graceful SIGTERM shutdown. These local checks
 do not constitute a full-history secret scan, an image OS vulnerability scan,
 or a test of the deployed stack.
 
+The gateway load probe is also Rust. Its `fixture-probe` feature and separate
+Docker `probe` target keep test tooling out of the default production image.
+The Rust-only probe passed the same eight-client/1,000-torrent isolated check;
+both runtime and probe images were checked for absence of Python executables.
+
 Review the root [homelab guide](README.md#docker-api-access) and component guides before exposing services. The Glance dashboard and gateway have no user authentication and should remain LAN-only. `glance-live` runs as UID/GID `10001:10001`, drops all Linux capabilities, has a read-only filesystem, and has no GPU device access. It joins only `homelab`, does not mount the Docker socket, and is limited by default to 96 MiB, 0.50 CPU, and 32 processes. It bounds active clients and upstream response/snapshot sizes; on provider errors or cap violations it reports stale state and keeps the last valid snapshot. The health route checks gateway availability, not provider health. The Jellyfin counts helper runs as UID/GID `1000:1000`, binds to the homelab network in Compose, and has no published host port. The shared HTTP client accepts valid HTTP and HTTPS service URLs, verifies TLS normally, rejects embedded credentials and malformed URLs, and does not follow redirects. The AIO proxy runs as UID/GID `99:33`, drops all Linux capabilities, and uses `network_mode: none`; its Unix socket grants the lifecycle permissions configured for AIO. Check each service's mounts, networks, and proxy rules before changing exposure. Trivy scans dependency manifests for vulnerabilities and Dockerfiles for misconfiguration; this workflow does not scan Compose configuration for misconfiguration or inspect operating-system vulnerabilities in supplied images.

@@ -25,6 +25,7 @@ networking. DNS, tunnel routes, and reverse-proxy hosts are configured separatel
 | [config/assets/widget-live.js](config/assets/widget-live.js) | Connects visible Media and Downloads widgets to the same-origin SSE stream |
 | [live/src/](live/src/) | Rust Glance proxy, bounded SSE relay, provider collectors, and configuration |
 | [live/Cargo.toml](live/Cargo.toml) | Pinned gateway dependencies and release profile |
+| [live/src/bin/glance-live-probe.rs](live/src/bin/glance-live-probe.rs) | Optional Rust load probe with fake loopback providers; excluded from the production image |
 | [config/assets/subtitle-studio.svg](config/assets/subtitle-studio.svg) | Local Subtitle Studio icon |
 | [config/assets/subforge.svg](config/assets/subforge.svg) | Current blue Subforge icon, used by the Overview Docker container entry and Media service monitor; the `v=2` asset query refreshes browser caches |
 | [jellyfin-counts-cache.py](jellyfin-counts-cache.py) | Internal HTTP service caching Jellyfin library counts |
@@ -310,6 +311,8 @@ Set-Location glance/live
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+cargo clippy --all-targets --locked --features fixture-probe -- -D warnings
+cargo test --all-targets --locked --features fixture-probe
 cargo run --locked
 ```
 
@@ -320,13 +323,19 @@ cd glance/live
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+cargo clippy --all-targets --locked --features fixture-probe -- -D warnings
+cargo test --all-targets --locked --features fixture-probe
 cargo run --locked
 ```
 
 The gateway tests use local fixtures and do not start Compose services or
 connect to the real Jellyfin/qBittorrent deployments. `cargo run --locked`
 starts the gateway using its environment configuration; it expects Glance and
-provider URLs to be reachable for full operation. No GPU is required or used.
+provider URLs to be reachable for full operation. The gateway, its fixtures,
+and its optional load probe are Rust and require no Python. The probe is enabled
+only by the `fixture-probe` Cargo feature and has a separate Docker `probe`
+target; the default image contains only the gateway binary. CI runs it in the
+gateway's disposable, isolated network namespace. No GPU is required or used.
 Check the browser script syntax from the repository root with
 `node --check glance/config/assets/widget-live.js`.
 

@@ -4,6 +4,16 @@ version = "1.0.0"
 edition = "2024"
 rust-version = "1.90"
 publish = false
+default-run = "glance-live"
+
+[features]
+default = []
+fixture-probe = []
+
+[[bin]]
+name = "glance-live-probe"
+path = "src/bin/glance-live-probe.rs"
+required-features = ["fixture-probe"]
 
 [dependencies]
 async-stream = "=0.3.6"

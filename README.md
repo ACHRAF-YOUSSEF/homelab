@@ -126,7 +126,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Infrastructure** | Cloudflare DDNS | `favonia/cloudflare-ddns` | - | Updates the configured DNS-only records |
 | **Infrastructure** | Nginx Proxy Manager | `jc21/nginx-proxy-manager` | 80, 81, 4443 | Reverse proxy and TLS; host 4443 maps to container 443 |
 | **Infrastructure** | [Glance](https://github.com/glanceapp/glance) | `glanceapp/glance` | Internal 8080 | Responsive dashboard with seven navigation pages; served through the live gateway |
-| **Infrastructure** | Glance live gateway | Local Rust build from `glance/live/` | 7575 (host, configurable bind) | Same-origin proxy and bounded server-side SSE relay for qBittorrent and Jellyfin; 96 MiB, 0.50 CPU, 32-process ceilings; no GPU access |
+| **Infrastructure** | Glance live gateway | Local Rust build from `glance/live/` | 7575 (host, configurable bind) | Same-origin proxy and bounded server-side SSE relay for qBittorrent and Jellyfin; Rust runtime and test tooling; 96 MiB, 0.50 CPU, 32-process ceilings; no GPU access |
 | **Infrastructure** | [Portracker](https://github.com/mostafa-wahied/portracker) | `mostafawahied/portracker` | 4999 | Docker container monitor |
 | **Infrastructure** | [Docker Socket Proxy](https://github.com/Tecnativa/docker-socket-proxy) | `tecnativa/docker-socket-proxy` | Internal 2375 | Read-only Docker API for monitoring clients |
 | **Infrastructure** | [Uptime Kuma](https://github.com/louislam/uptime-kuma) | `louislam/uptime-kuma` | 47028 | Uptime monitoring and alerting |
