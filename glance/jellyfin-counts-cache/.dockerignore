@@ -1,0 +1,8 @@
+# Only reviewed Rust application sources belong in the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!tests/
+!tests/**

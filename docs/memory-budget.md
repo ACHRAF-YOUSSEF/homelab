@@ -17,6 +17,17 @@ topic stale and preserve its last valid snapshot.
 
 The checked-in default `mem_limit` values across the Compose files sum to **18,304 MiB (17.875 GiB)**. The nine optional Nextcloud AIO child limits below add **7,680 MiB (7.5 GiB)**, for a combined ceiling of **25,984 MiB (25.375 GiB)**. This is a configured upper bound, not expected usage or a safe host-RAM recommendation. The Compose total changes if you edit the limits.
 
+The Rust `jellyfin-counts-cache` has configured ceilings of 64 MiB, 0.25 CPU,
+and 32 processes. It uses no GPU, runs as UID/GID `1000:1000`, and has a
+read-only root filesystem. Its current-thread Tokio runtime allows at most two
+blocking DNS workers and eight concurrent HTTP client tasks. Each request is
+limited to 8 KiB and 32 headers with a five-second lifetime; upstream JSON is
+limited to 16 KiB and a 30-second timeout. It keeps only the six serialized
+count fields in memory. These are configuration and implementation bounds, not
+measured working-set or CPU figures. Measure this container on the target host
+with `docker stats --no-stream jellyfin-counts-cache` before drawing conclusions
+about resource savings.
+
 ## Glance live migration measurements
 
 The October 16, 2026 migration check compared the original Python/aiohttp
@@ -51,6 +62,19 @@ runtime/fixture commands. Build the separate Docker `probe` target or use
 from `glance/live` beside an isolated gateway configured as shown in CI.
 The probe is excluded from the default production image. The gateway and its
 test tooling require no Python interpreter.
+
+## Jellyfin counts cache validation
+
+The October 16, 2026 Rust release-container check used a fake loopback Jellyfin
+service in an isolated network namespace, with no external network, host media,
+or Docker socket. The cache ran as UID/GID 1000 with a read-only filesystem,
+all capabilities dropped, and its 64 MiB, 0.25 CPU, and 32-process ceilings.
+It served 800 successful cached responses across eight concurrent clients.
+After that short run, `/proc/1/status` reported **3.4 MiB RSS and one thread**.
+The separate Rust fixture was excluded from the sample. The runtime contained
+neither Python nor Cargo and had no GPU device requests. This sample does not
+measure peak memory, sustained CPU use, real Jellyfin, DNS, or HTTPS workloads;
+there is no Python baseline or claimed percentage saving for this cache.
 
 ## Example application ceilings
 

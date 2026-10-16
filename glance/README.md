@@ -28,7 +28,7 @@ networking. DNS, tunnel routes, and reverse-proxy hosts are configured separatel
 | [live/src/bin/glance-live-probe.rs](live/src/bin/glance-live-probe.rs) | Optional Rust load probe with fake loopback providers; excluded from the production image |
 | [config/assets/subtitle-studio.svg](config/assets/subtitle-studio.svg) | Local Subtitle Studio icon |
 | [config/assets/subforge.svg](config/assets/subforge.svg) | Current blue Subforge icon, used by the Overview Docker container entry and Media service monitor; the `v=2` asset query refreshes browser caches |
-| [jellyfin-counts-cache.py](jellyfin-counts-cache.py) | Internal HTTP service caching Jellyfin library counts |
+| [jellyfin-counts-cache/](jellyfin-counts-cache/) | Rust service caching Jellyfin library counts for Glance |
 
 Compose mounts `glance/config` read-only at `/app/config`; assets are served from
 `/assets/`. The dashboard uses a dark theme, wide pages, and mobile headers.
@@ -106,8 +106,14 @@ address reachable from containers, and the host firewall must permit that traffi
 If Jellyfin runs in a separately managed container, attach it to the shared
 `homelab` network and set `JELLYFIN_INTERNAL_URL` to its service name or network
 alias, for example `http://jellyfin:8096`. The sessions widget appends `/Sessions`
-and the counts helper appends `/Items/Counts`; no script constant needs editing.
-Recreate `glance-live`, Glance, and the helper after changing this URL or the Jellyfin key.
+and the Rust counts cache appends `/Items/Counts`; no source constant needs editing.
+The cache stores only the six library count fields, refreshes every 300 seconds
+after a successful fetch, and retries failures after 30 seconds while keeping
+the previous successful counts. Its internal `/counts` endpoint is on container
+port `8765`; it returns `503` until the first valid fetch. Its readiness health
+check therefore remains unhealthy during warmup and becomes healthy once counts
+are available. Recreate `glance-live`, Glance, and the cache after changing this
+URL or the Jellyfin key.
 Set `JELLYFIN_PUBLIC_URL` to the browser destination independently.
 
 Sonarr, Radarr, Seerr, qBittorrent, and other container checks use the internal
@@ -279,11 +285,18 @@ docker compose restart glance glance-live
 ```
 
 After changing `.env`, recreate the containers so they receive the new values. The gateway resource variables are `GLANCE_LIVE_MEMORY_LIMIT`, `GLANCE_LIVE_CPUS`, `GLANCE_LIVE_MAX_CONNECTIONS`, `GLANCE_LIVE_MAX_HTTP_CONNECTIONS`, `GLANCE_LIVE_SSE_MAX_SECONDS`, `GLANCE_LIVE_MAX_PROVIDER_BYTES`, `GLANCE_LIVE_MAX_SNAPSHOT_BYTES`, `GLANCE_LIVE_MAX_TORRENTS`, and `GLANCE_LIVE_MAX_SESSIONS`. Compose enforces the memory and CPU ceilings. The application validates connection, lifetime, payload, torrent, and session limits on startup and caps their accepted values. Recreate `glance-live` after changing any of them.
-Recreate all three services when changing `JELLYFIN_API_KEY` or
-`JELLYFIN_INTERNAL_URL`:
+After changing cache code, rebuild and recreate only that service:
 
 ```shell
-docker compose up -d --build --force-recreate glance-live glance jellyfin-counts-cache
+docker compose build jellyfin-counts-cache
+docker compose up -d --no-deps jellyfin-counts-cache
+```
+
+When changing `JELLYFIN_API_KEY` or `JELLYFIN_INTERNAL_URL`, recreate the
+cache, Glance, and gateway so they receive the updated values:
+
+```shell
+docker compose up -d --force-recreate glance-live glance jellyfin-counts-cache
 ```
 
 Inspect startup, API, or cache failures with:
@@ -338,6 +351,42 @@ target; the default image contains only the gateway binary. CI runs it in the
 gateway's disposable, isolated network namespace. No GPU is required or used.
 Check the browser script syntax from the repository root with
 `node --check glance/config/assets/widget-live.js`.
+
+The counts cache is a native Rust service with no Python runtime or
+cache-specific Python source. Its current-thread Tokio runtime allows at most
+two blocking DNS workers. The server accepts at most eight concurrent clients,
+limits each request to 8 KiB and 32 headers, and closes connections within five
+seconds. Jellyfin JSON is limited to 16 KiB and a 30-second timeout. HTTPS uses
+bundled public WebPKI roots and rejects redirects. These
+bounds and Compose ceilings limit configured resources; they are not measured
+usage or guaranteed host savings. For local development, install Rust 1.90 and
+run from `glance/jellyfin-counts-cache`. PowerShell:
+
+```powershell
+Set-Location glance/jellyfin-counts-cache
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo audit --file Cargo.lock --deny warnings
+cargo run --locked
+```
+
+macOS or Linux:
+
+```bash
+cd glance/jellyfin-counts-cache
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo audit --file Cargo.lock --deny warnings
+cargo run --locked
+```
+
+`cargo run --locked` expects valid `JELLYFIN_INTERNAL_URL` and
+`JELLYFIN_API_KEY` values and a reachable Jellyfin service. Tests use local
+fixtures. Inspect actual container usage with
+`docker stats --no-stream jellyfin-counts-cache`; results vary by host and
+workload. The cache does not use a GPU.
 
 If library counts stay unavailable, check the cache logs, `JELLYFIN_INTERNAL_URL`,
 and `JELLYFIN_API_KEY`. Check qBittorrent credentials or its network whitelist

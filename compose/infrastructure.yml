@@ -92,13 +92,16 @@ services:
     networks:
       - homelab
 
-  # Responsive, feed-oriented dashboard with page tabs
+  # Rust last-good Jellyfin counts cache; no interpreter or GPU access.
   jellyfin-counts-cache:
-    image: python:3.12-alpine
+    build:
+      context: ../glance/jellyfin-counts-cache
     container_name: jellyfin-counts-cache
     mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 32
     restart: unless-stopped
-    command: python /app/jellyfin-counts-cache.py
+    read_only: true
     user: "1000:1000"
     cap_drop:
       - ALL
@@ -108,9 +111,12 @@ services:
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
       - JELLYFIN_INTERNAL_URL=${JELLYFIN_INTERNAL_URL}
       - JELLYFIN_COUNTS_BIND_ADDRESS=0.0.0.0
-    volumes:
-      - ../glance/jellyfin-counts-cache.py:/app/jellyfin-counts-cache.py:ro
-      - ../subtitle-worker/http_client.py:/app/http_client.py:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/jellyfin-counts-cache", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

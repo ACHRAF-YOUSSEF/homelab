@@ -106,7 +106,6 @@ jobs:
             --format custom --msg-template '{relpath}:{line}: {test_id} {severity}/{confidence}' \
             subtitle-worker/worker.py subtitle-worker/download_model.py \
             subtitle-worker/validate_srt.py subtitle-worker/http_client.py \
-            glance/jellyfin-counts-cache.py \
             .github/scripts/audit_repository.py
 
       - name: Test HTTP request security boundaries
@@ -116,6 +115,67 @@ jobs:
       - name: Audit resolved Python dependencies
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: pip-audit --strict --requirement subtitle-worker/requirements.txt --progress-spinner off
+
+  jellyfin-counts-cache-rust:
+    name: Jellyfin counts cache Rust checks and dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up locked Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: 1.90.0
+          components: clippy, rustfmt
+          build-warnings: ''
+          cache: false
+
+      - name: Check Rust formatting
+        working-directory: glance/jellyfin-counts-cache
+        run: cargo fmt --all -- --check
+
+      - name: Lint and test cache with disposable HTTP fixtures
+        working-directory: glance/jellyfin-counts-cache
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+
+      - name: Install pinned RustSec audit tool
+        run: cargo install --locked cargo-audit --version 0.22.2
+
+      - name: Audit locked Rust dependencies
+        working-directory: glance/jellyfin-counts-cache
+        run: cargo audit --file Cargo.lock --deny warnings
+
+      - name: Build and check isolated unprivileged warming-up runtime
+        run: |
+          docker build --tag jellyfin-counts-cache-runtime:test glance/jellyfin-counts-cache
+          docker run --detach --name jellyfin-counts-cache-runtime-test --network none \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --memory 64m --cpus 0.25 --pids-limit 32 \
+            --env JELLYFIN_INTERNAL_URL=http://127.0.0.1:9090 \
+            --env JELLYFIN_API_KEY=test-key jellyfin-counts-cache-runtime:test
+          trap 'docker rm --force jellyfin-counts-cache-runtime-test >/dev/null' EXIT
+          listening=false
+          for _ in {1..15}; do
+            if docker logs jellyfin-counts-cache-runtime-test 2>&1 | grep -q 'listening'; then
+              listening=true
+              break
+            fi
+            sleep 1
+          done
+          [ "$listening" = true ]
+          [ "$(docker inspect --format '{{.State.Running}}' jellyfin-counts-cache-runtime-test)" = true ]
+          # A live server with no upstream success must fail readiness.
+          if docker exec jellyfin-counts-cache-runtime-test /usr/local/bin/jellyfin-counts-cache --healthcheck; then
+            exit 1
+          fi
 
   glance-live-rust:
     name: Glance live Rust checks and dependency audit

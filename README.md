@@ -130,7 +130,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Infrastructure** | [Portracker](https://github.com/mostafa-wahied/portracker) | `mostafawahied/portracker` | 4999 | Docker container monitor |
 | **Infrastructure** | [Docker Socket Proxy](https://github.com/Tecnativa/docker-socket-proxy) | `tecnativa/docker-socket-proxy` | Internal 2375 | Read-only Docker API for monitoring clients |
 | **Infrastructure** | [Uptime Kuma](https://github.com/louislam/uptime-kuma) | `louislam/uptime-kuma` | 47028 | Uptime monitoring and alerting |
-| **Infrastructure** | Jellyfin counts cache | `python:3.12-alpine` | - | Internal library-count helper for Glance on container port 8765 |
+| **Infrastructure** | Jellyfin counts cache | Local Rust build from `glance/jellyfin-counts-cache/` | Internal 8765 | Last-good Jellyfin library counts for Glance; 64 MiB, 0.25 CPU, 32-process ceilings; no GPU access |
 | **DNS** | [AdGuard Home](https://github.com/AdguardTeam/AdGuardHome) | `adguard/adguardhome` | 53, 3000, 8180 | Network-wide DNS filtering |
 | **DNS** | [Unbound](https://github.com/MatthewVance/unbound-docker) | `mvance/unbound` | 5053 | Recursive DNS resolver |
 | **Media** | Jellyfin | Separate host installation | 8096 | Media server outside this Compose stack; use the installer for your OS |
@@ -823,8 +823,8 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | Gitleaks | Current files and full reachable Git history with complete redaction. |
 | Repository privacy checks | Unit fixtures and a checker for private deployment data, credentials, and literal Glance endpoints. |
 | actionlint | GitHub Actions workflow syntax using the pinned actionlint release. |
-| Bandit | Selected Python services, Glance counts helper, and privacy-checking tools at medium severity and confidence. |
-| Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audit for the Glance gateway and Subforge. |
+| Bandit | Selected Python services and privacy-checking tools at medium severity and confidence. |
+| Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audits for the Glance gateway, Jellyfin counts cache, and Subforge. |
 | Subtitle conversion integration | Pinned multi-stage container build and isolated text/OCR fixtures without network access or host media mounts. |
 | pip-audit | Strict audit of resolved Python 3.12 dependencies used by the Python services. |
 | pnpm audit | Subtitle worker lockfile, including development dependencies, without installing project packages. |
