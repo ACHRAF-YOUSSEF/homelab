@@ -374,6 +374,63 @@ fn utf8_path(path: &Path) -> String {
 }
 
 #[test]
+fn dashboard_auth_can_be_disabled_without_disabling_csrf_and_reenabled_on_restart() {
+    let mut server = Server::start_with_environment(
+        None,
+        &[
+            ("CONVERTER_AUTH_ENABLED", "false"),
+            ("CONVERTER_UI_PASSWORD", "invalid"),
+        ],
+    );
+    assert!(!server.data.join("ui-password").exists());
+    for path in ["/", "/api/status", "/api/inventory", "/api/settings"] {
+        assert_eq!(server.request("GET", path, &[], None).unwrap().status, 200);
+    }
+    let session = server.request("GET", "/api/session", &[], None).unwrap();
+    assert_eq!(session.status, 200);
+    let csrf = session.body["csrf_token"].as_str().unwrap();
+    let body = r#"{"languages":["en","fr"]}"#;
+    assert_eq!(
+        server
+            .request(
+                "PUT",
+                "/api/settings",
+                &[("Content-Type", "application/json")],
+                Some(body)
+            )
+            .unwrap()
+            .status,
+        403
+    );
+    let updated = server
+        .request(
+            "PUT",
+            "/api/settings",
+            &[("Content-Type", "application/json"), ("X-CSRF-Token", csrf)],
+            Some(body),
+        )
+        .unwrap();
+    assert_eq!(updated.status, 200);
+    assert_eq!(updated.body["languages"], json!(["en", "fr"]));
+    server.restart();
+    assert_eq!(
+        server
+            .request("GET", "/api/status", &[], None)
+            .unwrap()
+            .status,
+        401
+    );
+    let auth = server.auth_header();
+    assert_eq!(
+        server
+            .request("GET", "/api/status", &[("Authorization", &auth)], None)
+            .unwrap()
+            .status,
+        200
+    );
+}
+
+#[test]
 fn dashboard_http_auth_csrf_host_widget_and_webhook_boundaries() {
     let server = Server::start();
 

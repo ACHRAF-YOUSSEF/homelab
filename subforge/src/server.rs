@@ -468,7 +468,7 @@ pub struct App {
     public_integrations: Mutex<Value>,
     mounts: Vec<PathBuf>,
     data: PathBuf,
-    password: String,
+    password: Option<String>,
     csrf: String,
     webhook: String,
     widget: String,
@@ -582,6 +582,54 @@ fn inventory_rows(value: &Value, mounts: &[PathBuf], roots: &[PathBuf]) -> Vec<V
         }
         Some(result)
     }).collect()
+}
+
+fn dashboard_password(
+    data: &Path,
+    auth_enabled: &str,
+    supplied: Option<String>,
+) -> Result<Option<String>, String> {
+    match auth_enabled {
+        "false" => return Ok(None),
+        "true" | "" => {}
+        _ => return Err("CONVERTER_AUTH_ENABLED must be true or false".into()),
+    }
+    let password = match supplied.filter(|password| !password.is_empty()) {
+        Some(password) => password,
+        None => {
+            let path = data.join("ui-password");
+            if path.exists() {
+                if path.is_symlink() {
+                    return Err("Saved dashboard password must not be a symlink".into());
+                }
+                let mut bytes = String::new();
+                fs::File::open(&path)
+                    .map_err(|_| "Saved password is unavailable")?
+                    .take(1025)
+                    .read_to_string(&mut bytes)
+                    .map_err(|_| "Saved password could not be read")?;
+                bytes.trim().to_owned()
+            } else {
+                let password = token(32);
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options
+                    .open(&path)
+                    .map_err(|_| "Cannot create private dashboard password")?;
+                writeln!(file, "{password}").map_err(|_| "Cannot save dashboard password")?;
+                password
+            }
+        }
+    };
+    if !(12..=256).contains(&password.len()) || password.chars().any(char::is_control) {
+        return Err("CONVERTER_UI_PASSWORD must have 12–256 printable characters or be blank for a generated password".into());
+    }
+    Ok(Some(password))
 }
 
 impl App {
@@ -717,44 +765,11 @@ impl App {
                     .map(|(path, _)| path.clone()),
             );
         }
-        let password = match std::env::var("CONVERTER_UI_PASSWORD")
-            .ok()
-            .filter(|password| !password.is_empty())
-        {
-            Some(password) => password,
-            None => {
-                let path = data.join("ui-password");
-                if path.exists() {
-                    if path.is_symlink() {
-                        return Err("Saved dashboard password must not be a symlink".into());
-                    }
-                    let mut bytes = String::new();
-                    fs::File::open(&path)
-                        .map_err(|_| "Saved password is unavailable")?
-                        .take(1025)
-                        .read_to_string(&mut bytes)
-                        .map_err(|_| "Saved password could not be read")?;
-                    bytes.trim().to_owned()
-                } else {
-                    let password = token(32);
-                    let mut options = OpenOptions::new();
-                    options.write(true).create_new(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.mode(0o600);
-                    }
-                    let mut file = options
-                        .open(&path)
-                        .map_err(|_| "Cannot create private dashboard password")?;
-                    writeln!(file, "{password}").map_err(|_| "Cannot save dashboard password")?;
-                    password
-                }
-            }
-        };
-        if !(12..=256).contains(&password.len()) || password.chars().any(char::is_control) {
-            return Err("CONVERTER_UI_PASSWORD must have 12–256 printable characters or be blank for a generated password".into());
-        }
+        let password = dashboard_password(
+            &data,
+            &std::env::var("CONVERTER_AUTH_ENABLED").unwrap_or_else(|_| "true".into()),
+            std::env::var("CONVERTER_UI_PASSWORD").ok(),
+        )?;
         let widget = std::env::var("CONVERTER_WIDGET_TOKEN").unwrap_or_default();
         if !widget.is_empty()
             && (!(32..=256).contains(&widget.len())
@@ -3532,19 +3547,21 @@ fn guard(app: &App, request: &Request) -> Option<Reply> {
     if request.method == "GET" && request.target == "/health" {
         return None;
     }
-    let authenticated = request
-        .headers
-        .get("authorization")
-        .and_then(|value| value.strip_prefix("Basic "))
-        .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
-        .is_some_and(|bytes| constant_equal(&bytes, format!("admin:{}", app.password).as_bytes()));
-    if !authenticated {
-        let mut reply = Reply::error(401, "Dashboard login required");
-        reply.extra.push((
-            "WWW-Authenticate",
-            "Basic realm=\"Subforge\", charset=\"UTF-8\"".into(),
-        ));
-        return Some(reply);
+    if let Some(password) = &app.password {
+        let authenticated = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.strip_prefix("Basic "))
+            .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+            .is_some_and(|bytes| constant_equal(&bytes, format!("admin:{password}").as_bytes()));
+        if !authenticated {
+            let mut reply = Reply::error(401, "Dashboard login required");
+            reply.extra.push((
+                "WWW-Authenticate",
+                "Basic realm=\"Subforge\", charset=\"UTF-8\"".into(),
+            ));
+            return Some(reply);
+        }
     }
     if request.method != "GET"
         && !constant_equal(
@@ -3859,7 +3876,13 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
             }
         }));
     }
-    println!("Subforge Rust dashboard listening on port {port}; username admin");
+    if app.password.is_some() {
+        println!("Subforge Rust dashboard listening on port {port}; username admin");
+    } else {
+        println!(
+            "Subforge Rust dashboard listening on port {port}; dashboard authentication disabled"
+        );
+    }
     while !app.shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut socket, _)) => {
@@ -3889,6 +3912,122 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_auth_configuration_preserves_password_across_opt_out() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data = temporary.path();
+        let saved = data.join("ui-password");
+        assert_eq!(dashboard_password(data, "false", None).unwrap(), None);
+        assert!(!saved.exists());
+        let generated = dashboard_password(data, "true", None).unwrap();
+        assert!(generated.is_some());
+        assert_eq!(dashboard_password(data, "", None).unwrap(), generated);
+        let contents = fs::read(&saved).unwrap();
+        assert_eq!(
+            dashboard_password(data, "false", Some("invalid".into())).unwrap(),
+            None
+        );
+        assert_eq!(fs::read(&saved).unwrap(), contents);
+        assert_eq!(dashboard_password(data, "true", None).unwrap(), generated);
+        assert!(dashboard_password(data, "true", Some("invalid".into())).is_err());
+        for invalid in ["0", "1", "FALSE", "off", "flase", " false "] {
+            assert!(dashboard_password(data, invalid, None).is_err());
+        }
+    }
+
+    #[test]
+    fn dashboard_auth_opt_out_preserves_request_guards_and_service_tokens() {
+        let (_temporary, mut app, _paths, _gate) = gated_workers_fixture();
+        let password = "fixture-dashboard-password";
+        Arc::get_mut(&mut app).unwrap().password = Some(password.into());
+        let mut request = Request {
+            method: "GET".into(),
+            target: "/api/session".into(),
+            headers: BTreeMap::from([("host".into(), "localhost".into())]),
+            body: Vec::new(),
+        };
+        let denied = handle(&app, &request);
+        assert_eq!(denied.status, 401);
+        assert!(
+            denied
+                .extra
+                .iter()
+                .any(|(name, _)| *name == "WWW-Authenticate")
+        );
+        request.headers.insert(
+            "authorization".into(),
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("admin:{password}"))
+            ),
+        );
+        assert_eq!(handle(&app, &request).status, 200);
+        request.headers.remove("authorization");
+        Arc::get_mut(&mut app).unwrap().password = None;
+        for path in [
+            "/",
+            "/app.js",
+            "/api/session",
+            "/api/status",
+            "/api/settings",
+        ] {
+            request.target = path.into();
+            let reply = handle(&app, &request);
+            assert_eq!(reply.status, 200, "{path}");
+            assert!(
+                !reply
+                    .extra
+                    .iter()
+                    .any(|(name, _)| *name == "WWW-Authenticate")
+            );
+        }
+        request.method = "PUT".into();
+        assert_eq!(guard(&app, &request).unwrap().status, 403);
+        request
+            .headers
+            .insert("x-csrf-token".into(), app.csrf.clone());
+        assert!(guard(&app, &request).is_none());
+        request
+            .headers
+            .insert("origin".into(), "https://unexpected.invalid".into());
+        assert_eq!(guard(&app, &request).unwrap().status, 403);
+        request.headers.remove("origin");
+        request
+            .headers
+            .insert("host".into(), "unexpected.invalid".into());
+        assert_eq!(guard(&app, &request).unwrap().status, 403);
+        request.headers.insert("host".into(), "localhost".into());
+        let token = "r".repeat(48);
+        let app_mut = Arc::get_mut(&mut app).unwrap();
+        app_mut.widget = token.clone();
+        app_mut.webhook = token.clone();
+        *lock(&app.remote) =
+            crate::remote::Coordinator::new(token.clone(), app.mounts.clone()).unwrap();
+        for (path, method, header, value) in [
+            (
+                "/api/widget",
+                "GET",
+                "authorization",
+                format!("Bearer {token}"),
+            ),
+            ("/hooks/sonarr", "POST", "x-webhook-token", token.clone()),
+            ("/hooks/radarr", "POST", "x-webhook-token", token.clone()),
+            (
+                "/api/remote/register",
+                "POST",
+                "authorization",
+                format!("Bearer {token}"),
+            ),
+        ] {
+            request.target = path.into();
+            request.method = method.into();
+            assert_eq!(guard(&app, &request).unwrap().status, 401, "{path}");
+            request.headers.insert(header.into(), value);
+            assert!(guard(&app, &request).is_none(), "{path}");
+            request.headers.remove(header);
+        }
+    }
 
     struct BazarrFixture {
         url: String,

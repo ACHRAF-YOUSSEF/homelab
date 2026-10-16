@@ -174,8 +174,11 @@ two token values do not match.
 
 The separate Subforge service monitor checks the service's unauthenticated
 `/health` endpoint. This reports whether the service is reachable even when the
-optional widget token is blank; the Subforge dashboard itself still requires
-Basic Authentication.
+optional widget token is blank. The widget token remains a separate credential
+from Subforge's dashboard Basic Authentication, which is enabled by default
+and can be disabled with `CONVERTER_AUTH_ENABLED=false` in the ignored root
+`.env`. Disabling dashboard login does not enable the widget endpoint or remove
+its bearer-token check.
 
 After changing the token in `.env`, recreate both containers to apply it:
 
