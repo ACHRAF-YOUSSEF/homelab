@@ -185,7 +185,7 @@ Bind mounts beginning with `../` are relative to the included file in `compose/`
 - [Glance dashboard](glance/README.md): seven pages, live qBittorrent/Jellyfin widgets, LAN binding, API keys, and the Jellyfin counts helper.
 - [Subtitle Studio](subtitle-studio/README.md): Rust setup, model management, resource limits, translation, and development checks.
 - [Subforge subtitle conversion](subforge/README.md): responsive dashboard with optional Basic Authentication, watcher setup, media-server integrations, configuration, language handling, limitations, and native use.
-- [Memory budget guide](docs/memory-budget.md): selected Compose ceilings, Nextcloud AIO child limits, monitoring, and reversible adjustment steps.
+- [Memory budget guide](docs/memory-budget.md): selected Compose ceilings, Nextcloud AIO child limits, monitoring, and manual adjustment guidance.
 
 ---
 
@@ -432,6 +432,8 @@ docker compose up -d sonarr radarr prowlarr qbittorrent
 ```
 
 Subtitle Studio builds and starts independently with `docker compose up -d --build subtitle-studio`, using CPU by default. The full `large-v3` NVIDIA profile requires the CUDA override for every build, download, start, and later Compose operation, plus `WHISPER_MODEL=large-v3`, `WHISPER_DEVICE=cuda`, and an increased Studio RAM ceiling. Its CUDA setup, service-rename migration, and targeted recovery for root-owned data volumes are documented in [the component guide](subtitle-studio/README.md). The UI is at `http://localhost:8099`; the guide covers model downloads and translation setup. The app has no authentication. `SUBTITLE_BIND_ADDRESS` defaults the native bind and Compose host publication to loopback. Every HTTP Host header must also match `SUBTITLE_ALLOWED_HOSTS`; add the actual hostname or IP in `.env` for deliberate remote access and restrict it to trusted clients.
+
+Subtitle Studio uses segment-only Whisper JSON to avoid invalid UTF-8 in unused token metadata. If an older image reports `Invalid Whisper JSON output`, rebuild the selected CPU/CUDA image and retry transcription; see the [transcription troubleshooting notes](subtitle-studio/README.md#whisper-json-failures).
 
 ### Rename existing subtitle containers
 
@@ -837,9 +839,8 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | Check | Coverage |
 | --- | --- |
 | Gitleaks | Current files and full reachable Git history with complete redaction. |
-| Repository privacy checks | Unit fixtures and a checker for private deployment data, credentials, and literal Glance endpoints. |
+| Repository privacy checks | Node.js built-in test fixtures and a checker for private deployment data, credentials, literal Glance endpoints, and Python or PowerShell source scripts. Ignored runtime data is excluded from the source-script policy. |
 | actionlint | GitHub Actions workflow syntax using the pinned actionlint release. |
-| Bandit | Remaining Python source and privacy-checking tools at medium severity and confidence. |
 | Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audits for Glance, Jellyfin counts cache, Subtitle Studio, and Subforge. |
 | Subtitle conversion integration | Pinned multi-stage container build and isolated text/OCR fixtures without network access or host media mounts. |
 | pnpm audit | Subtitle Studio lockfile, including development dependencies, without installing project packages. |
@@ -859,6 +860,13 @@ After creating `.env`, validate the assembled configuration without starting con
 docker compose config --quiet
 docker compose config --services
 git diff --check
+```
+
+Run the repository privacy tests and checker with Node.js 24; they require no package installation and do not read the private `.env`:
+
+```shell
+node --test .github/scripts/test_audit_repository.mjs
+node .github/scripts/audit_repository.mjs
 ```
 
 The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes, Rust gateway checks, resource ceilings, and widget troubleshooting. Subtitle Studio's [guide](subtitle-studio/README.md) includes Rust checks and the command to rebuild the checked-in Tailwind CSS. The [Subforge guide](subforge/README.md) documents Rust Cargo tests/builds, native use, legacy state compatibility, and optional OCR. Rebuild Subtitle Studio after changing Rust source or bundled web files.

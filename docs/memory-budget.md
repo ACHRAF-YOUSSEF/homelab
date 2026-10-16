@@ -153,7 +153,7 @@ Subforge converts one input at a time and limits the OCR OpenMP thread count. It
 
 ## Optional Nextcloud AIO child limits
 
-The helper targets a fixed allowlist of nine Nextcloud AIO children. Their configured ceilings total 7680 MiB (7.5 GiB):
+The example ceilings for these nine Nextcloud AIO children total 7680 MiB (7.5 GiB):
 
 | AIO child | Ceiling |
 |---|---:|
@@ -169,47 +169,14 @@ The helper targets a fixed allowlist of nine Nextcloud AIO children. Their confi
 
 That 7.5 GiB sum is only the upper bound for these nine children. It excludes the AIO master container, other containers, Docker Desktop's Linux VM on Windows/macOS, the host operating system, and host applications such as LM Studio. Measure actual peak use on your machine and leave additional headroom before applying ceilings. Container limits alone cannot determine a safe LM Studio allocation; monitor its process alongside Docker workloads.
 
-The AIO helper is read-only by default: it reports current limits and the fixed targets for containers it finds. `--apply` saves the previous memory and swap limits to a restore point in the system temporary directory, applies targets to matching existing AIO children, and verifies them. `--restore` restores those saved values. It refuses to restore when a target container was recreated, preventing an old restore point from being applied to a new container. The script does not change AIO configuration, so AIO child limits do not persist when AIO recreates those children.
-
-## Apply the Compose project ceilings
-
-`scripts/compose_memory_limits.py` reports the checked-in Compose defaults and current limits for containers labelled as part of the `homelab` Compose project. It is a separate helper from the AIO child helper above. Its default report is read-only. `--apply` changes limits only on matching containers that currently exist, saves their previous memory and swap values in a restore point under the system temporary directory, then verifies the changes. It reads the Compose default expressions in the repository; it does not load the ignored `.env`, so review the report and confirm the checked-in defaults are what you intend before applying. These runtime Docker updates do not edit Compose files and can be replaced when containers are recreated. `--restore` restores the saved values and refuses stale restore points if a container was recreated or relabeled.
-
-Run the commands from the repository root after Docker is available. Start with dry runs for both groups:
-
-```powershell
-py -3 .\scripts\compose_memory_limits.py
-py -3 .\scripts\nextcloud_aio_memory_limits.py
-```
-
-If the reported ceilings fit the workload you measured, apply each set:
-
-```powershell
-py -3 .\scripts\compose_memory_limits.py --apply
-py -3 .\scripts\nextcloud_aio_memory_limits.py --apply
-```
-
-Restore each helper's saved values with:
-
-```powershell
-py -3 .\scripts\compose_memory_limits.py --restore
-py -3 .\scripts\nextcloud_aio_memory_limits.py --restore
-```
-
-On macOS/Linux, use `python3` with the same script arguments:
+The values in this guide are examples; inspect the current container configuration and workload before changing a ceiling. For example, inspect the configured memory and swap limits and current use of the AIO Apache child with Docker CLI commands available in PowerShell, Bash, and Zsh:
 
 ```shell
-python3 scripts/compose_memory_limits.py
-python3 scripts/nextcloud_aio_memory_limits.py
-python3 scripts/compose_memory_limits.py --apply
-python3 scripts/nextcloud_aio_memory_limits.py --apply
-python3 scripts/compose_memory_limits.py --restore
-python3 scripts/nextcloud_aio_memory_limits.py --restore
+docker inspect nextcloud-aio-apache --format '{{.Name}} memory={{.HostConfig.Memory}} memory-swap={{.HostConfig.MemorySwap}}'
+docker stats --no-stream nextcloud-aio-apache
 ```
 
-The Windows PowerShell wrapper `scripts/nextcloud-aio-memory-limits.ps1` remains available for AIO-only operations. It accepts no arguments for a dry run, `-Apply` to apply the caps, and `-Restore` to restore saved limits. The Python examples above work on both platforms when Python 3 and Docker CLI are installed.
-
-Review the default reports first. Apply changes only when the reported targets fit your measured workload and available host memory. If AIO recreates children after applying limits, inspect their new limits again; the old restore point is intentionally tied to the original container identities.
+To make a persistent change to a Compose-managed service, update its applicable `.env` limit or Compose `mem_limit`, then recreate that service with the same Compose files used to start it. A direct `docker update --memory 768m nextcloud-aio-apache` changes only the existing AIO Apache container; record the prior values first, and expect Nextcloud AIO to replace the manual setting when it recreates the child. Apply a one-off change only after confirming the exact child container and checking the proposed limit against measured host and workload headroom. Restore it by applying the values you recorded before the update. These manual steps do not create an automatic restore point or protect against applying a value to a recreated container.
 
 ## Observe actual use
 

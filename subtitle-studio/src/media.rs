@@ -440,7 +440,22 @@ fn read_json(path: &Path, limit: u64) -> Result<Value, String> {
     if bytes.len() as u64 > limit {
         return Err("Whisper JSON exceeds the configured limit".into());
     }
-    serde_json::from_slice(&bytes).map_err(|_| "Invalid Whisper JSON output".into())
+    serde_json::from_slice(&bytes).map_err(|error| {
+        let reason = if std::str::from_utf8(&bytes).is_err() {
+            "invalid UTF-8"
+        } else if error.is_eof() {
+            "empty or truncated JSON"
+        } else {
+            "malformed JSON"
+        };
+        // Native output may contain private paths and recognized speech. Expose
+        // only a fixed classification and coordinates, never the parser message.
+        format!(
+            "Invalid Whisper JSON output ({reason}; line {}, column {})",
+            error.line(),
+            error.column()
+        )
+    })
 }
 
 fn normalized(text: &str) -> String {
@@ -662,7 +677,10 @@ pub fn transcribe(
             &config.cpu_threads.clamp(1, 64).to_string(),
             "--processors",
             "1",
-            "--output-json-full",
+            // Full JSON writes individual byte-level tokens, which can split a
+            // UTF-8 character and make the entire document invalid. We consume
+            // segment text/offsets only; ordinary JSON retains both intact.
+            "--output-json",
             "--output-file",
         ]));
         arguments.push(prefix.as_os_str().into());
@@ -835,6 +853,51 @@ mod tests {
         fs::write(&path, b"{\"data\":\"oversize\"}").unwrap();
         assert!(read_json(&path, 4).is_err());
         assert_eq!(read_json(&path, 64).unwrap()["data"], "oversize");
+    }
+
+    #[test]
+    fn segment_json_preserves_unicode_text_and_offsets_without_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.json");
+        let bytes = r#"{"result":{"language":"ja"},"transcription":[{"offsets":{"from":1200,"to":2700},"text":" 日本語の\"字幕\" \\ テスト。 "}]}"#.as_bytes();
+        fs::write(&path, bytes).unwrap();
+        let data = read_json(&path, 4096).unwrap();
+        assert_eq!(data["result"]["language"], "ja");
+        let cues = decode_cues(&data, 300.0, 300.0).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "日本語の\"字幕\" \\ テスト。");
+        assert!((cues[0].start - 301.2).abs() < 0.0001);
+        assert!((cues[0].end - 302.7).abs() < 0.0001);
+    }
+
+    #[test]
+    fn whisper_json_errors_classify_output_without_disclosing_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.json");
+        for (bytes, reason) in [
+            // Byte-level token fragments can be invalid UTF-8 even when the
+            // enclosing segment text is valid. Do not repair text lossily.
+            (
+                b"{\"text\":\"PRIVATE_FIXTURE\",\"tokens\":[{\"text\":\"\xe6\x97\"}]}".as_slice(),
+                "invalid UTF-8",
+            ),
+            (b"".as_slice(), "empty or truncated JSON"),
+            (
+                b"{\"PRIVATE_FIXTURE\":".as_slice(),
+                "empty or truncated JSON",
+            ),
+            (
+                b"{\"PRIVATE_FIXTURE\":invalid}".as_slice(),
+                "malformed JSON",
+            ),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let error = read_json(&path, 4096).unwrap_err();
+            assert!(error.starts_with("Invalid Whisper JSON output ("));
+            assert!(error.contains(reason));
+            assert!(error.contains("; line ") && error.contains(", column "));
+            assert!(!error.contains("PRIVATE_FIXTURE"));
+        }
     }
 
     #[test]

@@ -359,6 +359,8 @@ fn transcript_key(
     if rust_engine {
         payload["engine"] = json!("whisper.cpp-cli-v1");
         // Rust CLI segmentation intentionally has a separate transcription identity.
+        // Retain the legacy json-full identity: ordinary JSON omits unused token
+        // metadata but preserves the same inference, segment text and offsets.
         payload["whisper_options"] = json!({"output":"json-full","split_on_word":true,"max_len":72,
             "chunk_seconds":job.get("audio_chunk_seconds").cloned().unwrap_or(json!(300))});
     }

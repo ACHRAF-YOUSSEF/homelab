@@ -185,6 +185,10 @@ Open **Resources** below the Whisper model selector and use **Refresh usage** to
 
 An existing ignored `.env` can preserve `WHISPER_MODEL=medium` even though the new example defaults to `small-q5_1`. After backing up `/data` and outputs, explicitly set `WHISPER_MODEL=small-q5_1` and `WHISPER_LOCAL_FILES_ONLY=true` in `.env` if you want the CPU-first defaults. Existing GGML files must be named `ggml-<model>.bin`; Faster Whisper Hugging Face caches cannot be reused. Explicit CLI downloads use `SUBTITLE_MODEL_DOWNLOAD_TIMEOUT` (3600 seconds by default), while automatic web-job downloads keep 120-second body and 180-second total timeouts per upstream URL. For large or slow downloads, use the explicit CLI command with an adequate timeout or obtain the official `.bin` from [the whisper.cpp model repository](https://huggingface.co/ggerganov/whisper.cpp/tree/main) and place it in `WHISPER_MODEL_ROOT` (or `/models` in the container) before inference.
 
+### Whisper JSON failures
+
+Transcription requests ordinary Whisper JSON with segment text and timestamps. Full token JSON can contain incomplete UTF-8 byte sequences inside individual tokens, causing `Invalid Whisper JSON output` even after successful inference. Builds with this fix omit the unused token metadata while preserving existing transcript cache identities. Rebuild the selected CPU or CUDA image and use **Retry** on the failed transcription step. Remaining parse failures report only the encoding/syntax category and line/column, without exposing transcript text or native paths.
+
 ## Development and validation
 
 From this directory:
