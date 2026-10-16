@@ -4,6 +4,7 @@ pub mod converter;
 pub mod edition;
 mod gpu;
 pub mod integrations;
+mod job_activity;
 pub mod maintenance;
 pub mod metadata;
 pub mod remote;

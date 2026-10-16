@@ -167,6 +167,8 @@ async function main() {
     // field aliases the first active job and must not duplicate it in Activity.
     const parallelA = { id: 'parallel-a', kind: 'extract', status: 'running', created: now + 1, total: 4, processed: 1, paths: ['/media/movies/Parallel A.mkv'], current: { path: '/media/movies/Parallel A.mkv', stage: 'Extracting subtitles' } };
     const parallelB = { id: 'parallel-b', kind: 'extract', status: 'running', created: now + 2, total: 3, processed: 0, paths: ['/media/tv/Parallel B.mkv'], current: { path: '/media/tv/Parallel B.mkv', stage: 'Recognizing image subtitles' } };
+    parallelA.telemetry={elapsed_seconds:20,progress_percent:25,eta_seconds:60,liveness:'running'};
+    parallelB.telemetry={elapsed_seconds:90,progress_percent:0,eta_seconds:null,liveness:'running',idle_seconds:20,heartbeat_age_seconds:1};
     activeJobs = [parallelA, parallelB]; runningJob = parallelA;
     fileWorkers = [
       { id: 41, resource: 'cpu', path: parallelA.paths[0], status: 'Extracting subtitles', started: now },
@@ -186,11 +188,36 @@ async function main() {
     assert.equal(await parallelRowA.count(), 1, 'running alias does not duplicate active job A in Activity');
     assert.equal(await parallelRowB.count(), 1, 'active job B appears once in Activity');
     assert.equal(await page.locator('#jobs-list .job-row').count(), 5, 'active jobs, queue, and history are merged without duplicates');
+    assert.match(await parallelRowA.innerText(), /Elapsed 20s.*~1m 0s remaining/);
+    assert.equal(await parallelRowA.locator('progress').getAttribute('value'), '25');
+    assert.match(await parallelRowB.innerText(), /Elapsed 1m 30s.*ETA estimating/);
     await parallelRowB.locator('[data-view-job]').click();
     const parallelCard = page.locator('#job-drawer-content .job-card');
     await parallelCard.waitFor();
     assert.match(await parallelCard.innerText(), /Parallel B\.mkv/);
     assert.match(await parallelCard.innerText(), /Running/);
+    for(const [liveness,label,detail] of [['waiting','Waiting','Waiting for CPU capacity'],['stalled','Possibly stalled','No progress for 6m 0s'],['unresponsive','Unresponsive','No heartbeat for 1m 15s']]){
+      Object.assign(parallelB.telemetry,{liveness,wait_reason:liveness==='waiting'?detail:null,idle_seconds:360,heartbeat_age_seconds:liveness==='unresponsive'?75:1});
+      await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+      await parallelCard.getByText(label,{exact:true}).waitFor();
+      assert((await parallelCard.innerText()).includes(detail), `${liveness} explains job health`);
+      assert((await parallelRowB.innerText()).includes(label), `${liveness} appears in Activity row`);
+    }
+    parallelB.telemetry.liveness='running';
+    parallelB.total=0;parallelB.telemetry.progress_percent=null;parallelB.current={status:'preparing'};
+    await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+    await parallelCard.getByText('Preparing job',{exact:true}).waitFor();
+    assert.equal(await parallelCard.locator('progress').getAttribute('value'),null,'unknown totals use indeterminate progress');
+    assert.doesNotMatch(await parallelRowB.locator('.job-result-copy').innerText(),/0%|Waiting to start/,'preparation does not claim measured 0%');
+    parallelB.total=3;parallelB.telemetry.progress_percent=0;parallelB.current={status:'ocr',path:parallelB.paths[0]};
+    await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+    await parallelCard.getByText('Running',{exact:true}).waitFor();
+    for(const width of [1440,320]){
+      await page.setViewportSize({width,height:640});
+      await assertViewport(`job timing ${width}px`);
+      if(output)await page.screenshot({path:path.join(output,`job-progress-${width}.png`),style:'.toast { visibility: hidden; }'});
+    }
+    await page.setViewportSize({width:1440,height:960});
     // Finish A while B remains active. Visibility polling refreshes the open
     // detail drawer without clicking the inert page behind it.
     activeJobs = [parallelB]; runningJob = parallelB;
@@ -424,9 +451,19 @@ async function main() {
     if (output) await page.screenshot({ path: path.join(output, 'bazarr-library-desktop.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
     inventoryAuthority = { status: 'refresh_pending' }; revision++;
     await page.locator('#refresh-button').click();
-    await page.locator('#inventory-authority').getByText(/indexing or inventory refresh is still pending/).waitFor();
-    assert(await page.locator('[data-action="scan"]').first().isDisabled());
+    await page.locator('#inventory-authority').getByText(/Published subtitle indexing is still unconfirmed/).waitFor();
+    assert(await page.locator('[data-action="scan"]').first().isEnabled(), 'fresh inventory allows conversion while indexing confirmation is pending');
     assert(await page.locator('[data-action="inspect"]').first().isEnabled(), 'sync remains available');
+    inventoryAuthority={status:'refresh_pending',verification_limited:true};revision++;
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-authority').getByText(/exceed the indexing verification limits/).waitFor();
+    assert(await page.locator('[data-action="scan"]').first().isEnabled(), 'limited historical verification does not permanently block conversion');
+    for(const status of ['stale','unavailable','reindex_failed']){
+      inventoryAuthority={status};revision++;
+      await page.locator('#refresh-button').click();
+      await page.waitForFunction(()=>document.querySelector('[data-action="scan"]').disabled);
+      assert(await page.locator('[data-action="inspect"]').first().isEnabled(), 'sync remains available for blocked authority');
+    }
     inventoryAuthority = { status: 'ready' }; revision++;
     needed.missing_targets = []; needed.missing_srt = false;
     needed.coverage = { status: 'covered', reason: 'Bazarr confirms the new SRT', existing_targets: wanted, missing_targets: [] };
@@ -434,6 +471,7 @@ async function main() {
     await page.locator('#inventory-filter').selectOption('covered');
     await page.waitForFunction(() => document.querySelectorAll('#inventory-body tr').length === 2);
     assert(await page.locator('[data-action="scan"]').first().isEnabled());
+    assert(await page.locator('#inventory-authority').isHidden(), 'healthy Bazarr inventory has no persistent banner');
     await page.getByRole('button', { name: 'Overview', exact: true }).click();
     inventoryAuthority = { status: 'refresh_pending' }; revision++;
     await page.locator('#refresh-button').click();
@@ -441,6 +479,7 @@ async function main() {
     const quickBazarrStatus = await page.locator('#overview-inventory-notice').innerText();
     assert.match(quickBazarrStatus, /Bazarr/i);
     assert.match(quickBazarrStatus, /pending|indexing|refresh/i, 'quick conversion explains when Bazarr inventory is not ready');
+    assert(await page.locator('#quick-form button[type="submit"]').isEnabled(), 'Overview conversion also remains available during indexing confirmation');
     inventoryAuthority = { status: 'ready' }; revision++;
     await page.locator('#refresh-button').click();
     await page.waitForFunction(() => !/pending|indexing/i.test(document.querySelector('#overview-inventory-notice').innerText));

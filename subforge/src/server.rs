@@ -860,7 +860,13 @@ impl App {
     fn status(&self) -> Value {
         let settings = self.settings();
         let runtime = lock(&self.runtime);
-        let mut history: Vec<Value> = runtime.history.iter().rev().cloned().collect();
+        let at = now();
+        let mut history: Vec<Value> = runtime
+            .history
+            .iter()
+            .rev()
+            .map(|job| crate::job_activity::public(job, at))
+            .collect();
         for job in &mut history {
             if job["status"] == "completed" {
                 job["status"] = json!(completed_status(job));
@@ -884,7 +890,7 @@ impl App {
         pipeline["inventory_updated"] = json!(runtime.inventory_updated);
         pipeline["inventory_truncated"] = json!(runtime.inventory_truncated);
         pipeline["inventory_partial"] = json!(runtime.inventory_partial);
-        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.primary_job(),"active_jobs":runtime.active_jobs.values().map(|active| &active.job).collect::<Vec<_>>(),"queue":runtime.queue,"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"pipeline":pipeline,"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision,"source":runtime.inventory_source,"authority":runtime.inventory_authority},"roots":runtime.cached_roots,"settings":settings})
+        json!({"version":env!("CARGO_PKG_VERSION"),"edition":crate::edition::NAME,"running":runtime.primary_job().map(|job| crate::job_activity::public(job, at)),"active_jobs":runtime.active_jobs.values().map(|active| crate::job_activity::public(&active.job, at)).collect::<Vec<_>>(),"queue":runtime.queue.iter().map(|job| crate::job_activity::public(job, at)).collect::<Vec<_>>(),"history":history,"logs":runtime.logs,"converted_count":runtime.converted.len(),"pipeline":pipeline,"inventory":{"count":runtime.inventory.len(),"updated":runtime.inventory_updated,"truncated":runtime.inventory_truncated,"partial":runtime.inventory_partial,"state_revision":runtime.state_revision,"source":runtime.inventory_source,"authority":runtime.inventory_authority},"roots":runtime.cached_roots,"settings":settings})
     }
     fn tasks(&self) -> Value {
         let mut value = lock(&self.scheduler).public();
@@ -1009,6 +1015,7 @@ impl App {
         job: &Value,
         probe: bool,
     ) -> Result<Vec<Value>, String> {
+        self.job_phase("syncing_bazarr");
         let inventory = match integrations.bazarr_inventory(&self.cancellation()) {
             Ok(inventory) => inventory,
             Err(error) => {
@@ -1018,9 +1025,15 @@ impl App {
         };
         let roots = lock(&self.runtime).roots.clone();
         let mut rows = inventory_rows(&inventory["items"], &self.mounts, &roots);
+        self.job_phase("checking_bazarr_coverage");
+        let mut last_heartbeat = Instant::now();
         // The profile is authoritative about requirements; a stale index does
         // not make an absent, empty or malformed local SRT valid coverage.
         for row in &mut rows {
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                self.job_heartbeat(0, 0, None);
+                last_heartbeat = Instant::now();
+            }
             row["bazarr_missing_targets"] = row["missing_targets"].clone();
             let hints = bazarr_source_hints(row, &self.mounts);
             row["source_hints"] = json!(hints);
@@ -1127,7 +1140,13 @@ impl App {
             (BTreeMap::new(), None)
         };
         let mut metadata_pending = 0_usize;
+        self.job_phase("checking_bazarr_coverage");
+        last_heartbeat = Instant::now();
         for row in &mut rows {
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                self.job_heartbeat(0, 0, None);
+                last_heartbeat = Instant::now();
+            }
             let targets: Vec<crate::converter::SubtitleTarget> =
                 serde_json::from_value(row["missing_targets"].clone())
                     .map_err(|_| "Bazarr returned invalid missing subtitle targets")?;
@@ -1266,7 +1285,8 @@ impl App {
         let rows = {
             // Inventory refresh/inspection is a single writer. Conversion
             // coordinators may then consume their selected snapshot in parallel.
-            let _sync = lock(&self.inventory_sync);
+            let _sync = self.wait_inventory_sync()?;
+            self.job_phase("preparing");
             let existing = {
                 let runtime = lock(&self.runtime);
                 (job["kind"] != "inspect"
@@ -1893,6 +1913,44 @@ impl App {
             eprintln!("Dashboard history could not be saved");
         }
     }
+    fn wait_inventory_sync(&self) -> Result<MutexGuard<'_, ()>, String> {
+        let cancellation = self.cancellation();
+        let mut last_heartbeat = None;
+        loop {
+            if cancellation.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed) {
+                return Err("Cancelled while waiting for Bazarr inventory sync".into());
+            }
+            match self.inventory_sync.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if last_heartbeat
+                        .is_none_or(|last: Instant| last.elapsed() >= HEARTBEAT_INTERVAL)
+                    {
+                        self.job_heartbeat(0, 0, Some("Waiting for Bazarr inventory sync"));
+                        last_heartbeat = Some(Instant::now());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    fn job_phase(&self, phase: &str) {
+        if let Some(job) = lock(&self.runtime).current_job_mut() {
+            let event = json!({"status":phase});
+            crate::job_activity::progress(job, &event, now());
+            job["phase"] = json!(phase);
+            job["current"] = event;
+        }
+    }
+
+    fn job_heartbeat(&self, active: usize, pending: usize, wait_reason: Option<&str>) {
+        if let Some(job) = lock(&self.runtime).current_job_mut() {
+            crate::job_activity::heartbeat(job, now(), active, pending, wait_reason);
+        }
+    }
+
     fn progress(&self, event: Value) {
         let mut runtime = lock(&self.runtime);
         let mut entry = progress_log(&event);
@@ -1909,6 +1967,7 @@ impl App {
         let Some(job) = runtime.current_job_mut() else {
             return;
         };
+        crate::job_activity::progress(job, &event, now());
         remember_executor(job, &event);
         job["current"] = event.clone();
         if let Some(summary) = event.get("summary") {
@@ -2116,11 +2175,14 @@ impl App {
             .filter_map(|(index, path)| seen.insert(path).then_some(index))
             .collect();
         if let Some(running) = lock(&self.runtime).current_job_mut() {
-            running["total"] = json!(pending.len());
             if matches!(mode, FileMode::Inspect { .. }) {
                 running["processed"] = json!(0);
             }
+            running["total"] = json!(pending.len() as u64 + count(&running["processed"]));
+            crate::job_activity::work_started(running, now());
         }
+        self.job_phase("waiting_for_worker");
+        self.job_heartbeat(0, pending.len(), None);
         let mut summary = if matches!(mode, FileMode::Inspect { .. }) {
             json!({"inspected":0,"failed":0,"metadata_pending":0})
         } else {
@@ -2705,6 +2767,7 @@ impl App {
                         pending.clear();
                         self.log("ERROR", &wait_reason);
                     } else if last_wait_reason.as_ref() != Some(&wait_reason) {
+                        self.job_heartbeat(0, pending.len(), Some(&wait_reason));
                         self.log("INFO", &wait_reason);
                         last_wait_reason = Some(wait_reason);
                     }
@@ -2712,6 +2775,11 @@ impl App {
                     last_wait_reason = None;
                 }
                 if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                    self.job_heartbeat(
+                        handles.len() + remote_jobs.len(),
+                        pending.len(),
+                        last_wait_reason.as_deref(),
+                    );
                     let workers = lock(&self.workers);
                     let active = workers.active.len() + remote_jobs.len();
                     let details = workers
@@ -2748,6 +2816,7 @@ impl App {
     }
 
     fn execute(&self, job: &Value, integrations: &mut Integrations) -> Result<(), String> {
+        self.job_phase("preparing");
         if ["health", "cleanup", "backup"].contains(&job["kind"].as_str().unwrap_or("")) {
             let result = match job["kind"].as_str().unwrap_or("") {
                 "cleanup" => lock(&self.converter).compact_cache()?,
@@ -2793,6 +2862,7 @@ impl App {
             .iter()
             .map(|path| validate_root(Path::new(path), &self.mounts, false))
             .collect::<Result<Vec<_>, _>>()?;
+        self.job_phase("discovering");
         let paths = if job["kind"] == "ocr" {
             lock(&self.converter).ocr_candidates(&roots, job["retry"].as_bool().unwrap_or(false))
         } else if strings(&job["paths"]).is_empty() {
@@ -2972,6 +3042,7 @@ impl App {
     }
 
     fn execute_job(&self, job: &Value) {
+        self.job_phase("preparing");
         let task_start = job["task_id"]
             .as_str()
             .filter(|id| !id.is_empty())
@@ -3144,6 +3215,7 @@ impl App {
             }
             runtime.running = Some(job.clone());
         }
+        self.job_phase("notifying_bazarr");
         self.cancel.store(false, Ordering::Relaxed);
         // Durably mark the uncertain network boundary before sending a PATCH.
         // On restart it is never blindly repeated.
@@ -3250,6 +3322,7 @@ impl App {
                     let mut job = runtime.queue.pop_front().expect("checked queue");
                     job["status"] = json!("running");
                     job["started"] = json!(now());
+                    crate::job_activity::started(&mut job, now());
                     runtime.active_jobs.insert(
                         job["id"].as_str().unwrap_or("").to_owned(),
                         ActiveJob {
@@ -4634,6 +4707,66 @@ mod tests {
         let failure = progress_log(&json!({"status":"failed","error":"x".repeat(10000)}));
         assert_eq!(failure["level"], "ERROR");
         assert_eq!(failure["error"].as_str().unwrap().len(), 240);
+    }
+
+    #[test]
+    fn inventory_lock_wait_reports_activity_and_remains_cancellable() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        lock(&app.runtime).running.as_mut().unwrap()["status"] = json!("running");
+        let guard = lock(&app.inventory_sync);
+        let waiting = Arc::clone(&app);
+        let handle = std::thread::spawn(move || waiting.wait_inventory_sync().map(|_| ()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut observed_wait = false;
+        while Instant::now() < deadline {
+            if app.status()["running"]["telemetry"]["wait_reason"]
+                == "Waiting for Bazarr inventory sync"
+            {
+                observed_wait = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.cancel.store(true, Ordering::Relaxed);
+        let result = handle.join().unwrap();
+        drop(guard);
+        assert!(
+            observed_wait,
+            "inventory contention must be visible before workers start"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "Cancelled while waiting for Bazarr inventory sync"
+        );
+    }
+
+    #[test]
+    fn status_exposes_waiting_progress_and_elapsed_without_refreshing_heartbeat() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        {
+            let mut runtime = lock(&app.runtime);
+            let job = runtime.running.as_mut().unwrap();
+            job["status"] = json!("running");
+            job["started"] = json!(now() - 600.0);
+            job["total"] = json!(4);
+            job["processed"] = json!(1);
+            job["last_progress_at"] = json!(now() - 600.0);
+        }
+        app.job_heartbeat(0, 3, Some("Worker allocation is paused"));
+        let status = app.status();
+        let telemetry = &status["running"]["telemetry"];
+        assert_eq!(telemetry["liveness"], "waiting");
+        assert_eq!(telemetry["progress_percent"], 25);
+        assert!(telemetry["elapsed_seconds"].as_u64().unwrap() >= 600);
+        assert!(telemetry["eta_seconds"].is_null());
+        assert_eq!(telemetry["pending_files"], 3);
+        assert_eq!(
+            app.status()["running"]["telemetry"]["heartbeat_at"],
+            telemetry["heartbeat_at"]
+        );
+        app.progress(json!({"status":"ocr","track":1}));
+        assert_eq!(app.status()["running"]["telemetry"]["liveness"], "running");
+        assert!(app.status()["running"]["telemetry"]["wait_reason"].is_null());
     }
 
     #[test]

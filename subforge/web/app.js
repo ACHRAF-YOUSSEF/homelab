@@ -54,7 +54,7 @@
   const fmtDate = value => { if (!value) return '—'; const parsed=typeof value==='number'?(value<1e12?value*1000:value):value; const date = new Date(parsed); return Number.isNaN(date.valueOf()) ? String(value) : new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}).format(date); };
   const currentLabel = current => {
     if(!current)return '';if(typeof current!=='object')return String(current);
-    const phase=({checking_gpu:'Checking GPU runtime',extracting:'Extracting text',ocr:'Recognizing images',validating:'Validating SRT',track_complete:'Track complete',processing:'Processing file',cached:'Already converted',pending:'Awaiting OCR',failed:'Failed'})[current.status]||current.status||'Processing';
+    const phase=({preparing:'Preparing job',discovering:'Discovering files',syncing_bazarr:'Syncing Bazarr inventory',checking_bazarr_coverage:'Checking subtitle coverage',notifying_bazarr:'Notifying Bazarr',waiting_for_worker:'Waiting for a worker',checking_gpu:'Checking GPU runtime',extracting:'Extracting text',ocr:'Recognizing images',validating:'Validating SRT',track_complete:'Track complete',processing:'Processing file',cached:'Already converted',pending:'Awaiting OCR',failed:'Failed'})[current.status]||current.stage||current.status||'Processing';
     const backend=({ffmpeg:'FFmpeg / CPU',tesseract:'Tesseract / CPU',paddle:'PaddleOCR / GPU',ocr_rs_cpu:'ocr-rs / CPU',ocr_rs_cuda:'ocr-rs / GPU',seconv:'Subtitle Edit'})[current.backend];
     return [phase,backend,current.track!=null?`track ${current.track}`:'',shortPath(current.path||current.output||'')].filter(Boolean).join(' · ');
   };
@@ -101,13 +101,15 @@
   const renderInventoryAuthority = () => {
     const bazarr=usesBazarr(),authority=state.inventoryAuthority||{},status=bazarr&&state.inventorySource!=='bazarr'?'stale':authority.status||'ready';
     setText($('#inventory-source'),bazarr?'Bazarr':'Filesystem');
-    const banner=$('#inventory-authority');banner.classList.toggle('hidden',!bazarr);
-    banner.classList.toggle('authority-error',status!=='ready');
-    setText(banner,bazarr?({ready:'Bazarr profiles define the wanted languages. Valid SRT coverage is verified before conversion.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:'Subtitles were published; Bazarr indexing or inventory refresh is still pending. Sync Bazarr inventory to check again.',reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(authority.error?` ${authority.error}`:''):'');
+    const blocked=bazarr&&!['ready','refresh_pending'].includes(status);
+    const banner=$('#inventory-authority');banner.classList.toggle('hidden',!bazarr||status==='ready');
+    banner.classList.toggle('authority-error',blocked);
+    const pendingCount=Array.isArray(authority.pending_srt_keys)?authority.pending_srt_keys.length:0;
+    const pendingDetail=authority.verification_limited===true?' Some published outputs exceed the indexing verification limits.':pendingCount?` ${pendingCount.toLocaleString()} published SRT file${pendingCount===1?' is':'s are'} not yet confirmed by Bazarr.`:'';
+    setText(banner,bazarr?({ready:'',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:`Bazarr inventory synced. Published subtitle indexing is still unconfirmed.${pendingDetail} Conversion is available; existing SRT files are checked before converting.`,reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(status!=='ready'&&authority.reason?` ${authority.reason}`:'')+(authority.error?` ${authority.error}`:''):'');
     $$('[data-action="inspect"]').forEach(button=>setText(button,bazarr?'Sync Bazarr inventory':'Inspect media'));
-    const blocked=bazarr&&status!=='ready';
     const overviewNotice=$('#overview-inventory-notice');
-    if(overviewNotice){overviewNotice.hidden=!blocked;setText(overviewNotice,blocked?banner.textContent:'');}
+    if(overviewNotice){overviewNotice.hidden=!bazarr||status==='ready';setText(overviewNotice,banner.textContent);}
     $$('[data-action="scan"],#quick-form button[type="submit"]').forEach(button=>{button.disabled=blocked;button.title=blocked?'Sync Bazarr before starting automatic conversion':'';});
     updateLanguageLabels();
   };
@@ -137,7 +139,7 @@
     setText($('#current-work-summary'),running?[active.length>1?`${active.length} jobs in progress`:running.total?`${running.processed||0} / ${running.total} files`:'Discovering work',queued?`${queued} queued job${queued===1?'':'s'}`:''].filter(Boolean).join(' · '):queued?`${queued} queued job${queued===1?'':'s'} · waiting for a worker`:'No jobs running');
     const title=document.createElement('strong'),detail=document.createElement('span');detail.className='muted';
     title.textContent=running?({scan:'Converting text subtitles',inspect:'Inspecting media',extract:'Converting selected tracks',ocr:'Recognizing image subtitles'})[running.kind]||'Running maintenance':queued?'Work is queued':'';
-    detail.textContent=running?currentLabel(running.current)||'Preparing files':queued?'Review the queue in Activity or check worker capacity below.':'';
+    detail.textContent=running?[currentLabel(running.current)||'Preparing files',jobTiming(running)].filter(Boolean).join(' · '):queued?'Review the queue in Activity or check worker capacity below.':'';
     content.append(title,detail);
   };
   const disclosureIcon = () => {
@@ -211,6 +213,7 @@
     setText($('#stat-languages'),isAll(state.selectedLanguages)?'All':state.selectedLanguages.length);
   };
   const jobPercent = job => {
+    if(Number.isFinite(job.telemetry?.progress_percent))return Math.max(0,Math.min(100,job.telemetry.progress_percent));
     const total=Number(job.total || 0), processed=Number(job.processed || 0);
     if (total>0) return Math.max(0,Math.min(100,Math.round(100*processed/total)));
     const summary = job.summary || {};
@@ -219,8 +222,37 @@
     const done = Number(summary.converted || 0) + Number(summary.cached || 0) + Number(summary.failed || 0);
     return counts ? Math.round(100 * done / counts) : job.status === 'completed' ? 100 : 0;
   };
+  const duration = value => {
+    const seconds=Math.max(0,Math.floor(Number(value)||0)),hours=Math.floor(seconds/3600),minutes=Math.floor(seconds%3600/60);
+    return hours?`${hours}h ${minutes}m`:minutes?`${minutes}m ${seconds%60}s`:`${seconds}s`;
+  };
+  const jobTiming = job => {
+    const telemetry=job.telemetry;
+    if(!telemetry)return '';
+    const parts=Number.isFinite(telemetry.elapsed_seconds)?[`${job.status==='queued'?'Queued':'Elapsed'} ${duration(telemetry.elapsed_seconds)}`]:[];
+    if(job.status==='running')parts.push(Number.isFinite(telemetry.eta_seconds)?`~${duration(telemetry.eta_seconds)} remaining`:['waiting','stalled','unresponsive'].includes(telemetry.liveness)?'ETA unavailable':'ETA estimating');
+    if(telemetry.liveness==='waiting')parts.push(telemetry.wait_reason||'Waiting for worker capacity');
+    if(telemetry.liveness==='stalled')parts.push(`No progress for ${duration(telemetry.idle_seconds)}; may be stalled`);
+    if(telemetry.liveness==='unresponsive')parts.push(`No heartbeat for ${duration(telemetry.heartbeat_age_seconds)}; coordinator may be unresponsive`);
+    return parts.join(' · ');
+  };
+  const jobProgressLabel = job => {
+    const known=Number(job.total)>0||Number.isFinite(job.telemetry?.progress_percent);
+    const phase=currentLabel(job.current)||(job.status==='queued'?'Waiting for a worker':'Preparing job');
+    return `${known?`${jobPercent(job)}% · `:''}${phase}`;
+  };
+  const jobProgressBar = job => {
+    const bar=document.createElement('progress');bar.className='job-meter';bar.max=100;
+    if(Number(job.total)>0||Number.isFinite(job.telemetry?.progress_percent))bar.value=jobPercent(job);
+    bar.setAttribute('aria-label',Number(job.total)>0?`${job.processed||0} of ${job.total} files processed`:'Preparing job; progress not yet available');
+    return bar;
+  };
   const jobTitle = job => job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider]||'Integration'} ${job.provider==='bazarr'?'inventory check':'library refresh'}`:({scan:job.include_ocr===true?'Convert missing subtitles':'Scan and convert text',inspect:'Inspect subtitle tracks',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind]||'Converter job';
   const jobStatus = job => {
+    if(job.status==='running'){
+      const health=({waiting:['queued','Waiting'],stalled:['queued','Possibly stalled'],unresponsive:['failed','Unresponsive']})[job.telemetry?.liveness];
+      if(health)return {style:health[0],label:health[1]};
+    }
     const pending=job.status==='completed'&&job.notifications?.some(item=>item?.pending===true);
     return {style:pending?'queued':escStatus(job.status),label:pending?'Converted · indexing pending':({completed_with_errors:'Completed with errors',running:'Running',queued:'Queued',completed:'Completed',failed:'Failed',cancelled:'Cancelled'})[job.status]||job.status||'Queued'};
   };
@@ -275,16 +307,17 @@
     const icon = document.createElement('div'),type=job.kind==='extract'?'convert':job.kind; icon.className = `job-icon job-${escStatus(type)}`; icon.append(iconSvg(type));
     const detail = document.createElement('div'); detail.className = 'job-detail';
     const title = document.createElement('strong'); title.textContent = jobTitle(job);
-    const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = currentLabel(job.current) || (job.paths && job.paths.length ? shortPath(job.paths[0]) : job.root_label || 'All scan roots');
+    const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = (['running','queued'].includes(job.status)?'':currentLabel(job.current)) || shortPath(job.current?.path||job.paths?.[0]) || job.root_label || 'All scan roots';
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
     const statusValue=jobStatus(job),pill = document.createElement('span'); pill.className=`status-pill ${statusValue.style}`; pill.textContent=statusValue.label;
-    const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.started || job.created);
+    const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.telemetry?.heartbeat_at || job.started || job.created);
     status.append(pill,time);
     card.append(icon,detail,status);
     const executors=renderJobExecutors(job,compact);if(executors)card.append(executors);
+    const timing=jobTiming(job);if(timing){const info=document.createElement('p');info.className='job-timing';info.textContent=timing;card.append(info);}
     if (job.status === 'running' || job.status === 'queued') {
-      const progress = document.createElement('div'); progress.className='job-progress'; const bar=document.createElement('span'); bar.style.width=`${jobPercent(job)}%`; progress.append(bar); card.append(progress);
+      const phase=document.createElement('p');phase.className='job-timing';phase.textContent=jobProgressLabel(job);card.append(phase,jobProgressBar(job));
       if (job.id) { const cancel=document.createElement('button'); cancel.className='text-button cancel-job'; cancel.textContent='Cancel'; cancel.dataset.jobId=job.id; cancel.dataset.jobFocus=`${errorViewKey(job,compact)}:cancel`; status.append(cancel); }
     } else if (job.summary) {
       const chips=document.createElement('div'); chips.className='job-summary';
@@ -336,8 +369,10 @@
       const workerLabels=executors.map(item=>`${({cpu:'CPU',cpu_ocr:'CPU OCR',gpu:'GPU OCR'})[item.resource]} · ${item.node_name}`);workers.textContent=workerLabels.slice(0,2).join(', ')+(workerLabels.length>2?` +${workerLabels.length-2}`:'')||'—';workers.title=workerLabels.join('\n');
       const result=cell('Result','job-row-result'),summary=job.summary||{},parts=[];
       for(const [key,label] of [['converted','converted'],['cached','ready'],['inspected','inspected'],['failed','failed']])if(Number(summary[key]))parts.push(`${Number(summary[key]).toLocaleString()} ${label}`);
-      result.textContent=['running','queued'].includes(job.status)?`${jobPercent(job)}% · ${currentLabel(job.current)||'Waiting to start'}`:parts.join(', ')||((job.notifications||[]).some(item=>item?.pending===true)?'Indexing pending':job.error?'Review error details':'—');result.title=result.textContent;
-      const updated=cell('Updated','job-row-time');updated.textContent=fmtDate(job.finished||job.started||job.created);
+      const live=['running','queued'].includes(job.status),copy=document.createElement('span');copy.className='job-result-copy';copy.textContent=live?jobProgressLabel(job):parts.join(', ')||((job.notifications||[]).some(item=>item?.pending===true)?'Indexing pending':job.error?'Review error details':'—');result.append(copy);
+      if(live)result.append(jobProgressBar(job));
+      const timing=jobTiming(job);if(timing){const info=document.createElement('small');info.className='job-timing';info.textContent=timing;result.append(info);}result.title=[copy.textContent,timing].filter(Boolean).join('\n');
+      const updated=cell('Updated','job-row-time');updated.textContent=fmtDate(job.finished||job.telemetry?.heartbeat_at||job.started||job.created);
       const actionsCell=cell('Actions','job-row-actions'),actions=document.createElement('div');actions.className='job-actions';actionsCell.append(actions);const details=document.createElement('button');details.className='row-action';details.type='button';details.textContent='Details';details.dataset.viewJob=job.id;details.dataset.jobFocus=`${job.id}:details`;details.setAttribute('aria-label',`Details for ${jobTitle(job)}`);details.addEventListener('click',()=>openJobDetails(job));actions.append(details);
       if(['running','queued'].includes(job.status)&&job.id){const cancel=document.createElement('button');cancel.type='button';cancel.className='text-button cancel-job';cancel.textContent='Cancel';cancel.dataset.jobId=job.id;cancel.dataset.jobFocus=`${job.id}:cancel`;actions.append(cancel);}
       body.append(row);

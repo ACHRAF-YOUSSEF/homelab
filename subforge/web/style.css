@@ -343,6 +343,13 @@ tbody tr:last-child td { border-bottom: 0; }
 .job-status-block { display: flex; align-items: flex-end; flex-direction: column; gap: 5px; }
 .job-progress { grid-column: 2 / -1; height: 4px; overflow: hidden; border-radius: 4px; background: var(--surface-raised); }
 .job-progress span { display: block; height: 100%; background: var(--accent); }
+  .job-meter { grid-column: 2 / -1; display: block; width: 100%; height: 4px; margin: 4px 0; border: 0; border-radius: 4px; overflow: hidden; accent-color: var(--accent); background: var(--surface-raised); }
+  .job-meter::-webkit-progress-bar { background: var(--surface-raised); }
+  .job-meter::-webkit-progress-value { background: var(--accent); }
+  .job-meter::-moz-progress-bar { background: var(--accent); }
+  .job-meter:indeterminate { opacity: .6; }
+  .job-timing { grid-column: 2 / -1; display: block; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; white-space: normal; overflow-wrap: anywhere; }
+  .job-result-copy { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-summary { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 5px; }
 .job-summary span { padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); background: var(--surface-raised); font-size: 13px; }
 .job-executors { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 0; padding: 0; margin: 0; list-style: none; }
@@ -541,7 +548,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .task-retry-controls .form-hint { margin: 0; }
   .job-card { grid-template-columns: 30px minmax(0,1fr); }
   .job-status-block { grid-column: 2; align-items: flex-start; flex-direction: row; flex-wrap: wrap; }
-  .job-progress, .job-summary, .job-executors, .job-result, .job-error { grid-column: 2; }
+  .job-progress, .job-meter, .job-timing, .job-summary, .job-executors, .job-result, .job-error { grid-column: 2; }
   .cancel-job { grid-column: 2; grid-row: auto; justify-self: start; }
   .job-detail strong { white-space: normal; }
   .modal-backdrop { align-items: end; padding: 0; }
