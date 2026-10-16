@@ -116,6 +116,39 @@ pub(crate) fn public(job: &Value, at: f64) -> Value {
     result
 }
 
+/// The separately authenticated widget must never expose raw job metadata or
+/// diagnostics: persisted wait reasons can contain private paths or addresses.
+pub(crate) fn widget(job: &Value, at: f64) -> Value {
+    let snapshot = public(job, at);
+    let telemetry = &snapshot["telemetry"];
+    let wait_reason = telemetry["wait_reason"].as_str().map(|reason| {
+        [
+            "Waiting for Bazarr inventory sync",
+            "Worker dispatch is paused; active files finish normally",
+            "Worker allocation is paused",
+            "Current cgroup memory pressure leaves insufficient headroom for another worker",
+            "Memory reservations leave insufficient space for another worker",
+            "Effective worker slots are occupied or limited by deployment and memory reservations",
+            "OCR is disabled by deployment permissions",
+            "No GPU workers requested",
+            "No CPU OCR workers requested",
+            "output family is active",
+        ]
+        .into_iter()
+        .find(|message| reason.contains(message))
+        .unwrap_or("Waiting for worker capacity")
+    });
+    json!({
+        "kind":job["kind"],"status":job["status"],
+        "processed":job["processed"].as_u64().unwrap_or(0),
+        "total":job["total"].as_u64().unwrap_or(0),
+        "progress_percent":telemetry["progress_percent"],
+        "elapsed_seconds":telemetry["elapsed_seconds"],
+        "eta_seconds":telemetry["eta_seconds"],
+        "liveness":telemetry["liveness"],"wait_reason":wait_reason
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +157,66 @@ mod tests {
         let mut job = json!({"status":"running","started":1000.0,"total":10,"processed":2});
         started(&mut job, 1000.0);
         job
+    }
+
+    #[test]
+    fn widget_projects_timing_and_liveness_without_exposing_job_details() {
+        let mut job = job();
+        job["kind"] = json!("extract");
+        job["paths"] = json!(["/private/movie.mkv"]);
+        job["current"] = json!({"path":"/private/movie.mkv","api_key":"private-key"});
+        heartbeat(&mut job, 1030.0, 1, 7, None);
+        let snapshot = widget(&job, 1040.0);
+        assert_eq!(snapshot["elapsed_seconds"], 40);
+        assert_eq!(snapshot["eta_seconds"], 160);
+        assert_eq!(snapshot["progress_percent"], 20);
+        assert_eq!(snapshot["liveness"], "running");
+        assert_eq!(snapshot.as_object().unwrap().len(), 9);
+        assert!(!snapshot.to_string().contains("private"));
+        assert_eq!(job["heartbeat_at"], 1030.0);
+
+        for (at, expected) in [(1301.0, "stalled"), (1361.0, "unresponsive")] {
+            heartbeat(&mut job, 1300.0, 1, 7, None);
+            let snapshot = widget(&job, at);
+            assert_eq!(snapshot["liveness"], expected);
+            assert!(snapshot["eta_seconds"].is_null());
+        }
+    }
+
+    #[test]
+    fn widget_wait_reasons_are_fixed_labels_and_unknown_timing_stays_null() {
+        let mut job = job();
+        for (reason, expected) in [
+            (
+                "Waiting for Bazarr inventory sync",
+                "Waiting for Bazarr inventory sync",
+            ),
+            (
+                "Dispatch waiting: Current cgroup memory pressure leaves insufficient headroom for another worker; pending files 1; GPU: /private/secret",
+                "Current cgroup memory pressure leaves insufficient headroom for another worker",
+            ),
+            (
+                "private-key at https://private.invalid/path",
+                "Waiting for worker capacity",
+            ),
+        ] {
+            heartbeat(&mut job, 1040.0, 0, 8, Some(reason));
+            let snapshot = widget(&job, 1041.0);
+            assert_eq!(snapshot["liveness"], "waiting");
+            assert_eq!(snapshot["wait_reason"], expected);
+            assert!(snapshot["eta_seconds"].is_null());
+            assert!(!snapshot.to_string().contains("private"));
+        }
+        let queued = widget(&json!({"kind":"scan","status":"queued"}), 1040.0);
+        assert_eq!(queued["liveness"], "queued");
+        for key in [
+            "elapsed_seconds",
+            "eta_seconds",
+            "progress_percent",
+            "wait_reason",
+        ] {
+            assert!(queued[key].is_null(), "{key} must remain unknown");
+        }
     }
 
     #[test]

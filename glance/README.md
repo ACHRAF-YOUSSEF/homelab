@@ -153,7 +153,7 @@ The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
 | [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Sonarr and Radarr `/api/v3/calendar`; renders the next 14 days | `30s` |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
-| [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; processed-file count, queued jobs, configured roots, recent failures, current run/progress, and selected languages | `15s` |
+| [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; processed-file count, queued jobs, configured roots, recent failures, current run/progress, elapsed time, approximate ETA when available, liveness/waiting state, and selected languages | `15s` cached snapshot |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
 
 The Subforge widget is optional. The `subforge` service starts with
@@ -163,7 +163,16 @@ token only enables the widget endpoint. Set a private random
 same variable is supplied to Glance and
 Subforge. It is separate from dashboard, webhook, and media-server credentials.
 The widget endpoint returns only aggregate status and does not expose media
-paths or accept actions. Its link uses `SUBFORGE_PUBLIC_URL` (default
+paths or credentials, and it does not accept actions. The current run includes
+elapsed seconds, nullable ETA, liveness (`running`, `waiting`, `stalled`,
+`unresponsive`, or `queued`), and an optional sanitized generic wait reason.
+Glance displays elapsed time, approximate ETA or its unavailable state, and
+the explicit waiting, possibly stalled, or unresponsive state. The estimate
+uses completed-file throughput and has the same limits as Subforge's dashboard:
+a single-file job has no ETA until the file completes, and quiet OCR may look
+possibly stalled while it is working. These states are diagnostic; they do not
+fail jobs automatically. Glance caches the aggregate snapshot for 15 seconds.
+Its link uses `SUBFORGE_PUBLIC_URL` (default
 `http://localhost:8100`); its server-side request uses
 `GLANCE_SUBFORGE_INTERNAL_URL` (default
 `http://subforge:8100`). When upgrading from the former service name, change

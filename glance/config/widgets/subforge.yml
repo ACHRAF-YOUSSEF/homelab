@@ -7,6 +7,7 @@
   headers:
     Authorization: Bearer ${CONVERTER_WIDGET_TOKEN}
   template: |
+    {{ define "subforge-duration" }}{{ $seconds := . }}{{ if ge $seconds 3600 }}{{ toInt (div (toFloat $seconds) 3600) }}h {{ end }}{{ if ge $seconds 60 }}{{ mod (toInt (div (toFloat $seconds) 60)) 60 }}m {{ end }}{{ mod $seconds 60 }}s{{ end }}
     {{ if eq .Response.StatusCode 200 }}
       {{ $runStatus := .JSON.String "current_run.status" }}
       {{ $runKind := .JSON.String "current_run.kind" }}
@@ -14,22 +15,39 @@
       {{ $total := .JSON.Int "current_run.total" }}
       {{ $progressValue := .JSON.String "current_run.progress_percent" }}
       {{ $progress := .JSON.Int "current_run.progress_percent" }}
+      {{ $liveness := .JSON.String "current_run.liveness" }}
+      {{ $waitReason := .JSON.String "current_run.wait_reason" }}
+      {{ $elapsedValue := .JSON.String "current_run.elapsed_seconds" }}
+      {{ $etaValue := .JSON.String "current_run.eta_seconds" }}
+      {{ $active := or (eq $runStatus "running") (eq $runStatus "cancelling") }}
       <div class="subforge-stats">
         <div><div class="color-highlight size-h3">{{ .JSON.Int "converted_count" | formatNumber }}</div><div class="size-h6">PROCESSED</div></div>
         <div><div class="color-primary size-h3">{{ .JSON.Int "queued_count" }}</div><div class="size-h6">QUEUED</div></div>
         <div><div class="color-highlight size-h3">{{ .JSON.Int "configured_root_count" }}</div><div class="size-h6">ROOTS</div></div>
         <div><div class="{{ if gt (.JSON.Int "recent_failures_count") 0 }}color-negative{{ else }}color-positive{{ end }} size-h3">{{ .JSON.Int "recent_failures_count" }}</div><div class="size-h6">LATEST SCAN FAILURES</div></div>
       </div>
-      <div class="flex justify-between items-center gap-10 margin-top-15">
+      <div class="subforge-run flex justify-between items-center gap-10 margin-top-15">
         <span class="size-h6">CURRENT RUN</span>
-        {{ if eq $runStatus "running" }}
-          {{ if and (gt $total 0) (ne $progressValue "") }}<span class="color-positive">Running{{ if ne $runKind "" }} · {{ $runKind }}{{ end }} · {{ $processed }}/{{ $total }}</span>{{ else }}<span class="color-positive">Preparing{{ if ne $runKind "" }} · {{ $runKind }}{{ end }}</span>{{ end }}
+        {{ if and $active (eq $liveness "unresponsive") }}<span class="color-negative">Unresponsive{{ if eq $runStatus "cancelling" }} · Cancelling{{ end }}</span>
+        {{ else if and $active (eq $liveness "stalled") }}<span class="color-primary">Possibly stalled{{ if eq $runStatus "cancelling" }} · Cancelling{{ end }}</span>
         {{ else if eq $runStatus "cancelling" }}<span class="color-primary">Cancelling{{ if ne $runKind "" }} · {{ $runKind }}{{ end }}</span>
+        {{ else if and $active (eq $liveness "waiting") }}<span class="color-primary">Waiting</span>
+        {{ else if eq $runStatus "running" }}
+          {{ if and (gt $total 0) (ne $progressValue "") }}<span class="color-positive">Running{{ if ne $runKind "" }} · {{ $runKind }}{{ end }} · {{ $processed }}/{{ $total }}</span>{{ else }}<span class="color-positive">Preparing{{ if ne $runKind "" }} · {{ $runKind }}{{ end }}</span>{{ end }}
         {{ else if eq $runStatus "queued" }}<span class="color-primary">Queued</span>
         {{ else }}<span class="color-subdue">Idle</span>{{ end }}
       </div>
-      {{ if and (eq $runStatus "running") (gt $total 0) (ne $progressValue "") }}
+      {{ if and $active (gt $total 0) (ne $progressValue "") }}
         <div class="subforge-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ $progress }}" aria-label="{{ $progress }}% complete"><div style="width: {{ $progress }}%"></div></div>
+      {{ end }}
+      {{ if $active }}
+        <div class="subforge-timing size-h6 margin-top-10">
+          <span>Elapsed {{ if ne $elapsedValue "" }}{{ template "subforge-duration" (.JSON.Int "current_run.elapsed_seconds") }}{{ else }}unavailable{{ end }}</span>
+          <span>{{ if and (eq $liveness "running") (eq $runStatus "running") (ne $etaValue "") }}Approx. {{ template "subforge-duration" (.JSON.Int "current_run.eta_seconds") }} remaining{{ else }}ETA unavailable{{ end }}</span>
+        </div>
+        {{ if ne $waitReason "" }}<p class="subforge-detail color-primary size-h6 margin-top-10">{{ $waitReason }}</p>{{ end }}
+        {{ if eq $liveness "stalled" }}<p class="subforge-detail color-primary size-h6 margin-top-10">No recent progress reported. Quiet OCR may still be working.</p>
+        {{ else if eq $liveness "unresponsive" }}<p class="subforge-detail color-negative size-h6 margin-top-10">Coordinator heartbeat overdue. Check Activity in Subforge.</p>{{ end }}
       {{ end }}
       <div class="margin-top-15">
         <div class="size-h6 color-subdue">LANGUAGES</div>
@@ -46,6 +64,9 @@
         .media-live-subforge .subforge-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; text-align: center; }
         .media-live-subforge .subforge-stats > div { min-width: 0; }
         .media-live-subforge .subforge-stats .size-h6 { overflow-wrap: anywhere; }
+        .media-live-subforge .subforge-run { flex-wrap: wrap; }
+        .media-live-subforge .subforge-timing { display: flex; flex-wrap: wrap; gap: .25rem 1rem; }
+        .media-live-subforge .subforge-detail { overflow-wrap: anywhere; }
         .media-live-subforge .subforge-languages { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .35rem; }
         .media-live-subforge .subforge-progress { height: 5px; margin-top: 10px; overflow: hidden; border-radius: 99px; background: var(--color-background); }
         .media-live-subforge .subforge-progress > div { height: 100%; background: var(--color-positive); }

@@ -1592,7 +1592,9 @@ impl App {
     }
     fn widget(&self) -> Value {
         let runtime = lock(&self.runtime);
-        let current=runtime.primary_job().map(|job|{let total=count(&job["total"]);let processed=count(&job["processed"]);json!({"kind":job["kind"],"status":job["status"],"processed":processed,"total":total,"progress_percent":if total>0 {Some((processed.saturating_mul(100)/total).min(100))}else{None}})});
+        let current = runtime
+            .primary_job()
+            .map(|job| crate::job_activity::widget(job, now()));
         let scan = runtime
             .running
             .iter()
@@ -4760,6 +4762,15 @@ mod tests {
         assert!(telemetry["elapsed_seconds"].as_u64().unwrap() >= 600);
         assert!(telemetry["eta_seconds"].is_null());
         assert_eq!(telemetry["pending_files"], 3);
+        let widget = app.widget();
+        assert_eq!(widget["current_run"]["liveness"], "waiting");
+        assert_eq!(widget["current_run"]["progress_percent"], 25);
+        assert!(widget["current_run"]["elapsed_seconds"].as_u64().unwrap() >= 600);
+        assert!(widget["current_run"]["eta_seconds"].is_null());
+        assert_eq!(
+            widget["current_run"]["wait_reason"],
+            "Worker allocation is paused"
+        );
         assert_eq!(
             app.status()["running"]["telemetry"]["heartbeat_at"],
             telemetry["heartbeat_at"]
