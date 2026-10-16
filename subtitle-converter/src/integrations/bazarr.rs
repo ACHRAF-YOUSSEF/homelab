@@ -498,6 +498,18 @@ impl Integrations {
                 Err(error) if error.category == "timeout" => {
                     return Ok(ScanOutcome::Uncertain(receipt, ScanUncertainty::Timeout));
                 }
+                Err(error) if error.category == "unreachable" => {
+                    // Losing the transport does not prove that Bazarr rejected
+                    // the PATCH: it may already have started the disk scan.
+                    return Ok(ScanOutcome::Uncertain(
+                        receipt,
+                        if Instant::now() >= deadline {
+                            ScanUncertainty::Timeout
+                        } else {
+                            ScanUncertainty::Response
+                        },
+                    ));
+                }
                 Err(error) => {
                     return Err(ScanFailure {
                         receipt,
@@ -782,17 +794,22 @@ mod tests {
                         } else {
                             body.to_string()
                         },
-                        status,
-                        delay,
+                        Some(status),
+                        ReplyTiming::After(delay),
                         None,
                     )
                 })
                 .collect(),
         )
     }
-    fn fixture_wire(
-        replies: Vec<(String, String, u16, Duration, Option<usize>)>,
-    ) -> (String, thread::JoinHandle<Vec<String>>) {
+    enum ReplyTiming {
+        After(Duration),
+        ClientDisconnect,
+    }
+
+    type WireReply = (String, String, Option<u16>, ReplyTiming, Option<usize>);
+
+    fn fixture_wire(replies: Vec<WireReply>) -> (String, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -849,7 +866,31 @@ mod tests {
                     "Unexpected Bazarr fixture API route"
                 );
                 requests.push(request);
-                thread::sleep(delay);
+                match delay {
+                    ReplyTiming::After(delay) => thread::sleep(delay),
+                    ReplyTiming::ClientDisconnect => {
+                        // Never race a late response/close against the client
+                        // deadline. Keep the request open until the client
+                        // times out; the existing socket read timeout bounds
+                        // this fixture if the client fails to disconnect.
+                        let mut byte = [0_u8; 1];
+                        match stream.read(&mut byte) {
+                            Ok(0) => {}
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                                ) => {}
+                            _ => panic!("Bazarr timeout fixture client did not disconnect"),
+                        }
+                        continue;
+                    }
+                }
+                let Some(status) = status else {
+                    // The entire request was received, but no status or body
+                    // reaches the client; the mutation may have been applied.
+                    continue;
+                };
                 let reply = format!(
                     "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     declared_length.unwrap_or(body.len())
@@ -1228,8 +1269,8 @@ mod tests {
     }
 
     fn partial_receipt_fixture(
-        status: u16,
-        delay: Duration,
+        status: Option<u16>,
+        delay: ReplyTiming,
     ) -> (
         tempfile::TempDir,
         Integrations,
@@ -1239,27 +1280,44 @@ mod tests {
         let series: Vec<_> = (1..=3)
             .map(|id| json!({"sonarrSeriesId":id,"path":format!("/tv/Fixture{id}")}))
             .collect();
-        let (endpoint, server) = fixture_responses(vec![
-            (
-                "GET /api/series?start=0&length=200 ".into(),
-                json!({"data":series,"total":3}),
-                200,
-                Duration::ZERO,
-            ),
-            (
-                "GET /api/movies?start=0&length=200 ".into(),
-                json!({"data":[],"total":0}),
-                200,
-                Duration::ZERO,
-            ),
-            (
-                "PATCH /api/series ".into(),
-                Value::Null,
-                204,
-                Duration::ZERO,
-            ),
-            ("PATCH /api/series ".into(), json!({}), status, delay),
-        ]);
+        let (endpoint, server) = fixture_wire(
+            vec![
+                (
+                    "GET /api/series?start=0&length=200 ".into(),
+                    json!({"data":series,"total":3}),
+                    Some(200),
+                    ReplyTiming::After(Duration::ZERO),
+                ),
+                (
+                    "GET /api/movies?start=0&length=200 ".into(),
+                    json!({"data":[],"total":0}),
+                    Some(200),
+                    ReplyTiming::After(Duration::ZERO),
+                ),
+                (
+                    "PATCH /api/series ".into(),
+                    Value::Null,
+                    Some(204),
+                    ReplyTiming::After(Duration::ZERO),
+                ),
+                ("PATCH /api/series ".into(), json!({}), status, delay),
+            ]
+            .into_iter()
+            .map(|(path, body, status, delay)| {
+                (
+                    path,
+                    if status == Some(204) {
+                        String::new()
+                    } else {
+                        body.to_string()
+                    },
+                    status,
+                    delay,
+                    None,
+                )
+            })
+            .collect(),
+        );
         integration
             .update(&json!({"bazarr":{"enabled":true,"url":endpoint,"api_key":"fixture-key"}}))
             .unwrap();
@@ -1269,7 +1327,7 @@ mod tests {
     #[test]
     fn scan_timeout_preserves_partial_receipts_and_never_retries() {
         let (_temporary, integration, server) =
-            partial_receipt_fixture(204, Duration::from_millis(1200));
+            partial_receipt_fixture(Some(204), ReplyTiming::ClientDisconnect);
         let paths: Vec<_> = (1..=3)
             .map(|id| format!("/tv/Fixture{id}/Episode.en.srt"))
             .collect();
@@ -1300,7 +1358,8 @@ mod tests {
 
     #[test]
     fn explicit_scan_http_failure_retains_acknowledged_count_without_uncertainty() {
-        let (_temporary, integration, server) = partial_receipt_fixture(500, Duration::ZERO);
+        let (_temporary, integration, server) =
+            partial_receipt_fixture(Some(500), ReplyTiming::After(Duration::ZERO));
         let paths: Vec<_> = (1..=3)
             .map(|id| format!("/tv/Fixture{id}/Episode.en.srt"))
             .collect();
@@ -1318,6 +1377,40 @@ mod tests {
     }
 
     #[test]
+    fn dropped_scan_connection_preserves_partial_receipts_without_replaying_the_batch() {
+        let (_temporary, mut integration, server) =
+            partial_receipt_fixture(None, ReplyTiming::After(Duration::ZERO));
+        let paths: Vec<_> = (1..=3)
+            .map(|id| format!("/tv/Fixture{id}/Episode.en.srt"))
+            .collect();
+        integration.notify(&paths);
+        let result = integration
+            .flush_bazarr(&AtomicBool::new(false), &mut |_| {})
+            .unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["pending"], true);
+        assert_eq!(result["uncertain"], true);
+        assert_eq!(result["attempted"], 2);
+        assert_eq!(result["acknowledged"], 1);
+        assert_eq!(result["triggered"], 1);
+        assert_eq!(
+            result["message"],
+            "Bazarr scan response could not be validated; scan completion not yet confirmed"
+        );
+        assert!(integration.bazarr_pending_paths.is_empty());
+        assert!(
+            integration
+                .flush_bazarr(&AtomicBool::new(false), &mut |_| {})
+                .is_none(),
+            "an unconfirmed PATCH must not be automatically replayed"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].ends_with("seriesid=1&action=scan-disk"));
+        assert!(requests[3].ends_with("seriesid=2&action=scan-disk"));
+    }
+
+    #[test]
     fn incomplete_or_invalid_success_response_is_uncertain_not_a_failed_scan() {
         for (body, length) in [("{}", Some(100)), ("invalid JSON", None)] {
             let (_temporary, mut integration) = integration();
@@ -1326,22 +1419,22 @@ mod tests {
                     "GET /api/series?start=0&length=200 ".into(),
                     json!({"data":[{"sonarrSeriesId":1,"path":"/tv/Fixture"}],"total":1})
                         .to_string(),
-                    200,
-                    Duration::ZERO,
+                    Some(200),
+                    ReplyTiming::After(Duration::ZERO),
                     None,
                 ),
                 (
                     "GET /api/movies?start=0&length=200 ".into(),
                     json!({"data":[],"total":0}).to_string(),
-                    200,
-                    Duration::ZERO,
+                    Some(200),
+                    ReplyTiming::After(Duration::ZERO),
                     None,
                 ),
                 (
                     "PATCH /api/series ".into(),
                     body.into(),
-                    200,
-                    Duration::ZERO,
+                    Some(200),
+                    ReplyTiming::After(Duration::ZERO),
                     length,
                 ),
             ]);

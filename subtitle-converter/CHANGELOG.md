@@ -7,9 +7,9 @@
 - Pin the CUDA build's CUTLASS source archive by commit and SHA-256, with an optional `cuda-source-cache` build context and a CMake source override that avoids cloning Git history.
 - Correct Arabic OCR's visual-to-logical character order while preserving left-to-right runs and combining marks; isolate backend-health child output so it cannot contaminate JSON.
 - Verify direct CPU helper recognition against exact English, French, and Arabic fixture phrases and pass all 11 helper tests with strict Clippy; the full CPU SUP-to-SRT pipeline now passes for all three languages and preserves existing SRT files.
-- Pass 512 MiB text/resource and 1.5 GiB OCR resource fixtures. GPU sessions require successful CUDA admission checks, though MNN can still execute unsupported individual operators on CPU; CUDA hardware validation remains pending.
+- Pass 512 MiB text/resource and 1.5 GiB OCR resource fixtures. Direct CUDA recognition in the deployed image matches exact English, French, and Arabic fixture text. The full CUDA SUP-to-SRT smoke passes for 200 English cues plus French and Arabic fixtures, with the CUDA backend and GPU worker observed, sources preserved, and cached repeat confirmed. GPU sessions reject sessions that MNN silently creates on CPU after CUDA setup fails, while individual unsupported operators may still execute on CPU within an admitted CUDA session. Runtime performance benchmarking remains pending.
 - Bound concurrent selected-file jobs by global worker admission while keeping full-library scans and inventory/maintenance work exclusive; expose active jobs while retaining `running` compatibility.
-- Persist and deduplicate validated Bazarr SRT publication receipts, scan after the queue drains, and verify uncertain attempts without blind replay.
+- Persist and deduplicate validated Bazarr SRT publication receipts, scan after the queue drains, and verify uncertain attempts without blind replay; classify raw socket timeouts consistently and treat transport loss after a scan PATCH as uncertain while keeping explicit HTTP and connection-refused errors definite.
 - Publish matching local `0.4.4-cpu` and `0.4.4-cuda` image tags.
 ## 0.4.3 — 2026-10-15
 

@@ -161,6 +161,14 @@ fn safe_error(error: &ureq::Error) -> HttpFailure {
             category: "timeout",
             status: None,
         },
+        ureq::Error::Io(source)
+            if matches!(source.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+        {
+            HttpFailure {
+                category: "timeout",
+                status: None,
+            }
+        }
         ureq::Error::Io(source) if source.kind() == ErrorKind::ConnectionRefused => HttpFailure {
             category: "refused",
             status: None,
@@ -1683,6 +1691,14 @@ mod tests {
         );
         let got = request(&url, "/System/Info", "GET", key, Auth::Jellyfin, None, None).unwrap();
         assert_eq!(got["Version"], "12.0");
+    }
+    #[test]
+    fn socket_timeout_errors_keep_the_timeout_classification() {
+        for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+            let error = safe_error(&ureq::Error::Io(std::io::Error::from(kind)));
+            assert_eq!(error.category, "timeout");
+            assert_eq!(error.status, None);
+        }
     }
     #[test]
     fn authentication_failures_are_sanitized() {
