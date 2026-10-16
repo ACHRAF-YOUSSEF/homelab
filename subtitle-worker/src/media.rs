@@ -307,12 +307,30 @@ fn download_url_allowed(url: &str) -> bool {
 /// A user-invoked download is the sole public-network operation. Redirects are
 /// validated individually; response bytes stream to disk with a 4 GiB ceiling.
 pub fn download_model(config: &Config, name: &str) -> Result<PathBuf, String> {
-    download_model_checked(config, name, || Ok(()))
+    download_model_with_timeouts(
+        config,
+        name,
+        config.model_download_timeout,
+        config.model_download_timeout,
+        || Ok(()),
+    )
 }
 
 fn download_model_checked(
     config: &Config,
     name: &str,
+    cancel: impl Fn() -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    // Keep stalled job downloads bounded for cancellation. Explicit CLI
+    // downloads get the separately configured large-model transfer budget.
+    download_model_with_timeouts(config, name, 120, 180, cancel)
+}
+
+fn download_model_with_timeouts(
+    config: &Config,
+    name: &str,
+    body_seconds: u64,
+    total_seconds: u64,
     cancel: impl Fn() -> Result<(), String>,
 ) -> Result<PathBuf, String> {
     cancel()?;
@@ -328,11 +346,9 @@ fn download_model_checked(
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
-        // ureq bounds the whole body phase rather than individual reads. Keep
-        // stalled automatic downloads cancellable within two minutes; larger
-        // or slow model transfers can be preloaded outside the running worker.
-        .timeout_recv_body(Some(Duration::from_secs(120)))
-        .timeout_global(Some(Duration::from_secs(180)))
+        // ureq bounds the whole body phase rather than individual reads.
+        .timeout_recv_body(Some(Duration::from_secs(body_seconds)))
+        .timeout_global(Some(Duration::from_secs(total_seconds)))
         .build()
         .into();
     let mut url =
@@ -656,18 +672,27 @@ pub fn transcribe(
             "--max-len",
             "72",
             "--split-on-word",
-            "--no-prints",
         ]));
         if config.whisper_device == "cpu" {
             arguments.push("--no-gpu".into());
         }
-        process::run(
-            &config.whisper_cli,
-            &arguments,
-            config.process_timeout,
-            0,
-            || app.check_cancel(id, "transcription"),
-        )?;
+        if config.whisper_device == "cuda" {
+            process::run_whisper_cuda(
+                &config.whisper_cli,
+                &arguments,
+                config.process_timeout,
+                || app.check_cancel(id, "transcription"),
+            )?;
+        } else {
+            arguments.push("--no-prints".into());
+            process::run(
+                &config.whisper_cli,
+                &arguments,
+                config.process_timeout,
+                0,
+                || app.check_cancel(id, "transcription"),
+            )?;
+        }
         let data = read_json(&prefix.with_extension("json"), config.max_json_bytes)?;
         if language == "auto" {
             language = data["result"]["language"]

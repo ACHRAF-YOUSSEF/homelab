@@ -1,3 +1,4 @@
+use crate::storage::{self, Operation, StorageRoot};
 use serde_json::{Value, json};
 use std::{env, fs, path::PathBuf};
 
@@ -20,6 +21,7 @@ pub struct Config {
     pub llm_model: String,
     pub review_model: String,
     pub llm_timeout: u64,
+    pub model_download_timeout: u64,
     pub max_json_bytes: u64,
     pub max_jobs: usize,
     pub max_queue: usize,
@@ -36,7 +38,11 @@ fn setting(name: &str, fallback: &str) -> String {
 }
 
 fn number(name: &str, fallback: u64, min: u64, max: u64) -> Result<u64, String> {
-    let value = setting(name, &fallback.to_string())
+    parse_number(name, &setting(name, &fallback.to_string()), min, max)
+}
+
+fn parse_number(name: &str, input: &str, min: u64, max: u64) -> Result<u64, String> {
+    let value = input
         .parse::<u64>()
         .map_err(|_| format!("{name} must be an integer"))?;
     if !(min..=max).contains(&value) {
@@ -104,6 +110,7 @@ impl Config {
             llm_model: setting("SUBTITLE_LLM_MODEL", ""),
             review_model: setting("SUBTITLE_REVIEW_MODEL", ""),
             llm_timeout: number("SUBTITLE_LLM_TIMEOUT", 600, 1, 3600)?,
+            model_download_timeout: number("SUBTITLE_MODEL_DOWNLOAD_TIMEOUT", 3600, 1, 86400)?,
             max_json_bytes: number(
                 "SUBTITLE_MAX_JSON_BYTES",
                 16 * 1024 * 1024,
@@ -126,20 +133,36 @@ impl Config {
     }
 
     pub fn prepare(&mut self) -> Result<(), String> {
-        for path in [
-            &self.library_root,
-            &self.output_root,
-            &self.data_root,
-            &self.model_root,
+        for (path, root) in [
+            (&self.library_root, StorageRoot::Library),
+            (&self.output_root, StorageRoot::Output),
+            (&self.data_root, StorageRoot::Data),
+            (&self.model_root, StorageRoot::Model),
         ] {
-            fs::create_dir_all(path).map_err(|_| "Could not create application directory")?;
+            fs::create_dir_all(path)
+                .map_err(|error| storage::io_error(root, Operation::CreateDirectory, &error))?;
         }
-        self.library_root =
-            fs::canonicalize(&self.library_root).map_err(|_| "Invalid library root")?;
-        self.output_root =
-            fs::canonicalize(&self.output_root).map_err(|_| "Invalid output root")?;
-        self.data_root = fs::canonicalize(&self.data_root).map_err(|_| "Invalid data root")?;
-        self.model_root = fs::canonicalize(&self.model_root).map_err(|_| "Invalid model root")?;
+        self.prepare_read_only()?;
+        storage::verify_writable(&self.data_root, StorageRoot::Data)?;
+        storage::verify_writable(&self.output_root, StorageRoot::Output)?;
+        Ok(())
+    }
+
+    /// Resolve existing roots for read-only commands, without creating files or
+    /// requiring permission to modify saved jobs, models, media or exports.
+    pub fn prepare_read_only(&mut self) -> Result<(), String> {
+        self.library_root = fs::canonicalize(&self.library_root).map_err(|error| {
+            storage::io_error(StorageRoot::Library, Operation::ResolveDirectory, &error)
+        })?;
+        self.output_root = fs::canonicalize(&self.output_root).map_err(|error| {
+            storage::io_error(StorageRoot::Output, Operation::ResolveDirectory, &error)
+        })?;
+        self.data_root = fs::canonicalize(&self.data_root).map_err(|error| {
+            storage::io_error(StorageRoot::Data, Operation::ResolveDirectory, &error)
+        })?;
+        self.model_root = fs::canonicalize(&self.model_root).map_err(|error| {
+            storage::io_error(StorageRoot::Model, Operation::ResolveDirectory, &error)
+        })?;
         if !crate::media::supported_model(&self.whisper_model) {
             return Err("Unsupported Whisper model".into());
         }
@@ -154,6 +177,193 @@ pub fn languages() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_config(root: &std::path::Path) -> Config {
+        Config {
+            library_root: root.join("library"),
+            output_root: root.join("output"),
+            data_root: root.join("data"),
+            model_root: root.join("models"),
+            bind_address: "127.0.0.1".into(),
+            port: 8099,
+            whisper_model: "small-q5_1".into(),
+            whisper_device: "cpu".into(),
+            whisper_cli: "whisper-cli".into(),
+            local_only: true,
+            cpu_threads: 2,
+            audio_chunk_seconds: 300,
+            process_timeout: 5,
+            llm_base: "http://127.0.0.1:1/v1".into(),
+            llm_model: String::new(),
+            review_model: String::new(),
+            llm_timeout: 3,
+            model_download_timeout: 3600,
+            max_json_bytes: 1024 * 1024,
+            max_jobs: 10,
+            max_queue: 4,
+            max_clients: 4,
+            max_streams: 2,
+            allowed_hosts: vec!["localhost".into()],
+        }
+    }
+
+    #[test]
+    fn preparation_creates_required_roots_without_leaving_write_probes() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut config = fixture_config(directory.path());
+        config.prepare().expect("prepare writable roots");
+        for root in [
+            &config.library_root,
+            &config.model_root,
+            &config.data_root,
+            &config.output_root,
+        ] {
+            assert!(root.is_absolute());
+            assert!(root.is_dir());
+            assert_eq!(fs::read_dir(root).expect("fixture listing").count(), 0);
+        }
+    }
+
+    #[test]
+    fn model_download_timeout_is_bounded_without_mutating_environment() {
+        const NAME: &str = "SUBTITLE_MODEL_DOWNLOAD_TIMEOUT";
+        assert_eq!(
+            parse_number(NAME, "3600", 1, 86400).expect("default timeout"),
+            3600
+        );
+        assert_eq!(
+            parse_number(NAME, "1", 1, 86400).expect("minimum timeout"),
+            1
+        );
+        assert_eq!(
+            parse_number(NAME, "86400", 1, 86400).expect("maximum timeout"),
+            86400
+        );
+        for value in ["0", "86401", "-1", "not-a-number", ""] {
+            assert!(parse_number(NAME, value, 1, 86400).is_err());
+        }
+    }
+
+    #[test]
+    fn read_only_preparation_never_creates_missing_directories() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut config = fixture_config(directory.path());
+        let error = config.prepare_read_only().expect_err("roots do not exist");
+        assert!(error.contains("SUBTITLE_LIBRARY_ROOT"));
+        assert!(error.contains("resolve directory"));
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("fixture listing")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    struct RestorePermissions(std::path::PathBuf, fs::Permissions);
+
+    #[cfg(unix)]
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_read_only(path: &std::path::Path) -> RestorePermissions {
+        use std::os::unix::fs::PermissionsExt;
+        let original = fs::metadata(path)
+            .expect("fixture permissions")
+            .permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555))
+            .expect("make fixture read only");
+        RestorePermissions(path.to_owned(), original)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unprivileged_data_root_without_write_permission_has_actionable_error() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut config = fixture_config(directory.path());
+        config.prepare().expect("initialize fixture roots");
+        let _restore = make_read_only(&config.data_root);
+        // This fixture must run as an unprivileged user (the container runtime
+        // UID 1000), so it tests actual OS denial rather than permission bits.
+        let error = config
+            .prepare()
+            .expect_err("run this Unix permission fixture as an unprivileged user");
+        assert!(error.contains("SUBTITLE_DATA_ROOT"), "{error}");
+        assert!(error.contains("create temporary file"), "{error}");
+        assert!(error.contains("PermissionDenied"), "{error}");
+        assert!(error.contains("UID 1000"), "{error}");
+        assert!(!error.contains(&directory.path().to_string_lossy().into_owned()));
+        assert_eq!(
+            fs::read_dir(&config.data_root)
+                .expect("read-only fixture listing")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preloaded_read_only_models_and_library_are_supported() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut config = fixture_config(directory.path());
+        config.prepare().expect("initialize fixture roots");
+        fs::write(
+            config.model_root.join("ggml-small-q5_1.bin"),
+            b"disposable preloaded-model fixture",
+        )
+        .expect("preloaded model fixture");
+        fs::write(
+            config.library_root.join("video.mkv"),
+            b"disposable library fixture",
+        )
+        .expect("library fixture");
+        let _model_restore = make_read_only(&config.model_root);
+        let _library_restore = make_read_only(&config.library_root);
+        config
+            .prepare()
+            .expect("read-only model and library roots need no writes");
+        assert_eq!(
+            fs::read_dir(&config.model_root)
+                .expect("model listing")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(&config.library_root)
+                .expect("library listing")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_commands_accept_read_only_data_and_output_roots() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut config = fixture_config(directory.path());
+        config.prepare().expect("initialize fixture roots");
+        let _data_restore = make_read_only(&config.data_root);
+        let _output_restore = make_read_only(&config.output_root);
+        config
+            .prepare_read_only()
+            .expect("validation needs no write permissions");
+        assert_eq!(
+            fs::read_dir(&config.data_root)
+                .expect("data listing")
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(&config.output_root)
+                .expect("output listing")
+                .count(),
+            0
+        );
+    }
     #[test]
     fn validates_service_urls() {
         for value in [

@@ -14,9 +14,59 @@ Whisper downloads are disabled by default (`WHISPER_LOCAL_FILES_ONLY=true`). Dow
 docker compose run --rm subtitle-worker download-model small-q5_1
 ```
 
+For the full `large-v3` model on an NVIDIA GPU, use the CUDA Compose override on every build, download, start, and later Compose command. The default image is CPU-only and does not request a GPU. Add these values to the ignored root `.env` (replace the allowed host list with the browser-facing names you use):
+
+```dotenv
+WHISPER_MODEL=large-v3
+WHISPER_DEVICE=cuda
+WHISPER_LOCAL_FILES_ONLY=true
+SUBTITLE_CUDA_ARCHITECTURES=86
+SUBTITLE_MODEL_DOWNLOAD_TIMEOUT=3600
+SUBTITLE_WORKER_MEMORY_LIMIT=6g
+SUBTITLE_WORKER_CPUS=2
+SUBTITLE_CPU_THREADS=2
+SUBTITLE_AUDIO_CHUNK_SECONDS=300
+```
+
+`large-v3` is the full precision GGML model; the [upstream model repository](https://huggingface.co/ggerganov/whisper.cpp/tree/main) lists its file at about 3.1 GB. Download it once into the persistent model volume, then start the service:
+
+```shell
+docker compose -f docker-compose.yml -f compose/subtitle-worker.cuda.yml build subtitle-worker
+docker compose -f docker-compose.yml -f compose/subtitle-worker.cuda.yml run --rm subtitle-worker download-model large-v3
+docker compose -f docker-compose.yml -f compose/subtitle-worker.cuda.yml up -d subtitle-worker
+```
+
+`SUBTITLE_CUDA_ARCHITECTURES=86` builds for an RTX 3060's CUDA compute capability; omit it on another GPU to use the override's generic architecture list, or set the value supported by your target GPU. Rebuild the CUDA image after changing this value. `SUBTITLE_MODEL_DOWNLOAD_TIMEOUT` applies to an explicit `download-model` command only; its default is 3600 seconds. Web jobs that need a missing model keep their shorter timeout and can be cancelled. Model downloads are streamed to a temporary file and installed atomically. Keep `WHISPER_LOCAL_FILES_ONLY=true` so a web job never starts an implicit download. A full model can use substantially more RAM and VRAM than the small quantized CPU default. The suggested 6 GiB container ceiling is a starting cap, not a measured requirement; Docker RAM and GPU VRAM are separate resources. An RTX 3060 with 12 GiB of VRAM shares that memory with LM Studio and other GPU processes. Subtitle Studio unloads Whisper before requesting translation/review from LM Studio, but other applications may retain their allocations. Check actual peak use with a representative video before lowering the ceiling or increasing concurrent work.
+
+When `WHISPER_DEVICE=cuda`, Subtitle Studio verifies that whisper.cpp selected and initialized CUDA for each audio chunk. If the CUDA backend cannot initialize or allocate its model state, that chunk fails with a clear CUDA error; the app will not silently run it on CPU. The error advises checking the CUDA image, GPU reservation and host driver. For a custom `WHISPER_CLI`, use a build matching the pinned whisper.cpp version and its initialization output format. Raw Whisper stderr is drained and discarded; it is not retained in logs or returned to the browser.
+
 Model files live in the persistent `/models` volume. These GGML files use the whisper.cpp model format and cannot reuse the old Hugging Face Faster Whisper cache. Back up `/data`, subtitle outputs, and any needed transcript data before replacing images or volumes. Existing job history and outputs remain in their mounts; inference caches are regenerated as needed.
 
-The image runs as UID/GID `1000:1000`. Keep `/data`, `/models` and the host output folder writable by that identity. For older root-owned named volumes, stop the worker, back them up, inspect the stopped container's mounts and migrate ownership only on the verified data/model volumes before restarting. Do not remove volumes with `down -v` as part of this migration. Interrupted tasks are marked failed on restart; completed snapshots and matching saved transcript sources remain usable for downloads and later reviews. Each job has a snapshot under `/data/job_outputs/<job_id>/`; conventional exports under `/media/output` may be replaced by a later job for the same media/language.
+The image runs as UID/GID `1000:1000`. Keep `/data`, `/models` and the host output folder writable by that identity. The repeated “Could not create temporary file” startup log can occur when an existing `/data` volume is owned by root: the app needs to atomically replace its jobs file during startup. The screenshot alone cannot establish which mount has the wrong permissions. Check the startup log for the path-free storage diagnostic, then verify ownership and access for `/data` and `/media/output` before changing permissions.
+
+For an older root-owned **named volume**, stop the worker, make a backup, and inspect the stopped container's mounts. `docker inspect subtitle-worker --format '{{range .Mounts}}{{println .Destination .Type .Name .Source}}{{end}}'` shows each destination, mount type, and volume name or bind source. Only if `/data` or `/models` is confirmed to be the affected named volume, set the volume variable to that exact inspected name and repair that one mount. PowerShell example (repeat separately for `/models` only if needed):
+
+```powershell
+docker compose stop subtitle-worker
+$workerImage = docker inspect subtitle-worker --format '{{.Config.Image}}'
+$dataVolume = '<verified-volume-mounted-at-/data>'
+$modelVolume = '<verified-volume-mounted-at-/models>'
+docker run --rm --pull=never --network none --read-only --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true --user 0:0 --mount "type=volume,source=$dataVolume,target=/data" --entrypoint chown $workerImage -R -h -P -- 1000:1000 /data
+docker run --rm --pull=never --network none --read-only --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true --user 0:0 --mount "type=volume,source=$modelVolume,target=/models" --entrypoint chown $workerImage -R -h -P -- 1000:1000 /models
+```
+
+Bash or zsh:
+
+```bash
+docker compose stop subtitle-worker
+worker_image=$(docker inspect subtitle-worker --format '{{.Config.Image}}')
+data_volume='<verified-volume-mounted-at-/data>'
+model_volume='<verified-volume-mounted-at-/models>'
+docker run --rm --pull=never --network none --read-only --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true --user 0:0 --mount "type=volume,source=$data_volume,target=/data" --entrypoint chown "$worker_image" -R -h -P -- 1000:1000 /data
+docker run --rm --pull=never --network none --read-only --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true --user 0:0 --mount "type=volume,source=$model_volume,target=/models" --entrypoint chown "$worker_image" -R -h -P -- 1000:1000 /models
+```
+
+Replace each placeholder only with the exact volume name printed for that mount; leave out the command for any mount that does not need repair. These commands require a backup first and do not apply to a host bind mount; use the host filesystem's permissions for bind-mounted paths. The helper runs offline with a read-only root and only the `CHOWN` capability. If directory traversal fails because directories are mode `0700`, add `--cap-add DAC_READ_SEARCH` to that helper invocation only. Do not use `down -v` as part of this migration. Interrupted tasks are marked failed on restart; completed snapshots and matching saved transcript sources remain usable for downloads and later reviews. Each job has a snapshot under `/data/job_outputs/<job_id>/`; conventional exports under `/media/output` may be replaced by a later job for the same media/language.
 
 ## Run with Docker Compose
 
@@ -30,14 +80,14 @@ Open <http://localhost:8099>. Select a video, audio track, source language, mode
 
 The server checks every HTTP `Host` header against `SUBTITLE_ALLOWED_HOSTS` to reduce DNS rebinding risk. Its default allowlist is `localhost,127.0.0.1,::1,subtitle-worker`. Access through another hostname or IP requires adding that exact name or address to the comma-separated setting in `.env`; a non-loopback bind by itself does not allow that Host. Only list names or addresses through which trusted clients should reach the app.
 
-The default service requires no GPU. On a supported NVIDIA host, the optional CUDA build is provided by `compose/subtitle-worker.cuda.yml`:
+The default service requires no GPU. On a supported NVIDIA host, the optional CUDA build is provided by `compose/subtitle-worker.cuda.yml`. The override both builds the CUDA-capable image and requests one GPU; merely setting `WHISPER_DEVICE=cuda` on the default image is insufficient:
 
 ```shell
 docker compose -f docker-compose.yml -f compose/subtitle-worker.cuda.yml build subtitle-worker
 docker compose -f docker-compose.yml -f compose/subtitle-worker.cuda.yml up -d subtitle-worker
 ```
 
-That image compiles whisper.cpp v1.8.3 at the pinned upstream commit. CUDA support requires NVIDIA drivers and the NVIDIA Container Toolkit. Docker Desktop GPU passthrough is supported through its Windows WSL 2 backend; Docker Desktop on macOS does not expose NVIDIA CUDA. Apple GPU acceleration is not configured by this optional CUDA image.
+That image compiles whisper.cpp v1.8.3 at the pinned upstream commit. CUDA support requires NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). The Compose device request follows [Docker's GPU reservation configuration](https://docs.docker.com/compose/how-tos/gpu-support/). Docker Desktop GPU passthrough is supported through its Windows WSL 2 backend; Docker Desktop on macOS does not expose NVIDIA CUDA. Apple GPU acceleration is not configured by this optional CUDA image.
 
 ## Native run
 
@@ -91,8 +141,10 @@ Compose maps `SUBTITLE_LIBRARY_DIR` and `SUBTITLE_MEDIA_DIR` from host paths. Ap
 | `WHISPER_MODEL_ROOT` | `./models` native; `/models` in Compose | GGML model directory. |
 | `WHISPER_MODEL` | `small-q5_1` | Default Whisper model. |
 | `WHISPER_DEVICE` | `cpu` | `cpu` by default; `cuda` or `metal` requires a whisper-cli built with that backend. |
+| `SUBTITLE_CUDA_ARCHITECTURES` | `75;80;86;89` in the CUDA override | Compose build argument, not a runtime setting. Set it to the target GPU's CUDA compute capability to avoid building unrelated architectures. |
 | `WHISPER_CLI` | `whisper-cli` | Whisper.cpp CLI executable. |
 | `WHISPER_LOCAL_FILES_ONLY` | `true` | Require an explicit model download before inference. |
+| `SUBTITLE_MODEL_DOWNLOAD_TIMEOUT` | `3600` seconds | Timeout for explicit CLI `download-model`; bounded to 1–86400 seconds. Automatic job downloads use fixed 120-second body and 180-second total timeouts per upstream URL. |
 | `SUBTITLE_CPU_THREADS` | `2` | Whisper CPU thread count. |
 | `SUBTITLE_AUDIO_CHUNK_SECONDS` | `300` | Maximum extracted WAV chunk duration. |
 | `SUBTITLE_PROCESS_TIMEOUT` | `3600` | FFmpeg/Whisper process timeout in seconds. |
@@ -107,9 +159,9 @@ Compose maps `SUBTITLE_LIBRARY_DIR` and `SUBTITLE_MEDIA_DIR` from host paths. Ap
 
 `WHISPER_MODEL_ROOT` uses GGML model names from the app's allowlist, such as `small-q5_1`. Model downloads access the configured upstream model source; inference can run offline after download when local-only mode remains enabled. LLM requests send transcript text to the configured endpoint. Review and translation use that endpoint and its model loading behavior; this Rust worker does not allocate LM Studio GPU memory.
 
-Open **Resources** below the Whisper model selector and use **Refresh usage** to sample resource use without background polling. The same data is available at <http://localhost:8099/api/resources> and `/api/config`. On Linux, the endpoint reports server process RSS, container cgroup memory use/limit and CPU use when available; unsupported measurements are `null`. CPU percentage is the average between successive resource requests, with 100% representing one core; the first request has no interval yet. It also reports cumulative CPU seconds, configured Whisper threads, device, chunk duration, job history and queue size. In CUDA mode it queries `nvidia-smi` with a three-second timeout for whole-device utilization and VRAM, including other applications; unavailable GPU measurements are `null`. LM Studio manages its own model allocation. These are sampled observations and configured values, not a resource guarantee.
+Open **Resources** below the Whisper model selector and use **Refresh usage** to sample resource use without background polling. The same data is available at <http://localhost:8099/api/resources> and `/api/config`. On Linux, the endpoint reports server process RSS, container cgroup memory use/limit, its kernel-recorded memory peak and CPU use when available; unsupported measurements are `null`. The memory peak covers the current container lifetime, including native helpers and file cache; refreshing does not reset it. CPU percentage is the average between successive resource requests, with 100% representing one core; the first request has no interval yet. It also reports cumulative CPU seconds, configured Whisper threads, device, chunk duration, job history and queue size. In CUDA mode it queries `nvidia-smi` with a three-second timeout for whole-device utilization and VRAM, including other applications; unavailable GPU measurements are `null`. LM Studio manages its own model allocation. These are sampled observations and configured values, not a resource guarantee.
 
-An existing ignored `.env` can preserve `WHISPER_MODEL=medium` even though the new example defaults to `small-q5_1`. After backing up `/data` and outputs, explicitly set `WHISPER_MODEL=small-q5_1` and `WHISPER_LOCAL_FILES_ONLY=true` in `.env` if you want the CPU-first defaults. Existing GGML files must be named `ggml-<model>.bin`; Faster Whisper Hugging Face caches cannot be reused. A model download has a 120-second body receive timeout and a 180-second total timeout per upstream URL. For large or slow downloads, obtain the official `.bin` from [the whisper.cpp model repository](https://huggingface.co/ggerganov/whisper.cpp/tree/main) and place it in `WHISPER_MODEL_ROOT` (or `/models` in the container) before inference.
+An existing ignored `.env` can preserve `WHISPER_MODEL=medium` even though the new example defaults to `small-q5_1`. After backing up `/data` and outputs, explicitly set `WHISPER_MODEL=small-q5_1` and `WHISPER_LOCAL_FILES_ONLY=true` in `.env` if you want the CPU-first defaults. Existing GGML files must be named `ggml-<model>.bin`; Faster Whisper Hugging Face caches cannot be reused. Explicit CLI downloads use `SUBTITLE_MODEL_DOWNLOAD_TIMEOUT` (3600 seconds by default), while automatic web-job downloads keep 120-second body and 180-second total timeouts per upstream URL. For large or slow downloads, use the explicit CLI command with an adequate timeout or obtain the official `.bin` from [the whisper.cpp model repository](https://huggingface.co/ggerganov/whisper.cpp/tree/main) and place it in `WHISPER_MODEL_ROOT` (or `/models` in the container) before inference.
 
 ## Development and validation
 

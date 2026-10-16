@@ -93,7 +93,12 @@ file cache. Transcription and the cached follow-up completed in about 2.3
 seconds; cumulative container CPU time was 2.9 seconds. No OOM kill occurred.
 This short quantized-tiny fixture is not a peak-memory benchmark for movies,
 the default `small-q5_1` model, LM Studio, CUDA or translation quality. There
-is no comparable Python baseline or claimed percentage reduction.
+is no comparable Python baseline or claimed percentage reduction. The optional
+full `large-v3` model uses the CUDA image and a suggested initial 6 GiB
+container ceiling; that ceiling has not been measured with this model. GPU VRAM
+is separate from the container's RAM ceiling and is shared with host GPU
+applications such as LM Studio. The component guide documents the model and
+CUDA setup.
 
 The optional Docker `test` target includes the
 [Rust fixture probe](../subtitle-worker/src/bin/subtitle-studio-probe.rs).
@@ -109,13 +114,13 @@ The root `.env.example` provides these adjustable ceilings for selected workload
 | Container | Default ceiling |
 |---|---:|
 | Open WebUI | 1280 MiB |
-| Subtitle Studio worker | 1 GiB |
+| Subtitle Studio worker | 1 GiB CPU default; 6 GiB suggested starting ceiling for full `large-v3` CUDA |
 | Stirling PDF | 1536 MiB |
 | TubeArchivist Elasticsearch | 1536 MiB |
 | Subforge default, OCR disabled | 1536 MiB |
 | Subforge text-only option | 512 MiB |
 
-The first four values can be changed through `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_WORKER_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, and `ARCHIVIST_ES_MEMORY_LIMIT`. Subtitle Studio defaults to `1g`, `2` CPUs, and 64 processes. Whisper is CPU-only by default with two threads, one pipeline worker, and 300-second WAV chunks; the worker releases its model between chunks before translation/review. CUDA is available only through the optional CUDA Compose override. These are configured bounds and do not predict a specific working set; translation model memory belongs to the LM Studio process. Subforge uses `CONVERTER_MEMORY_LIMIT`; its Compose and `.env.example` default is `1536m` with image OCR disabled. Text-only deployments can lower it to `512m` after considering their formats and workload. Image-subtitle OCR is opt-in with `CONVERTER_ENABLE_OCR=true` and needs the `1536m` ceiling. Keep OCR disabled to lock image-based subtitle extraction; some text sidecars, including TTML and SBV, still use the bounded Subtitle Edit converter when OCR is off. Recreate the affected container after changing a Compose environment value or memory limit. OCR and other converter child processes count against the same container ceiling.
+The first four values can be changed through `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_WORKER_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, and `ARCHIVIST_ES_MEMORY_LIMIT`. Subtitle Studio defaults to `1g`, `2` CPUs, and 64 processes. Whisper is CPU-only by default with two threads, one pipeline worker, and 300-second WAV chunks; the worker releases its model between chunks before translation/review. CUDA is available only through the optional CUDA Compose override. Full `large-v3` uses a suggested `6g` worker ceiling as a starting point; this was not benchmarked on the target workload, and GPU VRAM is a separate shared resource. These are configured bounds and do not predict a specific working set; translation model memory belongs to the LM Studio process. Subforge uses `CONVERTER_MEMORY_LIMIT`; its Compose and `.env.example` default is `1536m` with image OCR disabled. Text-only deployments can lower it to `512m` after considering their formats and workload. Image-subtitle OCR is opt-in with `CONVERTER_ENABLE_OCR=true` and needs the `1536m` ceiling. Keep OCR disabled to lock image-based subtitle extraction; some text sidecars, including TTML and SBV, still use the bounded Subtitle Edit converter when OCR is off. Recreate the affected container after changing a Compose environment value or memory limit. OCR and other converter child processes count against the same container ceiling.
 
 Subforge converts one input at a time and limits the OCR OpenMP thread count. Its four HTTP workers and job queue are bounded, but that does not reserve memory for the host or reduce memory used by unrelated services.
 

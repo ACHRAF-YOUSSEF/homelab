@@ -64,7 +64,7 @@ fn run() -> Result<bool, String> {
                 return Err("Usage: subtitle-studio validate-srt FILE [--source FILE] [--video FILE] [--max-cps 20], or --job-id ID --target-language en".into());
             }
             if let Some(id) = job_id {
-                config.prepare()?;
+                config.prepare_read_only()?;
                 let jobs =
                     storage::read_json(&config.data_root.join("jobs.json"), config.max_json_bytes)?;
                 let job = jobs

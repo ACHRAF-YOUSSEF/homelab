@@ -1330,6 +1330,7 @@ mod tests {
             whisper_model: "small-q5_1".into(),
             whisper_device: "cpu".into(),
             whisper_cli: "whisper-cli".into(),
+            model_download_timeout: 3600,
             local_only: true,
             cpu_threads: 2,
             audio_chunk_seconds: 300,

@@ -1,8 +1,12 @@
 services:
   subtitle-worker:
+    image: homelab-subtitle-worker:1.0.0-cuda
+    pull_policy: never
     build:
-      context: ../subtitle-worker
+      context: ./subtitle-worker
       dockerfile: Dockerfile.cuda
+      args:
+        CUDA_ARCHITECTURES: "${SUBTITLE_CUDA_ARCHITECTURES:-75;80;86;89}"
     deploy:
       resources:
         reservations:

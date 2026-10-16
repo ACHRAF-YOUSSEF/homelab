@@ -162,7 +162,11 @@ impl App {
         if data.len() as u64 > self.config.max_json_bytes {
             return Err("Job history reached the configured JSON size limit; archive saved jobs before adding work".into());
         }
-        storage::write_bytes(&self.config.data_root.join("jobs.json"), &data)?;
+        storage::write_bytes_for(
+            &self.config.data_root.join("jobs.json"),
+            &data,
+            storage::StorageRoot::Data,
+        )?;
         state.revision = state.revision.wrapping_add(1);
         self.changed.notify_all();
         Ok(())

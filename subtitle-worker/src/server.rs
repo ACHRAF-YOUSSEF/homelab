@@ -530,7 +530,7 @@ fn resources(app: &App) -> Value {
     } else {
         None
     };
-    json!({"cpu_threads":app.config.cpu_threads,"whisper_device":app.config.whisper_device,"audio_chunk_seconds":app.config.audio_chunk_seconds,"model_residency":"per audio chunk; unloaded before translation","queue_length":queue_length,"queue_limit":app.config.max_queue,"history_count":history_count,"history_limit":app.config.max_jobs,"server_rss_bytes":rss,"container_memory_bytes":read_number("/sys/fs/cgroup/memory.current"),"container_memory_limit_bytes":read_number("/sys/fs/cgroup/memory.max"),"container_cpu_seconds":cpu_usage_seconds,"container_cpu_percent":cpu_percent,"gpu":gpu,"gpu_usage_note":"GPU metrics are whole-device usage when nvidia-smi is available. LM Studio controls its own allocation."})
+    json!({"cpu_threads":app.config.cpu_threads,"whisper_device":app.config.whisper_device,"audio_chunk_seconds":app.config.audio_chunk_seconds,"model_residency":"per audio chunk; unloaded before translation","queue_length":queue_length,"queue_limit":app.config.max_queue,"history_count":history_count,"history_limit":app.config.max_jobs,"server_rss_bytes":rss,"container_memory_bytes":read_number("/sys/fs/cgroup/memory.current"),"container_memory_peak_bytes":read_number("/sys/fs/cgroup/memory.peak"),"container_memory_limit_bytes":read_number("/sys/fs/cgroup/memory.max"),"container_cpu_seconds":cpu_usage_seconds,"container_cpu_percent":cpu_percent,"gpu":gpu,"gpu_usage_note":"GPU metrics are whole-device usage when nvidia-smi is available. LM Studio controls its own allocation."})
 }
 
 pub fn serve(app: Arc<App>) -> Result<(), String> {
