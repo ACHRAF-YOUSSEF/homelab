@@ -123,7 +123,7 @@ impl Config {
             max_streams,
             allowed_hosts: setting(
                 "SUBTITLE_ALLOWED_HOSTS",
-                "localhost,127.0.0.1,::1,subtitle-worker",
+                "localhost,127.0.0.1,::1,subtitle-studio,subtitle-worker",
             )
             .split(',')
             .map(|s| s.trim().trim_matches(['[', ']']).to_ascii_lowercase())

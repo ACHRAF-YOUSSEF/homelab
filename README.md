@@ -29,13 +29,14 @@
   - [Platform Guide](#platform-guide)
     - [Choose Your Runtime](#choose-your-runtime)
     - [Portable Paths and Local Overrides](#portable-paths-and-local-overrides)
-    - [Machines Without NVIDIA GPUs](#machines-without-nvidia-gpus)
+    - [Optional CUDA services](#optional-cuda-services)
     - [Host Networking and Permissions](#host-networking-and-permissions)
   - [Setup Guide](#setup-guide)
     - [1. Clone the Repository](#1-clone-the-repository)
     - [2. Configure Environment Variables](#2-configure-environment-variables)
     - [3. Configure DNS (AdGuard Home + Unbound)](#3-configure-dns-adguard-home--unbound)
     - [4. Start the Stack](#4-start-the-stack)
+    - [Rename existing subtitle containers](#rename-existing-subtitle-containers)
     - [5. Configure Nginx Proxy Manager](#5-configure-nginx-proxy-manager)
     - [6. Configure Jellyfin Direct Access](#6-configure-jellyfin-direct-access)
     - [7. Configure Nextcloud AIO](#7-configure-nextcloud-aio)
@@ -98,7 +99,7 @@ Internet
 
 Shared homelab Docker network
   +-- Browser -> host:7575 -> glance-live:8081 -> Glance:8080
-  +-- Browser -> host:8100 -> subtitle-converter:8100 (loopback by default)
+  +-- Browser -> host:8100 -> subforge:8100 (loopback by default)
   +-- glance-live -> qBittorrent sync API and host Jellyfin:8096
   +-- Glance -> jellyfin-counts-cache:8765 -> host Jellyfin:8096
   +-- AdGuard Home -> Unbound:5053 (requires local resolver config)
@@ -112,7 +113,7 @@ Nextcloud AIO -> separate Unix socket proxy -> Docker socket
 Nextcloud AIO manages its own containers and networks.
 ```
 
-The `subtitle-converter` joins `homelab` for its authenticated dashboard and configured media-server integrations. Build the selected local CPU or CUDA image before starting it; Compose does not build or pull either image. Its UI defaults to `http://localhost:8100`; the host bind defaults to loopback.
+The `subforge` service joins `homelab` for its authenticated dashboard and configured media-server integrations. Build the selected local CPU or CUDA image before starting it; Compose does not build or pull either image. Its UI defaults to `http://localhost:8100`; the host bind defaults to loopback.
 
 The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays on internal container port `8080`. `GLANCE_BIND_ADDRESS` defaults to loopback. For LAN clients, set it in the ignored root `.env` to the Docker host's LAN interface address and set `GLANCE_PUBLIC_URL` to the corresponding browser URL. This dashboard is unauthenticated and intended for the LAN: keep the bind private, firewall it to trusted LAN clients, and do not forward it from the Internet or add it to a public tunnel route. Do not change an Nginx Proxy Manager or tunnel route to publish this gateway. These settings do not verify the firewall or running services.
 
@@ -140,7 +141,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Media** | [Radarr](https://github.com/linuxserver/docker-radarr) | `lscr.io/linuxserver/radarr` | 7878 | Movie automation |
 | **Media** | [Seerr](https://github.com/seerr-team/seerr) | `ghcr.io/seerr-team/seerr` | 5055 | Media discovery and requests |
 | **Media** | [Bazarr](https://github.com/linuxserver/docker-bazarr) | `lscr.io/linuxserver/bazarr` | 6767 | Subtitle automation |
-| **Media** | Subforge *(subtitle-converter)* | Prebuilt local CPU or CUDA image from `subtitle-converter/` | 8100 (loopback by default) | Responsive authenticated UI and SRT conversion for embedded tracks and supported subtitle sidecars |
+| **Media** | Subforge (`subforge`) | Prebuilt local CPU or CUDA image from `subforge/` | 8100 (loopback by default) | Responsive authenticated UI and SRT conversion for embedded tracks and supported subtitle sidecars |
 | **Media** | [Tdarr](https://github.com/HaveAGitGat/Tdarr) | `ghcr.io/haveagitgat/tdarr` | 8265, 8266 | GPU media transcoding |
 | **Media** | [TubeArchivist](https://github.com/tubearchivist/tubearchivist) | `bbilly1/tubearchivist` | 8000 | YouTube archiving and management |
 | **Media** | [MeTube](https://github.com/alexta69/metube) | `ghcr.io/alexta69/metube` | 8085 | YouTube downloader |
@@ -150,7 +151,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Cloud** | Nextcloud Docker proxy | Local build from `docker-proxy/aio/` | Unix socket only | Separate Docker API proxy for AIO lifecycle operations |
 | **Cloud** | [Nextcloud AIO](https://github.com/nextcloud/all-in-one) | `ghcr.io/nextcloud-releases/all-in-one` | 30917 (loopback) | Master interface; AIO provisions Apache separately on port 11000 |
 | **Automation** | [n8n](https://github.com/n8n-io/n8n) | `n8nio/n8n` | 5678 | Workflow automation |
-| **Subtitles** | Subtitle Studio | Local Rust build from `subtitle-worker/` | 8099 | CPU-first transcription, local translation, and optional quality review |
+| **Subtitles** | Subtitle Studio | Local Rust build from `subtitle-studio/` | 8099 | CPU-first transcription, local translation, and optional quality review |
 | **Tools** | [IT-Tools](https://github.com/CorentinTh/it-tools) | `corentinth/it-tools` | 8888 | Developer tools |
 | **Tools** | [Stirling PDF](https://github.com/Stirling-Tools/Stirling-PDF) | `stirlingtools/stirling-pdf` | 48537 | PDF tools |
 | **Remote** | [RustDesk HBBS/HBBR](https://github.com/rustdesk/rustdesk-server) | `rustdesk/rustdesk-server` | 21115-21119 | Remote desktop rendezvous and relay |
@@ -166,7 +167,7 @@ The stack is split into smaller Compose files under `./compose/`, grouped by ser
 | `docker-compose.yml` | Compose entrypoint and service network definitions |
 | `compose/infrastructure.yml` | Cloudflared, Cloudflare DDNS, Nginx Proxy Manager, Glance, Glance live gateway, Jellyfin counts cache, Portracker, Docker Socket Proxy, Uptime Kuma |
 | `compose/dns.yml` | AdGuard Home, Unbound |
-| `compose/media.yml` | qBittorrent, Prowlarr, Sonarr, Radarr, Seerr, Bazarr, subtitle converter, Tdarr, MeTube, TubeArchivist, Redis, Elasticsearch |
+| `compose/media.yml` | qBittorrent, Prowlarr, Sonarr, Radarr, Seerr, Bazarr, Subforge, Tdarr, MeTube, TubeArchivist, Redis, Elasticsearch |
 | `compose/ai.yml` | Open WebUI, SearxNG |
 | `compose/cloud-automation.yml` | n8n, Subtitle Studio, and its model/data volumes |
 | `compose/nextcloud-aio.yml` | Nextcloud AIO master container, its Unix socket Docker proxy, and named volumes |
@@ -175,15 +176,15 @@ The stack is split into smaller Compose files under `./compose/`, grouped by ser
 
 Services that declare `homelab` can use service names such as `nginx-proxy-manager`, `unbound`, and `archivist-redis`. Glance, Portracker, and Uptime Kuma reach the read-only Docker proxy through `docker-monitoring`. Nextcloud AIO manages its own child containers and persistent Docker volumes.
 
-Docker build exclusions are scoped to each build context: the repository-root `.dockerignore` applies only when the repository root is the context, while `subtitle-worker/.dockerignore` and `docker-proxy/aio/.dockerignore` control their own service builds. The root ignore file keeps repository-only secrets, agent/CI metadata, caches, dependencies, and runtime data out of root-context builds; it does not change what Git tracks. Git ignores the local Compose override names listed below and root-anchored service data directories, while preserving `.env.example`, lockfiles, `subtitle-worker/web/app.css`, `.codex/`, and `.github/`. Adding an ignore rule does not untrack a file already committed.
+Docker build exclusions are scoped to each build context: the repository-root `.dockerignore` applies only when the repository root is the context, while `subtitle-studio/.dockerignore` and `docker-proxy/aio/.dockerignore` control their own service builds. The root ignore file keeps repository-only secrets, agent/CI metadata, caches, dependencies, and runtime data out of root-context builds; it does not change what Git tracks. Git ignores the local Compose override names listed below and root-anchored service data directories, while preserving `.env.example`, lockfiles, `subtitle-studio/web/app.css`, `.codex/`, and `.github/`. Adding an ignore rule does not untrack a file already committed.
 
 Bind mounts beginning with `../` are relative to the included file in `compose/`, so application data is stored beside the root README. Most of those directories are intentionally ignored by Git. Jellyfin and LM Studio are host applications rather than Compose services.
 
 ## Component Guides
 
 - [Glance dashboard](glance/README.md): seven pages, live qBittorrent/Jellyfin widgets, LAN binding, API keys, and the Jellyfin counts helper.
-- [Subtitle Studio](subtitle-worker/README.md): Rust setup, model management, resource limits, translation, and development checks.
-- [Subforge subtitle conversion](subtitle-converter/README.md): responsive authenticated dashboard, watcher setup, media-server integrations, configuration, language handling, limitations, and native use.
+- [Subtitle Studio](subtitle-studio/README.md): Rust setup, model management, resource limits, translation, and development checks.
+- [Subforge subtitle conversion](subforge/README.md): responsive authenticated dashboard, watcher setup, media-server integrations, configuration, language handling, limitations, and native use.
 - [Memory budget guide](docs/memory-budget.md): selected Compose ceilings, Nextcloud AIO child limits, monitoring, and reversible adjustment steps.
 
 ---
@@ -218,7 +219,7 @@ Docker Desktop's CUDA GPU passthrough to Linux containers uses the [Windows WSL 
 
 On Apple silicon or Linux ARM64, check the architecture support of each image you select. For example, `docker buildx imagetools inspect <image:tag>` lists the image's published platforms. Subtitle Studio's default image is CPU-only; its optional CUDA override targets NVIDIA-enabled hosts.
 
-Run Windows examples in PowerShell, and macOS/Linux examples in Bash or Zsh. When using a WSL terminal, use Linux-visible paths such as `/mnt/d/homelab-media`, rather than copying a PowerShell drive path. Single-line `docker compose` commands work in each shell. Native Subtitle Studio commands use Cargo; see its [component guide](subtitle-worker/README.md).
+Run Windows examples in PowerShell, and macOS/Linux examples in Bash or Zsh. When using a WSL terminal, use Linux-visible paths such as `/mnt/d/homelab-media`, rather than copying a PowerShell drive path. Single-line `docker compose` commands work in each shell. Native Subtitle Studio commands use Cargo; see its [component guide](subtitle-studio/README.md).
 
 ### Portable Paths and Local Overrides
 
@@ -310,7 +311,7 @@ This is a starting subset. Add DNS, media, tunnel, and cloud services only after
 
 Docker Desktop provides [`host.docker.internal`](https://docs.docker.com/desktop/features/networking/networking-how-tos/#connect-a-container-to-a-service-on-the-host) for reaching host applications. On native Linux Engine, [`extra_hosts: ["host.docker.internal:host-gateway"]`](https://docs.docker.com/compose/how-tos/networking/#custom-dns-with-extra_hosts) maps that name to the host gateway. The base files already add it to Glance, the counts helper, Open WebUI, and the subtitle container; the override above adds it to Nginx Proxy Manager for Jellyfin and AIO proxy access.
 
-On Linux, a host API bound only to `127.0.0.1` cannot normally be reached through the Docker bridge gateway. Bind Jellyfin or LM Studio to an address reachable from the containers and permit the needed container traffic through the host firewall. From a native CPU subtitle worker on the same host, use `http://127.0.0.1:1234/v1` instead of `host.docker.internal`. If Jellyfin runs in another container, attach it to the `homelab` network and adapt the proxy and dashboard targets to its service name.
+On Linux, a host API bound only to `127.0.0.1` cannot normally be reached through the Docker bridge gateway. Bind Jellyfin or LM Studio to an address reachable from the containers and permit the needed container traffic through the host firewall. From a native CPU Subtitle Studio process on the same host, use `http://127.0.0.1:1234/v1` instead of `host.docker.internal`. If Jellyfin runs in another container, attach it to the `homelab` network and adapt the proxy and dashboard targets to its service name.
 
 Several media services set `PUID=1000` and `PGID=1000`. On Linux, use `id -u` and `id -g` to choose the intended owner's IDs, update those services' environment values, and grant that owner access to the bind mounts. Merely adding `PUID` or `PGID` to `.env` does not replace the hardcoded service values. On macOS/Windows, check Docker Desktop file access and image-specific permission behavior rather than assuming Linux ownership commands apply.
 
@@ -349,7 +350,7 @@ Run Compose commands from the repository root. The root file explicitly sets `en
 
 See the [Environment Variables Reference](#environment-variables-reference) and the grouped entries in [`.env.example`](.env.example). Configure shared defaults, public links, internal API URLs, Cloudflare domains/tokens, dashboard branding/feeds, TubeArchivist, n8n, and subtitle paths. Keep your actual domains, addresses, API keys, and personal links in the ignored `.env` file.
 
-Use the [portable path override](#portable-paths-and-local-overrides) to supply your own absolute media directories for Windows, macOS, or Linux while retaining container targets such as `/downloads`, `/tv`, and `/media`. For the Docker subtitle worker, set `SUBTITLE_LIBRARY_DIR` to the library you want to expose and `SUBTITLE_MEDIA_DIR` to its writable export directory. The native subtitle recipe uses separate `*_ROOT` process environment variables.
+Use the [portable path override](#portable-paths-and-local-overrides) to supply your own absolute media directories for Windows, macOS, or Linux while retaining container targets such as `/downloads`, `/tv`, and `/media`. For the Docker Subtitle Studio service, set `SUBTITLE_LIBRARY_DIR` to the library you want to expose and `SUBTITLE_MEDIA_DIR` to its writable export directory. The native Subtitle Studio recipe uses separate `*_ROOT` process environment variables.
 
 ### 3. Configure DNS (AdGuard Home + Unbound)
 
@@ -430,7 +431,24 @@ docker compose up -d adguardhome unbound
 docker compose up -d sonarr radarr prowlarr qbittorrent
 ```
 
-Subtitle Studio builds and starts independently with `docker compose up -d --build subtitle-worker`, using CPU by default. The full `large-v3` NVIDIA profile requires the CUDA override for every build, download, start, and later Compose operation, plus `WHISPER_MODEL=large-v3`, `WHISPER_DEVICE=cuda`, and an increased worker RAM ceiling. Its optional CUDA setup and a targeted recovery for root-owned data volumes are documented in [the component guide](subtitle-worker/README.md). The UI is at `http://localhost:8099`; the guide covers model downloads and translation setup. The app has no authentication. `SUBTITLE_BIND_ADDRESS` defaults the native bind and Compose host publication to loopback. Every HTTP Host header must also match `SUBTITLE_ALLOWED_HOSTS`; add the actual hostname or IP in `.env` for deliberate remote access and restrict it to trusted clients.
+Subtitle Studio builds and starts independently with `docker compose up -d --build subtitle-studio`, using CPU by default. The full `large-v3` NVIDIA profile requires the CUDA override for every build, download, start, and later Compose operation, plus `WHISPER_MODEL=large-v3`, `WHISPER_DEVICE=cuda`, and an increased Studio RAM ceiling. Its CUDA setup, service-rename migration, and targeted recovery for root-owned data volumes are documented in [the component guide](subtitle-studio/README.md). The UI is at `http://localhost:8099`; the guide covers model downloads and translation setup. The app has no authentication. `SUBTITLE_BIND_ADDRESS` defaults the native bind and Compose host publication to loopback. Every HTTP Host header must also match `SUBTITLE_ALLOWED_HOSTS`; add the actual hostname or IP in `.env` for deliberate remote access and restrict it to trusted clients.
+
+### Rename existing subtitle containers
+
+The Compose services and container names changed from `subtitle-worker` to `subtitle-studio` and from `subtitle-converter` to `subforge`. Docker labels on existing containers cannot be renamed. Let current jobs finish or cancel them, back up application data, and build the selected new local images. Before removing anything, inspect each exact former container and confirm its Compose project, service label, and mounted volume names. A similarly named container such as `compose-subtitle-converter-1` could belong to another project; do not remove it based on its name alone. If the labels and mounts match the installation being migrated, stop and remove only that exact container:
+
+```shell
+docker inspect subtitle-worker --format '{{.Name}} {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}} {{range .Mounts}}{{.Destination}} {{.Type}} {{.Name}}; {{end}}'
+docker inspect subtitle-converter --format '{{.Name}} {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}} {{range .Mounts}}{{.Destination}} {{.Type}} {{.Name}}; {{end}}'
+docker volume ls
+docker stop subtitle-worker
+docker rm subtitle-worker
+docker stop subtitle-converter
+docker rm subtitle-converter
+docker compose --project-name homelab up -d --no-deps subtitle-studio subforge
+```
+
+For a standard installation, run the Compose commands from the repository root with project name `homelab`; this preserves the Compose project identity and resolves the same physical volumes through their unchanged keys (`subtitle_data`, `subtitle_models`, and `subtitle_converter_data`). If inspection shows the existing containers use a custom project name, use that exact project name in every migration Compose command below instead of `homelab`. Check mount destinations, types, and names before stopping containers, and verify the volumes still exist after removal. For a CUDA build, include the matching `compose/subtitle-studio.cuda.yml` and/or `compose/subforge.cuda.yml` override on each applicable Compose command. Do not run `down -v` or `--remove-orphans` for this rename. In the ignored `.env`, update `GLANCE_SUBTITLE_STUDIO_INTERNAL_URL` and `GLANCE_SUBFORGE_INTERNAL_URL` if they point to the old service hosts; the new hosts are `subtitle-studio` and `subforge`. Existing `CONVERTER_*` settings are unchanged. `SUBTITLE_STUDIO_MEMORY_LIMIT` and `SUBTITLE_STUDIO_CPUS` are the canonical container ceilings; if they are unset, Compose still accepts legacy `SUBTITLE_WORKER_MEMORY_LIMIT` and `SUBTITLE_WORKER_CPUS` values, with the canonical names taking precedence when both are set.
 
 `docker compose down` leaves named volumes and bind-mounted data in place. Subtitle Studio uses named `subtitle_models` and `subtitle_data` volumes; Nextcloud AIO uses `nextcloud_aio_mastercontainer` and the proxy socket volume `nextcloud_aio_docker_socket`, and manages additional volumes itself. Keep those volumes and the ignored application directories when moving or restoring the stack.
 
@@ -605,9 +623,9 @@ edits to deployment addresses in the dashboard YAML.
 | Glance appearance | `GLANCE_APP_NAME`, `GLANCE_LOGO_TEXT`, and `GLANCE_WEATHER_LOCATION` replace example branding and weather. |
 | Public external bookmarks and search providers | `GLANCE_*_URL` values customize external links and search shortcuts. |
 | Glance public RSS feed sources | `GLANCE_*_FEED_URL` values customize RSS sources. |
-| Selected workload memory ceilings | `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_WORKER_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, `ARCHIVIST_ES_MEMORY_LIMIT`, and `CONVERTER_MEMORY_LIMIT` cap individual containers. These are not host RAM reservations; see the [memory budget guide](docs/memory-budget.md). |
+| Selected workload ceilings | `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_STUDIO_MEMORY_LIMIT`, `SUBTITLE_STUDIO_CPUS`, `STIRLING_PDF_MEMORY_LIMIT`, `ARCHIVIST_ES_MEMORY_LIMIT`, and `CONVERTER_MEMORY_LIMIT` cap individual containers. Subtitle Studio also accepts the legacy `SUBTITLE_WORKER_MEMORY_LIMIT` and `SUBTITLE_WORKER_CPUS` names when the new settings are unset. These are not host RAM reservations; see the [memory budget guide](docs/memory-budget.md). |
 | Media paths | `EXAMPLE_MEDIA_ROOT` supports the portable override example. `SUBTITLE_MEDIA_DIR` and `SUBTITLE_LIBRARY_DIR` choose the worker's writable output and read-only source mounts. Use absolute paths for your OS. |
-| Subtitle models and local inference | `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_LOCAL_FILES_ONLY`, `SUBTITLE_MODEL_DOWNLOAD_TIMEOUT`, `SUBTITLE_CPU_THREADS`, chunk/process and queue limits, and LLM variables configure transcription and translation/review. Defaults use `small-q5_1`, CPU, two threads, and explicit model downloads. The optional full `large-v3` NVIDIA profile is documented in the [worker guide](subtitle-worker/README.md). `SUBTITLE_BIND_ADDRESS` defaults the native bind and Docker host publication to loopback; `SUBTITLE_ALLOWED_HOSTS` lists accepted HTTP Host names and IPs. |
+| Subtitle models and local inference | `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_LOCAL_FILES_ONLY`, `SUBTITLE_MODEL_DOWNLOAD_TIMEOUT`, `SUBTITLE_CPU_THREADS`, chunk/process and queue limits, and LLM variables configure transcription and translation/review. Defaults use `small-q5_1`, CPU, two threads, and explicit model downloads. The optional full `large-v3` NVIDIA profile is documented in the [Subtitle Studio guide](subtitle-studio/README.md). `SUBTITLE_BIND_ADDRESS` defaults the native bind and Docker host publication to loopback; `SUBTITLE_ALLOWED_HOSTS` lists accepted HTTP Host names and IPs. |
 
 `HOMELAB_URL` contains a scheme and host without a port or trailing slash; Glance
 appends ports for shared-host links. A localhost public URL works for a browser
@@ -716,7 +734,7 @@ Seerr (requests) -> Sonarr/Radarr <- Prowlarr (indexers)
                        v
                  qBittorrent -> imported media
                                   +-- Bazarr (downloaded subtitles)
-                                  +-- subtitle-converter (SRT exports)
+                                  +-- subforge (SRT exports)
                                   +-- Tdarr (transcode)
                                   +-- Jellyfin (playback)
                                   `-- Subtitle Studio (manual local subtitles)
@@ -738,11 +756,11 @@ If Glance's Sonarr/Radarr calendar reports an HTTP `400`, check **Settings > Gen
 
 ### Automatic Subtitle Conversion
 
-The `subtitle-converter` service (dashboard name **Subforge**) scans the four configured media mounts on persisted schedules; discovery defaults to every six hours. FFmpeg converts common text tracks, while TTML and SBV use Subtitle Edit even when image OCR is disabled. Image tracks use the native ocr-rs/MNN OCR helper only when `CONVERTER_ENABLE_OCR=true`; CUDA builds can use the CUDA backend. Explicit selected-file jobs share bounded CPU/GPU admission, while full scans and inventory maintenance run exclusively. Its authenticated dashboard at `http://localhost:8100` provides a scope review before text conversion, file inspection, per-track selection, job cancellation, and activity history. Settings has full-width Preferences, Media folders, Tasks, System, and Connections sections. Overview combines library totals with actionable counts, places Quick conversion beside local worker allocation, and shows Current work and active file workers when busy; remote nodes and the operation log are under expandable Worker nodes and diagnostics. The shell fills the dynamic viewport, with the top bar staying visible as the workspace and sidebar scroll independently; the desktop navigation's expand/collapse chevron remains visible in either state. Native select menus retain keyboard behavior and share the dark control styling. Mobile uses a drawer and stacked file cards. Library and Activity use paginated tables with sticky headings and controls; Auto fits responsive rows to the available table viewport, and only table rows scroll. Activity defaults to subtitle jobs and opens full job details, including errors, indexing status, retries, and executor history. New job activity identifies the assigned CPU, CPU OCR, or GPU OCR node and worker; retained job history shows up to 64 unique executor combinations, with older jobs left unchanged. Subforge writes sanitized newline-delimited JSON operation events to stdout and retains up to 200 for `/api/status` and the dashboard; a successful status response is HTTP 200. Events describe conversion phases, backend and track, file, job, worker, schedule, settings, and media-folder operations, rather than dashboard GET requests or heartbeat traffic. The component guide documents the local resource limits, optional remote workers, conversion behavior, and deployment requirements. Subforge provides locally built `0.4.4-cpu` and `0.4.4-cuda` images; Compose does not build or pull them. Set the host-side folders with the four `CONVERTER_*_DIR` variables; the container paths remain `/movies`, `/movies-C`, `/tv`, and `/tv-C`. The persistent data volume retains settings, worker allocation, preferences, jobs, scan state, and the generated password. The optional Glance status widget uses a dedicated private `CONVERTER_WIDGET_TOKEN`.
+The `subforge` service (dashboard name **Subforge**) scans the four configured media mounts on persisted schedules; discovery defaults to every six hours. FFmpeg converts common text tracks, while TTML and SBV use Subtitle Edit even when image OCR is disabled. Image tracks use the native ocr-rs/MNN OCR helper only when `CONVERTER_ENABLE_OCR=true`; CUDA builds can use the CUDA backend. Explicit selected-file jobs share bounded CPU/GPU admission, while full scans and inventory maintenance run exclusively. Its authenticated dashboard at `http://localhost:8100` provides a scope review before text conversion, file inspection, per-track selection, job cancellation, and activity history. Settings has full-width Preferences, Media folders, Tasks, System, and Connections sections. Overview combines library totals with actionable counts, places Quick conversion beside local worker allocation, and shows Current work and active file workers when busy; remote nodes and the operation log are under expandable Worker nodes and diagnostics. The shell fills the dynamic viewport, with the top bar staying visible as the workspace and sidebar scroll independently; the desktop navigation's expand/collapse chevron remains visible in either state. Native select menus retain keyboard behavior and share the dark control styling. Mobile uses a drawer and stacked file cards. Library and Activity use paginated tables with sticky headings and controls; Auto fits responsive rows to the available table viewport, and only table rows scroll. Activity defaults to subtitle jobs and opens full job details, including errors, indexing status, retries, and executor history. New job activity identifies the assigned CPU, CPU OCR, or GPU OCR node and worker; retained job history shows up to 64 unique executor combinations, with older jobs left unchanged. Subforge writes sanitized newline-delimited JSON operation events to stdout and retains up to 200 for `/api/status` and the dashboard; a successful status response is HTTP 200. Events describe conversion phases, backend and track, file, job, worker, schedule, settings, and media-folder operations, rather than dashboard GET requests or heartbeat traffic. The component guide documents the local resource limits, optional remote workers, conversion behavior, and deployment requirements. Subforge provides locally built `0.4.4-cpu` and `0.4.4-cuda` images; Compose does not build or pull them. Set the host-side folders with the four `CONVERTER_*_DIR` variables; the container paths remain `/movies`, `/movies-C`, `/tv`, and `/tv-C`. The persistent data volume retains settings, worker allocation, preferences, jobs, scan state, and the generated password. The optional Glance status widget uses a dedicated private `CONVERTER_WIDGET_TOKEN`.
 
-Subforge can integrate with Sonarr, Radarr, Bazarr, and Jellyfin. For Bazarr, configure its URL and private API key in the ignored `.env`, then enable and test the integration under **Settings → Connections → Bazarr**. Bazarr language profiles define wanted language, forced, and HI/SDH variants. Subforge checks matching non-empty, valid local SRT files before converting, and automatically skips untagged tracks. A failed or incomplete Bazarr inventory sync keeps automatic conversion fail-closed until a successful sync. Published SRT paths are durably aggregated; scoped Bazarr `scan-disk` notifications run after queued and active jobs drain (up to 120 seconds per request within a 300-second batch), then inventory refreshes (90-second fetch allowance); lightweight requests remain 8 seconds. An uncertain scan is not retried: the job stays converted with indexing pending until a fresh inventory read confirms every output. **Check Bazarr indexing** is read-only, and pending verification survives restart. Whole-series scans can outlast a connection test; do not re-extract existing SRTs for indexing delays. Bazarr inventory is capped at 20,000 media items. Configure path mappings when services see different container paths; Windows, macOS, and Linux host paths still map to the container paths each service sees. Build the selected Subforge image locally before starting the service; Compose does not build or pull it. The [Subforge guide](subtitle-converter/README.md) documents Bazarr coverage, manual track override, bounded inventory behavior, worker limits, and platform paths.
+Subforge can integrate with Sonarr, Radarr, Bazarr, and Jellyfin. For Bazarr, configure its URL and private API key in the ignored `.env`, then enable and test the integration under **Settings → Connections → Bazarr**. Bazarr language profiles define wanted language, forced, and HI/SDH variants. Subforge checks matching non-empty, valid local SRT files before converting, and automatically skips untagged tracks. A failed or incomplete Bazarr inventory sync keeps automatic conversion fail-closed until a successful sync. Published SRT paths are durably aggregated; scoped Bazarr `scan-disk` notifications run after queued and active jobs drain (up to 120 seconds per request within a 300-second batch), then inventory refreshes (90-second fetch allowance); lightweight requests remain 8 seconds. An uncertain scan is not retried: the job stays converted with indexing pending until a fresh inventory read confirms every output. **Check Bazarr indexing** is read-only, and pending verification survives restart. Whole-series scans can outlast a connection test; do not re-extract existing SRTs for indexing delays. Bazarr inventory is capped at 20,000 media items. Configure path mappings when services see different container paths; Windows, macOS, and Linux host paths still map to the container paths each service sees. Build the selected Subforge image locally before starting the service; Compose does not build or pull it. The [Subforge guide](subforge/README.md) documents Bazarr coverage, manual track override, bounded inventory behavior, worker limits, and platform paths.
 
-For a read-only integration diagnostic, run `docker compose exec subtitle-converter subforge integration-check bazarr` (replace `bazarr` with `sonarr`, `radarr`, or `jellyfin`). It prints only a connection result and safe counts, never endpoint or credential values; see the [Subforge guide](subtitle-converter/README.md#safe-integration-diagnostic) for details.
+For a read-only integration diagnostic, run `docker compose exec subforge subforge integration-check bazarr` (replace `bazarr` with `sonarr`, `radarr`, or `jellyfin`). It prints only a connection result and safe counts, never endpoint or credential values; see the [Subforge guide](subforge/README.md#safe-integration-diagnostic) for details.
 
 Jellyfin's `JELLYFIN_INTERNAL_URL` and `JELLYFIN_API_KEY` remain environment-managed, and Subforge uses Jellyfin's current MediaBrowser authorization header. An HTTP 401/403 can reflect authorization format, a rejected key, or insufficient access; verify the safe connection diagnostic before changing the key. Recreate the converter after changing `JELLYFIN_API_KEY` in the private `.env`.
 
@@ -824,7 +842,7 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | Bandit | Remaining Python source and privacy-checking tools at medium severity and confidence. |
 | Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audits for Glance, Jellyfin counts cache, Subtitle Studio, and Subforge. |
 | Subtitle conversion integration | Pinned multi-stage container build and isolated text/OCR fixtures without network access or host media mounts. |
-| pnpm audit | Subtitle worker lockfile, including development dependencies, without installing project packages. |
+| pnpm audit | Subtitle Studio lockfile, including development dependencies, without installing project packages. |
 | Trivy | Filesystem dependency-manifest vulnerability and Dockerfile misconfiguration scan, including development dependencies. Compose misconfiguration and supplied-image OS vulnerabilities are outside this scan. |
 
 See [SECURITY.md](SECURITY.md) for findings, remediation, scan limits, and deployment guidance. The workflow is the source of the current validation result; an earlier passing run does not cover later changes. For task-focused repository help, global personal Codex agents and cross-platform setup are documented in [.codex/agents/README.md](.codex/agents/README.md). The role definitions live in the user's Codex home, so they can be reused across projects; cloning this repository does not install them.
@@ -843,7 +861,7 @@ docker compose config --services
 git diff --check
 ```
 
-The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes, Rust gateway checks, resource ceilings, and widget troubleshooting. Subtitle Studio's [guide](subtitle-worker/README.md) includes Rust checks and the command to rebuild the checked-in Tailwind CSS. The [Subforge guide](subtitle-converter/README.md) documents Rust Cargo tests/builds, native use, legacy state compatibility, and optional OCR. Rebuild Subtitle Studio after changing Rust source or bundled web files.
+The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes, Rust gateway checks, resource ceilings, and widget troubleshooting. Subtitle Studio's [guide](subtitle-studio/README.md) includes Rust checks and the command to rebuild the checked-in Tailwind CSS. The [Subforge guide](subforge/README.md) documents Rust Cargo tests/builds, native use, legacy state compatibility, and optional OCR. Rebuild Subtitle Studio after changing Rust source or bundled web files.
 
 Application runtime data, API credentials, proxy hosts, certificates, router forwarding, LM Studio models, and Nextcloud's child containers are not fully represented by the tracked files. A successful Compose configuration check verifies the service definitions; use service logs and the component guides to verify your local deployment.
 

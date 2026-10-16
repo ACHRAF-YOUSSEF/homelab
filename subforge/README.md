@@ -1,6 +1,26 @@
 # Subforge — Automatic Subtitle Conversion
 
-**Subforge** is the name of the subtitle-conversion dashboard. The Compose service and folder remain `subtitle-converter`. It is a Rust watcher and local web dashboard that creates UTF-8 SubRip (`.srt`) sidecars from embedded subtitle tracks and supported subtitle files. FFmpeg handles common text tracks; TTML and SBV sidecars use the official [Subtitle Edit command-line converter](https://github.com/SubtitleEdit/subtitleedit/releases) even when OCR is disabled. Image-based subtitle tracks use a native Rust `ocr-rs` 2.4.1 helper backed by MNN 3.4.1 when OCR is enabled. Its verified offline models explicitly support English (`en`), French (`fr`, using the Latin model family), and Arabic (`ar`), alongside additional language families. Both CPU and CUDA production and test images contain no Python or PaddlePaddle runtime; the CUDA edition builds the same helper with MNN CUDA support. MNN is native C++ code and the app still invokes external tools such as FFmpeg and Subtitle Edit, so the complete application is not Rust-only.
+Subforge is the subtitle-conversion dashboard, with Compose service and project directory both named `subforge`. It is a Rust watcher and local web dashboard that creates UTF-8 SubRip (`.srt`) sidecars from embedded subtitle tracks and supported subtitle files. FFmpeg handles common text tracks; TTML and SBV sidecars use the official [Subtitle Edit command-line converter](https://github.com/SubtitleEdit/subtitleedit/releases) even when OCR is disabled. Image-based subtitle tracks use a native Rust `ocr-rs` 2.4.1 helper backed by MNN 3.4.1 when OCR is enabled. Its verified offline models explicitly support English (`en`), French (`fr`, using the Latin model family), and Arabic (`ar`), alongside additional language families. Both CPU and CUDA production and test images contain no Python or PaddlePaddle runtime; the CUDA edition builds the same helper with MNN CUDA support. MNN is native C++ code and the app still invokes external tools such as FFmpeg and Subtitle Edit, so the complete application is not Rust-only.
+
+### Upgrade from the former service name
+
+The service used to be named `subtitle-converter`. Docker does not change labels on an existing container when a Compose service is renamed. Build the new local image first and back up the retained data. Inspect the exact old container and confirm its Compose project, service label, and mounted volume before stopping it. Do not remove similarly named containers such as `compose-subtitle-converter-1` unless inspection confirms they belong to this installation. Run Compose from the repository root with the same project name as the old container; `homelab` is the standard example, but if inspection shows a custom prior project, use that exact project name in every migration Compose command. This retains the existing physical volume through the unchanged Compose key `subtitle_converter_data`; inspect the mount because another prior project name may produce a different physical name.
+
+```shell
+docker inspect subtitle-converter --format '{{.Name}} {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}} {{range .Mounts}}{{.Destination}} {{.Type}} {{.Name}}; {{end}}'
+docker volume ls
+docker stop subtitle-converter
+docker rm subtitle-converter
+docker compose --project-name homelab up -d --no-deps subforge
+```
+
+For CUDA, keep the same project name and use the `-f compose/subforge.cuda.yml` override on the start command:
+
+```shell
+docker compose --project-name homelab -f docker-compose.yml -f compose/subforge.cuda.yml up -d --no-deps subforge
+```
+
+After removal, verify the inspected volume still exists; the command removes only the container object. Do not use `down -v` or `--remove-orphans` for this rename. The persistent volume retains Subforge's password, settings, jobs, and scan state. Keep the existing `CONVERTER_*` variable names. If `.env` explicitly sets `GLANCE_SUBFORGE_INTERNAL_URL` or `CONVERTER_ALLOWED_HOSTS` to the former service hostname, update that value to `subforge` only where the service name is the intended host.
 
 ## Start the service
 
@@ -9,25 +29,25 @@ Compose requires the ignored root `.env` for interpolation. Create it from `.env
 Build the selected edition locally before starting it. Compose only starts a prebuilt tag: it neither builds nor pulls Subforge, and startup fails if the selected local tag is missing.
 
 ```shell
-docker build --target final --tag homelab-subtitle-converter:0.4.4-cpu subtitle-converter
+docker build --target final --tag homelab-subforge:0.4.4-cpu subforge
 ```
 
 PowerShell uses the same local build command:
 
 ```powershell
-docker build --target final --tag homelab-subtitle-converter:0.4.4-cpu subtitle-converter
+docker build --target final --tag homelab-subforge:0.4.4-cpu subforge
 ```
 
 Then start the prebuilt CPU image from the repository root:
 
 ```shell
-docker compose up -d --no-deps subtitle-converter
+docker compose up -d --no-deps subforge
 ```
 
 Open the responsive Subforge dashboard at `http://localhost:8100`. Routes are bookmarkable: reloading the page and using browser back/forward preserves the selected page and Settings section. Settings use full-width tabs for Preferences, Media folders, Tasks, System, and media-server Connections. Overview combines library totals with actionable counts, pairs Quick conversion and local worker allocation, and shows Current work and active file workers while work is active. Worker nodes and the operation log are inside expandable **Worker nodes and diagnostics**. Worker information refreshes while Overview is visible; the old `#/settings/workers` bookmark redirects to Overview. The shell fills the dynamic viewport; the top bar stays in place while the workspace and sidebar scroll independently. The top-bar chevron remains visible when expanding or collapsing desktop navigation. On narrow screens the navigation opens as a drawer and inventory rows become stacked file cards. Native select menus retain keyboard behavior and use the same dark styling as other controls. The dashboard always requires HTTP Basic Authentication with username `admin`. **Settings → System**, the sidebar, and the header identify whether the running binary is the compiled CPU-only or CUDA edition; environment variables cannot change this build-time edition. If `CONVERTER_UI_PASSWORD` is blank, the service creates a random password once and stores it in `/data/ui-password` with mode `0600`; the password is not written to logs. Retrieve it from PowerShell, Bash, or Zsh with:
 
 ```shell
-docker compose exec subtitle-converter cat /data/ui-password
+docker compose exec subforge cat /data/ui-password
 ```
 
 Alternatively, set `CONVERTER_UI_PASSWORD` in the ignored root `.env` to a private password of at least 12 characters. The named `subtitle_converter_data` volume preserves the generated password, jobs, settings, preferences, worker allocation, and scan state across container rebuilds. The Rust runtime reads existing state/settings/preferences/history files and the password, preserving compatible data when the image is upgraded; Jellyfin connection details remain managed through environment variables.
@@ -63,10 +83,10 @@ Unix media tools run with a fixed UTF-8 locale so non-ASCII Matroska titles cann
 If the service exits during startup and its logs identify `CONVERTER_UI_PASSWORD` as invalid, set it privately in the ignored root `.env` to a strong printable password of 12–256 characters, or leave it blank to use the persistent generated password. Recreate only this service:
 
 ```shell
-docker compose up -d --no-deps subtitle-converter
+docker compose up -d --no-deps subforge
 ```
 
-For a CUDA deployment, keep `-f compose/subtitle-converter.cuda.yml` in the command so troubleshooting does not switch the service to the CPU image.
+For a CUDA deployment, keep `-f compose/subforge.cuda.yml` in the command so troubleshooting does not switch the service to the CPU image.
 
 When using the generated password, retrieve it with the command above. Startup validation reports the setting and phase without printing its value; never paste credentials into logs or shared documentation.
 
@@ -101,15 +121,15 @@ The Library inventory, Activity's Jobs list, scheduled tasks, System panels, and
 
 The Glance **Media** page includes a Subforge custom API widget. It displays the processed-file count, queue length, configured scan-root count, recent failures, current run and progress, and selected languages. It only reads an aggregate from Subforge's `/api/widget` endpoint; the response contains no media paths and the widget cannot start or change jobs. Glance refreshes the widget every 15 seconds. The widget uses the copied [Subforge SVG icon](../glance/config/assets/subforge.svg) in the dashboard service list.
 
-The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. The Compose file passes this dedicated token only to Glance and Subforge. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is Glance's container-to-container base URL and defaults to `http://subtitle-converter:8100`.
+The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. The Compose file passes this dedicated token only to Glance and Subforge. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is Glance's container-to-container base URL and defaults to `http://subforge:8100`.
 
 Subforge is part of the regular Compose stack and starts after its selected local image has been built. The widget token only enables the read-only widget endpoint. After changing the token, recreate both containers so each receives the same value:
 
 ```shell
-docker compose up -d --force-recreate glance subtitle-converter
+docker compose up -d --force-recreate glance subforge
 ```
 
-For a CUDA deployment, add `-f compose/subtitle-converter.cuda.yml` after
+For a CUDA deployment, add `-f compose/subforge.cuda.yml` after
 `docker-compose.yml` to both this command and the CUDA service start command.
 
 After changing only either URL, recreate Glance. A `404` status means the widget endpoint is disabled; `401` means the tokens do not match. A connection error usually means Subforge is stopped or `GLANCE_SUBFORGE_INTERNAL_URL` cannot reach it on the Compose network.
@@ -145,7 +165,7 @@ The Compose service lets you change the four host-side library folders through `
 | `CONVERTER_ENABLE_GPU` | CUDA runtime permission for direct Docker runs; CPU Compose forces `false`, CUDA Compose sets `true`. Environment values cannot make the CPU edition GPU-capable | `false` in CPU Compose |
 | `CONVERTER_OCR_LANGUAGE` | Offline OCR model family for unknown image-subtitle language | `eng` |
 | `CONVERTER_BIND_ADDRESS` | Host interface for the dashboard publication | `127.0.0.1` |
-| `CONVERTER_ALLOWED_HOSTS` | Comma-separated `Host` header allowlist; preserve the defaults and add your browser hostname if needed | `localhost,127.0.0.1,::1,subtitle-converter` |
+| `CONVERTER_ALLOWED_HOSTS` | Comma-separated `Host` header allowlist; preserve the defaults and add your browser hostname if needed | `localhost,127.0.0.1,::1,subforge` |
 | `CONVERTER_UI_PASSWORD` | Dashboard password (12–256 printable characters); blank generates and saves one in `/data/ui-password` | Blank |
 | `CONVERTER_WEBHOOK_TOKEN` | Shared Sonarr/Radarr webhook token; blank disables the hook endpoints | Blank |
 | `BAZARR_INTERNAL_URL` | Bazarr URL reachable from the converter on `homelab` | `http://bazarr:6767` |
@@ -172,10 +192,10 @@ The UI saves requested targets immediately; they apply to newly admitted files w
 Admission estimates reserve 128 MiB for the server, 256 MiB per CPU file worker, and 1 GiB per CPU OCR or GPU worker, then also checks current cgroup memory headroom when available. These estimates guide concurrency; they are not guaranteed peaks or reserved memory. Under memory pressure, new work waits and the UI shows the reason. **Pause local workers** stops admitting new files and lets active workers finish; queued work waits until resumed. This setting is separate from **Settings → Tasks → Pause schedules**. OCR workers are admitted only when image OCR is enabled. `CONVERTER_CPU_LIMIT` controls Docker's CPU ceiling independently. Changing it requires recreating the service; `docker compose restart` retains the existing container configuration. Use this generic command from the repository root on PowerShell, Bash, or Zsh:
 
 ```shell
-docker compose up -d --force-recreate --no-deps subtitle-converter
+docker compose up -d --force-recreate --no-deps subforge
 ```
 
-This recreates only `subtitle-converter`, without rebuilding its image or starting dependencies.
+This recreates only `subforge`, without rebuilding its image or starting dependencies.
 
 ### Optional remote worker nodes
 
@@ -208,7 +228,7 @@ Run the `subforge-worker` binary from the locally built CPU or CUDA image, or fr
 The default Compose service and CPU image expose no GPU devices. The optional edition is a separate `linux/amd64` image built with `Dockerfile.cuda` and the CUDA feature for native `ocr-rs`/MNN. CPU and CUDA test/runtime images contain no Python or PaddlePaddle stack. Both helpers and their test suites are Rust; native MNN is built from its pinned 3.4.1 source commit, and 25 model files come from an immutable source revision and are checked against `native-ocr/models.sha256`. A normal build needs network access for the MNN source and models. For an optional cache, place the pinned MNN archive `mnn-6b1db4c2eacf8193e6b7a1841acb6e31a1938e82.tar.gz` at the root of `output/ocr-cache` and any cached model files under `output/ocr-cache/models/`, using the exact filenames in `native-ocr/models.sha256`. Pass `--build-context native-source-cache=output/ocr-cache` to the Docker build. Every cached model is still checked against the manifest; a missing cache file is downloaded from the same immutable source URL and checked too. The CUDA build also fetches a pinned CUTLASS archive. Optionally cache `cutlass-319a389f42b776fae5701afcb943fc03be5b5c25.tar.gz` under `output/ocr-cutlass-cache` and pass `--build-context cuda-source-cache=output/ocr-cutlass-cache` to the CUDA build. Its SHA-256 is checked whether cached or downloaded, and CMake is directed to the verified source tree to avoid cloning its history. Build the CPU edition first because the CUDA image uses the matching `0.4.4-cpu` runtime base.
 
 ```shell
-docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.4.4-cuda subtitle-converter
+docker build --platform linux/amd64 --file subforge/Dockerfile.cuda --tag homelab-subforge:0.4.4-cuda subforge
 ```
 
 The optional source-cache context can avoid downloading the pinned MNN archive and any supplied model files. Cached and downloaded MNN archives and model files are hash-verified before compilation or packaging. The separate CUDA source-cache context holds the optional pinned CUTLASS archive; its SHA-256 is `1d1eac5bcbcced5c1a7f3de433143c0ab269f07551865ba9aa0fcb8618e988c4`.
@@ -220,21 +240,21 @@ This configuration is provided for compatible NVIDIA-enabled Docker hosts on Lin
 The CPU and CUDA images are built separately; Compose never builds or pulls these local tags. Build CPU first because the CUDA Dockerfile reuses its runtime base, then build CUDA:
 
 ```shell
-docker build --target final --tag homelab-subtitle-converter:0.4.4-cpu subtitle-converter
-docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.4.4-cuda subtitle-converter
+docker build --target final --tag homelab-subforge:0.4.4-cpu subforge
+docker build --platform linux/amd64 --file subforge/Dockerfile.cuda --tag homelab-subforge:0.4.4-cuda subforge
 ```
 
 The same commands work in Windows PowerShell:
 
 ```powershell
-docker build --target final --tag homelab-subtitle-converter:0.4.4-cpu subtitle-converter
-docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --tag homelab-subtitle-converter:0.4.4-cuda subtitle-converter
+docker build --target final --tag homelab-subforge:0.4.4-cpu subforge
+docker build --platform linux/amd64 --file subforge/Dockerfile.cuda --tag homelab-subforge:0.4.4-cuda subforge
 ```
 
 Create the ignored root `.env` from `.env.example`, set the four host media directories, and start the CUDA edition with its override:
 
 ```shell
-docker compose -f docker-compose.yml -f compose/subtitle-converter.cuda.yml up -d --no-deps subtitle-converter
+docker compose -f docker-compose.yml -f compose/subforge.cuda.yml up -d --no-deps subforge
 ```
 
 The override grants only NVIDIA device `0`, with the `compute` and `utility` driver capabilities, and sets `CONVERTER_ENABLE_OCR=true`, `CONVERTER_ENABLE_GPU=true`, `NVIDIA_VISIBLE_DEVICES=0`, and `NVIDIA_DRIVER_CAPABILITIES=compute,utility`. It does not grant every GPU or the Docker socket. For direct `docker run`, set those four environment values and separately grant device access (for example `--gpus device=0`); environment variables alone do not expose a GPU. The CUDA-edition dashboard, API, sidebar, and header identify the compiled edition, while the Overview worker panel reports whether the runtime and device are eligible. The saved GPU worker allocation remains zero until you set **GPU OCR slots** to one. The default free-memory threshold in workers.conf is 2048 MiB. With the GPU worker allocation left at zero, Subforge starts no GPU OCR work and leaves device memory available to other GPU applications such as LM Studio. The threshold is checked before work, but Docker does not reserve or cap GPU VRAM. Keep the GPU worker count at one when sharing the device. The override configures a `1536m` container RAM ceiling by default; this is system memory, separate from device VRAM. See [Development checks](#development-checks) for the native smoke-test procedure.
@@ -242,7 +262,7 @@ The override grants only NVIDIA device `0`, with the `compute` and `utility` dri
 To return to the CPU image, recreate the service from the ordinary Compose entrypoint without the CUDA override. On startup, Subforge clamps the saved worker allocation to the compiled edition's permissions and deployment limits, then persists the adjusted values, so GPU slots return to zero:
 
 ```shell
-docker compose up -d --force-recreate --no-deps subtitle-converter
+docker compose up -d --force-recreate --no-deps subforge
 ```
 
 ## Media server connections
@@ -256,7 +276,7 @@ The Settings page stores Sonarr, Radarr, and Bazarr URLs, API keys, and path map
 | Sonarr `/tv` | `/tv` | Matches the first TV mount in Compose. |
 | Sonarr `/tv-C` | `/tv-C` | Matches the second TV mount in Compose. |
 
-If your Arr path differs, add a mapping under that server's Settings tab. Sonarr and Radarr webhooks require a shared token. Set `CONVERTER_WEBHOOK_TOKEN` in the ignored `.env`, then in each app's **Settings → Connect**, add a Webhook targeting `http://subtitle-converter:8100/hooks/sonarr` or `http://subtitle-converter:8100/hooks/radarr`. See the [Sonarr](https://wiki.servarr.com/sonarr/settings#connect) or [Radarr](https://wiki.servarr.com/radarr/settings#connect) connection guide. In the connection's advanced headers, add `X-Webhook-Token` with the same token. Enable file import/download, upgrade, and rename events, then use the app's **Test** action. The webhook accepts the Test event without queueing a job; supported media events queue an extraction. If a newly imported file is younger than `CONVERTER_MIN_AGE`, that attempt remains pending for the next background scan.
+If your Arr path differs, add a mapping under that server's Settings tab. Sonarr and Radarr webhooks require a shared token. Set `CONVERTER_WEBHOOK_TOKEN` in the ignored `.env`, then in each app's **Settings → Connect**, add a Webhook targeting `http://subforge:8100/hooks/sonarr` or `http://subforge:8100/hooks/radarr`. See the [Sonarr](https://wiki.servarr.com/sonarr/settings#connect) or [Radarr](https://wiki.servarr.com/radarr/settings#connect) connection guide. In the connection's advanced headers, add `X-Webhook-Token` with the same token. Enable file import/download, upgrade, and rename events, then use the app's **Test** action. The webhook accepts the Test event without queueing a job; supported media events queue an extraction. If a newly imported file is younger than `CONVERTER_MIN_AGE`, that attempt remains pending for the next background scan.
 
 For Bazarr, configure and enable the integration in **Settings → Connections → Bazarr**. Bazarr language profiles are authoritative for wanted language, forced, and HI/SDH variants. Sync reads the profile list, paged movie and series records, and episodes in bounded series-ID batches. Subforge counts only non-empty, structurally valid local SRTs matching the required language and flags; the `missing_subtitles` indicator alone is insufficient. Supported tagged embedded tracks and sidecars can fill missing variants. Automatic work skips untagged tracks; inspect and select one manually when its language is unknown. To intentionally create another output for a variant already covered, select the track and enable **Allow another selected track for a language that already has SRT**. Old `.trackN.und.srt` sidecars are not coverage and are not removed automatically.
 
@@ -273,7 +293,7 @@ If Jellyfin uses different paths, add mappings on its Settings tab. A native Win
 The Rust executable includes a read-only connection check for configured media integrations. Run it from the repository root with the service running:
 
 ```shell
-docker compose exec subtitle-converter subforge integration-check bazarr
+docker compose exec subforge subforge integration-check bazarr
 ```
 
 Replace `bazarr` with `sonarr`, `radarr`, or `jellyfin` to check another integration. The diagnostic uses the converter's configured credentials, prints only the provider, connection result, and—for Jellyfin—library/selection counts. It does not print server addresses, library names, API keys, or raw server responses. A nonzero exit status means the configured connection check failed; use the dashboard's safe diagnostic and service logs for next steps. This check verifies connectivity only and does not change server settings or queue scans.
@@ -293,7 +313,7 @@ PowerShell example with two Windows media roots and persistent application data:
 ```powershell
 $subforgeData = Join-Path $env:LOCALAPPDATA 'Subforge'
 New-Item -ItemType Directory -Force -Path $subforgeData | Out-Null
-cargo run --manifest-path .\subtitle-converter\Cargo.toml -- --host 127.0.0.1 --data $subforgeData --root 'D:\Media\Movies' --root 'D:\Media\TV'
+cargo run --manifest-path .\subforge\Cargo.toml -- --host 127.0.0.1 --data $subforgeData --root 'D:\Media\Movies' --root 'D:\Media\TV'
 ```
 
 On macOS/Linux, use native paths and a user state directory:
@@ -301,7 +321,7 @@ On macOS/Linux, use native paths and a user state directory:
 ```shell
 subforge_data="${XDG_STATE_HOME:-$HOME/.local/state}/subforge"
 mkdir -p "$subforge_data"
-cargo run --manifest-path subtitle-converter/Cargo.toml -- --host 127.0.0.1 --data "$subforge_data" --root /srv/media/movies --root /srv/media/tv
+cargo run --manifest-path subforge/Cargo.toml -- --host 127.0.0.1 --data "$subforge_data" --root /srv/media/movies --root /srv/media/tv
 ```
 
 The native server enables persisted scheduled tasks by default; pass `--no-auto-scan` to disable automatic scheduling. Set environment variables such as `CONVERTER_ENABLE_OCR`, `CONVERTER_OCR_LANGUAGE`, and the media-server integration URLs/keys in the shell environment before running. Keep API keys private.
@@ -311,13 +331,13 @@ The native server enables persisted scheduled tasks by default; pass `--no-auto-
 Run the Rust test suite from the repository root:
 
 ```shell
-cargo test --locked --manifest-path subtitle-converter/Cargo.toml
+cargo test --locked --manifest-path subforge/Cargo.toml
 ```
 
 Build the production binary without updating locked dependencies:
 
 ```shell
-cargo build --locked --release --manifest-path subtitle-converter/Cargo.toml
+cargo build --locked --release --manifest-path subforge/Cargo.toml
 ```
 
 The locked Rust dependencies use rustls 0.23.46, which fixes RustSec advisories RUSTSEC-2026-0346, -0347, -0348, and -0349 ([upstream release](https://github.com/rustls/rustls/releases/tag/v%2F0.23.46), [RustSec advisory database](https://rustsec.org/)). Existing installations need a rebuilt image to receive the dependency fix. The rustls change is a dependency security fix; this release also updates OCR and job scheduling as described above. Current checks pass for both strict locked RustSec audits (130 application and 157 native-OCR lockfile packages) and workflow linting. All 11 native helper tests pass with strict Clippy, including Arabic visual-to-logical ordering; direct CPU recognition has produced the expected exact English (`HELLO WORLD`), French (`L'ÉTÉ À PARIS`), and Arabic (`مرحبا بالعالم`) fixture text. The full CPU SUP-to-SRT extraction pipeline now passes for English, French, and Arabic, and confirms existing SRT files are preserved. The Rust HTTP text-conversion and 512 MiB resource smokes pass; OCR also passes within a 1.5 GiB memory limit. Direct CUDA recognition in the deployed image has produced the exact English, French, and Arabic fixture text. The full CUDA SUP-to-SRT smoke passes in an isolated test container for 200 English cues plus French and Arabic SUP fixtures, observing the CUDA backend and GPU worker, expected text, source preservation, and a cached repeat. Runtime performance benchmarking remains pending.
@@ -325,16 +345,16 @@ The locked Rust dependencies use rustls 0.23.46, which fixes RustSec advisories 
 The CPU and CUDA Dockerfiles build the Rust app, OCR helper, and test-only `subforge-smoke` CLI. The `test` target is a disposable fixture image. The CPU `extraction` procedure generates SUP image-subtitle fixtures with Subtitle Edit for English, French, and Arabic, runs them through the service, checks expected script/text in the resulting SRTs, and confirms an existing SRT and the SUP inputs remain unchanged; this full CPU SUP-to-SRT pipeline has passed. `extraction --text-only` checks supported text conversions and preservation without image OCR. Build the test image and run these checks without network access:
 
 ```shell
-docker build --target test --tag homelab-subtitle-converter:0.4.4-cpu-test subtitle-converter
-docker run --rm --network none --entrypoint /usr/local/bin/subforge-smoke homelab-subtitle-converter:0.4.4-cpu-test extraction
-docker run --rm --network none --entrypoint /usr/local/bin/subforge-smoke homelab-subtitle-converter:0.4.4-cpu-test extraction --text-only
+docker build --target test --tag homelab-subforge:0.4.4-cpu-test subforge
+docker run --rm --network none --entrypoint /usr/local/bin/subforge-smoke homelab-subforge:0.4.4-cpu-test extraction
+docker run --rm --network none --entrypoint /usr/local/bin/subforge-smoke homelab-subforge:0.4.4-cpu-test extraction --text-only
 ```
 
 For the full CUDA SUP-to-SRT smoke on a compatible Linux/amd64 host, build the CUDA test target and expose only NVIDIA device 0. Direct native CUDA recognition in the deployed image matched the exact English (`HELLO WORLD`), French (`L'ÉTÉ À PARIS`), and Arabic (`مرحبا بالعالم`) fixture text. The full GPU smoke has also passed in an isolated test container: 200 English cues plus French and Arabic SUP fixtures were recognized with the CUDA backend and GPU worker observed, sources preserved, and a repeated extraction served from the OCR cache. Runtime performance benchmarking remains pending. To repeat the smoke:
 
 ```shell
-docker build --platform linux/amd64 --file subtitle-converter/Dockerfile.cuda --target test --tag homelab-subtitle-converter:0.4.4-cuda-test subtitle-converter
-docker run --rm --gpus device=0 --network none --entrypoint /usr/local/bin/subforge-smoke homelab-subtitle-converter:0.4.4-cuda-test gpu --cues 200
+docker build --platform linux/amd64 --file subforge/Dockerfile.cuda --target test --tag homelab-subforge:0.4.4-cuda-test subforge
+docker run --rm --gpus device=0 --network none --entrypoint /usr/local/bin/subforge-smoke homelab-subforge:0.4.4-cuda-test gpu --cues 200
 ```
 
 The same single-line `docker build` and `docker run` commands work in Windows PowerShell with Docker Desktop WSL 2 GPU support enabled. CPU and CUDA test targets contain no Python runtime. GPU behavior depends on the host and driver; the fixture smoke establishes this pipeline on the tested host, while performance on a particular workload remains unmeasured.

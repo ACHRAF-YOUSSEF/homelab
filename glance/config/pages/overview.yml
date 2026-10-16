@@ -169,12 +169,12 @@
               name: Stirling PDF
               icon: sh:stirling-pdf
               url: ${HOMELAB_URL}:48537
-            subtitle-worker:
+            subtitle-studio:
               name: Subtitle Studio
               description: Local subtitle transcription and translation
               icon: /assets/subtitle-studio.svg
               url: ${HOMELAB_URL}:8099
-            subtitle-converter:
+            subforge:
               name: Subforge
               description: Subtitle extraction and OCR
               icon: /assets/subforge.svg?v=2

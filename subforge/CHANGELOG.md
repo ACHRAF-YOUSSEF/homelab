@@ -10,7 +10,7 @@
 - Pass 512 MiB text/resource and 1.5 GiB OCR resource fixtures. Direct CUDA recognition in the deployed image matches exact English, French, and Arabic fixture text. The full CUDA SUP-to-SRT smoke passes for 200 English cues plus French and Arabic fixtures, with the CUDA backend and GPU worker observed, sources preserved, and cached repeat confirmed. GPU sessions reject sessions that MNN silently creates on CPU after CUDA setup fails, while individual unsupported operators may still execute on CPU within an admitted CUDA session. Runtime performance benchmarking remains pending.
 - Bound concurrent selected-file jobs by global worker admission while keeping full-library scans and inventory/maintenance work exclusive; expose active jobs while retaining `running` compatibility.
 - Persist and deduplicate validated Bazarr SRT publication receipts, scan after the queue drains, and verify uncertain attempts without blind replay; classify raw socket timeouts consistently and treat transport loss after a scan PATCH as uncertain while keeping explicit HTTP and connection-refused errors definite.
-- Publish matching local `0.4.4-cpu` and `0.4.4-cuda` image tags.
+- Publish local `homelab-subforge:0.4.4-cpu` and `homelab-subforge:0.4.4-cuda` image tags.
 ## 0.4.3 — 2026-10-15
 
 - Prioritize conversion and local worker controls together on Overview, with a compact library summary and actionable failure and OCR counts.
@@ -45,7 +45,7 @@
 
 ## 0.3.1
 
-- Split Subforge into fixed local tags `homelab-subtitle-converter:0.3.1-cpu` and `homelab-subtitle-converter:0.3.1-cuda`; Compose starts prebuilt images and never builds or pulls them.
+- At this historical release, before the service rename, split Subforge into former fixed local tags `homelab-subtitle-converter:0.3.1-cpu` and `homelab-subtitle-converter:0.3.1-cuda`; Compose started those prebuilt images and never built or pulled them.
 - Start the service with the regular Compose stack after building the selected local image; use the CUDA override when running the CUDA edition.
 - Compile the image edition into the Rust binary and report it in the API and dashboard; GPU OCR requires the CUDA edition plus explicit runtime permissions and an allocated GPU worker.
 - Keep the CPU image Python-free, build the CUDA Rust binary in its own stage, and isolate locked Python/PaddleOCR tools in a separately cacheable stage.

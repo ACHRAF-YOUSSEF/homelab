@@ -73,6 +73,10 @@ subtitle-worker/data
 subtitle-worker/models
 subtitle-worker/output
 subtitle-worker/library
+subtitle-studio/data
+subtitle-studio/models
+subtitle-studio/output
+subtitle-studio/library
 
 **/*.log
 **/*.tmp

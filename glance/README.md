@@ -129,9 +129,9 @@ configured endpoint groups, rejects other HTTP methods with `POST=0`, and
 publishes no host port. See
 [Docker API access](../README.md#docker-api-access) for the other Docker clients.
 
-The `subtitle-converter` container has an explicit **Subforge** display name,
-current icon, and `${SUBFORGE_PUBLIC_URL}` link. Without that mapping, automatic
-name formatting displays it as **Subtitle Converter** with Docker's generic icon.
+The `subforge` container has an explicit **Subforge** display name, current
+icon, and `${SUBFORGE_PUBLIC_URL}` link. Without that mapping, automatic name
+formatting uses the service name and Docker's generic icon.
 
 ## Security and proxy access
 
@@ -156,7 +156,7 @@ The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling
 | [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; processed-file count, queued jobs, configured roots, recent failures, current run/progress, and selected languages | `15s` |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
 
-The Subforge widget is optional. The `subtitle-converter` service starts with
+The Subforge widget is optional. The `subforge` service starts with
 the regular Compose stack after its selected local image has been built. The
 token only enables the widget endpoint. Set a private random
 `CONVERTER_WIDGET_TOKEN` of 32–256 characters in the ignored root `.env`; the
@@ -166,11 +166,13 @@ The widget endpoint returns only aggregate status and does not expose media
 paths or accept actions. Its link uses `SUBFORGE_PUBLIC_URL` (default
 `http://localhost:8100`); its server-side request uses
 `GLANCE_SUBFORGE_INTERNAL_URL` (default
-`http://subtitle-converter:8100`). The internal URL must be reachable on the
+`http://subforge:8100`). When upgrading from the former service name, change
+an explicit `.env` value that still points to `subtitle-converter` to
+`http://subforge:8100`. The internal URL must be reachable on the
 Compose network. A blank token disables the endpoint; a 401 response means the
 two token values do not match.
 
-The separate Subforge service monitor checks the converter's unauthenticated
+The separate Subforge service monitor checks the service's unauthenticated
 `/health` endpoint. This reports whether the service is reachable even when the
 optional widget token is blank; the Subforge dashboard itself still requires
 Basic Authentication.
@@ -178,14 +180,14 @@ Basic Authentication.
 After changing the token in `.env`, recreate both containers to apply it:
 
 ```shell
-docker compose up -d --force-recreate glance subtitle-converter
+docker compose up -d --force-recreate glance subforge
 ```
 
 Run the matching command from the repository root. For a CUDA deployment, use
 the CUDA override so recreating the service keeps its selected image:
 
 ```shell
-docker compose -f docker-compose.yml -f compose/subtitle-converter.cuda.yml up -d --force-recreate glance subtitle-converter
+docker compose -f docker-compose.yml -f compose/subforge.cuda.yml up -d --force-recreate glance subforge
 ```
 
 After changing only a Subforge public or internal URL, recreate Glance with the

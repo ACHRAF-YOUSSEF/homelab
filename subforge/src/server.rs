@@ -767,7 +767,7 @@ impl App {
             );
         }
         let hosts = std::env::var("CONVERTER_ALLOWED_HOSTS")
-            .unwrap_or_else(|_| "localhost,127.0.0.1,::1,subtitle-converter".into())
+            .unwrap_or_else(|_| "localhost,127.0.0.1,::1,subforge,subtitle-converter".into())
             .split(',')
             .map(|host| host.trim().to_lowercase())
             .filter(|host| !host.is_empty())

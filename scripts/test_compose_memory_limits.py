@@ -25,6 +25,55 @@ class ComposeMemoryToolTests(unittest.TestCase):
                 {"alpha": 128 * TOOL.MIB, "beta": 2 * 1024 * TOOL.MIB},
             )
 
+    def test_nested_memory_defaults_use_literal_fallbacks_without_environment_reads(self):
+        value = "${SUBTITLE_STUDIO_MEMORY_LIMIT:-${SUBTITLE_WORKER_MEMORY_LIMIT:-1g}}"
+        with patch.dict(
+            TOOL.os.environ,
+            {"SUBTITLE_STUDIO_MEMORY_LIMIT": "6g", "SUBTITLE_WORKER_MEMORY_LIMIT": "3g"},
+        ):
+            self.assertEqual(TOOL.parse_size(value), 1024 * TOOL.MIB)
+
+    def test_memory_default_syntax_and_nesting_are_bounded(self):
+        invalid_values = (
+            "${LIMIT:-}",
+            "${LIMIT:-1g",
+            "${LIMIT:-prefix${OTHER:-1g}}",
+            "${LIMIT:-1g}suffix",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaises(TOOL.ToolError):
+                TOOL.parse_size(value)
+
+        nested = "1g"
+        for depth in range(TOOL.MAX_ENV_DEFAULT_DEPTH):
+            nested = f"${{LIMIT_{depth}:-{nested}}}"
+        self.assertEqual(TOOL.parse_size(nested), 1024 * TOOL.MIB)
+        too_deep = f"${{LIMIT:-{nested}}}"
+        with self.assertRaises(TOOL.ToolError):
+            TOOL.parse_size(too_deep)
+
+    def test_cuda_overlay_limits_do_not_replace_base_compose_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            compose = Path(directory)
+            (compose / "base.yml").write_text(
+                "services:\n  subtitle-studio:\n    mem_limit: ${STUDIO_LIMIT:-${WORKER_LIMIT:-1g}}\n",
+                encoding="utf-8",
+            )
+            (compose / "subtitle-studio.cuda.yml").write_text(
+                "services:\n  subtitle-studio:\n    mem_limit: 6g\n  cuda-only:\n    mem_limit: 2g\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                TOOL.compose_caps(compose, {"subtitle-studio"}),
+                {"subtitle-studio": 1024 * TOOL.MIB},
+            )
+
+    def test_repository_base_compose_defaults_match_service_allowlist(self):
+        caps = TOOL.compose_caps()
+        self.assertEqual(set(caps), TOOL.SERVICE_ALLOWLIST)
+        self.assertEqual(caps["subtitle-studio"], 1024 * TOOL.MIB)
+        self.assertEqual(caps["subforge"], TOOL.OCR_MINIMUM_MEMORY)
+
     def test_updates_target_immutable_id_and_detects_recreated_container(self):
         record = {"id": "immutable-id", "service": "open-webui"}
         observed = {"id": "immutable-id", "service": "open-webui", "memory": 0, "memory_swap": 0}

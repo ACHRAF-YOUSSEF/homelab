@@ -125,11 +125,11 @@ jobs:
           cache: false
 
       - name: Check Rust formatting
-        working-directory: subtitle-worker
+        working-directory: subtitle-studio
         run: cargo fmt --all -- --check
 
       - name: Run Rust lint and tests with warnings denied
-        working-directory: subtitle-worker
+        working-directory: subtitle-studio
         env:
           RUSTFLAGS: -D warnings
         run: |
@@ -140,7 +140,7 @@ jobs:
         run: cargo install --locked cargo-audit --version 0.22.2
 
       - name: Audit locked Rust dependencies
-        working-directory: subtitle-worker
+        working-directory: subtitle-studio
         run: cargo audit --file Cargo.lock --deny warnings
 
   subtitle-studio-cpu-runtime:
@@ -154,7 +154,7 @@ jobs:
           persist-credentials: false
 
       - name: Build CPU-only runtime image
-        run: docker build --tag subtitle-studio-runtime:test subtitle-worker
+        run: docker build --tag subtitle-studio-runtime:test subtitle-studio
 
       - name: Check isolated runtime and SRT validator without a model
         run: |
@@ -311,7 +311,7 @@ jobs:
             --memory 96m --cpus 0.50 --pids-limit 32 \
             glance-live-probe:test --seconds 10
 
-  subtitle-converter-rust:
+  subforge-rust:
     name: Subforge Rust checks and dependency audit
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -330,13 +330,13 @@ jobs:
           cache: false
 
       - name: Check Rust formatting
-        working-directory: subtitle-converter
+        working-directory: subforge
         run: |
           cargo fmt --all -- --check
           cargo fmt --manifest-path native-ocr/Cargo.toml -- --check
 
       - name: Run Rust lint and tests with warnings denied
-        working-directory: subtitle-converter
+        working-directory: subforge
         env:
           RUSTFLAGS: -D warnings
         run: |
@@ -353,7 +353,7 @@ jobs:
         run: cargo install --locked cargo-audit --version 0.22.2
 
       - name: Audit locked Rust dependencies
-        working-directory: subtitle-converter
+        working-directory: subforge
         run: |
           cargo audit --file Cargo.lock --deny warnings
           cargo audit --file native-ocr/Cargo.lock --deny warnings
@@ -369,10 +369,10 @@ jobs:
           persist-credentials: false
 
       - name: Build, lint, and test the standalone CPU OCR helper
-        run: docker build --target native-ocr-build --tag subforge-native-ocr-build:test subtitle-converter
+        run: docker build --target native-ocr-build --tag subforge-native-ocr-build:test subforge
 
       - name: Build isolated Rust runtime test stage
-        run: docker build --target test --tag subtitle-converter-test subtitle-converter
+        run: docker build --target test --tag subforge-test subforge
 
       - name: Test text extraction with OCR disabled in a 512 MiB memory limit
         run: |
@@ -381,7 +381,7 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
             --env OMP_THREAD_LIMIT=1 \
             --entrypoint /usr/local/bin/subforge-smoke \
-            subtitle-converter-test extraction --text-only
+            subforge-test extraction --text-only
 
       - name: Test OCR extraction without network or host media
         run: |
@@ -390,14 +390,14 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
             --env OMP_THREAD_LIMIT=1 \
             --entrypoint /usr/local/bin/subforge-smoke \
-            subtitle-converter-test extraction
+            subforge-test extraction
 
       - name: Test actual CPU and memory telemetry in an isolated container
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --memory 512m --cpus 2 --pids-limit 128 \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-            --entrypoint /usr/local/bin/subforge-smoke subtitle-converter-test resources \
+            --entrypoint /usr/local/bin/subforge-smoke subforge-test resources \
             --expected-cpus 2 --expected-memory-mib 512
 
   frontend-dependencies:
@@ -423,15 +423,15 @@ jobs:
         run: |
           node --check glance/config/assets/media-live.js
           node --check glance/config/assets/widget-live.js
-          node --check subtitle-worker/web/app.js
-          node --check subtitle-converter/web/app.js
+          node --check subtitle-studio/web/app.js
+          node --check subforge/web/app.js
 
       - name: Run Subtitle Studio frontend regression tests
-        run: node --test subtitle-worker/test_*.cjs
+        run: node --test subtitle-studio/test_*.cjs
 
       # Audit the lockfile without installing or executing repository packages.
       - name: Audit frontend and development dependencies
-        run: pnpm --dir subtitle-worker audit --audit-level moderate
+        run: pnpm --dir subtitle-studio audit --audit-level moderate
 
   dockerfiles-and-lockfiles:
     name: Dockerfile and lockfile security audit
@@ -451,4 +451,4 @@ jobs:
             fs --scanners vuln,misconfig --include-dev-deps \
             --severity HIGH,CRITICAL --exit-code 1 --timeout 10m \
             --cache-dir /tmp/trivy-cache --skip-dirs /repo/.git \
-            --skip-dirs /repo/subtitle-worker/node_modules /repo
+            --skip-dirs /repo/subtitle-studio/node_modules /repo

@@ -47,6 +47,10 @@ id_ed25519
 /subtitle-worker/models/
 /subtitle-worker/output/
 /subtitle-worker/library/
+/subtitle-studio/data/
+/subtitle-studio/models/
+/subtitle-studio/output/
+/subtitle-studio/library/
 
 # Python environments, bytecode, and tool caches in any component.
 __pycache__/
@@ -92,3 +96,6 @@ subtitle-converter/native-ocr/target/
 glance/live/target/
 glance/jellyfin-counts-cache/target/
 subtitle-worker/target/
+subtitle-studio/target/
+subforge/target/
+subforge/native-ocr/target/

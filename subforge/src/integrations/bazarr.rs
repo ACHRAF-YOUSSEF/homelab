@@ -804,7 +804,7 @@ mod tests {
     }
     enum ReplyTiming {
         After(Duration),
-        ClientDisconnect,
+        HoldThroughDeadline(std::sync::mpsc::Receiver<Instant>),
     }
 
     type WireReply = (String, String, Option<u16>, ReplyTiming, Option<usize>);
@@ -868,21 +868,20 @@ mod tests {
                 requests.push(request);
                 match delay {
                     ReplyTiming::After(delay) => thread::sleep(delay),
-                    ReplyTiming::ClientDisconnect => {
-                        // Never race a late response/close against the client
-                        // deadline. Keep the request open until the client
-                        // times out; the existing socket read timeout bounds
-                        // this fixture if the client fails to disconnect.
-                        let mut byte = [0_u8; 1];
-                        match stream.read(&mut byte) {
-                            Ok(0) => {}
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
-                                ) => {}
-                            _ => panic!("Bazarr timeout fixture client did not disconnect"),
-                        }
+                    ReplyTiming::HoldThroughDeadline(deadline) => {
+                        // A peer read/EOF or a separate socket timeout must not
+                        // close this response before the deadline under test:
+                        // that tests an uncertain transport failure instead.
+                        // The caller supplies the same absolute deadline used
+                        // by the scan, after settings/fixture setup completes.
+                        let deadline = deadline
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("Bazarr fixture scan deadline was not supplied");
+                        thread::sleep(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .saturating_add(Duration::from_millis(100)),
+                        );
                         continue;
                     }
                 }
@@ -1326,18 +1325,21 @@ mod tests {
 
     #[test]
     fn scan_timeout_preserves_partial_receipts_and_never_retries() {
-        let (_temporary, integration, server) =
-            partial_receipt_fixture(Some(204), ReplyTiming::ClientDisconnect);
+        let (deadline_sender, deadline_receiver) = std::sync::mpsc::sync_channel(1);
+        let (_temporary, integration, server) = partial_receipt_fixture(
+            Some(204),
+            ReplyTiming::HoldThroughDeadline(deadline_receiver),
+        );
         let paths: Vec<_> = (1..=3)
             .map(|id| format!("/tv/Fixture{id}/Episode.en.srt"))
             .collect();
+        // Inventory GETs and the first acknowledged PATCH share the deadline.
+        // Give those setup requests slack on loaded builders while withholding
+        // only the second PATCH response through this exact deadline.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        deadline_sender.send(deadline).unwrap();
         let result = integration
-            .bazarr_scan_paths_until(
-                &paths,
-                &AtomicBool::new(false),
-                &mut |_| {},
-                Instant::now() + Duration::from_secs(1),
-            )
+            .bazarr_scan_paths_until(&paths, &AtomicBool::new(false), &mut |_| {}, deadline)
             .unwrap()
             .notification();
         assert_eq!(result["ok"], false);

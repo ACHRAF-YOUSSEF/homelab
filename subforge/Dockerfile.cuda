@@ -74,7 +74,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/subforge-worker /build/subforge-worker \
     && cp target/release/subforge-smoke /build/subforge-smoke
 
-FROM homelab-subtitle-converter:0.4.4-cpu AS cuda-runtime-app
+FROM homelab-subforge:0.4.4-cpu AS cuda-runtime-app
 USER root
 COPY --from=native-ocr-build /opt/subforge-ocr /usr/local/bin/subforge-ocr
 COPY --from=native-ocr-build /opt/native-libs/ /usr/local/lib/

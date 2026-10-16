@@ -93,15 +93,42 @@ file cache. Transcription and the cached follow-up completed in about 2.3
 seconds; cumulative container CPU time was 2.9 seconds. No OOM kill occurred.
 This short quantized-tiny fixture is not a peak-memory benchmark for movies,
 the default `small-q5_1` model, LM Studio, CUDA or translation quality. There
-is no comparable Python baseline or claimed percentage reduction. The optional
-full `large-v3` model uses the CUDA image and a suggested initial 6 GiB
-container ceiling; that ceiling has not been measured with this model. GPU VRAM
-is separate from the container's RAM ceiling and is shared with host GPU
-applications such as LM Studio. The component guide documents the model and
-CUDA setup.
+is no comparable Python baseline or claimed percentage reduction.
+
+## Subtitle Studio full large-v3 CUDA validation
+
+A separate short CUDA validation used the full official `large-v3` GGML model,
+a public JFK fixture converted to MKV, and the isolated CUDA test image on an
+RTX 3060 with 12 GiB VRAM. It ran as UID/GID 1000 with a read-only root, all
+capabilities dropped, no network, a 6 GiB memory ceiling, a 2 CPU quota,
+and a 64-process ceiling. The fixture input and preloaded model were read-only mounts;
+job data and outputs used temporary filesystems. A fresh transcription
+produced three source cues and a valid SRT. A second job reused the transcript
+cache. The production CUDA image was separately checked to contain no Python,
+Cargo, Rust compiler, probe, or unit-test executable.
+
+| Measure | Observed value |
+|---|---:|
+| Elapsed time for both jobs | 11.34 seconds |
+| Container CPU time | 3.52 seconds |
+| Server RSS before / after transcription | 3.44 / 3.59 MiB |
+| Sampled container memory | 351.5 MiB |
+| Kernel-recorded container memory peak | 369.2 MiB |
+| Whole-device VRAM at start / observed peak | 1007 / 5102 MiB |
+| OOM events | 0 |
+
+The VRAM numbers are whole-device `nvidia-smi` readings and include other GPU
+applications; they do not isolate Subtitle Studio's allocation. The short
+fixture does not establish movie-length peak memory, transcription quality,
+named-volume cold-start behavior, a minimum safe limit, or a Python comparison.
+Filesystem cache accounting and cold versus warm model state affect container
+memory samples. Keep 6 GiB as a starting ceiling until representative media
+and concurrent LM Studio use have been measured on the target host. The
+[component guide](../subtitle-studio/README.md) documents the model and CUDA
+setup.
 
 The optional Docker `test` target includes the
-[Rust fixture probe](../subtitle-worker/src/bin/subtitle-studio-probe.rs).
+[Rust fixture probe](../subtitle-studio/src/bin/subtitle-studio-probe.rs).
 Production excludes the probe. The server unloads Whisper between bounded
 audio chunks and before LLM translation/review. The UI's Resources disclosure
 and `/api/resources` provide on-demand samples; unavailable measurements stay
@@ -114,13 +141,13 @@ The root `.env.example` provides these adjustable ceilings for selected workload
 | Container | Default ceiling |
 |---|---:|
 | Open WebUI | 1280 MiB |
-| Subtitle Studio worker | 1 GiB CPU default; 6 GiB suggested starting ceiling for full `large-v3` CUDA |
+| Subtitle Studio | 1 GiB CPU default; 6 GiB suggested starting ceiling for full `large-v3` CUDA |
 | Stirling PDF | 1536 MiB |
 | TubeArchivist Elasticsearch | 1536 MiB |
 | Subforge default, OCR disabled | 1536 MiB |
 | Subforge text-only option | 512 MiB |
 
-The first four values can be changed through `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_WORKER_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, and `ARCHIVIST_ES_MEMORY_LIMIT`. Subtitle Studio defaults to `1g`, `2` CPUs, and 64 processes. Whisper is CPU-only by default with two threads, one pipeline worker, and 300-second WAV chunks; the worker releases its model between chunks before translation/review. CUDA is available only through the optional CUDA Compose override. Full `large-v3` uses a suggested `6g` worker ceiling as a starting point; this was not benchmarked on the target workload, and GPU VRAM is a separate shared resource. These are configured bounds and do not predict a specific working set; translation model memory belongs to the LM Studio process. Subforge uses `CONVERTER_MEMORY_LIMIT`; its Compose and `.env.example` default is `1536m` with image OCR disabled. Text-only deployments can lower it to `512m` after considering their formats and workload. Image-subtitle OCR is opt-in with `CONVERTER_ENABLE_OCR=true` and needs the `1536m` ceiling. Keep OCR disabled to lock image-based subtitle extraction; some text sidecars, including TTML and SBV, still use the bounded Subtitle Edit converter when OCR is off. Recreate the affected container after changing a Compose environment value or memory limit. OCR and other converter child processes count against the same container ceiling.
+The first four values can be changed through `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_STUDIO_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, and `ARCHIVIST_ES_MEMORY_LIMIT`. Subtitle Studio defaults to `1g`, `2` CPUs, and 64 processes. If the canonical Studio ceiling settings are unset, Compose accepts the legacy `SUBTITLE_WORKER_MEMORY_LIMIT` and `SUBTITLE_WORKER_CPUS` variables; canonical values take precedence when both forms are set. Whisper is CPU-only by default with two threads, one pipeline worker, and 300-second WAV chunks; the worker releases its model between chunks before translation/review. CUDA is available only through the optional CUDA Compose override. Full `large-v3` uses a suggested `6g` worker ceiling as a starting point; one short CUDA fixture stayed below this limit, but that run does not establish a minimum safe ceiling. GPU VRAM is a separate shared resource. These configured bounds do not predict a specific working set; translation model memory belongs to the LM Studio process. Subforge uses `CONVERTER_MEMORY_LIMIT`; its Compose and `.env.example` default is `1536m` with image OCR disabled. Text-only deployments can lower it to `512m` after considering their formats and workload. Image-subtitle OCR is opt-in with `CONVERTER_ENABLE_OCR=true` and needs the `1536m` ceiling. Keep OCR disabled to lock image-based subtitle extraction; some text sidecars, including TTML and SBV, still use the bounded Subtitle Edit converter when OCR is off. Recreate the affected container after changing a Compose environment value or memory limit. OCR and other converter child processes count against the same container ceiling.
 
 Subforge converts one input at a time and limits the OCR OpenMP thread count. Its four HTTP workers and job queue are bounded, but that does not reserve memory for the host or reduce memory used by unrelated services.
 

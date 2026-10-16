@@ -2,8 +2,9 @@
 """Dry-run-first memory caps for this repository's Compose project.
 
 Only containers carrying the fixed Compose project label and a service name
-with an explicit ``mem_limit`` in ``compose/*.yml`` are considered. Applying
-limits is opt-in and saves exact memory/swap values for restoration.
+with an explicit ``mem_limit`` in base Compose files are considered. Optional
+GPU overlays are excluded from configured defaults. Applying limits is opt-in
+and saves exact memory/swap values for restoration.
 """
 
 from __future__ import annotations
@@ -21,10 +22,10 @@ from typing import Any
 
 PROJECT = "homelab"
 SERVICE_ALLOWLIST = {
-    "open-webui", "searxng", "n8n", "subtitle-worker", "unbound", "adguardhome",
+    "open-webui", "searxng", "n8n", "subtitle-studio", "unbound", "adguardhome",
     "tunnel", "cloudflare-ddns", "docker-proxy", "portracker", "nginx-proxy-manager",
     "jellyfin-counts-cache", "glance", "glance-live", "uptime-kuma", "qbittorrent",
-    "prowlarr", "sonarr", "radarr", "seerr", "bazarr", "subtitle-converter", "tdarr",
+    "prowlarr", "sonarr", "radarr", "seerr", "bazarr", "subforge", "tdarr",
     "metube", "tubearchivist", "archivist-redis", "archivist-es",
     "nextcloud-docker-proxy", "nextcloud-aio-mastercontainer", "hbbs", "hbbr",
     "it-tools", "stirling-pdf",
@@ -35,8 +36,10 @@ STATE_PATH = Path(tempfile.gettempdir()) / "homelab-compose-memory-limits.json"
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE_LINE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 MEM_LINE = re.compile(r"^    mem_limit:\s*(\S+)\s*$")
-ENV_DEFAULT = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]+)}$")
+ENV_DEFAULT_PREFIX = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):-")
 SIZE = re.compile(r"^(\d+)([bkmg]?)$", re.IGNORECASE)
+MAX_ENV_DEFAULT_DEPTH = 8
+MAX_MEM_LIMIT_VALUE_LENGTH = 256
 INSPECT_FORMAT = (
     '{{.Id}}|{{.State.Running}}|{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}|'
     '{{index .Config.Labels "com.docker.compose.service"}}|'
@@ -48,10 +51,50 @@ class ToolError(RuntimeError):
     pass
 
 
+def _literal_environment_default(value: str, depth: int = 0) -> str:
+    """Resolve Compose's literal defaults without reading process environment."""
+    if len(value) > MAX_MEM_LIMIT_VALUE_LENGTH:
+        raise ToolError("A Compose mem_limit value has unsupported syntax.")
+    if not value.startswith("${"):
+        return value
+    if depth >= MAX_ENV_DEFAULT_DEPTH:
+        raise ToolError("A Compose mem_limit value has unsupported syntax.")
+
+    nesting = 0
+    closing = -1
+    index = 0
+    while index < len(value):
+        if value.startswith("${", index):
+            nesting += 1
+            index += 2
+            continue
+        if value[index] == "}":
+            nesting -= 1
+            if nesting < 0:
+                raise ToolError("A Compose mem_limit value has unsupported syntax.")
+            if nesting == 0:
+                closing = index
+                break
+        index += 1
+    if closing != len(value) - 1:
+        raise ToolError("A Compose mem_limit value has unsupported syntax.")
+
+    body = value[2:closing]
+    prefix = ENV_DEFAULT_PREFIX.match(body)
+    if not prefix:
+        raise ToolError("A Compose mem_limit value has unsupported syntax.")
+    default = body[prefix.end():]
+    if "${" in default:
+        if not default.startswith("${"):
+            raise ToolError("A Compose mem_limit value has unsupported syntax.")
+        return _literal_environment_default(default, depth + 1)
+    if "{" in default or "}" in default:
+        raise ToolError("A Compose mem_limit value has unsupported syntax.")
+    return default
+
+
 def parse_size(value: str) -> int:
-    default = ENV_DEFAULT.fullmatch(value)
-    if default:
-        value = default.group(1)
+    value = _literal_environment_default(value)
     match = SIZE.fullmatch(value)
     if not match:
         raise ToolError("A Compose mem_limit value has unsupported syntax.")
@@ -65,6 +108,8 @@ def compose_caps(compose_dir: Path | None = None, expected_services: set[str] | 
     directory = compose_dir or ROOT / "compose"
     caps: dict[str, int] = {}
     for path in sorted(directory.glob("*.yml")):
+        if path.name.endswith(".cuda.yml"):
+            continue
         in_services = False
         current: str | None = None
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -235,8 +280,8 @@ def apply(caps: dict[str, int], path: Path) -> dict[str, Any]:
     found = discover(caps)
     if not found:
         raise ToolError("No containers from the fixed Compose project were found.")
-    converter = next((item for item in found if item["service"] == "subtitle-converter"), None)
-    if converter and converter_ocr_enabled(converter["id"]) and caps["subtitle-converter"] < OCR_MINIMUM_MEMORY:
+    converter = next((item for item in found if item["service"] == "subforge"), None)
+    if converter and converter_ocr_enabled(converter["id"]) and caps["subforge"] < OCR_MINIMUM_MEMORY:
         raise ToolError("OCR is enabled in the converter; its declared memory limit must be at least 1536 MiB.")
     snapshot = [dict(item) for item in found]
     write_snapshot(path, snapshot)

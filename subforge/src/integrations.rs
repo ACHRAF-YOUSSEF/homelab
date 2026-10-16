@@ -393,7 +393,7 @@ fn request_response_bounded(
             Auth::Jellyfin => {
                 let token = encode_component(key);
                 let value = format!(
-                    "MediaBrowser Client=\"Subforge\", Device=\"Subtitle converter\", DeviceId=\"subforge\", Version=\"1\", Token=\"{token}\""
+                    "MediaBrowser Client=\"Subforge\", Device=\"Subforge\", DeviceId=\"subforge\", Version=\"1\", Token=\"{token}\""
                 );
                 builder = builder.header("Authorization", value);
             }
@@ -1682,7 +1682,7 @@ mod tests {
         let key = "a secret+/token";
         let encoded = encode_component(key);
         let header = format!(
-            "MediaBrowser Client=\"Subforge\", Device=\"Subtitle converter\", DeviceId=\"subforge\", Version=\"1\", Token=\"{encoded}\""
+            "MediaBrowser Client=\"Subforge\", Device=\"Subforge\", DeviceId=\"subforge\", Version=\"1\", Token=\"{encoded}\""
         );
         let url = fixture(
             "200 OK",

@@ -177,7 +177,7 @@ function updateWhisperSelection() {
   const selected = $('whisper-select').value;
   const downloaded = state.whisperModels.get(selected);
   const availability = state.whisperLocalOnly && !downloaded
-    ? `Not downloaded locally. Run: docker compose run --rm subtitle-worker download-model ${selected}`
+    ? `Not downloaded locally. Run: docker compose run --rm subtitle-studio download-model ${selected}`
     : downloaded
       ? 'Downloaded locally. A different model needs a new transcription unless its result is cached.'
       : 'This model will be downloaded when first used.';
