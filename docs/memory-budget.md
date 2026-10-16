@@ -15,7 +15,7 @@ application bounds reduce unbounded growth but do not guarantee a particular
 working set or host capacity; oversized or failed upstream updates mark the
 topic stale and preserve its last valid snapshot.
 
-The checked-in default `mem_limit` values across the Compose files sum to **18,304 MiB (17.875 GiB)**. The nine optional Nextcloud AIO child limits below add **7,680 MiB (7.5 GiB)**, for a combined ceiling of **25,984 MiB (25.375 GiB)**. This is a configured upper bound, not expected usage or a safe host-RAM recommendation. The Compose total changes if you edit the limits.
+The checked-in default `mem_limit` values across the Compose files sum to **16,256 MiB (15.875 GiB)**. The nine optional Nextcloud AIO child limits below add **7,680 MiB (7.5 GiB)**, for a combined ceiling of **23,936 MiB (23.375 GiB)**. This is a configured upper bound, not expected usage or a safe host-RAM recommendation. The Compose total changes if you edit the limits.
 
 The Rust `jellyfin-counts-cache` has configured ceilings of 64 MiB, 0.25 CPU,
 and 32 processes. It uses no GPU, runs as UID/GID `1000:1000`, and has a
@@ -76,6 +76,32 @@ neither Python nor Cargo and had no GPU device requests. This sample does not
 measure peak memory, sustained CPU use, real Jellyfin, DNS, or HTTPS workloads;
 there is no Python baseline or claimed percentage saving for this cache.
 
+## Subtitle Studio Rust validation
+
+The October 16, 2026 CPU release-container check used the public whisper.cpp
+JFK audio fixture, converted to a disposable MKV, with `tiny-q5_1`, two CPU
+threads, one pipeline worker, a 1 GiB ceiling, and a 2 CPU quota. It ran as
+UID/GID 1000 with a read-only root, all capabilities dropped, no external
+network access, and no host media or Docker socket. The Rust probe confirmed
+two timed source cues, a valid SRT download, and transcript cache reuse on a
+second job. The runtime contained no Python interpreter.
+
+Idle server RSS was **3.3 MiB**, and server RSS after transcription was
+**3.6 MiB**. The highest cgroup memory sample observed while polling every
+250 ms was **127.4 MiB**, including the separate probe process and reclaimable
+file cache. Transcription and the cached follow-up completed in about 2.3
+seconds; cumulative container CPU time was 2.9 seconds. No OOM kill occurred.
+This short quantized-tiny fixture is not a peak-memory benchmark for movies,
+the default `small-q5_1` model, LM Studio, CUDA or translation quality. There
+is no comparable Python baseline or claimed percentage reduction.
+
+The optional Docker `test` target includes the
+[Rust fixture probe](../subtitle-worker/src/bin/subtitle-studio-probe.rs).
+Production excludes the probe. The server unloads Whisper between bounded
+audio chunks and before LLM translation/review. The UI's Resources disclosure
+and `/api/resources` provide on-demand samples; unavailable measurements stay
+null, and CUDA GPU samples cover the whole device, including other apps.
+
 ## Example application ceilings
 
 The root `.env.example` provides these adjustable ceilings for selected workloads:
@@ -83,13 +109,13 @@ The root `.env.example` provides these adjustable ceilings for selected workload
 | Container | Default ceiling |
 |---|---:|
 | Open WebUI | 1280 MiB |
-| Subtitle Studio worker | 3 GiB |
+| Subtitle Studio worker | 1 GiB |
 | Stirling PDF | 1536 MiB |
 | TubeArchivist Elasticsearch | 1536 MiB |
 | Subforge default, OCR disabled | 1536 MiB |
 | Subforge text-only option | 512 MiB |
 
-The first four values can be changed through `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_WORKER_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, and `ARCHIVIST_ES_MEMORY_LIMIT`. Subforge uses `CONVERTER_MEMORY_LIMIT`; its Compose and `.env.example` default is `1536m` with image OCR disabled. Text-only deployments can lower it to `512m` after considering their formats and workload. Image-subtitle OCR is opt-in with `CONVERTER_ENABLE_OCR=true` and needs the `1536m` ceiling. Keep OCR disabled to lock image-based subtitle extraction; some text sidecars, including TTML and SBV, still use the bounded Subtitle Edit converter when OCR is off. Recreate the affected container after changing a Compose environment value or memory limit. OCR and other converter child processes count against the same container ceiling.
+The first four values can be changed through `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_WORKER_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, and `ARCHIVIST_ES_MEMORY_LIMIT`. Subtitle Studio defaults to `1g`, `2` CPUs, and 64 processes. Whisper is CPU-only by default with two threads, one pipeline worker, and 300-second WAV chunks; the worker releases its model between chunks before translation/review. CUDA is available only through the optional CUDA Compose override. These are configured bounds and do not predict a specific working set; translation model memory belongs to the LM Studio process. Subforge uses `CONVERTER_MEMORY_LIMIT`; its Compose and `.env.example` default is `1536m` with image OCR disabled. Text-only deployments can lower it to `512m` after considering their formats and workload. Image-subtitle OCR is opt-in with `CONVERTER_ENABLE_OCR=true` and needs the `1536m` ceiling. Keep OCR disabled to lock image-based subtitle extraction; some text sidecars, including TTML and SBV, still use the bounded Subtitle Edit converter when OCR is off. Recreate the affected container after changing a Compose environment value or memory limit. OCR and other converter child processes count against the same container ceiling.
 
 Subforge converts one input at a time and limits the OCR OpenMP thread count. Its four HTTP workers and job queue are bounded, but that does not reserve memory for the host or reduce memory used by unrelated services.
 

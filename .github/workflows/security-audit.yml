@@ -81,8 +81,8 @@ jobs:
             rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
             -color
 
-  python-security:
-    name: Remaining Python source and dependency audits
+  python-source-audit:
+    name: Remaining Python source audit
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -98,23 +98,91 @@ jobs:
 
       - name: Install pinned audit tools
         id: tools
-        run: python -m pip install --disable-pip-version-check bandit==1.9.4 pip-audit==2.10.1
+        run: python -m pip install --disable-pip-version-check bandit==1.9.4
 
-      - name: Audit production Python source
+      - name: Audit repository privacy tooling
         run: |
           bandit --severity-level medium --confidence-level medium \
             --format custom --msg-template '{relpath}:{line}: {test_id} {severity}/{confidence}' \
-            subtitle-worker/worker.py subtitle-worker/download_model.py \
-            subtitle-worker/validate_srt.py subtitle-worker/http_client.py \
             .github/scripts/audit_repository.py
 
-      - name: Test HTTP request security boundaries
-        if: ${{ !cancelled() }}
-        run: python -m unittest discover -s subtitle-worker -p test_http_client.py
+  subtitle-studio-rust:
+    name: Subtitle Studio Rust checks and dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Audit resolved Python dependencies
-        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
-        run: pip-audit --strict --requirement subtitle-worker/requirements.txt --progress-spinner off
+      - name: Set up locked Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: 1.90.0
+          components: clippy, rustfmt
+          build-warnings: ''
+          cache: false
+
+      - name: Check Rust formatting
+        working-directory: subtitle-worker
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust lint and tests with warnings denied
+        working-directory: subtitle-worker
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+
+      - name: Install pinned RustSec audit tool
+        run: cargo install --locked cargo-audit --version 0.22.2
+
+      - name: Audit locked Rust dependencies
+        working-directory: subtitle-worker
+        run: cargo audit --file Cargo.lock --deny warnings
+
+  subtitle-studio-cpu-runtime:
+    name: Subtitle Studio CPU image health and CLI smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build CPU-only runtime image
+        run: docker build --tag subtitle-studio-runtime:test subtitle-worker
+
+      - name: Check isolated runtime and SRT validator without a model
+        run: |
+          docker run --detach --name subtitle-studio-runtime-test --network none \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --memory 1g --cpus 2 --pids-limit 64 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+            --tmpfs /data:rw,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /models:rw,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /media:rw,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /library:rw,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700 \
+            subtitle-studio-runtime:test
+          trap 'docker rm --force subtitle-studio-runtime-test >/dev/null' EXIT
+          ready=false
+          for _ in {1..20}; do
+            if docker exec subtitle-studio-runtime-test /usr/local/bin/subtitle-studio --healthcheck; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          [ "$ready" = true ]
+          docker exec -i subtitle-studio-runtime-test /bin/sh -c 'cat > /tmp/sample.srt' <<'SRT'
+          1
+          00:00:01,000 --> 00:00:02,000
+          Hello.
+          SRT
+          docker exec subtitle-studio-runtime-test /usr/local/bin/subtitle-studio validate-srt /tmp/sample.srt
 
   jellyfin-counts-cache-rust:
     name: Jellyfin counts cache Rust checks and dependency audit
@@ -355,7 +423,11 @@ jobs:
         run: |
           node --check glance/config/assets/media-live.js
           node --check glance/config/assets/widget-live.js
+          node --check subtitle-worker/web/app.js
           node --check subtitle-converter/web/app.js
+
+      - name: Run Subtitle Studio frontend regression tests
+        run: node --test subtitle-worker/test_*.cjs
 
       # Audit the lockfile without installing or executing repository packages.
       - name: Audit frontend and development dependencies

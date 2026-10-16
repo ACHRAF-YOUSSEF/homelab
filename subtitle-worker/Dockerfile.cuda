@@ -1,0 +1,41 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97 AS whisper-build
+ARG WHISPER_CPP_COMMIT=2eeeba56e9edd762b4b38467bab96c2517163158
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates cmake g++ make git \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone https://github.com/ggml-org/whisper.cpp.git /src/whisper.cpp \
+    && git -C /src/whisper.cpp checkout --detach "$WHISPER_CPP_COMMIT" \
+    && cmake -S /src/whisper.cpp -B /src/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF \
+      -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=OFF \
+    && cmake --build /src/whisper.cpp/build --config Release --target whisper-cli -j2
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97 AS app-build
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0
+ENV PATH=/root/.cargo/bin:$PATH
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+COPY web/ ./web/
+RUN cargo build --release --locked
+
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04@sha256:4a801ef9232d2b05e69df4eb8aa054dbbe2824e5499e1e6e857320bb01ac41a9
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 subtitle \
+    && useradd --uid 1000 --gid 1000 --create-home subtitle \
+    && mkdir -p /data /models /media/output /library \
+    && chown -R subtitle:subtitle /data /models /media /library
+COPY --from=app-build /build/target/release/subtitle-studio /usr/local/bin/subtitle-studio
+COPY --from=whisper-build /src/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli
+WORKDIR /app
+ENV SUBTITLE_BIND_ADDRESS=0.0.0.0 SUBTITLE_PORT=8099 \
+    SUBTITLE_LIBRARY_ROOT=/library SUBTITLE_OUTPUT_ROOT=/media/output \
+    SUBTITLE_DATA_ROOT=/data WHISPER_MODEL_ROOT=/models WHISPER_DEVICE=cuda
+EXPOSE 8099
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD ["/usr/local/bin/subtitle-studio", "--healthcheck"]
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/subtitle-studio"]
+CMD ["serve"]

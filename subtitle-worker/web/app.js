@@ -177,11 +177,24 @@ function updateWhisperSelection() {
   const selected = $('whisper-select').value;
   const downloaded = state.whisperModels.get(selected);
   const availability = state.whisperLocalOnly && !downloaded
-    ? `Not downloaded locally. Run: docker compose run --rm subtitle-worker python download_model.py ${selected}`
+    ? `Not downloaded locally. Run: docker compose run --rm subtitle-worker download-model ${selected}`
     : downloaded
       ? 'Downloaded locally. A different model needs a new transcription unless its result is cached.'
       : 'This model will be downloaded when first used.';
-  $('whisper-note').textContent = `${availability}${selected.endsWith('.en') ? ' This model only supports English audio.' : ''}`;
+  $('whisper-note').textContent = `${availability}${/\.en(?:-|$)/.test(selected) ? ' This model only supports English audio.' : ''}`;
+}
+
+function renderResources(data) {
+  if (!data) return;
+  const mib = bytes => Number.isFinite(bytes) ? `${(bytes / 1048576).toFixed(1)} MiB` : 'unavailable';
+  const gpu = data.gpu?.length ? data.gpu.map(item => `${item.utilization_percent}% · ${item.memory_used_mib}/${item.memory_total_mib} MiB`).join('; ') : 'not sampled';
+  const cpu = Number.isFinite(data.container_cpu_percent) ? `${data.container_cpu_percent.toFixed(1)}% (100% = one core)` : 'refresh again to sample';
+  $('runtime-resources').textContent = `${data.cpu_threads} CPU threads · Whisper ${data.whisper_device} · ${data.audio_chunk_seconds}s audio chunks. CPU ${cpu}. Server RAM ${mib(data.server_rss_bytes)}. Container RAM ${mib(data.container_memory_bytes)} / ${mib(data.container_memory_limit_bytes)}. Queue ${data.queue_length}/${data.queue_limit}. GPU ${gpu}. Models unload after each audio chunk. LM Studio manages its own resources.`;
+}
+
+async function refreshResources() {
+  try { renderResources(await api('/api/resources')); }
+  catch { $('runtime-resources').textContent = 'Resource usage is unavailable. Try refreshing again.'; }
 }
 
 function thinkingValue(id) {
@@ -245,6 +258,8 @@ function updateReviewSelection() {
 
 async function loadConfig() {
   const data = await api('/api/config');
+  renderResources(data.resources);
+  $('refresh-resources').onclick = refreshResources;
   state.languages = data.languages;
   state.whisperLocalOnly = data.whisper_local_only;
   state.defaultReviewModel = data.default_review_model || '';

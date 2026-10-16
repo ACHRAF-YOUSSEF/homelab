@@ -91,3 +91,4 @@ subtitle-converter/target/
 subtitle-converter/native-ocr/target/
 glance/live/target/
 glance/jellyfin-counts-cache/target/
+subtitle-worker/target/

@@ -74,7 +74,7 @@ Replace the example domain, LAN address, timezone, credentials, and media folder
 - **Local AI** - [Open WebUI](https://github.com/open-webui/open-webui) with NVIDIA GPU acceleration, connected to [LM Studio](https://lmstudio.ai/) for local LLM inference.
 - **Self-hosted cloud** - [Nextcloud All-in-One](https://github.com/nextcloud/all-in-one) manages the Nextcloud deployment.
 - **Automation** - [n8n](https://github.com/n8n-io/n8n) for workflow automation.
-- **Local subtitles** - Subtitle Studio transcribes media with Faster Whisper, translates and optionally reviews subtitles through LM Studio, and provides a browser UI with resumable jobs.
+- **Local subtitles** - Subtitle Studio is a Rust web app that uses native whisper.cpp and FFmpeg, with optional translation and review through LM Studio.
 - **Subforge subtitle conversion** - An authenticated Rust dashboard and watcher export embedded tracks and supported sidecars as UTF-8 SRT. Image-track OCR uses the native Rust `ocr-rs`/MNN helper with bundled English (`en`), French (`fr`), and Arabic (`ar`) recognition models; the `0.4.4` CPU and CUDA images contain no Python or PaddlePaddle runtime.
 - **Remote access** - Self-hosted [RustDesk](https://github.com/rustdesk/rustdesk) relay/rendezvous server.
 - **Self-hosted PDF tools** - [Stirling PDF](https://github.com/Stirling-Tools/Stirling-PDF) for PDF management, OCR, conversion, and automated pipeline processing.
@@ -102,7 +102,7 @@ Shared homelab Docker network
   +-- glance-live -> qBittorrent sync API and host Jellyfin:8096
   +-- Glance -> jellyfin-counts-cache:8765 -> host Jellyfin:8096
   +-- AdGuard Home -> Unbound:5053 (requires local resolver config)
-  `-- Subtitle Studio:8099 -> Whisper GPU + host LM Studio:1234
+  `-- Subtitle Studio:8099 -> CPU whisper.cpp + host LM Studio:1234
 
 Isolated docker-monitoring network
   `-- Glance / Portracker / Uptime Kuma -> docker-proxy:2375 -> Docker socket
@@ -150,7 +150,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Cloud** | Nextcloud Docker proxy | Local build from `docker-proxy/aio/` | Unix socket only | Separate Docker API proxy for AIO lifecycle operations |
 | **Cloud** | [Nextcloud AIO](https://github.com/nextcloud/all-in-one) | `ghcr.io/nextcloud-releases/all-in-one` | 30917 (loopback) | Master interface; AIO provisions Apache separately on port 11000 |
 | **Automation** | [n8n](https://github.com/n8n-io/n8n) | `n8nio/n8n` | 5678 | Workflow automation |
-| **Subtitles** | Subtitle Studio | Local build from `subtitle-worker/` | 8099 | GPU transcription, local translation, and optional quality review |
+| **Subtitles** | Subtitle Studio | Local Rust build from `subtitle-worker/` | 8099 | CPU-first transcription, local translation, and optional quality review |
 | **Tools** | [IT-Tools](https://github.com/CorentinTh/it-tools) | `corentinth/it-tools` | 8888 | Developer tools |
 | **Tools** | [Stirling PDF](https://github.com/Stirling-Tools/Stirling-PDF) | `stirlingtools/stirling-pdf` | 48537 | PDF tools |
 | **Remote** | [RustDesk HBBS/HBBR](https://github.com/rustdesk/rustdesk-server) | `rustdesk/rustdesk-server` | 21115-21119 | Remote desktop rendezvous and relay |
@@ -182,7 +182,7 @@ Bind mounts beginning with `../` are relative to the included file in `compose/`
 ## Component Guides
 
 - [Glance dashboard](glance/README.md): seven pages, live qBittorrent/Jellyfin widgets, LAN binding, API keys, and the Jellyfin counts helper.
-- [Subtitle Studio](subtitle-worker/README.md): setup, caching, cancellation and retries, translation reviews, API endpoints, and development checks.
+- [Subtitle Studio](subtitle-worker/README.md): Rust setup, model management, resource limits, translation, and development checks.
 - [Subforge subtitle conversion](subtitle-converter/README.md): responsive authenticated dashboard, watcher setup, media-server integrations, configuration, language handling, limitations, and native use.
 - [Memory budget guide](docs/memory-budget.md): selected Compose ceilings, Nextcloud AIO child limits, monitoring, and reversible adjustment steps.
 
@@ -197,12 +197,12 @@ Before you begin, ensure you have the following installed on your host machine:
 | Docker Desktop / Docker Engine | Linux containers; use the runtime for your OS in the platform guide | [Install Docker](https://docs.docker.com/get-docker/) |
 | Docker Compose | Recent release supporting `include` and global overrides; the CPU override also uses `!reset` | [Include and overrides](https://docs.docker.com/compose/how-tos/multiple-compose-files/include/) |
 | Git | Any | [Install Git](https://git-scm.com/downloads) |
-| NVIDIA GPU support in Docker | Required for the original GPU configuration; use the non-GPU recipe otherwise | [NVIDIA container guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
+| NVIDIA GPU support in Docker | Optional; required only for Subtitle Studio's CUDA override and GPU-enabled services | [NVIDIA container guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
 | LM Studio | Host server on port 1234 for AI and subtitle translation/review | [lmstudio.ai](https://lmstudio.ai/) |
 | Jellyfin | Host server on port 8096 for playback and dashboard widgets | [Jellyfin downloads](https://jellyfin.org/downloads/server) |
 | Cloudflare account + domain | Needed for tunnel and DDNS services | [Cloudflare dashboard](https://dash.cloudflare.com/) |
 
-The base configuration reserves NVIDIA GPUs for Tdarr, Open WebUI, and Subtitle Studio. Those reservations apply on every OS unless you change the model or omit those services. Platform instructions below describe the required adaptations; they are not a claim that every image and service has been tested on every CPU architecture.
+The base configuration reserves NVIDIA GPUs for Tdarr and Open WebUI. Subtitle Studio defaults to CPU; a separate Compose override enables its optional CUDA image. Platform instructions below describe required adaptations; they are not a claim that every image and service has been tested on every CPU architecture.
 
 ## Platform Guide
 
@@ -211,14 +211,14 @@ The base configuration reserves NVIDIA GPUs for Tdarr, Open WebUI, and Subtitle 
 | System | Container runtime | GPU path for this example | Media path example |
 |---|---|---|---|
 | Windows | Docker Desktop with Linux containers and WSL 2 | Supported NVIDIA GPU and Windows driver with WSL 2 GPU support | `D:/homelab-media` |
-| macOS, Intel or Apple silicon | Docker Desktop | Use the non-GPU override; run Subtitle Studio natively on CPU | `/Users/your-user/homelab-media` |
-| Linux | Docker Engine with the Compose plugin | NVIDIA driver plus NVIDIA Container Toolkit, or use the non-GPU override | `/srv/homelab-media` |
+| macOS, Intel or Apple silicon | Docker Desktop | CPU default; native Rust is also supported | `/Users/your-user/homelab-media` |
+| Linux | Docker Engine with the Compose plugin | CPU default; optional CUDA override needs NVIDIA Container Toolkit | `/srv/homelab-media` |
 
 Docker Desktop's CUDA GPU passthrough to Linux containers uses the [Windows WSL 2 backend](https://docs.docker.com/desktop/features/gpu/). Apple silicon's GPU is not an NVIDIA CUDA device; running an `amd64` image through emulation does not provide CUDA access. For native Linux GPU containers, follow [NVIDIA's toolkit installation and Docker runtime configuration](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
-On Apple silicon or Linux ARM64, check the architecture support of each image you select. For example, `docker buildx imagetools inspect <image:tag>` lists the image's published platforms. Select compatible images before startup; the checked-in Subtitle Studio Dockerfile uses an NVIDIA CUDA base, while its [native CPU instructions](subtitle-worker/README.md#native-cpu-setup-windows-macos-and-linux) avoid that base entirely.
+On Apple silicon or Linux ARM64, check the architecture support of each image you select. For example, `docker buildx imagetools inspect <image:tag>` lists the image's published platforms. Subtitle Studio's default image is CPU-only; its optional CUDA override targets NVIDIA-enabled hosts.
 
-Run Windows examples in PowerShell, and macOS/Linux examples in Bash or Zsh. When using a WSL terminal, use Linux-visible paths such as `/mnt/d/homelab-media`, rather than copying a PowerShell drive path. Single-line `docker compose` commands work in each shell. Native Python commands differ: use `python` on Windows and `python3` on macOS/Linux, or the interpreter in your virtual environment. The Glance live gateway development checks use Cargo; see its [component guide](glance/README.md#maintenance).
+Run Windows examples in PowerShell, and macOS/Linux examples in Bash or Zsh. When using a WSL terminal, use Linux-visible paths such as `/mnt/d/homelab-media`, rather than copying a PowerShell drive path. Single-line `docker compose` commands work in each shell. Native Subtitle Studio commands use Cargo; see its [component guide](subtitle-worker/README.md).
 
 ### Portable Paths and Local Overrides
 
@@ -278,17 +278,15 @@ docker compose -f docker-compose.yml -f compose.override.yaml up -d nginx-proxy-
 
 Inspect the rendered model locally to confirm host paths, retained config mounts, and hostnames. Its output can include credentials from `.env`. The last command starts two example services without GPU requirements; add others after preparing their configuration. If using this override, append the same `-f` flags to the later lifecycle commands in this guide. Alternatively, edit the corresponding base files directly for your deployment.
 
-### Machines Without NVIDIA GPUs
+### Optional CUDA services
 
-For macOS, or Windows/Linux without NVIDIA, extend the same override under its existing `services` mapping. Add `profiles` to the existing `tdarr` entry, add the `subtitle-worker` and `open-webui` entries below, and retain the other path overrides. Do not create duplicate YAML service keys:
+For macOS, or Windows/Linux without NVIDIA, keep the default Subtitle Studio service on CPU. The optional CUDA Compose file enables its CUDA image on supported NVIDIA Docker hosts. The following example still shows how to disable GPU reservations for Open WebUI and profile Tdarr:
 
 ```yaml
 services:
   tdarr:
     profiles: [nvidia]
     # Retain the volumes from your path override here.
-  subtitle-worker:
-    profiles: [nvidia]
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     deploy:
@@ -299,7 +297,7 @@ services:
 
 The `main` image is the [standard Open WebUI image](https://docs.openwebui.com/getting-started/quick-start/). Clearing its inherited device reservations removes the container's NVIDIA requirement; LM Studio's own acceleration is configured separately on the host. Compose's [`!reset` merge tag](https://docs.docker.com/reference/compose-file/merge/#reset-value) clears inherited settings rather than appending to them.
 
-The `nvidia` profile excludes Tdarr and Subtitle Studio from ordinary startup. Subforge uses its locally built CPU image in the regular stack and does not require NVIDIA; its CUDA edition requires the separate CUDA Compose override and an NVIDIA-enabled host. Use the [native CPU subtitle instructions](subtitle-worker/README.md#native-cpu-setup-windows-macos-and-linux) for Subtitle Studio on machines without NVIDIA. After adapting the paths and validating the override, a non-GPU AI/tools example is:
+Subforge uses its locally built CPU image in the regular stack and does not require NVIDIA; its CUDA edition requires the separate CUDA Compose override and an NVIDIA-enabled host. After adapting the paths and validating the override, a non-GPU AI/tools example is:
 
 ```shell
 docker compose -f docker-compose.yml -f compose.override.yaml config --quiet
@@ -432,7 +430,7 @@ docker compose up -d adguardhome unbound
 docker compose up -d sonarr radarr prowlarr qbittorrent
 ```
 
-On a configured NVIDIA host, Subtitle Studio can be built and started independently with `docker compose up -d --build subtitle-worker`. On macOS or a host without NVIDIA, use its [native CPU setup](subtitle-worker/README.md#native-cpu-setup-windows-macos-and-linux). Both serve the UI at `http://localhost:8099`; see the [component guide](subtitle-worker/README.md) for model downloads and translation setup. The app has no authentication. `SUBTITLE_BIND_ADDRESS` defaults the native bind and Compose host publication to loopback; change it only when you intend remote access and can restrict it to trusted clients.
+Subtitle Studio builds and starts independently with `docker compose up -d --build subtitle-worker`, using CPU by default. Its optional CUDA configuration is documented in [the component guide](subtitle-worker/README.md). The UI is at `http://localhost:8099`; the guide covers model downloads and translation setup. The app has no authentication. `SUBTITLE_BIND_ADDRESS` defaults the native bind and Compose host publication to loopback. Every HTTP Host header must also match `SUBTITLE_ALLOWED_HOSTS`; add the actual hostname or IP in `.env` for deliberate remote access and restrict it to trusted clients.
 
 `docker compose down` leaves named volumes and bind-mounted data in place. Subtitle Studio uses named `subtitle_models` and `subtitle_data` volumes; Nextcloud AIO uses `nextcloud_aio_mastercontainer` and the proxy socket volume `nextcloud_aio_docker_socket`, and manages additional volumes itself. Keep those volumes and the ignored application directories when moving or restoring the stack.
 
@@ -609,7 +607,7 @@ edits to deployment addresses in the dashboard YAML.
 | Glance public RSS feed sources | `GLANCE_*_FEED_URL` values customize RSS sources. |
 | Selected workload memory ceilings | `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_WORKER_MEMORY_LIMIT`, `STIRLING_PDF_MEMORY_LIMIT`, `ARCHIVIST_ES_MEMORY_LIMIT`, and `CONVERTER_MEMORY_LIMIT` cap individual containers. These are not host RAM reservations; see the [memory budget guide](docs/memory-budget.md). |
 | Media paths | `EXAMPLE_MEDIA_ROOT` supports the portable override example. `SUBTITLE_MEDIA_DIR` and `SUBTITLE_LIBRARY_DIR` choose the worker's writable output and read-only source mounts. Use absolute paths for your OS. |
-| Subtitle models and local inference | `WHISPER_MODEL`, `WHISPER_LOCAL_FILES_ONLY`, `SUBTITLE_LLM_MODEL`, `SUBTITLE_REVIEW_MODEL`, `SUBTITLE_LLM_BASE_URL`, and `SUBTITLE_LLM_TIMEOUT` configure transcription and translation/review. Blank LLM model IDs select automatically. `SUBTITLE_BIND_ADDRESS` controls the native worker bind and Docker host publication; it defaults to loopback. See the [worker guide](subtitle-worker/README.md). |
+| Subtitle models and local inference | `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_LOCAL_FILES_ONLY`, `SUBTITLE_CPU_THREADS`, chunk/process and queue limits, and LLM variables configure transcription and translation/review. Defaults use `small-q5_1`, CPU, two threads, and explicit model downloads. `SUBTITLE_BIND_ADDRESS` defaults the native bind and Docker host publication to loopback; `SUBTITLE_ALLOWED_HOSTS` lists accepted HTTP Host names and IPs. See the [worker guide](subtitle-worker/README.md). |
 
 `HOMELAB_URL` contains a scheme and host without a port or trailing slash; Glance
 appends ports for shared-host links. A localhost public URL works for a browser
@@ -823,10 +821,9 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | Gitleaks | Current files and full reachable Git history with complete redaction. |
 | Repository privacy checks | Unit fixtures and a checker for private deployment data, credentials, and literal Glance endpoints. |
 | actionlint | GitHub Actions workflow syntax using the pinned actionlint release. |
-| Bandit | Selected Python services and privacy-checking tools at medium severity and confidence. |
-| Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audits for the Glance gateway, Jellyfin counts cache, and Subforge. |
+| Bandit | Remaining Python source and privacy-checking tools at medium severity and confidence. |
+| Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audits for Glance, Jellyfin counts cache, Subtitle Studio, and Subforge. |
 | Subtitle conversion integration | Pinned multi-stage container build and isolated text/OCR fixtures without network access or host media mounts. |
-| pip-audit | Strict audit of resolved Python 3.12 dependencies used by the Python services. |
 | pnpm audit | Subtitle worker lockfile, including development dependencies, without installing project packages. |
 | Trivy | Filesystem dependency-manifest vulnerability and Dockerfile misconfiguration scan, including development dependencies. Compose misconfiguration and supplied-image OS vulnerabilities are outside this scan. |
 
@@ -846,7 +843,7 @@ docker compose config --services
 git diff --check
 ```
 
-The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes, Rust gateway checks, resource ceilings, and widget troubleshooting. Subtitle Studio's [guide](subtitle-worker/README.md) includes Python and Node tests and the command to rebuild the checked-in Tailwind CSS. The [Subforge guide](subtitle-converter/README.md) documents Rust Cargo tests/builds, native use, legacy state compatibility, and optional OCR. Rebuild `subtitle-worker` after changing its Python or bundled web files because those files are copied into the image.
+The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes, Rust gateway checks, resource ceilings, and widget troubleshooting. Subtitle Studio's [guide](subtitle-worker/README.md) includes Rust checks and the command to rebuild the checked-in Tailwind CSS. The [Subforge guide](subtitle-converter/README.md) documents Rust Cargo tests/builds, native use, legacy state compatibility, and optional OCR. Rebuild Subtitle Studio after changing Rust source or bundled web files.
 
 Application runtime data, API credentials, proxy hosts, certificates, router forwarding, LM Studio models, and Nextcloud's child containers are not fully represented by the tracked files. A successful Compose configuration check verifies the service definitions; use service logs and the component guides to verify your local deployment.
 
@@ -895,7 +892,7 @@ This homelab would not be possible without these amazing open-source projects:
 | SearxNG | [searxng/searxng](https://github.com/searxng/searxng) |
 | Nextcloud AIO | [nextcloud/all-in-one](https://github.com/nextcloud/all-in-one) |
 | n8n | [n8n-io/n8n](https://github.com/n8n-io/n8n) |
-| Faster Whisper | [SYSTRAN/faster-whisper](https://github.com/SYSTRAN/faster-whisper) |
+| whisper.cpp | [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) |
 | Tailwind CSS | [tailwindlabs/tailwindcss](https://github.com/tailwindlabs/tailwindcss) |
 | Stirling PDF | [Stirling-Tools/Stirling-PDF](https://github.com/Stirling-Tools/Stirling-PDF) |
 | IT-Tools | [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) |

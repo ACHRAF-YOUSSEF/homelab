@@ -1,0 +1,14 @@
+services:
+  subtitle-worker:
+    build:
+      context: ../subtitle-worker
+      dockerfile: Dockerfile.cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - WHISPER_DEVICE=cuda

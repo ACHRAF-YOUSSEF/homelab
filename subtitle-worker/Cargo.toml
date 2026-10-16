@@ -1,0 +1,35 @@
+[package]
+name = "subtitle-studio"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+default-run = "subtitle-studio"
+
+[features]
+default = []
+fixture-probe = []
+
+[[bin]]
+name = "subtitle-studio-probe"
+path = "src/bin/subtitle-studio-probe.rs"
+required-features = ["fixture-probe"]
+
+[dependencies]
+httparse = "=1.10.1"
+rand = "=0.9.3"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+tempfile = "=3.23.0"
+ureq = { version = "=3.4.1", default-features = false, features = ["rustls", "json"] }
+url = "=2.5.7"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
