@@ -126,7 +126,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Infrastructure** | Cloudflare DDNS | `favonia/cloudflare-ddns` | - | Updates the configured DNS-only records |
 | **Infrastructure** | Nginx Proxy Manager | `jc21/nginx-proxy-manager` | 80, 81, 4443 | Reverse proxy and TLS; host 4443 maps to container 443 |
 | **Infrastructure** | [Glance](https://github.com/glanceapp/glance) | `glanceapp/glance` | Internal 8080 | Responsive dashboard with seven navigation pages; served through the live gateway |
-| **Infrastructure** | Glance live gateway | Local build from `glance/live/` | 7575 (host, configurable bind) | Same-origin dashboard proxy and server-side SSE relay for qBittorrent and Jellyfin widgets |
+| **Infrastructure** | Glance live gateway | Local Rust build from `glance/live/` | 7575 (host, configurable bind) | Same-origin proxy and bounded server-side SSE relay for qBittorrent and Jellyfin; 96 MiB, 0.50 CPU, 32-process ceilings; no GPU access |
 | **Infrastructure** | [Portracker](https://github.com/mostafa-wahied/portracker) | `mostafawahied/portracker` | 4999 | Docker container monitor |
 | **Infrastructure** | [Docker Socket Proxy](https://github.com/Tecnativa/docker-socket-proxy) | `tecnativa/docker-socket-proxy` | Internal 2375 | Read-only Docker API for monitoring clients |
 | **Infrastructure** | [Uptime Kuma](https://github.com/louislam/uptime-kuma) | `louislam/uptime-kuma` | 47028 | Uptime monitoring and alerting |
@@ -218,7 +218,7 @@ Docker Desktop's CUDA GPU passthrough to Linux containers uses the [Windows WSL 
 
 On Apple silicon or Linux ARM64, check the architecture support of each image you select. For example, `docker buildx imagetools inspect <image:tag>` lists the image's published platforms. Select compatible images before startup; the checked-in Subtitle Studio Dockerfile uses an NVIDIA CUDA base, while its [native CPU instructions](subtitle-worker/README.md#native-cpu-setup-windows-macos-and-linux) avoid that base entirely.
 
-Run Windows examples in PowerShell, and macOS/Linux examples in Bash or Zsh. When using a WSL terminal, use Linux-visible paths such as `/mnt/d/homelab-media`, rather than copying a PowerShell drive path. Single-line `docker compose` commands work in each shell. Native Python commands differ: use `python` on Windows and `python3` on macOS/Linux, or the interpreter in your virtual environment.
+Run Windows examples in PowerShell, and macOS/Linux examples in Bash or Zsh. When using a WSL terminal, use Linux-visible paths such as `/mnt/d/homelab-media`, rather than copying a PowerShell drive path. Single-line `docker compose` commands work in each shell. Native Python commands differ: use `python` on Windows and `python3` on macOS/Linux, or the interpreter in your virtual environment. The Glance live gateway development checks use Cargo; see its [component guide](glance/README.md#maintenance).
 
 ### Portable Paths and Local Overrides
 
@@ -823,8 +823,8 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | Gitleaks | Current files and full reachable Git history with complete redaction. |
 | Repository privacy checks | Unit fixtures and a checker for private deployment data, credentials, and literal Glance endpoints. |
 | actionlint | GitHub Actions workflow syntax using the pinned actionlint release. |
-| Bandit | Selected Python services, Glance helpers, and privacy-checking tools at medium severity and confidence; the Rust runtime is checked separately. |
-| Subforge Rust checks | Formatting, Clippy with warnings denied, Rust tests, and a locked RustSec dependency audit. |
+| Bandit | Selected Python services, Glance counts helper, and privacy-checking tools at medium severity and confidence. |
+| Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audit for the Glance gateway and Subforge. |
 | Subtitle conversion integration | Pinned multi-stage container build and isolated text/OCR fixtures without network access or host media mounts. |
 | pip-audit | Strict audit of resolved Python 3.12 dependencies used by the Python services. |
 | pnpm audit | Subtitle worker lockfile, including development dependencies, without installing project packages. |
@@ -846,7 +846,7 @@ docker compose config --services
 git diff --check
 ```
 
-The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes and widget troubleshooting. Subtitle Studio's [guide](subtitle-worker/README.md) includes Python and Node tests and the command to rebuild the checked-in Tailwind CSS. The [Subforge guide](subtitle-converter/README.md) documents Rust Cargo tests/builds, native use, legacy state compatibility, and optional OCR. Rebuild `subtitle-worker` after changing its Python or bundled web files because those files are copied into the image.
+The Glance YAML and assets are mounted read-only from `glance/config`; its [guide](glance/README.md) documents configuration changes, Rust gateway checks, resource ceilings, and widget troubleshooting. Subtitle Studio's [guide](subtitle-worker/README.md) includes Python and Node tests and the command to rebuild the checked-in Tailwind CSS. The [Subforge guide](subtitle-converter/README.md) documents Rust Cargo tests/builds, native use, legacy state compatibility, and optional OCR. Rebuild `subtitle-worker` after changing its Python or bundled web files because those files are copied into the image.
 
 Application runtime data, API credentials, proxy hosts, certificates, router forwarding, LM Studio models, and Nextcloud's child containers are not fully represented by the tracked files. A successful Compose configuration check verifies the service definitions; use service logs and the component guides to verify your local deployment.
 

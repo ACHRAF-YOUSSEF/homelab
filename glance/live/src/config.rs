@@ -73,7 +73,7 @@ pub fn authority(raw: &str) -> Result<(String, Option<u16>), Error> {
 
 pub fn base(raw: &str, name: &'static str) -> Result<Url, Error> {
     let invalid = || Error::Configuration(name);
-    if raw.chars().any(char::is_whitespace) || raw.contains('\\') {
+    if raw.chars().any(char::is_whitespace) || raw.contains(['\\', '%']) {
         return Err(invalid());
     }
     let parsed = Url::parse(raw).map_err(|_| invalid())?;
@@ -127,9 +127,18 @@ impl Config {
             _ => return Err(Error::Configuration("GLANCE_LIVE_JELLYFIN_WS")),
         };
         let config = Self {
-            glance: base(&value("GLANCE_UPSTREAM_URL", "http://glance:8080"), "GLANCE_UPSTREAM_URL")?,
-            qbittorrent: base(&value("QBITTORRENT_INTERNAL_URL", "http://qbittorrent:8080"), "QBITTORRENT_INTERNAL_URL")?,
-            jellyfin: base(&value("JELLYFIN_INTERNAL_URL", "http://jellyfin:8096"), "JELLYFIN_INTERNAL_URL")?,
+            glance: base(
+                &value("GLANCE_UPSTREAM_URL", "http://glance:8080"),
+                "GLANCE_UPSTREAM_URL",
+            )?,
+            qbittorrent: base(
+                &value("QBITTORRENT_INTERNAL_URL", "http://qbittorrent:8080"),
+                "QBITTORRENT_INTERNAL_URL",
+            )?,
+            jellyfin: base(
+                &value("JELLYFIN_INTERNAL_URL", "http://jellyfin:8096"),
+                "JELLYFIN_INTERNAL_URL",
+            )?,
             allowed_hosts,
             bind: SocketAddr::new(host, port),
             qb_interval: seconds("GLANCE_LIVE_QBITTORRENT_INTERVAL", "2", 60.0)?,
@@ -138,7 +147,11 @@ impl Config {
             max_connections: integer("GLANCE_LIVE_MAX_CONNECTIONS", "64", 1000)?,
             max_http_connections: integer("GLANCE_LIVE_MAX_HTTP_CONNECTIONS", "128", 2000)?,
             sse_lifetime: seconds("GLANCE_LIVE_SSE_MAX_SECONDS", "900", 86400.0)?,
-            provider_bytes: integer("GLANCE_LIVE_MAX_PROVIDER_BYTES", "2097152", 16 * 1024 * 1024)?,
+            provider_bytes: integer(
+                "GLANCE_LIVE_MAX_PROVIDER_BYTES",
+                "2097152",
+                16 * 1024 * 1024,
+            )?,
             snapshot_bytes: integer("GLANCE_LIVE_MAX_SNAPSHOT_BYTES", "262144", 2 * 1024 * 1024)?,
             max_torrents: integer("GLANCE_LIVE_MAX_TORRENTS", "2000", 10000)?,
             max_sessions: integer("GLANCE_LIVE_MAX_SESSIONS", "256", 2048)?,
@@ -146,8 +159,13 @@ impl Config {
             qb_password: value("QBITTORRENT_PASSWORD", ""),
             jellyfin_key: value("JELLYFIN_API_KEY", ""),
         };
-        if [&config.qb_username, &config.qb_password, &config.jellyfin_key]
-            .iter().any(|v| v.len() > 4096 || v.chars().any(char::is_control))
+        if [
+            &config.qb_username,
+            &config.qb_password,
+            &config.jellyfin_key,
+        ]
+        .iter()
+        .any(|v| v.len() > 4096 || v.chars().any(char::is_control))
             || config.jellyfin_key.contains(['"', '\\'])
         {
             return Err(Error::Configuration("provider credentials"));
@@ -162,10 +180,23 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_authorities_and_provider_urls() {
-        for invalid in ["http://@localhost", "http://localhost:bad", "http://localhost:", "http://bad host", "http://localhost\\@evil", "http://localhost:0", "http://user:pass@localhost", "http://localhost/a/../b", "http://localhost/%2e%2e"] {
+        for invalid in [
+            "http://@localhost",
+            "http://localhost:bad",
+            "http://localhost:",
+            "http://bad host",
+            "http://localhost\\@evil",
+            "http://localhost:0",
+            "http://user:pass@localhost",
+            "http://localhost/a/../b",
+            "http://localhost/%2e%2e",
+        ] {
             assert!(base(invalid, "TEST").is_err(), "{invalid}");
         }
-        assert_eq!(authority("LOCALHOST.:8081").unwrap(), ("localhost".into(), Some(8081)));
+        assert_eq!(
+            authority("LOCALHOST.:8081").unwrap(),
+            ("localhost".into(), Some(8081))
+        );
         assert!(base("http://jellyfin:8096/base", "TEST").is_ok());
     }
 }

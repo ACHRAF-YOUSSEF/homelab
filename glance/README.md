@@ -23,8 +23,8 @@ networking. DNS, tunnel routes, and reverse-proxy hosts are configured separatel
 | [config/widgets/](config/widgets/) | Reusable custom API widgets for Jellyfin, Sonarr/Radarr, Seerr, qBittorrent, and Subforge |
 | [config/assets/media-live.js](config/assets/media-live.js) | Refreshes Media widgets outside the live Jellyfin session feed |
 | [config/assets/widget-live.js](config/assets/widget-live.js) | Connects visible Media and Downloads widgets to the same-origin SSE stream |
-| [live/server.py](live/server.py) | Internal Glance proxy and SSE relay for qBittorrent and Jellyfin |
-| [live/test_server.py](live/test_server.py) | Offline relay tests using local fake upstream services |
+| [live/src/](live/src/) | Rust Glance proxy, bounded SSE relay, provider collectors, and configuration |
+| [live/Cargo.toml](live/Cargo.toml) | Pinned gateway dependencies and release profile |
 | [config/assets/subtitle-studio.svg](config/assets/subtitle-studio.svg) | Local Subtitle Studio icon |
 | [config/assets/subforge.svg](config/assets/subforge.svg) | Current blue Subforge icon, used by the Overview Docker container entry and Media service monitor; the `v=2` asset query refreshes browser caches |
 | [jellyfin-counts-cache.py](jellyfin-counts-cache.py) | Internal HTTP service caching Jellyfin library counts |
@@ -130,7 +130,13 @@ name formatting displays it as **Subtitle Converter** with Docker's generic icon
 
 The Glance dashboard and live stream have no user authentication. Keep host port `7575` on the LAN: `GLANCE_BIND_ADDRESS` defaults to loopback; for LAN devices set it privately to the Docker host's LAN interface address, restrict it with the host firewall, and do not configure WAN forwarding or a public tunnel route. If an existing reverse proxy is used only on the LAN, point its upstream at `glance-live:8081` (not `glance:8080`) and configure streaming responses without buffering; the Compose service itself publishes no other host port. A proxy or tunnel route is a separate exposure path and is not made private by the bind setting.
 
-The gateway proxies Glance and emits sanitized JSON snapshots, keeping Jellyfin and optional qBittorrent credentials on the server. The `/live/events` route accepts only the `media` and `downloads` topics and applies same-origin checks; its request also probes the corresponding Glance page-content route with the browser cookie, preserving Glance's native authorization if enabled later. This probe does not add authentication to the current unauthenticated dashboard. The gateway runs as an unprivileged user, drops Linux capabilities, has a read-only filesystem, and is connected only to `homelab`; its image base and Python dependency are pinned. Glance remains on the internal `docker-monitoring` network for its read-only Docker API proxy and does not mount the raw Docker socket. Keep API credentials and deployment-specific addresses in `.env`, and review [SECURITY.md](../SECURITY.md) before changing exposure or network access.
+The gateway proxies the upstream Glance application and emits sanitized JSON snapshots, keeping Jellyfin and optional qBittorrent credentials on the server. The `/live/events` route accepts only the `media` and `downloads` topics and applies same-origin checks; its request also probes the corresponding Glance page-content route with the browser cookie, preserving Glance's native authorization if enabled later. This probe does not add authentication to the current unauthenticated dashboard.
+
+`glance-live` uses one Tokio event-loop thread and at most two blocking DNS workers, with shared, on-demand collectors: a collector runs only while its topic has subscribers, and stops when the last browser disconnects. It has no GPU device access. Provider responses are limited to 2 MiB, normalized snapshots to 256 KiB, torrent lists to 2,000 entries, Jellyfin sessions to 256, active SSE clients to 64, accepted HTTP connections to 128, and SSE lifetime to 900 seconds by default. If an upstream payload exceeds its bound or fails, the topic is marked stale and its last valid snapshot is retained; the gateway does not synthesize replacement values. These defaults are configurable through `GLANCE_LIVE_*` variables described below.
+
+The gateway runs as an unprivileged user, drops Linux capabilities, has a read-only filesystem, and is connected only to `homelab`; its Rust toolchain and runtime image are pinned. Glance itself remains upstream and continues on the internal `docker-monitoring` network for its read-only Docker API proxy; it does not mount the raw Docker socket. Keep API credentials and deployment-specific addresses in `.env`, and review [SECURITY.md](../SECURITY.md) before changing exposure or network access.
+
+The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling, and a 32-process limit. The memory value is an upper bound, not an expected working set or a reservation. See the [isolated migration measurements](../docs/memory-budget.md#glance-live-migration-measurements) for observed usage and test limits.
 
 ## Custom widgets and refresh behavior
 
@@ -271,7 +277,7 @@ loaded, then reload the browser to pick up script changes:
 docker compose restart glance glance-live
 ```
 
-After changing `.env`, recreate the containers so they receive the new values.
+After changing `.env`, recreate the containers so they receive the new values. The gateway resource variables are `GLANCE_LIVE_MEMORY_LIMIT`, `GLANCE_LIVE_CPUS`, `GLANCE_LIVE_MAX_CONNECTIONS`, `GLANCE_LIVE_MAX_HTTP_CONNECTIONS`, `GLANCE_LIVE_SSE_MAX_SECONDS`, `GLANCE_LIVE_MAX_PROVIDER_BYTES`, `GLANCE_LIVE_MAX_SNAPSHOT_BYTES`, `GLANCE_LIVE_MAX_TORRENTS`, and `GLANCE_LIVE_MAX_SESSIONS`. Compose enforces the memory and CPU ceilings. The application validates connection, lifetime, payload, torrent, and session limits on startup and caps their accepted values. Recreate `glance-live` after changing any of them.
 Recreate all three services when changing `JELLYFIN_API_KEY` or
 `JELLYFIN_INTERNAL_URL`:
 
@@ -294,29 +300,33 @@ credentials. Changing the Jellyfin URL/key also requires recreating `glance` and
 `glance` for its server-rendered fallback.
 
 The gateway health route is `/live/health` at the same browser origin; it checks
-the gateway process, not the Jellyfin or qBittorrent upstreams. For backend tests,
-create an isolated Python environment in `glance/live`, install the pinned
-`requirements.txt`, and run `python -m unittest test_server -v`. On Windows
-PowerShell:
+the gateway process, not the Jellyfin or qBittorrent upstreams. The container's
+health check uses the binary's `--healthcheck` mode, which makes a local request
+to that route. For local development, install the Rust 1.90 toolchain and run
+the locked checks from `glance/live`. On Windows PowerShell:
 
 ```powershell
 Set-Location glance/live
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m unittest test_server -v
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo run --locked
 ```
 
 On macOS or Linux:
 
 ```bash
 cd glance/live
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m unittest test_server -v
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo run --locked
 ```
 
-The tests use disposable local HTTP/WebSocket fixtures and do not start Compose
-services or connect to the real Jellyfin/qBittorrent deployments.
+The gateway tests use local fixtures and do not start Compose services or
+connect to the real Jellyfin/qBittorrent deployments. `cargo run --locked`
+starts the gateway using its environment configuration; it expects Glance and
+provider URLs to be reachable for full operation. No GPU is required or used.
 Check the browser script syntax from the repository root with
 `node --check glance/config/assets/widget-live.js`.
 

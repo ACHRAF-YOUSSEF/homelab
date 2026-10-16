@@ -2,7 +2,51 @@
 
 Compose memory limits are ceilings for individual containers. They do not reserve that amount from physical RAM when a container starts, and several containers can use less than their limits when idle. A container can still be OOM-killed if its working set reaches its ceiling. Treat totals as maximum combined use for the listed containers, not a reservation or a whole-host capacity estimate.
 
+The `glance-live` dashboard gateway uses one Rust/Tokio event-loop thread and at most two blocking DNS workers, with
+configured ceilings of 96 MiB memory, 0.50 CPU, and 32 processes. Its
+`GLANCE_LIVE_MEMORY_LIMIT` and `GLANCE_LIVE_CPUS` settings are adjustable in
+`.env`; the Compose process limit is fixed at 32. The memory ceiling remains
+96 MiB to retain headroom for varied workloads, so the Rust migration does not
+change the configured Compose memory total. The gateway does not use a GPU.
+Its defaults also bound active SSE streams to 64, accepted HTTP connections to
+128, provider bodies to 2 MiB, shared snapshots to 256 KiB, torrent entries to
+2,000, Jellyfin sessions to 256, and SSE connections to 900 seconds. These
+application bounds reduce unbounded growth but do not guarantee a particular
+working set or host capacity; oversized or failed upstream updates mark the
+topic stale and preserve its last valid snapshot.
+
 The checked-in default `mem_limit` values across the Compose files sum to **18,304 MiB (17.875 GiB)**. The nine optional Nextcloud AIO child limits below add **7,680 MiB (7.5 GiB)**, for a combined ceiling of **25,984 MiB (25.375 GiB)**. This is a configured upper bound, not expected usage or a safe host-RAM recommendation. The Compose total changes if you edit the limits.
+
+## Glance live migration measurements
+
+The October 16, 2026 migration check compared the original Python/aiohttp
+gateway with the Rust release image in Docker Desktop Linux containers. Both
+ran without external network access, as UID/GID 10001, with a read-only root,
+all capabilities dropped, and identical 96 MiB, 0.50 CPU, and 32-process limits.
+The load fixture used four Downloads and four Media SSE clients, 1,000 fake
+torrents, one Jellyfin session, two-second polling, and WebSockets disabled.
+The fixture process ran in a separate container sharing only the gateway's
+isolated network namespace. It was excluded from the gateway measurements.
+
+| Sample | Original Python gateway | Rust gateway |
+| --- | ---: | ---: |
+| Idle process RSS (`/proc/1/status`) | 44.1 MiB | 3.8 MiB |
+| Active process RSS | 43.9 MiB | 7.7 MiB |
+| Active container memory (`docker stats`) | 31.3 MiB | 4.5 MiB |
+
+These were short, sampled measurements, not maximum-memory or long-duration
+benchmarks. The active container sample was about 85% smaller with Rust.
+Docker's displayed memory excludes reclaimable cache; RSS includes resident
+file-backed pages, so the two measures are not interchangeable. Both probes
+delivered 40 successful snapshots across eight clients and confirmed that
+collectors stopped after disconnects. This did not exercise the real Glance,
+Jellyfin, qBittorrent, TLS, or sustained WebSocket deployment workload. No CPU
+speedup is claimed from these samples; the gateway has no GPU access.
+
+The reusable [load probe](../scripts/benchmark_glance_live.py) uses only Python's
+standard library and fake loopback services. The [Rust CI job](../.github/workflows/security-audit.yml)
+shows the disposable runtime/fixture commands. Python is used by this test
+helper; the production Rust image contains no Python interpreter.
 
 ## Example application ceilings
 

@@ -3,8 +3,9 @@ WORKDIR /build
 ENV CARGO_BUILD_JOBS=1
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo test --all-targets --locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    find src tests -type f -exec touch {} + \
+    && cargo test --all-targets --locked \
     && cargo build --release --locked \
     && cp target/release/glance-live /build/glance-live
 
