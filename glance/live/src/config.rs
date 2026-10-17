@@ -7,6 +7,8 @@ pub struct Config {
     pub glance: Url,
     pub qbittorrent: Url,
     pub jellyfin: Url,
+    pub sonarr: Url,
+    pub radarr: Url,
     pub allowed_hosts: HashSet<String>,
     pub bind: SocketAddr,
     pub qb_interval: Duration,
@@ -22,6 +24,8 @@ pub struct Config {
     pub qb_username: String,
     pub qb_password: String,
     pub jellyfin_key: String,
+    pub sonarr_key: String,
+    pub radarr_key: String,
 }
 
 fn value(name: &str, default: &str) -> String {
@@ -139,6 +143,14 @@ impl Config {
                 &value("JELLYFIN_INTERNAL_URL", "http://jellyfin:8096"),
                 "JELLYFIN_INTERNAL_URL",
             )?,
+            sonarr: base(
+                &value("SONARR_INTERNAL_URL", "http://sonarr:8989"),
+                "SONARR_INTERNAL_URL",
+            )?,
+            radarr: base(
+                &value("RADARR_INTERNAL_URL", "http://radarr:7878"),
+                "RADARR_INTERNAL_URL",
+            )?,
             allowed_hosts,
             bind: SocketAddr::new(host, port),
             qb_interval: seconds("GLANCE_LIVE_QBITTORRENT_INTERVAL", "2", 60.0)?,
@@ -158,11 +170,15 @@ impl Config {
             qb_username: value("QBITTORRENT_USERNAME", ""),
             qb_password: value("QBITTORRENT_PASSWORD", ""),
             jellyfin_key: value("JELLYFIN_API_KEY", ""),
+            sonarr_key: value("SONARR_API_KEY", ""),
+            radarr_key: value("RADARR_API_KEY", ""),
         };
         if [
             &config.qb_username,
             &config.qb_password,
             &config.jellyfin_key,
+            &config.sonarr_key,
+            &config.radarr_key,
         ]
         .iter()
         .any(|v| v.len() > 4096 || v.chars().any(char::is_control))

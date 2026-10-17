@@ -74,6 +74,15 @@ async function main() {
     ];
     jobs[0].executors=[null,{resource:'unknown',node_name:'Invalid',execution:'remote'},{resource:'cpu',node_name:'',execution:'local'}];
     let inventorySource = 'filesystem', inventoryAuthority = { status: 'ready' }, revision = 1;
+    const pipeline = { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true };
+    let holdInventory = false, releaseInventory, inventoryHeld = false;
+    let holdSystem = false, releaseSystem, systemHeld = false, systemMemory = 1300000000;
+    let failWorkers = false;
+    let abortedSystemReads=0;
+    page.on('requestfailed',request=>{if(new URL(request.url()).pathname==='/api/system')abortedSystemReads++;});
+    await page.exposeFunction('__inventoryHeld',()=>inventoryHeld);
+    await page.exposeFunction('__systemHeld',()=>systemHeld);
+    await page.exposeFunction('__abortedSystemReads',()=>abortedSystemReads);
     let settings = { languages: ['*'], permissions: { ocr: true }, integrations: {} };
     let allocation = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1, paused: false };
     const remote = { enabled: true, nodes: [{ id: 'node-1', name: 'Studio GPU', resource: 'gpu', last_seen_seconds: 2, active: 1, status: 'busy' }], pending: 0, active: 1 };
@@ -84,29 +93,42 @@ async function main() {
       const request = route.request(), endpoint = new URL(request.url()).pathname;
       let value;
       if(request.method()==='GET'&&endpoint==='/api/workers')workerReads++;
+      if(endpoint==='/api/inventory'&&holdInventory){inventoryHeld=true;await new Promise(resolve=>{releaseInventory=resolve;});}
+      if(endpoint==='/api/system'&&holdSystem){systemHeld=true;await new Promise(resolve=>{releaseSystem=resolve;});}
+      if(endpoint==='/api/workers'&&failWorkers){await route.fulfill({status:503,contentType:'application/json',body:'{"error":"Fixture unavailable"}'});return;}
       if (request.method() !== 'GET') {
         const body = request.postDataJSON(); writes.push({ endpoint, body });
         if (endpoint === '/api/workers') allocation = body;
         if (endpoint === '/api/settings') settings = { ...settings, ...body };
       }
       if (endpoint === '/api/session') value = { csrf_token: 'disposable-ui-fixture' };
-      else if (endpoint === '/api/status') value = { edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline: { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true } };
+      else if (endpoint === '/api/status') value = { edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline };
       else if (endpoint === '/api/inventory') value = { items, updated: now, state_revision: revision, truncated: inventorySource !== 'bazarr', source: inventorySource, authority: inventoryAuthority };
       else if (endpoint === '/api/settings') value = settings;
       else if (endpoint === '/api/workers') value = workerData();
       else if (endpoint === '/api/nodes') value = remote;
-      else if (endpoint === '/api/system') value = { edition: 'cuda', version: 'fixture', uptime_seconds: 120, resource_usage: { cpu: { effective_cores: 4 }, memory: { cgroup_current_bytes: 1300000000, cgroup_limit_bytes: 1610612736 } }, resources: {}, limits: {} };
+      else if (endpoint === '/api/system') value = { edition: 'cuda', version: 'fixture', uptime_seconds: 120, resource_usage: { cpu: { effective_cores: 4 }, memory: { cgroup_current_bytes: systemMemory, cgroup_limit_bytes: 1610612736 } }, resources: {}, limits: {} };
       else if (endpoint === '/api/jobs') value = { message: 'Fixture job queued' };
       else if (endpoint === '/api/root-folders') value = { roots: [], mounts: [] };
       else if (endpoint === '/api/tasks') value = { tasks: [], paused: false };
       else throw new Error(`Unexpected fixture API ${request.method()} ${endpoint}`);
-      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) });
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) }).catch(error=>{if(!request.failure())throw error;});
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/#/overview`);
     await page.getByText('Service connected', { exact: true }).waitFor();
     await page.locator('#pipeline-ready').getByText('11,326', { exact: true }).waitFor();
     await page.waitForFunction(async () => await window.__workerReads() > 0);
     await page.locator('#pipeline-status').getByText(/Inspected/i).waitFor();
+    // Idle polling updates counters without a click or waiting for a large inventory response.
+    holdInventory = true; revision++; pipeline.generated_srt_count++; pipeline.failed_files--;
+    await page.locator('#pipeline-ready').getByText('11,327', {exact:true}).waitFor({timeout:22000});
+    await page.locator('#attention-failed').getByText('511', {exact:true}).waitFor();
+    await page.waitForFunction(async()=>await window.__inventoryHeld());
+    assert(inventoryHeld, 'inventory request remains pending while fresh counters are rendered');
+    holdInventory=false;releaseInventory();
+    pipeline.generated_srt_count--;pipeline.failed_files++;revision++;
+    await page.locator('#refresh-button').click();
+    await page.locator('#pipeline-ready').getByText('11,326', {exact:true}).waitFor();
     assert.equal(writes.length, 0, 'initial page must not mutate the backend');
     await page.setViewportSize({ width: 1440, height: 960 });
     await assertViewport('Overview idle desktop');
@@ -590,6 +612,21 @@ async function main() {
       assert(await page.locator('.inventory-pagination').isVisible(), `Library paging stays visible at ${width}x${height}`);
       assert.equal(await page.locator('#inventory-body tr').count(), 25, 'manual page size keeps exactly 25 rows');
     }
+    await page.setViewportSize({width:1440,height:960});
+    await page.getByRole('button', {name:'Overview',exact:true}).click();
+    await page.locator('#worker-ram').getByText(/1\.21 GiB/).waitFor();
+    holdSystem=true;
+    await page.waitForFunction(async()=>await window.__systemHeld());
+    await page.waitForFunction(async()=>await window.__abortedSystemReads()>0,null,{timeout:22000});
+    await page.locator('#worker-ram').getByText('Sample stale · retrying',{exact:true}).waitFor();
+    assert(await page.locator('#worker-memory-meter').isHidden(),'stale RAM sample is not drawn as live');
+    systemMemory=1500000000;holdSystem=false;releaseSystem();
+    await page.locator('#worker-ram').getByText(/1\.4 GiB/).waitFor({timeout:10000});
+    assert(await page.locator('#worker-memory-meter').isVisible(),'automatic sampling recovers after a read times out');
+    failWorkers=true;
+    await page.locator('#worker-pool-state').getByText('Sample stale',{exact:true}).waitFor({timeout:10000});
+    failWorkers=false;
+    await page.locator('#worker-pool-state').getByText('Ready',{exact:true}).waitFor({timeout:10000});
     assert.deepEqual(errors, [], 'browser must have no uncaught errors');
     console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, executor metadata, keyboard, Bazarr coverage/authority, and pending indexing confirmation regressions');
     await context.close();

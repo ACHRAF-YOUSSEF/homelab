@@ -114,6 +114,8 @@ type ConversionJob = (
     SubtitleTarget,
 );
 
+type ScopeResolutionMarker = (Option<String>, Option<bool>);
+
 pub struct Converter {
     pub roots: Vec<PathBuf>,
     pub state: Value,
@@ -888,6 +890,9 @@ impl Converter {
         scope: Option<&str>,
         mut entry: Value,
     ) -> Result<(), String> {
+        if let Some(fields) = entry.as_object_mut() {
+            fields.remove("inventory_resolved");
+        }
         let previous = self.state.get(key);
         let current_fingerprint = entry.get("fingerprint").cloned();
         if let Some(scope) = scope {
@@ -1046,12 +1051,112 @@ impl Converter {
             }
         }
         let coverage = entry.get("coverage").cloned().unwrap_or(Value::Null);
-        if coverage["status"] == "already_covered" {
-            pending = false;
-            failed = false;
-            latest_error = None;
-        }
         json!({"pending_ocr":pending,"failed":failed,"generated_srt_count":if available {Some(outputs.len())}else{None},"last_error":latest_error.map(|(_, error)|error),"coverage":coverage})
+    }
+
+    /// Reconcile existing processing records during an explicit inventory job.
+    /// Verified external coverage resolves only the same source and exact scope;
+    /// it never adds publication receipts or rewrites historical errors.
+    pub(crate) fn reconcile_inventory_processing(
+        &mut self,
+        rows: &[Value],
+    ) -> Result<bool, String> {
+        // Roll back only bounded boolean annotations if persistence fails;
+        // never clone the conversion library or overwrite historical records.
+        let mut undo: Vec<(String, Vec<ScopeResolutionMarker>)> = Vec::new();
+        for row in rows.iter().take(MAX_CANDIDATES) {
+            let Some(source) = row["path"].as_str() else {
+                continue;
+            };
+            if self.state.get(source).is_none() {
+                continue;
+            }
+            let Ok(path) = Self::safe_path(source, &self.roots) else {
+                continue;
+            };
+            let Ok(stamp) = fingerprint(&path) else {
+                continue;
+            };
+            let current = fingerprint_json(&stamp);
+            let existing: Vec<SubtitleTarget> = row["coverage"]["existing_targets"]
+                .as_array()
+                .filter(|targets| targets.len() <= MAX_COVERAGE_ENTRIES)
+                .and_then(|targets| serde_json::from_value(json!(targets)).ok())
+                .unwrap_or_default();
+            let known_coverage = matches!(
+                row["coverage"]["status"].as_str(),
+                Some("covered" | "already_covered" | "needs_conversion" | "no_convertible_source")
+            );
+            let Some(entry) = self.state.get_mut(source) else {
+                continue;
+            };
+            // Scope records stay independent: covering a normal English track
+            // cannot hide an unresolved French, forced, or hearing-impaired one.
+            let tracks = row["tracks"].as_array();
+            let mut previous_markers = Vec::new();
+            let mut resolve = |item: &mut Value, scope: Option<&str>| {
+                let previous = match item.get("inventory_resolved") {
+                    Some(Value::Bool(previous)) => Some(*previous),
+                    Some(_) => return,
+                    None => None,
+                };
+                let resolved = item["fingerprint"] == current
+                    && known_coverage
+                    && inventory_covers_scope(
+                        item,
+                        scope,
+                        tracks.map(Vec::as_slice).unwrap_or(&[]),
+                        &existing,
+                    );
+                if previous.unwrap_or(false) == resolved {
+                    return;
+                }
+                previous_markers.push((scope.map(str::to_owned), previous));
+                item["inventory_resolved"] = json!(resolved);
+            };
+            resolve(entry, None);
+            if let Some(scopes) = entry["track_selections"].as_object_mut() {
+                for (scope, item) in scopes.iter_mut().take(MAX_SELECTED_TRACKS) {
+                    resolve(item, Some(scope));
+                }
+            }
+            if !previous_markers.is_empty() {
+                undo.push((source.to_owned(), previous_markers));
+            }
+        }
+        let changed = !undo.is_empty();
+        if changed {
+            let previous_dirty = self.state_dirty;
+            self.state_dirty = true;
+            if let Err(error) = self.persist_state() {
+                for (source, markers) in undo.into_iter().rev() {
+                    let Some(entry) = self.state.get_mut(&source) else {
+                        continue;
+                    };
+                    for (scope, previous) in markers {
+                        let item = match scope {
+                            Some(scope) => entry
+                                .get_mut("track_selections")
+                                .and_then(|scopes| scopes.get_mut(&scope)),
+                            None => Some(&mut *entry),
+                        };
+                        if let Some(fields) = item.and_then(Value::as_object_mut) {
+                            match previous {
+                                Some(previous) => {
+                                    fields.insert("inventory_resolved".into(), json!(previous));
+                                }
+                                None => {
+                                    fields.remove("inventory_resolved");
+                                }
+                            }
+                        }
+                    }
+                }
+                self.state_dirty = previous_dirty;
+                return Err(error);
+            }
+        }
+        Ok(changed)
     }
 
     fn worker_with_state(&self, state: Value) -> Self {
@@ -2444,7 +2549,91 @@ fn current_processing_entries(entry: &Value) -> impl Iterator<Item = &Value> {
         .flat_map(|scopes| scopes.values());
     std::iter::once(entry).chain(scopes).filter(move |item| {
         fingerprint.is_none_or(|fingerprint| item.get("fingerprint") == Some(fingerprint))
+            && item["inventory_resolved"] != true
     })
+}
+
+fn inventory_covers_scope(
+    item: &Value,
+    scope: Option<&str>,
+    tracks: &[Value],
+    existing: &[SubtitleTarget],
+) -> bool {
+    let covered =
+        |wanted: &SubtitleTarget| existing.iter().any(|available| wanted.matches(available));
+    if let Ok(targets) = serde_json::from_value::<Vec<SubtitleTarget>>(item["targets"].clone()) {
+        return !targets.is_empty()
+            && targets.len() <= MAX_SELECTED_TRACKS
+            && targets.iter().all(covered);
+    }
+    let languages = item["selection_coverage"]["languages"]
+        .as_array()
+        .or_else(|| item["languages"].as_array());
+    let ids = scope.map(|scope| {
+        scope
+            .split(',')
+            .take(MAX_SELECTED_TRACKS + 1)
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+    });
+    if matches!(ids, Some(Err(_))) || (scope.is_none() && languages.is_none()) {
+        return false;
+    }
+    if ids.as_ref().is_some_and(|ids| {
+        ids.as_ref()
+            .is_ok_and(|ids| ids.len() > MAX_SELECTED_TRACKS)
+    }) {
+        return false;
+    }
+    if scope.is_none()
+        && !languages.is_some_and(|languages| {
+            !languages.is_empty()
+                && languages.iter().all(|language| {
+                    language == "*"
+                        || tracks
+                            .iter()
+                            .take(MAX_TRACKS)
+                            .any(|track| track["language"] == *language)
+                })
+        })
+    {
+        return false;
+    }
+    let mut matched = 0_usize;
+    for track in tracks.iter().take(MAX_TRACKS) {
+        if let Some(Ok(ids)) = &ids {
+            if !track["number"].as_u64().is_some_and(|id| ids.contains(&id)) {
+                continue;
+            }
+        } else if !languages.is_some_and(|languages| {
+            languages
+                .iter()
+                .any(|language| language == "*" || language == &track["language"])
+        }) {
+            continue;
+        }
+        let Some(language) = track["language"]
+            .as_str()
+            .filter(|language| !matches!(*language, "und" | "unknown" | "zxx"))
+        else {
+            return false;
+        };
+        let (Some(forced), Some(hi)) = (track["forced"].as_bool(), track["hi"].as_bool()) else {
+            return false;
+        };
+        if !covered(&SubtitleTarget {
+            language: language.into(),
+            forced,
+            hi,
+        }) {
+            return false;
+        }
+        matched += 1;
+    }
+    matched > 0
+        && ids
+            .as_ref()
+            .is_none_or(|ids| ids.as_ref().is_ok_and(|ids| matched == ids.len()))
 }
 
 fn resolved_selection(whole: &Value, selection: &Value) -> bool {
@@ -4131,6 +4320,155 @@ mod tests {
         }
         assert!(validate_track_ids(&json!([{"number":3},{"number":3}]), &[3]).is_err());
         validate_track_ids(&tracks, &[3, 4]).unwrap();
+    }
+
+    #[test]
+    fn inventory_coverage_resolves_only_matching_processing_and_preserves_receipts_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("inventory.mkv");
+        fs::write(&source, b"disposable media").unwrap();
+        let key = source.to_string_lossy().into_owned();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        let stamp = fingerprint_json(&fingerprint(&source).unwrap());
+        let target = json!({"language":"en","forced":false,"hi":false});
+        converter.set_state_entry(&key, json!({"fingerprint":stamp,"ok":false,"error":"Preserved conversion failure","ocr_pending":true,"targets":[target],"outputs":["inventory.en.srt"],"track_selections":{
+            "3":{"fingerprint":stamp,"ok":false,"error":"Preserved selected failure","ocr_pending":true,"selection_coverage":{"languages":["en"]}}
+        }}));
+        let mut row = json!({"path":source,"tracks":[{"number":3,"language":"en","forced":false,"hi":false}],"coverage":{"status":"covered","existing_targets":[target]}});
+        assert!(
+            converter
+                .reconcile_inventory_processing(std::slice::from_ref(&row))
+                .unwrap()
+        );
+        assert_eq!(converter.pipeline_counts()["failed_files"], 0);
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 0);
+        assert_eq!(converter.pipeline_counts()["generated_srt_count"], 1);
+        assert_eq!(
+            converter.state[&key]["error"],
+            "Preserved conversion failure"
+        );
+        assert_eq!(
+            converter.state[&key]["track_selections"]["3"]["error"],
+            "Preserved selected failure"
+        );
+        assert_eq!(converter.file_processing(&key)["failed"], false);
+        assert!(converter.file_processing(&key)["last_error"].is_null());
+        assert!(
+            !converter
+                .reconcile_inventory_processing(std::slice::from_ref(&row))
+                .unwrap()
+        );
+        let restarted = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        assert_eq!(restarted.pipeline_counts()["failed_files"], 0);
+        row["coverage"] = json!({"status":"needs_conversion","existing_targets":[]});
+        converter.reconcile_inventory_processing(&[row]).unwrap();
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 1);
+    }
+
+    #[test]
+    fn inventory_coverage_keeps_unknown_languages_variants_and_other_scopes_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("scope.mkv");
+        fs::write(&source, b"disposable media").unwrap();
+        let key = source.to_string_lossy().into_owned();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        let stamp = fingerprint_json(&fingerprint(&source).unwrap());
+        converter.set_state_entry(&key, json!({"fingerprint":stamp,"ok":false,"error":"Unresolved language","languages":["en","fr"],"track_selections":{
+            "3":{"fingerprint":stamp,"ok":false,"error":"Covered English"},
+            "4":{"fingerprint":stamp,"ok":false,"error":"French forced","ocr_pending":true},
+            "5":{"fingerprint":stamp,"ok":false,"error":"Unknown language"},
+            "99":{"fingerprint":stamp,"ok":false,"error":"Missing metadata"}
+        }}));
+        let row = json!({"path":source,"tracks":[{"number":3,"language":"en","forced":false,"hi":false},{"number":4,"language":"fr","forced":true,"hi":false},{"number":5,"language":"und","forced":false,"hi":false}],"coverage":{"status":"covered","existing_targets":[{"language":"en","forced":false,"hi":false},{"language":"fr","forced":false,"hi":false}]}});
+        converter.reconcile_inventory_processing(&[row]).unwrap();
+        assert_eq!(
+            converter.state[&key]["track_selections"]["3"]["inventory_resolved"],
+            true
+        );
+        for scope in ["4", "5", "99"] {
+            assert_ne!(
+                converter.state[&key]["track_selections"][scope]["inventory_resolved"],
+                true
+            );
+        }
+        assert_ne!(converter.state[&key]["inventory_resolved"], true);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 1);
+        // An unversioned legacy error is ambiguous and must remain visible.
+        converter.set_state_entry(&key, json!({"ok":false,"error":"Legacy unknown failure"}));
+        converter
+            .reconcile_inventory_processing(&[
+                json!({"path":source,"coverage":{"status":"covered","existing_targets":[]}}),
+            ])
+            .unwrap();
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+    }
+
+    #[test]
+    fn inventory_observation_never_hides_changed_source_or_unrelated_coverage_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("changed.mkv");
+        fs::write(&source, b"original disposable media").unwrap();
+        let key = source.to_string_lossy().into_owned();
+        let mut converter = Converter::new(
+            vec![dir.path().to_path_buf()],
+            dir.path().join("state.json"),
+        )
+        .unwrap();
+        let stamp = fingerprint_json(&fingerprint(&source).unwrap());
+        converter.set_state_entry(&key,json!({"fingerprint":stamp,"processing_fingerprint":stamp,"ok":false,"error":"French OCR failure","ocr_pending":true,"targets":[{"language":"fr","forced":false,"hi":false}],"coverage":{"status":"already_covered","existing_targets":[{"language":"en","forced":false,"hi":false}]}}));
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        assert_eq!(converter.file_processing(&key)["failed"], true);
+        fs::write(&source, b"changed source with different length").unwrap();
+        assert!(
+            !converter
+                .reconcile_inventory_processing(&[
+                    json!({"path":source,"coverage":{"status":"unknown","existing_targets":[]}})
+                ])
+                .unwrap()
+        );
+        assert_eq!(converter.state[&key]["processing_fingerprint"], stamp);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 1);
+    }
+
+    #[test]
+    fn inventory_resolution_rolls_back_on_persist_failure_and_retries_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("retry.mkv");
+        fs::write(&source, b"disposable media").unwrap();
+        let key = source.to_string_lossy().into_owned();
+        let state_path = dir.path().join("state.json");
+        let mut converter =
+            Converter::new(vec![dir.path().to_path_buf()], state_path.clone()).unwrap();
+        let stamp = fingerprint_json(&fingerprint(&source).unwrap());
+        let target = json!({"language":"en","forced":false,"hi":false});
+        converter.set_state_entry(&key,json!({"fingerprint":stamp,"ok":false,"error":"Preserved failure","ocr_pending":true,"targets":[target],"track_selections":{"3":{"fingerprint":stamp,"ok":false,"error":"Preserved selected failure","targets":[target]}}}));
+        let before = converter.state.clone();
+        fs::create_dir(&state_path).unwrap();
+        let rows =
+            [json!({"path":source,"coverage":{"status":"covered","existing_targets":[target]}})];
+        assert!(converter.reconcile_inventory_processing(&rows).is_err());
+        assert_eq!(converter.state, before);
+        assert_eq!(converter.pipeline_counts()["failed_files"], 1);
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 1);
+        fs::remove_dir(&state_path).unwrap();
+        assert!(converter.reconcile_inventory_processing(&rows).unwrap());
+        assert_eq!(converter.pipeline_counts()["failed_files"], 0);
+        assert_eq!(converter.pipeline_counts()["pending_ocr_files"], 0);
     }
 
     #[test]

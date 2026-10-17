@@ -21,6 +21,8 @@ networking. DNS, tunnel routes, and reverse-proxy hosts are configured separatel
 | [config/glance.yml](config/glance.yml) | Server settings, branding, theme, asset directory, script, and page includes |
 | [config/pages/](config/pages/) | One YAML file per navigation tab |
 | [config/widgets/](config/widgets/) | Reusable custom API widgets for Jellyfin, Sonarr/Radarr, Seerr, qBittorrent, and Subforge |
+| [config/assets/media-calendar.js](config/assets/media-calendar.js) | Browser calendar controls, rendering, and same-origin calendar requests |
+| [config/assets/media-calendar.css](config/assets/media-calendar.css) | Responsive calendar layout and disclosure styling |
 | [config/assets/media-live.js](config/assets/media-live.js) | Refreshes Media widgets outside the live Jellyfin session feed |
 | [config/assets/widget-live.js](config/assets/widget-live.js) | Connects visible Media and Downloads widgets to the same-origin SSE stream |
 | [live/src/](live/src/) | Rust Glance proxy, bounded SSE relay, provider collectors, and configuration |
@@ -41,7 +43,7 @@ root `.env` file; edit YAML when changing the dashboard layout or widget behavio
 | Tab | Configured content |
 | --- | --- |
 | [Overview](config/pages/overview.yml) | SearxNG search with `!yt`, `!gh`, and `!r` shortcuts; clock; configured weather; calendar; Docker containers; core service status; quick links |
-| [Media](config/pages/media.yml) | Jellyfin sessions and library totals; 14-day Sonarr/Radarr calendar; Seerr request counts; media and automation status including Subtitle Studio and Subforge; links and project releases |
+| [Media](config/pages/media.yml) | Jellyfin sessions and library totals; interactive Sonarr/Radarr calendar; Seerr request counts; media and automation status including Subtitle Studio and Subforge; links and project releases |
 | [Downloads](config/pages/downloads.yml) | qBittorrent transfer and torrent statistics; download and processing service status; bookmarks; download stack releases |
 | [Network](config/pages/network.yml) | AdGuard Home, Nginx Proxy Manager, Uptime Kuma, and Portracker status; public-service links and checks; infrastructure releases; administration links |
 | [Tools](config/pages/tools.yml) | Tool status; AI, automation, document, and cloud links; latest Glance community widgets; developer links |
@@ -151,7 +153,7 @@ The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling
 | --- | --- | --- |
 | [Jellyfin sessions](config/widgets/jellyfin-stats.yml) | Live relay uses Jellyfin `/socket` `SessionsStart`, plus `/Sessions` snapshots/reconciliation; shows active playback, users, devices, play method, pause state, and progress | `15s` initial cache; then event-driven, with `5s` REST reconciliation by default |
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
-| [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Sonarr and Radarr `/api/v3/calendar`; renders the next 14 days | `30s` |
+| [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Same-origin `/live/calendar` gateway route backed by Sonarr and Radarr `/api/v3/calendar`; renders day, Monday-first week, month, or year views | Browser refresh every `30s` while visible |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
 | [Subforge](config/widgets/subforge.yml) | Subforge `/api/widget` with a dedicated read-only bearer token; processed-file count, queued jobs, configured roots, recent failures, current run/progress, elapsed time, approximate ETA when available, liveness/waiting state, and selected languages | `15s` cached snapshot |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
@@ -235,8 +237,18 @@ session does not animate progress; playing progress is interpolated for at most
 15 seconds between confirmed snapshots and corrected on the next update.
 
 The existing `media-live.js` continues to refresh the other selected Media
-widgets (service monitors, library counts, calendar, and Seerr) from Glance's
-rendered page content every 15 seconds while visible. The two service monitors
+widgets (service monitors, library counts, and Seerr) from Glance's rendered
+page content every 15 seconds while visible. The calendar has its own browser
+refresh every 30 seconds while visible. It starts on the current Monday-first
+week, offers day, week, month, and year views, and has previous/next plus
+Today, This week, This month, and This year controls. The year view shows all
+12 months and scheduled release days. More than three episodes from the same
+series on one browser-local day appear in a collapsed native disclosure; up to
+three remain listed individually. Navigation resets disclosures, while refresh
+preserves navigation and expansion state. Episode timestamps use the browser's
+local timezone; movie release dates remain date-only calendar days.
+
+The two service monitors
 have `30s` server caches. Neither stream nor browser refresh updates Media's
 release feed. Cache durations determine when Glance can fetch fresh source data;
 they do not themselves push changes to an open page. If upstream calls fail,
@@ -253,24 +265,42 @@ container port `8765` without publishing a host port.
 
 ### Sonarr and Radarr calendar troubleshooting
 
-The calendar calls `${SONARR_INTERNAL_URL}/api/v3/calendar` and
-`${RADARR_INTERNAL_URL}/api/v3/calendar` from the Glance container. If either
-service returns HTTP `400`, check its **Settings > General > Host > Allowed
+The browser fetches `/live/calendar?start=YYYY-MM-DD&end=YYYY-MM-DD` from the
+same origin as Glance; `end` is exclusive. The gateway calls the configured
+Sonarr and Radarr calendar APIs server-side, so API keys are never sent to the
+browser. Compose supplies the existing `SONARR_INTERNAL_URL`, `SONARR_API_KEY`,
+`RADARR_INTERNAL_URL`, and `RADARR_API_KEY` values to `glance-live`. Leave a
+provider key blank to skip that provider; both keys blank return HTTP `503`.
+Invalid ranges return `400`, same-origin/auth failures are rejected, and
+configured provider or response-limit failures return `502`. The gateway
+accepts ranges up to 366 days, pads provider requests by one day at each edge
+for local-time conversion, allows at most two concurrent calendar requests,
+and enforces provider and output size limits. Its HTTP client does not follow
+redirects. The UI requires JavaScript.
+
+If either provider returns HTTP `400`, check its **Settings > General > Host > Allowed
 Hosts** list. Preserve existing entries and add `sonarr` for Sonarr or `radarr`
 for Radarr, matching the hostname in the corresponding `*_INTERNAL_URL`. Enter
 only the hostname: no scheme or port. Save the setting and restart the affected
 service; the Arr host setting takes effect after restart. Do not clear the
 allowlist or disable authentication.
 
-HTTP `401` points to authentication or an API key problem; verify the matching
-`SONARR_API_KEY` or `RADARR_API_KEY` in the private `.env`. A connection error
-instead points to service status, container networking, or the internal URL.
-After changing an API key in `.env`, recreate Glance so it receives the new
-value:
+HTTP `502` points to provider authentication, reachability, invalid provider
+data, or a configured response limit; verify the matching API key in private
+`.env` and check service status and internal URLs. After changing a provider
+URL or API key in `.env`, rebuild and recreate `glance-live` so it receives the
+new values. After editing the Glance YAML or assets, restart Glance and reload
+the browser. These commands work in PowerShell, Bash, and Zsh from the
+repository root:
 
 ```shell
-docker compose up -d --force-recreate glance
+docker compose up -d --build --force-recreate glance-live
+docker compose restart glance
 ```
+
+The calendar browser tests use local fixtures and do not contact Sonarr or
+Radarr. Run them from the repository root with `node --test
+glance/test_media_calendar.cjs` (PowerShell, Bash, or Zsh).
 
 ## Maintenance
 

@@ -103,6 +103,8 @@ impl Fixture {
             glance: base(&upstream_url, "GLANCE_UPSTREAM_URL").unwrap(),
             qbittorrent: base(&upstream_url, "QBITTORRENT_INTERNAL_URL").unwrap(),
             jellyfin: base(&upstream_url, "JELLYFIN_INTERNAL_URL").unwrap(),
+            sonarr: base(&format!("http://{upstream}/sonarr"), "SONARR_INTERNAL_URL").unwrap(),
+            radarr: base(&format!("http://{upstream}/radarr"), "RADARR_INTERNAL_URL").unwrap(),
             allowed_hosts: HashSet::from(["localhost".to_owned(), "127.0.0.1".to_owned()]),
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             qb_interval: Duration::from_millis(500),
@@ -118,6 +120,8 @@ impl Fixture {
             qb_username: String::new(),
             qb_password: String::new(),
             jellyfin_key: "fixture-key".into(),
+            sonarr_key: "fixture-sonarr-key".into(),
+            radarr_key: "fixture-radarr-key".into(),
         };
         configure(&mut config);
         let relay = Relay::new(config).unwrap();
@@ -904,4 +908,244 @@ async fn rejected_or_redirected_qb_login_never_fetches_data_or_follows_redirects
         drop(subscription);
         fixture.close().await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn calendar_projects_provider_fields_and_pads_date_queries_without_exposing_keys() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let captured = captured.clone();
+        Box::pin(async move {
+            let path = request.uri().path();
+            if path == "/api/pages/media/content/" {
+                assert_eq!(request.headers().get("cookie").unwrap(), "auth=valid");
+                assert!(request.headers().get("x-api-key").is_none());
+                return response(StatusCode::OK, "authorized");
+            }
+            assert!(request.headers().get("cookie").is_none());
+            captured.lock().unwrap().push((
+                request.uri().to_string(),
+                request
+                    .headers()
+                    .get("x-api-key")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            ));
+            if path == "/sonarr/api/v3/calendar" {
+                json_response(json!([
+                    {"id": 1, "seriesId": 20, "title":"First", "airDateUtc":"2026-10-19T23:30:00Z", "series":{"title":"Cyberpunk", "titleSlug":"cyberpunk"}, "seasonNumber":2,"episodeNumber":1,"path":"private-provider-path", "apiKey":"private-provider-key"},
+                    {"id": 2, "seriesId": 20, "title":"Second", "airDateUtc":"2026-10-20T00:00:00Z", "series":{"title":"Cyberpunk", "titleSlug":"cyberpunk"}, "seasonNumber":2,"episodeNumber":2},
+                    {"id": 3, "seriesId": 20, "title":"Outside", "airDateUtc":"2027-01-20T00:00:00Z", "series":{"title":"Cyberpunk", "titleSlug":"cyberpunk"}, "seasonNumber":2,"episodeNumber":3}
+                ]))
+            } else {
+                assert_eq!(path, "/radarr/api/v3/calendar");
+                json_response(
+                    json!([{"id": 30,"title":"Movie","titleSlug":"12345","releaseDate":"2026-10-20T00:00:00Z","digitalRelease":"2026-11-20T00:00:00Z","path":"private-movie-path"}]),
+                )
+            }
+        })
+    });
+    let fixture = Fixture::start(handler, |_| {}).await;
+    let result = fixture
+        .client
+        .get(fixture.url("/live/calendar?start=2026-10-20&end=2026-10-21"))
+        .header("host", "localhost")
+        .header("cookie", "auth=valid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), StatusCode::OK);
+    assert_eq!(result.headers().get("cache-control").unwrap(), "no-store");
+    let body = result.text().await.unwrap();
+    assert!(!body.contains("private-"));
+    assert!(!body.contains("fixture-"));
+    let calendar: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(calendar["start"], "2026-10-20");
+    assert_eq!(calendar["end"], "2026-10-21");
+    let events = calendar["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["seriesId"], 20);
+    assert_eq!(events[0]["date"], "2026-10-19T23:30:00Z");
+    assert_eq!(events[1]["episode"], 2);
+    assert_eq!(events[2]["kind"], "movie");
+    assert_eq!(events[2]["date"], "2026-10-20T00:00:00Z");
+    {
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].0,
+            "/sonarr/api/v3/calendar?start=2026-10-19&end=2026-10-22&includeSeries=true"
+        );
+        assert_eq!(calls[0].1, "fixture-sonarr-key");
+        assert_eq!(
+            calls[1].0,
+            "/radarr/api/v3/calendar?start=2026-10-19&end=2026-10-22"
+        );
+        assert_eq!(calls[1].1, "fixture-radarr-key");
+    }
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn calendar_rejects_bad_ranges_origins_methods_and_unauthorized_requests_before_provider_access()
+ {
+    let providers = Arc::new(AtomicUsize::new(0));
+    let captured = providers.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let captured = captured.clone();
+        Box::pin(async move {
+            if request.uri().path() == "/api/pages/media/content/" {
+                return response(StatusCode::UNAUTHORIZED, "auth required");
+            }
+            captured.fetch_add(1, Ordering::SeqCst);
+            json_response(json!([]))
+        })
+    });
+    let fixture = Fixture::start(handler, |_| {}).await;
+    for (query, origin, expected) in [
+        (
+            "start=2026-02-29&end=2026-03-01",
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "start=2026-10-20&end=2026-10-21",
+            Some("https://elsewhere.example"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "start=2026-10-20&end=2026-10-21",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let mut request = fixture
+            .client
+            .get(fixture.url(&format!("/live/calendar?{query}")))
+            .header("host", "localhost");
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        assert_eq!(request.send().await.unwrap().status(), expected);
+    }
+    let denied = fixture
+        .client
+        .post(fixture.url("/live/calendar?start=2026-10-20&end=2026-10-21"))
+        .header("host", "localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(denied.headers().get("allow").unwrap(), "GET");
+    assert_eq!(providers.load(Ordering::SeqCst), 0);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn calendar_rejects_provider_redirects_oversize_and_unsafe_link_paths() {
+    for mode in ["redirect", "oversize", "slug", "output"] {
+        let leak = Arc::new(AtomicUsize::new(0));
+        let captured = leak.clone();
+        let handler: Handler = Arc::new(move |request| {
+            let captured = captured.clone();
+            Box::pin(async move {
+                if request.uri().path() == "/api/pages/media/content/" {
+                    return response(StatusCode::OK, "authorized");
+                }
+                if request.uri().path() == "/leak" {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    return json_response(json!([]));
+                }
+                match mode {
+                    "redirect" => {
+                        let mut result = response(StatusCode::FOUND, "redirect");
+                        result
+                            .headers_mut()
+                            .insert("location", HeaderValue::from_static("/leak"));
+                        result
+                    }
+                    "oversize" => response(StatusCode::OK, Bytes::from(vec![b'x'; 2048])),
+                    _ => json_response(
+                        json!([{"id":1,"title":"Movie","titleSlug":if mode == "slug" {"../private"} else {"123"},"releaseDate":"2026-10-20T00:00:00Z"}]),
+                    ),
+                }
+            })
+        });
+        let fixture = Fixture::start(handler, |config| {
+            config.sonarr_key.clear();
+            config.provider_bytes = 1024;
+            if mode == "output" {
+                config.snapshot_bytes = 32;
+            }
+        })
+        .await;
+        let result = fixture
+            .client
+            .get(fixture.url("/live/calendar?start=2026-10-20&end=2026-10-21"))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::BAD_GATEWAY, "{mode}");
+        assert_eq!(leak.load(Ordering::SeqCst), 0);
+        fixture.close().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn calendar_bounds_concurrent_provider_requests() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let captured_calls = calls.clone();
+    let captured_gate = gate.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let calls = captured_calls.clone();
+        let gate = captured_gate.clone();
+        Box::pin(async move {
+            if request.uri().path() == "/api/pages/media/content/" {
+                return response(StatusCode::OK, "authorized");
+            }
+            calls.fetch_add(1, Ordering::SeqCst);
+            gate.acquire().await.unwrap().forget();
+            json_response(json!([]))
+        })
+    });
+    let fixture = Fixture::start(handler, |config| config.sonarr_key.clear()).await;
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        let client = fixture.client.clone();
+        let url = fixture.url("/live/calendar?start=2026-10-20&end=2026-10-21");
+        pending.push(tokio::spawn(async move {
+            client
+                .get(url)
+                .header("host", "localhost")
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    timeout(Duration::from_secs(2), async {
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let denied = fixture
+        .client
+        .get(fixture.url("/live/calendar?start=2026-10-20&end=2026-10-21"))
+        .header("host", "localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    gate.add_permits(2);
+    for task in pending {
+        assert_eq!(task.await.unwrap().status(), StatusCode::OK);
+    }
+    fixture.close().await;
 }

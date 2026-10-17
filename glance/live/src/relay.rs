@@ -83,6 +83,7 @@ struct Channel {
 pub struct Relay {
     pub config: Arc<Config>,
     pub http: Client,
+    pub(crate) calendar_slots: Semaphore,
     topics: [Channel; 2],
     slots: Arc<Semaphore>,
 }
@@ -137,7 +138,7 @@ pub async fn bounded_body(mut response: Response, limit: usize) -> Result<Bytes,
 }
 
 /// Stop serialization before a large provider state can allocate an oversized event.
-fn bounded_json(data: &Value, limit: usize) -> Result<Bytes, Error> {
+pub(crate) fn bounded_json(data: &impl serde::Serialize, limit: usize) -> Result<Bytes, Error> {
     struct Buffer {
         bytes: Vec<u8>,
         limit: usize,
@@ -187,6 +188,7 @@ impl Relay {
             }
         });
         Ok(Arc::new(Self {
+            calendar_slots: Semaphore::new(2),
             slots: Arc::new(Semaphore::new(config.max_connections)),
             config: Arc::new(config),
             http: http_client()?,

@@ -1,5 +1,6 @@
 use crate::{
     Error,
+    calendar::{self, Range},
     config::{Config, authority, endpoint},
     relay::{Relay, Topic, http_client},
 };
@@ -156,6 +157,58 @@ async fn events(request: Request<Incoming>, relay: Arc<Relay>, host: &str) -> Re
     output
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    output
+}
+
+async fn calendar(request: Request<Incoming>, relay: Arc<Relay>, host: &str) -> Response<Body> {
+    if !same_origin(request.headers(), host) {
+        return response(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let Ok(range) = Range::parse(request.uri().query().unwrap_or_default()) else {
+        return response(
+            StatusCode::BAD_REQUEST,
+            "start and exclusive end must be valid dates at most 366 days apart",
+        );
+    };
+    let Ok(_permit) = relay.calendar_slots.try_acquire() else {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "calendar request limit reached",
+        );
+    };
+    let mut auth = relay
+        .http
+        .get(endpoint(&relay.config.glance, "/api/pages/media/content/"));
+    if let Some(cookie) = request.headers().get(header::COOKIE) {
+        auth = auth.header(header::COOKIE, cookie);
+    }
+    if !matches!(auth.send().await, Ok(response) if response.status() == StatusCode::OK) {
+        return response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    if relay.config.sonarr_key.is_empty() && relay.config.radarr_key.is_empty() {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "calendar providers are not configured",
+        );
+    }
+    let Ok(bytes) = calendar::load(&relay, range).await else {
+        return response(
+            StatusCode::BAD_GATEWAY,
+            "calendar providers unavailable or calendar limit exceeded",
+        );
+    };
+    let mut output = Response::new(
+        Full::new(bytes)
+            .map_err(|never: Infallible| match never {})
+            .boxed_unsync(),
+    );
+    output.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    output
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     output
 }
 
@@ -326,6 +379,14 @@ async fn handle(
             result
         }
         ("GET", "/live/events") => events(request, relay, &host).await,
+        ("GET", "/live/calendar") => calendar(request, relay, &host).await,
+        (_, "/live/calendar") => {
+            let mut denied = response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+            denied
+                .headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static("GET"));
+            denied
+        }
         _ => proxy(request, relay, &host, remote).await,
     };
     Ok(output)

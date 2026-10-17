@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod calendar;
 pub mod config;
 pub mod gateway;
 pub mod model;

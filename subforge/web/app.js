@@ -42,6 +42,8 @@
   state.systemSampleHealthy=false;
   state.workersInfo=null;
   state.workersBusy=false;
+  state.workersSampleHealthy=false;
+  state.workersReceivedAt=0;
   state.workersDirty=false;
   state.workersSaving=false;
   state.tasksDirty=false;
@@ -64,7 +66,9 @@
     const headers = new Headers(options.headers || {});
     if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type','application/json');
     if (state.csrf && options.method && options.method !== 'GET') headers.set('X-CSRF-Token', state.csrf);
-    const response = await fetch(path,{...options,headers,credentials:'same-origin'});
+    // A stalled read must release polling's busy flags so the next sample can recover.
+    const readOnly=!options.method||options.method==='GET';
+    const response = await fetch(path,{...options,headers,credentials:'same-origin',cache:'no-store',signal:options.signal||(readOnly?AbortSignal.timeout(15000):undefined)});
     const contentType = response.headers.get('content-type') || '';
     const payload = contentType.includes('json') ? await response.json() : await response.text();
     if (!response.ok) throw new Error(typeof payload === 'object' ? payload.error || payload.message || `Request failed (${response.status})` : payload || `Request failed (${response.status})`);
@@ -412,7 +416,7 @@
   const loadInventory = async summary => {
     if(state.inventoryBusy)return;if(summary?.authority)state.inventoryAuthority=summary.authority;if(summary?.source)state.inventorySource=summary.source;renderInventoryAuthority();if(state.inventoryLoaded&&state.inventoryUpdated===summary?.updated&&state.inventoryRevision===summary?.state_revision)return;
     state.inventoryBusy=true;
-    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryRevision=data.state_revision;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;state.inventorySource=data.source||'filesystem';state.inventoryAuthority=data.authority||{status:'ready'};renderInventoryAuthority();renderInventory();}
+    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryRevision=data.state_revision;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;state.inventorySource=data.source||'filesystem';state.inventoryAuthority=data.authority||{status:'ready'};renderInventoryAuthority();renderInventory();renderPipeline();}
     catch(error){notify(`Could not load library inventory: ${error.message}`,'error');}
     finally{state.inventoryBusy=false;}
   };
@@ -423,8 +427,8 @@
     try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:'auto';$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','needed','covered','unavailable','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
   };
   const pollStatus = async () => {
-    if (state.pollBusy || !state.csrf) return; state.pollBusy=true;
-    try { state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); await loadInventory(state.status.inventory); renderInventory(); renderPipeline(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`); updateHookStates(); updateIntegrationUsage(); updateIntegrationDots(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)await loadTasks(); }
+    if (state.pollBusy) return; state.pollBusy=true;
+    try { if(!state.csrf){const session=await api('/api/session');state.csrf=session.csrf_token||'';if(!state.csrf)throw new Error('Session is unavailable');} state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); renderPipeline(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`); void loadInventory(state.status.inventory); updateHookStates(); updateIntegrationUsage(); updateIntegrationDots(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)void loadTasks(); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
@@ -761,12 +765,12 @@
     if(!state.workersDirty&&!state.workersSaving){for(const [kind,selector] of Object.entries(workerFields))$(selector).value=String(allocation[kind]??0);$('#worker-paused').checked=!!allocation.paused;}
     renderWorkerSteppers();
     const paused=!!allocation.paused,total=Number(active.cpu_workers||0)+Number(active.gpu_workers||0);
-    setText($('#worker-pool-state'),paused?'Paused':total?`${total} active`:'Ready');$('#worker-pool-state').className=`status-pill ${paused?'cancelled':total?'running':'completed'}`;
+    setText($('#worker-pool-state'),!state.workersSampleHealthy?'Sample stale':paused?'Paused':total?`${total} active`:'Ready');$('#worker-pool-state').className=`status-pill ${!state.workersSampleHealthy||paused?'cancelled':total?'running':'completed'}`;
     const allowance=measuredNumber(cpu.effective_cores)??measuredNumber(detected.cpu_allowance_cores);
     setText($('#worker-cpu-allowance'),allowance===null?'Unavailable':`${allowance.toLocaleString()} CPU${allowance===1?'':'s'}`);
-    setText($('#worker-cpu-usage'),measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% in use`:'Sampling usage…');
-    setText($('#worker-ram'),measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
-    const meter=$('#worker-memory-meter');meter.value=memory.cgroup_limit_bytes>0?Math.min(1,(memory.cgroup_current_bytes||0)/memory.cgroup_limit_bytes):0;meter.hidden=measuredNumber(memory.cgroup_current_bytes)===null||!(memory.cgroup_limit_bytes>0);
+    setText($('#worker-cpu-usage'),!state.systemSampleHealthy?'Sample stale · retrying':measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% in use`:'Sampling usage…');
+    setText($('#worker-ram'),!state.systemSampleHealthy?'Sample stale · retrying':measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
+    const meter=$('#worker-memory-meter');meter.value=memory.cgroup_limit_bytes>0?Math.min(1,(memory.cgroup_current_bytes||0)/memory.cgroup_limit_bytes):0;meter.hidden=!state.systemSampleHealthy||measuredNumber(memory.cgroup_current_bytes)===null||!(memory.cgroup_limit_bytes>0);
     setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA checked':'CUDA enabled'):'Unavailable');
     const gpuReason=$('#worker-gpu-reason');setText(gpuReason,detected.gpu_available?'Verified before each OCR file':detected.gpu_reason||'GPU OCR is unavailable.');gpuReason.title=detected.gpu_reason||'CUDA, VRAM, and offline models are checked before each OCR file.';
     for(const [kind,resource,selector,limit] of [['cpu_workers','cpu','#worker-cpu-capacity','cpu_limit_reason'],['ocr_workers','cpu_ocr','#worker-ocr-capacity','ocr_limit_reason'],['gpu_workers','gpu','#worker-gpu-capacity','gpu_limit_reason']]){
@@ -785,8 +789,8 @@
   };
   const loadWorkers = async (quiet=false) => {
     if(!state.csrf||state.workersBusy||state.workersSaving)return;state.workersBusy=true;
-    try{state.workersInfo=await api('/api/workers');renderWorkers();renderWorkerNodes(state.workersInfo.remote);}
-    catch(error){setText($('#worker-live-state'),'Disconnected · retrying');if(!quiet)notify(`Could not load workers: ${error.message}`,'error');}
+    try{state.workersInfo=await api('/api/workers');state.workersReceivedAt=performance.now();state.workersSampleHealthy=true;renderWorkers();renderWorkerNodes(state.workersInfo.remote);}
+    catch(error){state.workersSampleHealthy=false;renderWorkers();setText($('#worker-live-state'),'Disconnected · retrying');if(!quiet)notify(`Could not load workers: ${error.message}`,'error');}
     finally{state.workersBusy=false;}
   };
   const saveWorkers = async event => {
@@ -813,9 +817,12 @@
   };
   const formatUptime = seconds => {const uptime=Math.max(0,Math.floor(seconds));return `${Math.floor(uptime/86400)}d ${Math.floor(uptime%86400/3600)}h ${Math.floor(uptime%3600/60)}m ${uptime%60}s`;};
   const tickSystemUptime = () => {
-    if(!systemVisible()||state.settingsSection!=='status'||!state.systemSampleHealthy||!state.systemInfo)return;
+    if(!systemVisible())return;
+    if(state.workersSampleHealthy&&performance.now()-state.workersReceivedAt>15000){state.workersSampleHealthy=false;if(workersVisible())renderWorkers();}
+    if(!state.systemSampleHealthy||!state.systemInfo)return;
     const elapsed=(performance.now()-state.systemReceivedAt)/1000;
-    if(elapsed>15){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Sample stale');return;}
+    if(elapsed>15){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Sample stale · retrying');if(workersVisible())renderWorkers();return;}
+    if(state.currentPage!=='settings'||state.settingsSection!=='status')return;
     setText($('#system-uptime'),formatUptime(Number(state.systemInfo.uptime_seconds||0)+elapsed));
   };
   const renderSystem = () => {
@@ -855,7 +862,7 @@
   const loadSystem = async (quiet=false) => {
     if(!state.csrf||state.systemBusy)return;state.systemBusy=true;
     try{state.systemInfo=await api('/api/system');state.systemReceivedAt=performance.now();state.systemSampleHealthy=true;renderSystem();if(workersVisible())renderWorkers();}
-    catch(error){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Disconnected · retrying');if(!quiet)notify(`Could not load system status: ${error.message}`,'error');}
+    catch(error){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Disconnected · retrying');if(workersVisible())renderWorkers();if(!quiet)notify(`Could not load system status: ${error.message}`,'error');}
     finally{state.systemBusy=false;}
   };
   const syncSystemMonitor = () => {
@@ -982,7 +989,7 @@
       if($('#sidebar').classList.contains('mobile-open')){const focusable=$$('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled)', $('#sidebar')).filter(node=>!node.closest('[inert]')&&node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}
     });
   };
-  const scheduleStatusPoll = () => {clearTimeout(state.pollTimer);const busy=!!state.status?.running||!!state.status?.queue?.length;state.pollTimer=setTimeout(async()=>{await pollStatus();scheduleStatusPoll();},document.hidden?60000:busy?3000:15000);};
+  const scheduleStatusPoll = () => {clearTimeout(state.pollTimer);const busy=activeJobs().length>0||!!state.status?.queue?.length;state.pollTimer=setTimeout(async()=>{await pollStatus();scheduleStatusPoll();},document.hidden?60000:busy?3000:15000);};
   const initialize = async () => { bind();restoreRoute(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]);if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();if(state.currentPage==='settings'&&state.settingsSection==='tasks')await loadTasks();if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers(); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } scheduleStatusPoll();syncSystemMonitor();document.addEventListener('visibilitychange',async()=>{syncSystemMonitor();if(!document.hidden){await pollStatus();if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers();}scheduleStatusPoll();}); };
   initialize();
 })();

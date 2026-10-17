@@ -397,9 +397,13 @@ jobs:
       - name: Validate dashboard scripts
         run: |
           node --check glance/config/assets/media-live.js
+          node --check glance/config/assets/media-calendar.js
           node --check glance/config/assets/widget-live.js
           node --check subtitle-studio/web/app.js
           node --check subforge/web/app.js
+
+      - name: Run Media calendar frontend regression tests
+        run: node --test glance/test_media_calendar.cjs
 
       - name: Run Subtitle Studio frontend regression tests
         run: node --test subtitle-studio/test_*.cjs

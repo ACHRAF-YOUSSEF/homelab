@@ -465,6 +465,7 @@ pub struct App {
     dispatch: Mutex<()>,
     inventory_sync: Mutex<()>,
     inventory_persist: Mutex<()>,
+    pipeline_refresh: Mutex<()>,
     public_integrations: Mutex<Value>,
     mounts: Vec<PathBuf>,
     data: PathBuf,
@@ -800,6 +801,7 @@ impl App {
             dispatch: Mutex::new(()),
             inventory_sync: Mutex::new(()),
             inventory_persist: Mutex::new(()),
+            pipeline_refresh: Mutex::new(()),
             mounts,
             data,
             password,
@@ -1223,6 +1225,10 @@ impl App {
                 }
             }
         }
+        let processing_changed = lock(&self.converter).reconcile_inventory_processing(&rows)?;
+        if processing_changed {
+            self.refresh_pipeline();
+        }
         let partial = inventory["partial"].as_bool().unwrap_or(false)
             || metadata_pending > 0
             || self.cancellation().load(Ordering::Relaxed);
@@ -1585,10 +1591,21 @@ impl App {
     }
 
     fn refresh_pipeline(&self) {
+        // Serialize snapshots without retaining the converter lock while taking
+        // runtime: inventory readers acquire those two locks in the other order.
+        let _refresh = lock(&self.pipeline_refresh);
         let counts = lock(&self.converter).pipeline_counts();
         let mut runtime = lock(&self.runtime);
         runtime.pipeline_counts = counts;
         runtime.state_revision = runtime.state_revision.saturating_add(1);
+    }
+    fn merge_processing_state(&self, path: &Path, entry: Option<Value>) -> Result<(), String> {
+        let changed = entry.is_some();
+        lock(&self.converter).merge_file_state(path, entry)?;
+        if changed {
+            self.refresh_pipeline();
+        }
+        Ok(())
     }
     fn widget(&self) -> Value {
         let runtime = lock(&self.runtime);
@@ -2649,15 +2666,11 @@ impl App {
                                 if let Some(health) = outcome.gpu_health {
                                     lock(&self.workers).gpu.verified = Some(health);
                                 }
-                                let changed = outcome.state.is_some();
-                                let merged =
-                                    lock(&self.converter).merge_file_state(&path, outcome.state);
+                                let merged = self.merge_processing_state(&path, outcome.state);
                                 if let Err(error) = merged {
                                     failure = Some(error);
                                     self.cancellation().store(true, Ordering::Relaxed);
                                     pending.clear();
-                                } else if changed {
-                                    self.refresh_pipeline();
                                 }
                                 lock(&self.workers).active.retain(|worker| worker.id != id);
                                 drop(remote_commit_guard.take());
@@ -2696,7 +2709,7 @@ impl App {
                                         outputs,
                                     } => {
                                         if let Err(error) =
-                                            lock(&self.converter).merge_file_state(&path, state)
+                                            self.merge_processing_state(&path, state)
                                         {
                                             failure = Some(error);
                                             self.cancellation().store(true, Ordering::Relaxed);
@@ -2967,6 +2980,11 @@ impl App {
             let partial = cancelled || metadata_pending > 0;
             let keep_previous = cancelled && !lock(&self.runtime).inventory.is_empty();
             if !keep_previous {
+                let processing_changed =
+                    lock(&self.converter).reconcile_inventory_processing(&results)?;
+                if processing_changed {
+                    self.refresh_pipeline();
+                }
                 let updated = now();
                 let truncated = paths.len() > INVENTORY_LIMIT;
                 write_private(
@@ -5693,6 +5711,69 @@ mod tests {
         let restarted =
             App::new(vec![mount], data, Duration::from_secs(21600), false).expect("app");
         assert_eq!(restarted.status()["converted_count"], 2);
+    }
+
+    #[test]
+    fn bazarr_sync_refreshes_resolved_pipeline_flags_without_counting_external_srt_as_generated() {
+        let (_temporary, app, _paths, gate) = gated_workers_fixture();
+        let movie = app.mounts[0].join("observed.mkv");
+        fs::write(&movie, b"disposable media").unwrap();
+        let subtitle = movie.with_extension("en.srt");
+        target_srt(&subtitle);
+        let metadata = fs::metadata(&movie).unwrap();
+        let stamp = json!([[
+            metadata.len(),
+            metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ]]);
+        app.merge_processing_state(&movie, Some(json!({"fingerprint":stamp,"ok":false,"error":"Preserved OCR failure","ocr_pending":true,"targets":[{"language":"en","forced":false,"hi":false}],"outputs":[]}))).unwrap();
+        assert_eq!(app.status()["pipeline"]["failed_files"], 1);
+        assert_eq!(app.status()["pipeline"]["pending_ocr_files"], 1);
+        let fixture = BazarrFixture::new(
+            vec![
+                json!({"radarrId":1,"profileId":1,"path":movie,"subtitles":[{"code2":"en","path":subtitle,"forced":false,"hi":false}]}),
+            ],
+            &["en"],
+        );
+        let mut integrations = fixture.integration(&app);
+        let job = json!({"kind":"inspect","root_paths":app.mounts,"languages":["*"]});
+        lock(&app.runtime).running = Some(job.clone());
+        app.execute(&job, &mut integrations).unwrap();
+        let status = app.status();
+        assert_eq!(status["pipeline"]["failed_files"], 0);
+        assert_eq!(status["pipeline"]["pending_ocr_files"], 0);
+        assert_eq!(status["pipeline"]["generated_srt_count"], 0);
+        assert_eq!(app.inventory()["items"][0]["processing"]["failed"], false);
+        assert_eq!(
+            lock(&app.converter).state[movie.to_string_lossy().as_ref()]["error"],
+            "Preserved OCR failure"
+        );
+        assert_eq!(gate.entered.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn processing_merge_refreshes_failure_pending_and_publication_counters_before_polling() {
+        let (_temporary, app, paths, _gate) = gated_workers_fixture();
+        let path = &paths[0];
+        // The shared merge path handles both normal outcomes and publication
+        // followed by a conversion failure; these receipts must not stay stale.
+        app.merge_processing_state(path, Some(json!({"ok":false,"error":"Fixture failure after publication","ocr_pending":true,"outputs":["receipt.en.srt"]}))).unwrap();
+        let status = app.status();
+        assert_eq!(status["pipeline"]["failed_files"], 1);
+        assert_eq!(status["pipeline"]["pending_ocr_files"], 1);
+        assert_eq!(status["pipeline"]["generated_srt_count"], 1);
+        app.merge_processing_state(path, Some(json!({"ok":true,"ocr_pending":false,"outputs":["receipt.en.srt","receipt.fr.srt"]}))).unwrap();
+        let status = app.status();
+        assert_eq!(status["pipeline"]["failed_files"], 0);
+        assert_eq!(status["pipeline"]["pending_ocr_files"], 0);
+        assert_eq!(status["pipeline"]["generated_srt_count"], 2);
+        let revision = status["inventory"]["state_revision"].clone();
+        app.merge_processing_state(path, None).unwrap();
+        assert_eq!(app.status()["inventory"]["state_revision"], revision);
     }
 
     #[test]
