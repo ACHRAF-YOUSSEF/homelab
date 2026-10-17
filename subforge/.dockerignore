@@ -4,6 +4,7 @@
 !web/
 !web/index.html
 !web/app.js
+!web/live.js
 !web/style.css
 !web/icon.svg
 # Rust sources only; local cache/compiler output and private state stay excluded.

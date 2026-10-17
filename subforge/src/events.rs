@@ -170,12 +170,19 @@ impl Events {
         *self.revision.acquire()
     }
     pub(crate) fn permit(self: &Arc<Self>) -> Option<Permit> {
-        self.slots
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
-                (slots < STREAM_LIMIT).then_some(slots + 1)
-            })
-            .ok()?;
-        Some(Permit(self.clone()))
+        loop {
+            let slots = self.slots.load(Ordering::Acquire);
+            if slots >= STREAM_LIMIT {
+                return None;
+            }
+            if self
+                .slots
+                .compare_exchange_weak(slots, slots + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Permit(self.clone()));
+            }
+        }
     }
     fn wait(&self, revision: u64, duration: Duration) {
         let guard = self.revision.acquire();
