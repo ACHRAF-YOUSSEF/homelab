@@ -91,6 +91,12 @@ async function main() {
       { id: 'backup-1', kind: 'backup', status: 'completed', created: now - 60, summary: {} }
     ];
     jobs[0].executors=[null,{resource:'unknown',node_name:'Invalid',execution:'remote'},{resource:'cpu',node_name:'',execution:'local'}];
+    jobs[0].notifications=[
+      { provider:'sonarr', ok:true, sent_at:now-3600 },
+      { provider:'radarr', ok:false, sent_at:now-7200 },
+      { provider:'jellyfin', ok:true },
+      { provider:'bazarr', ok:true, sent_at:now-14400 },
+    ];
     let inventorySource = 'filesystem', inventoryAuthority = { status: 'ready' }, revision = 1;
     const pipeline = { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true };
     let holdInventory = false, releaseInventory, inventoryHeld = false;
@@ -102,13 +108,20 @@ async function main() {
     await page.exposeFunction('__systemHeld',()=>systemHeld);
     await page.exposeFunction('__abortedSystemReads',()=>abortedSystemReads);
     let settings = { languages: ['*'], permissions: { ocr: true }, integrations: {} };
+    let failSettings = false;
+    const taskRows = [
+      { id: 'discovery', name: 'Library discovery', description: 'Find media files and subtitle tracks.', enabled: true, interval_seconds: 21600, status: 'idle', last_result: 'Completed', last_run: now - 20700 },
+      { id: 'inventory', name: 'Media inventory', description: 'Refresh the media inventory.', enabled: true, interval_seconds: 86400, status: 'idle', last_result: 'Completed', last_run: now - 20700 },
+    ];
+    let tasksPaused = false;
+    const taskData = () => ({ tasks: taskRows, paused: tasksPaused });
     let allocation = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1, paused: false };
     let effectiveWorkers = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1 };
     const remote = { enabled: true, nodes: [{ id: 'node-1', name: 'Studio GPU', resource: 'gpu', last_seen_seconds: 2, active: 1, status: 'busy' }], pending: 0, active: 1 };
     const longGpuAdmissionReason = 'GPU admission is paused because memory headroom is below the configured safety threshold and will retry when the next file starts.';
     let runningJob = null, activeJobs = [], queuedJobs = [], fileWorkers = [];
     const workerData = () => ({ edition: 'cuda', max_requested: 1000000, allocation, requested: allocation, effective: effectiveWorkers, active: { cpu_workers: fileWorkers.filter(worker => worker.resource !== 'gpu').length, ocr_workers: fileWorkers.filter(worker => worker.resource === 'cpu_ocr').length, gpu_workers: fileWorkers.filter(worker => worker.resource === 'gpu').length }, detected: { cpu_allowance_cores: 4, gpu_available: true, gpu_verification: 'verified', gpu_reason: 'CUDA runtime enabled' }, deployment: { max_cpu_workers: 32, max_ocr_workers: 16, max_gpu_workers: 4 }, admission: { gpu: { allowed: false, reason: longGpuAdmissionReason } }, workers: fileWorkers, remote });
-    const statusData = includeTasks => ({ edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline, ...(includeTasks ? { tasks: { tasks: [], paused: false } } : {}) });
+    const statusData = includeTasks => ({ edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline, ...(includeTasks ? { tasks: taskData() } : {}) });
     const systemData = () => ({ edition: 'cuda', version: 'fixture', uptime_seconds: 120, resource_usage: { cpu: { effective_cores: 4 }, memory: { cgroup_current_bytes: systemMemory, cgroup_limit_bytes: 1610612736 } }, resources: {}, limits: {} });
     const writeEvent = (client, type, value) => {
       if (client.destroyed || !client.writable) return;
@@ -137,10 +150,12 @@ async function main() {
       if(endpoint==='/api/library'&&holdInventory){inventoryHeld=true;await new Promise(resolve=>{releaseInventory=resolve;});}
       if(endpoint==='/api/system'&&holdSystem){systemHeld=true;await new Promise(resolve=>{releaseSystem=resolve;});}
       if(endpoint==='/api/workers'&&failWorkers){await route.fulfill({status:503,contentType:'application/json',body:'{"error":"Fixture unavailable"}'});return;}
+      if (request.method() !== 'GET' && endpoint === '/api/settings' && failSettings) { writes.push({ endpoint, body: request.postDataJSON() }); await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Fixture settings save failed"}' }); return; }
       if (request.method() !== 'GET') {
         const body = request.postDataJSON(); writes.push({ endpoint, body });
         if (endpoint === '/api/workers') allocation = body;
         if (endpoint === '/api/settings') settings = { ...settings, ...body };
+        if (endpoint === '/api/tasks') { tasksPaused = !!body.paused; for (const update of body.tasks || []) { const task = taskRows.find(item => item.id === update.id); if (task) Object.assign(task, update); } }
       }
       if (endpoint === '/api/session') value = { csrf_token: 'disposable-ui-fixture' };
       else if (endpoint === '/api/status') value = statusData(false);
@@ -151,7 +166,7 @@ async function main() {
       else if (endpoint === '/api/system') value = systemData();
       else if (endpoint === '/api/jobs') value = { message: 'Fixture job queued' };
       else if (endpoint === '/api/root-folders') value = { roots: [], mounts: [] };
-      else if (endpoint === '/api/tasks') value = { tasks: [], paused: false };
+      else if (endpoint === '/api/tasks') value = taskData();
       else throw new Error(`Unexpected fixture API ${request.method()} ${endpoint}`);
       await route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) }).catch(error=>{if(!request.failure())throw error;});
     });
@@ -389,14 +404,60 @@ async function main() {
     assert.equal(await legacyRow.locator('.job-row-workers').innerText(),'—','legacy history does not invent executor hardware');
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     assert.equal(await page.locator('.settings-tab.active').getAttribute('aria-current'), 'page');
+    await page.locator('[data-setting-tab="tasks"]').click();
+    const inventoryTask = page.locator('#tasks-body tr').filter({ hasText: 'Media inventory' });
+    assert(await inventoryTask.locator('.task-enabled').isChecked(), 'Media inventory defaults to Automatic');
+    assert.doesNotMatch(await inventoryTask.innerText(), /Not run yet/, 'Media inventory has a recorded run when the library inventory has been synced');
+    assert.match(await page.locator('#task-failure-scope').innerText(), /512 saved file failures.*Task results below count failures in that run only/i, 'Tasks distinguishes saved global failures from per-run failures');
+    await page.locator('#task-failure-scope').click();
+    await page.waitForFunction(() => location.hash.includes('/library'));
+    assert.match(await page.locator('#inventory-scope-note').innerText(), /512 failed files across saved conversion state/, 'saved-failure drill-down reports the global count and its scope');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    for (const [provider, expected] of [['sonarr', /Last notification sent: Succeeded/], ['radarr', /Last notification sent: Failed/], ['bazarr', /Last notification sent: Succeeded/]]) {
+      await page.locator(`[data-setting-tab="${provider}"]`).click();
+      const notification = page.locator(`[data-provider="${provider}"] .integration-last-result`);
+      assert.match(await notification.innerText(), expected, `${provider} uses its recorded notification result`);
+    }
+    await page.locator('[data-setting-tab="jellyfin"]').click();
+    assert.match(await page.locator('[data-provider="jellyfin"] .integration-last-result').innerText(), /Last notification sent: Succeeded · Time unavailable \(legacy record\)/, 'legacy notification without sent_at is shown without borrowing the job timestamp');
+    await page.locator('[data-setting-tab="general"]').click();
     await page.locator('[data-open-languages="settings"]').click();
     await page.locator('#language-list input[value="fr"]').check();
     await page.locator('#apply-languages').click();
     assert.match(await page.locator('#settings-languages').textContent(), /French/);
     assert.match(await page.locator('#quick-languages').textContent(), /English/, 'defaults must not overwrite one-job scope');
-    await page.locator('#save-settings').click();
+    const saveBar = page.locator('.settings-save-bar');
+    assert(await saveBar.isVisible(), 'settings edits show the shared sticky save bar');
+    assert.match(await saveBar.innerText(), /Unsaved changes/);
+    if (output) await page.screenshot({ path: path.join(output, 'settings-unsaved-desktop.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert(await saveBar.isVisible(), 'shared save bar remains visible on mobile');
+    if (output) await page.screenshot({ path: path.join(output, 'settings-unsaved-mobile.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await saveBar.getByRole('button', { name: 'Save', exact: true }).click();
     await page.getByText('Settings saved.', { exact: true }).waitFor();
     assert.deepEqual(writes.at(-1).body.languages, ['fr']);
+    await page.locator('[data-open-languages="settings"]').click();
+    await page.locator('#language-list input[value="ar"]').check();
+    await page.locator('#apply-languages').click();
+    failSettings = true;
+    await saveBar.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('#toast').getByText(/Fixture settings save failed/).waitFor();
+    assert(await saveBar.isVisible(), 'failed save keeps the shared dirty state and save bar');
+    failSettings = false;
+    await saveBar.getByRole('button', { name: 'Discard', exact: true }).click();
+    assert.doesNotMatch(await page.locator('#settings-languages').innerText(), /Arabic/, 'Discard restores the last saved settings');
+    await page.locator('[data-open-languages="settings"]').click();
+    await page.locator('#language-list input[value="ar"]').check();
+    await page.locator('#apply-languages').click();
+    let navigationPrompt;
+    page.once('dialog', async dialog => { navigationPrompt = dialog.message(); await dialog.dismiss(); });
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
+    await page.waitForFunction(() => location.hash.includes('/settings'));
+    assert.match(navigationPrompt || '', /unsaved changes.*discard/i, 'SPA navigation warns before leaving dirty settings');
+    page.once('dialog', dialog => dialog.accept());
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
+    await page.waitForFunction(() => location.hash.includes('/overview'));
     await page.getByRole('button', { name: 'Overview', exact: true }).click();
     const diagnosticsSummary = page.locator('#overview-diagnostics > summary');
     const diagnosticNodeCount = page.locator('#worker-nodes-summary');
@@ -412,7 +473,7 @@ async function main() {
     await page.keyboard.press('Enter');
     assert.equal(await diagnostics.evaluate(el => el.open), false, 'keyboard can collapse Overview diagnostics');
     await page.locator('#overview-workers #worker-cpu-count').fill('1000');
-    await page.locator('#overview-workers #save-worker-allocation').click();
+    await page.locator('.settings-save-bar').getByRole('button', { name: 'Save', exact: true }).click();
     await page.getByText('Worker allocation saved. It applies to new files.', { exact: true }).waitFor();
     assert.equal(writes.at(-1).body.cpu_workers, 1000);
     const gpuAdmission = page.locator('#overview-workers #worker-gpu-capacity');
@@ -435,10 +496,10 @@ async function main() {
     await page.locator('#refresh-button').click();
     await page.waitForFunction(async previous=>await window.__workerReads()>previous,readsBeforeOverviewRefresh);
     assert.equal(await page.locator('#overview-workers #worker-cpu-count').inputValue(),'999','manual worker refresh preserves an unsaved user edit');
-    assert.match(await page.locator('#worker-allocation-note').textContent(), /Unsaved/);
+    assert(await page.locator('.settings-save-bar').isVisible(), 'worker edits use the shared unsaved state indicator');
     assert(workerReads>readsBeforeOverviewRefresh,'overview refresh reloads persisted worker allocation');
     await page.locator('#overview-workers #worker-cpu-count').fill('1000');
-    await page.locator('#overview-workers #save-worker-allocation').click();
+    await page.locator('.settings-save-bar').getByRole('button', { name: 'Save', exact: true }).click();
     await page.getByText('Worker allocation saved. It applies to new files.', { exact: true }).waitFor();
     await page.evaluate(()=>{location.hash='#/settings/workers';});
     await page.waitForFunction(()=>location.hash.includes('/overview'));
@@ -473,13 +534,14 @@ async function main() {
       await assertViewport(`library ${width}px`);
       await assertTablePane('library', width, 900);
     }
-    // A later tall metadata-failure row must not make Auto pagination oscillate
-    // between including and excluding that row as repeated live snapshots arrive.
+    // Auto keeps a useful minimum page size; tall row content wraps naturally
+    // inside the scrollable pane instead of shrinking the page to a handful of rows.
     await page.setViewportSize({ width: 1440, height: 720 });
     const fitShortRows = Array.from({ length: 40 }, (_, index) => ({
       name: `Auto fit short ${String(index + 1).padStart(2, '0')}.mkv`,
-      path: `/media/movies/auto-fit/short-${index + 1}.mkv`, root_id: 'movies', type: 'video', tracks: [],
-      coverage: { status: 'needs_conversion', reason: 'French subtitle is required', missing_targets: [{ language: 'fr' }] },
+      path: `/media/movies/auto-fit/production/season-2026/festival-release-candidates/with-a-deliberately-long-directory-component-${index + 1}/short-${index + 1}.mkv`, root_id: 'movies', type: 'video',
+      tracks: [{id:1,language:'en',codec:'ASS'},{id:2,language:'fr',codec:'PGS',image:true},{id:3,language:'de',codec:'SRT'},{id:4,language:'es',codec:'VobSub',image:true}],
+      coverage: { status: 'needs_conversion', reason: 'French subtitle is required', existing_targets:[{language:'en'}], missing_targets: [{ language: 'fr' },{language:'de',forced:true},{language:'es',hi:true}] },
       missing_srt: true, processing: {},
     }));
     items = fitShortRows; inventorySource = 'filesystem'; inventoryAuthority = { status: 'ready' }; revision++;
@@ -488,8 +550,8 @@ async function main() {
     await page.locator('#inventory-meta').getByText(/40 matches/).waitFor();
     await page.waitForFunction(() => /Fit \(\d+\)/.test(document.querySelector('#inventory-page-size option[value="auto"]').textContent));
     const fittedShortCount = Number((await page.locator('#inventory-page-size option[value="auto"]').textContent()).match(/Fit \((\d+)\)/)?.[1]);
-    assert(Number.isInteger(fittedShortCount) && fittedShortCount >= 2 && fittedShortCount < fitShortRows.length,
-      `the short rows prime a multirow Auto page (Fit ${fittedShortCount})`);
+    assert(Number.isInteger(fittedShortCount) && fittedShortCount >= 25,
+      `Auto retains at least 25 rows per page (Fit ${fittedShortCount})`);
     const metadataError = `Metadata failure: ${'invalid embedded metadata field; '.repeat(7)}`;
     items = fitShortRows.slice();
     items[fittedShortCount - 1] = {
@@ -501,33 +563,26 @@ async function main() {
     revision++; pushStatus();
     await tallRowReload;
     await page.waitForFunction(() => /Fit \(\d+\)/.test(document.querySelector('#inventory-page-size option[value="auto"]').textContent));
-    const pulse = setInterval(pushStatus, 180);
-    let fitSamples;
-    try {
-      fitSamples = await page.evaluate(async () => {
-        const samples = [];
-        const option = document.querySelector('#inventory-page-size option[value="auto"]');
-        const pane = document.querySelector('.inventory-table-wrap');
-        for (let frame = 0; frame < 75; frame++) {
-          await new Promise(resolve => requestAnimationFrame(resolve));
-          const rows = [...document.querySelectorAll('#inventory-body > tr')];
-          const paneRect = pane.getBoundingClientRect();
-          samples.push({ range: document.querySelector('#inventory-range').textContent, fit: option.textContent,
-            rowCount: rows.length, lastRowFits: !rows.length || rows.at(-1).getBoundingClientRect().bottom <= paneRect.bottom + 1 });
-        }
-        return samples;
-      });
-    } finally { clearInterval(pulse); }
-    const settledFitSamples = fitSamples.slice(12);
-    const fitStates = new Set(settledFitSamples.map(sample => `${sample.range}|${sample.fit}|${sample.rowCount}`));
-    assert.equal(fitStates.size, 1, `Auto row count, range, and fitted size settle during repeated SSE updates: ${JSON.stringify([...fitStates])}`);
-    assert(settledFitSamples.every(sample => sample.lastRowFits), 'Auto-fitted rows stay inside the visible Library pane');
-    const settledFitSize = Number(settledFitSamples.at(-1).fit.match(/Fit \((\d+)\)/)?.[1]);
-    const metadataRowPage = Math.floor((fittedShortCount - 1) / settledFitSize) + 1;
+    const actualAutoCount = Number((await page.locator('#inventory-page-size option[value="auto"]').textContent()).match(/Fit \((\d+)\)/)?.[1]);
+    assert(actualAutoCount >= 25, `a tall metadata row does not reduce Auto below 25 rows (Fit ${actualAutoCount})`);
+    assert.equal(await page.locator('#inventory-body tr').count(), actualAutoCount);
+    assert(await page.locator('.inventory-table-wrap').evaluate(el => el.scrollHeight >= el.clientHeight), 'Auto rows remain reachable through the inventory pane scroll');
+    const metadataRowPage = Math.floor((fittedShortCount - 1) / actualAutoCount) + 1;
     await page.locator('#inventory-page').selectOption(String(metadataRowPage));
     await page.getByText(/Auto fit metadata failure row\.mkv/).waitFor();
     const tallRowHeight = await page.locator('#inventory-body tr').filter({ hasText: 'Auto fit metadata failure row.mkv' }).evaluate(row => row.getBoundingClientRect().height);
     assert(tallRowHeight > 72, `metadata failure row exercises a taller-than-default table entry (${tallRowHeight}px)`);
+    const wrappedRow = page.locator('#inventory-body tr').nth(1);
+    const wrapping = await wrappedRow.evaluate(row => ({
+      chips: row.querySelector('.language-tags').getBoundingClientRect().height,
+      path: row.querySelector('.file-cell-copy small'),
+      pathStyle: { whiteSpace: getComputedStyle(row.querySelector('.file-cell-copy small')).whiteSpace, overflowWrap: getComputedStyle(row.querySelector('.file-cell-copy small')).overflowWrap },
+    }));
+    assert(wrapping.chips > 20, 'multi-language coverage chips occupy wrapped lines in early rows');
+    assert.equal(wrapping.pathStyle.whiteSpace, 'normal', 'long paths can wrap instead of clipping');
+    assert.equal(wrapping.pathStyle.overflowWrap, 'anywhere', 'long path components break within the file cell');
+    await page.locator('.inventory-table-wrap').evaluate(el => { el.scrollTop = 0; });
+    if (output) await page.screenshot({ path: path.join(output, 'library-mixed-long-rows.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
     await page.locator('#inventory-page-size').selectOption('25');
     assert.equal(await page.locator('#inventory-page-size').inputValue(), '25');
     await page.locator('#inventory-page-size').selectOption('auto');
@@ -555,6 +610,31 @@ async function main() {
     assert.equal(await page.locator('#inventory-body tr').count(), 1);
     assert.match(await page.locator('#inventory-body').innerText(), /Already covered/);
     assert.doesNotMatch(await page.locator('#inventory-body').innerText(), /Historical extraction failure/);
+    await page.locator('#inventory-filter').selectOption('all');
+    await page.locator('#inventory-select-all').check();
+    assert.equal(await page.locator('#inventory-body .media-select:checked').count(), 1, 'select-all visibly selects eligible media on the current page');
+    const bulkBar = page.locator('#inventory-bulk-bar');
+    assert(await bulkBar.isVisible(), 'selected media exposes a bulk action bar');
+    await page.locator('#inventory-bulk-convert').click();
+    await page.locator('#conversion-modal').waitFor({ state: 'visible' });
+    assert.match(await page.locator('#conversion-scope').innerText(), /1 media|Missing French/i, 'bulk review names and counts the explicit selected media');
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.locator('#inventory-clear-selection').click();
+    items = Array.from({ length: 65 }, (_, index) => ({
+      name: `Bulk candidate ${index + 1}.mkv`, path: `/media/movies/bulk-${index + 1}.mkv`, root_id: 'movies', type: 'video', tracks: [],
+      coverage: { status: 'needs_conversion', missing_targets: [target('fr')] }, processing: {},
+    }));
+    revision++;
+    await page.locator('#inventory-page-size').selectOption('100');
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-select-all').click();
+    assert.equal(await page.locator('#inventory-body .media-select:checked').count(), 64, 'page select-all respects the 64-media conversion limit');
+    assert.match(await page.locator('#inventory-selection-count').innerText(), /64 media selected.*maximum 64/i);
+    await page.locator('#inventory-clear-selection').click();
+    await page.locator('#inventory-page-size').selectOption('auto');
+    items = [covered, needed]; revision++;
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-filter').selectOption('covered');
     await page.locator('#inventory-body .row-action').first().click();
     assert.equal(await page.locator('#track-drawer-list input:checked').count(), 0);
     assert.match(await page.locator('#track-drawer-hint').innerText(), /No extraction needed/);
@@ -583,6 +663,22 @@ async function main() {
     assert(!(await page.locator('#track-drawer-list input').nth(3).isChecked()), 'untagged track not selected automatically');
     await page.getByRole('button', { name: 'Close track details' }).click();
     await page.locator('#inventory-filter').selectOption('all');
+    const unavailable = {
+      name: 'No source match.mkv', path: '/media/movies/No source match.mkv', root_id: 'movies', type: 'video', tracks: [],
+      coverage: { status: 'no_convertible_source', reason: 'No compatible subtitle source is available' }, processing: {},
+    };
+    items = [unavailable]; inventoryAuthority = { status: 'ready' }; revision++;
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-filter').selectOption('unavailable');
+    await page.locator('#inventory-body').getByText('No source match.mkv').waitFor();
+    const unavailableRow = page.locator('#inventory-body tr').filter({ hasText: 'No source match.mkv' });
+    assert(await unavailableRow.getByRole('button', { name: /retry inventory/i }).isVisible(), `unavailable source row provides a retry action (${await unavailableRow.innerText()})`);
+    const writesBeforeRetry = writes.length;
+    await unavailableRow.getByRole('button', { name: /retry inventory/i }).click();
+    assert.equal(writes.length, writesBeforeRetry + 1);
+    assert.equal(writes.at(-1).endpoint, '/api/jobs');
+    assert.equal(writes.at(-1).body.kind, 'inspect', 'retry refreshes inventory without launching extraction');
+    items = [covered, needed]; revision++;
     if (output) await page.screenshot({ path: path.join(output, 'bazarr-library-desktop.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
     inventoryAuthority = { status: 'refresh_pending' }; revision++;
     await page.locator('#refresh-button').click();
@@ -598,6 +694,18 @@ async function main() {
       await page.locator('#refresh-button').click();
       await page.waitForFunction(()=>document.querySelector('[data-action="scan"]').disabled);
       assert(await page.locator('[data-action="inspect"]').first().isEnabled(), 'sync remains available for blocked authority');
+      assert.match(await page.locator('[data-action="scan"]').first().getAttribute('title')||'', /sync/i, 'blocked conversion explains how to proceed');
+      assert.match(await page.locator('#quick-form button[type="submit"]').getAttribute('title')||'', /sync/i, 'blocked quick conversion has an explanatory tooltip');
+      if(status==='stale'){
+        const authority=page.locator('#inventory-authority');
+        assert(await page.locator('#inventory-sync-now').isVisible(),'stale banner offers a direct Sync now action');
+        assert.match(await page.locator('#inventory-authority-copy').innerText(),/Synced .* ago/i,'stale banner shows the age of the last successful sync');
+        assert.match(await page.locator('#inventory-authority-copy').innerText(),/restart|age cutoff/i,'stale banner explains the current staleness rule');
+        const writesBeforeSync = writes.length;
+        await page.locator('#inventory-sync-now').click();
+        assert.equal(writes.length, writesBeforeSync + 1);
+        assert.equal(writes.at(-1).body.kind, 'inspect', 'Sync now queues an inventory inspection');
+      }
     }
     inventoryAuthority = { status: 'ready' }; revision++;
     needed.missing_targets = []; needed.missing_srt = false;

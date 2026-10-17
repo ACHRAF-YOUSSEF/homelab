@@ -21,6 +21,7 @@ const NOTIFICATION_DEADLINE: Duration = Duration::from_secs(300);
 pub(super) struct ScanReceipt {
     attempted: usize,
     acknowledged: usize,
+    sent_at: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -67,12 +68,12 @@ impl ScanOutcome {
                 match reason { ScanUncertainty::Timeout=>"Bazarr response timed out; scan completion not yet confirmed",ScanUncertainty::Response=>"Bazarr scan response could not be validated; scan completion not yet confirmed"}.into(),
             ),
         };
-        json!({"provider":"bazarr","ok":!pending,"pending":pending,"uncertain":pending,"attempted":receipt.attempted,"acknowledged":receipt.acknowledged,"triggered":receipt.acknowledged,"message":message})
+        json!({"provider":"bazarr","ok":!pending,"pending":pending,"uncertain":pending,"attempted":receipt.attempted,"acknowledged":receipt.acknowledged,"triggered":receipt.acknowledged,"message":message,"sent_at":receipt.sent_at})
     }
 }
 impl ScanFailure {
     pub(super) fn notification(self) -> Value {
-        json!({"provider":"bazarr","ok":false,"pending":false,"uncertain":false,"attempted":self.receipt.attempted,"acknowledged":self.receipt.acknowledged,"triggered":self.receipt.acknowledged,"message":self.message})
+        json!({"provider":"bazarr","ok":false,"pending":false,"uncertain":false,"attempted":self.receipt.attempted,"acknowledged":self.receipt.acknowledged,"triggered":self.receipt.acknowledged,"message":self.message,"sent_at":self.receipt.sent_at})
     }
 }
 
@@ -470,6 +471,7 @@ impl Integrations {
             // Only this documented action reindexes already published files.
             let fields = [(field, id.to_string()), ("action", "scan-disk".to_owned())];
             receipt.attempted += 1;
+            receipt.sent_at.get_or_insert_with(crate::util::now);
             let conf = self.conf("bazarr");
             let result = request_response_bounded(
                 get_str(conf, "url"),
@@ -1180,14 +1182,17 @@ mod tests {
         integration
             .update(&json!({"bazarr":{"enabled":true,"url":endpoint,"api_key":"fixture-key"}}))
             .unwrap();
+        let mut dispatch_at = None;
         let triggered = integration
             .bazarr_scan_paths(
                 &["/tv/Show/Extras/Episode.en.srt".into()],
                 &AtomicBool::new(false),
-                &mut |_| {},
+                &mut |_| dispatch_at = Some(crate::util::now()),
             )
             .unwrap();
-        assert_eq!(triggered.notification()["triggered"], 1);
+        let notification = triggered.notification();
+        assert_eq!(notification["triggered"], 1);
+        assert!(notification["sent_at"].as_f64().unwrap() >= dispatch_at.unwrap());
         let requests = server.join().unwrap();
         assert!(
             requests

@@ -980,6 +980,7 @@ impl Integrations {
             if !enabled(c) || get_str(c, "url").is_empty() || get_str(c, "api_key").is_empty() {
                 continue;
             }
+            let started_at = crate::util::now();
             let (ok, count, message) = if provider == "jellyfin" {
                 let n = self.jellyfin_refresh(paths, false, &AtomicBool::new(false), &mut |_| {});
                 match n {
@@ -1010,7 +1011,7 @@ impl Integrations {
                     Err(m) => (false, 0, m),
                 }
             };
-            results.push(json!({"provider":provider,"ok":ok,"triggered":count,"message":message}));
+            results.push(json!({"provider":provider,"ok":ok,"triggered":count,"message":message,"recorded_at":crate::util::now(),"sent_at":if count>0 {Some(started_at)} else {None}}));
         }
         results
     }
@@ -1380,10 +1381,14 @@ impl Integrations {
             );
         }
         let result = self.bazarr_scan_paths(&paths, stop, progress);
-        Some(match result {
+        let mut notice = match result {
             Ok(outcome) => outcome.notification(),
             Err(failure) => failure.notification(),
-        })
+        };
+        notice["recorded_at"] = json!(crate::util::now());
+        // sent_at belongs to the actual PATCH attempt; job completion may
+        // precede the queue drain and the inventory lookup by several minutes.
+        Some(notice)
     }
 }
 

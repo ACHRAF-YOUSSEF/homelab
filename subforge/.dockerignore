@@ -4,6 +4,7 @@
 !web/
 !web/index.html
 !web/app.js
+!web/settings-save.js
 !web/live.js
 !web/dist/
 !web/dist/app.min.js

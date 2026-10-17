@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 const MAX_STATE_BYTES: usize = 64 * 1024;
 const MAX_INTERVAL: u64 = 2_592_000;
+const DEFAULTS_VERSION: u64 = 1;
 const TASKS: [(&str, &str, &str, bool, u64, u64); 6] = [
     (
         "discovery",
@@ -25,7 +26,7 @@ const TASKS: [(&str, &str, &str, bool, u64, u64); 6] = [
         "inventory",
         "Media inventory",
         "Refresh the media inventory.",
-        false,
+        true,
         86_400,
         21_600,
     ),
@@ -100,6 +101,8 @@ impl Scheduler {
         let mut paused = false;
         if path.exists() {
             let saved = crate::util::read_json(&path, MAX_STATE_BYTES)?;
+            let migrate_inventory_default =
+                saved["defaults_version"].as_u64().unwrap_or(0) < DEFAULTS_VERSION;
             if let Some(values) = saved.get("tasks").and_then(Value::as_array) {
                 for value in values {
                     let Some(id) = value.get("id").and_then(Value::as_str) else {
@@ -111,7 +114,10 @@ impl Scheduler {
                     let (_, _, _, _, _, min_interval) =
                         TASKS.iter().find(|spec| spec.0 == id).expect("fixed task");
                     if let Some(enabled) = value.get("enabled").and_then(Value::as_bool) {
-                        task.enabled = enabled;
+                        // Older releases disabled inventory by default, without
+                        // recording whether that was an explicit preference.
+                        // Upgrade once; subsequent manual opt-outs persist.
+                        task.enabled = (id == "inventory" && migrate_inventory_default) || enabled;
                     }
                     if let Some(interval) = value
                         .get("interval_seconds")
@@ -170,7 +176,7 @@ impl Scheduler {
     }
 
     fn state_value(tasks: &[Task], paused: bool) -> Value {
-        json!({"paused": paused, "tasks": tasks.iter().map(|t| json!({"id":t.id,"enabled":t.enabled,"interval_seconds":t.interval,"next_run":t.next_run,"last_run":t.last_run,"last_result":t.last_result,"status":t.status})).collect::<Vec<_>>()})
+        json!({"defaults_version":DEFAULTS_VERSION,"paused": paused, "tasks": tasks.iter().map(|t| json!({"id":t.id,"enabled":t.enabled,"interval_seconds":t.interval,"next_run":t.next_run,"last_run":t.last_run,"last_result":t.last_result,"status":t.status})).collect::<Vec<_>>()})
     }
 
     fn persist(&self, tasks: &[Task], paused: bool) -> Result<(), String> {
@@ -336,6 +342,29 @@ mod tests {
             loaded.public()["tasks"][1]["enabled"].as_bool().unwrap(),
             loaded.ocr_available
         );
+        assert_eq!(loaded.public()["tasks"][2]["enabled"], true);
+    }
+
+    #[test]
+    fn legacy_inventory_defaults_upgrade_once_and_later_opt_out_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+        crate::util::write_private(
+            &path,
+            &json!({"tasks":[{"id":"inventory","enabled":false,"interval_seconds":21600,"last_run":42.0}]}),
+        ).unwrap();
+        let mut migrated = Scheduler::new(path.clone(), 100.0, true).unwrap();
+        assert_eq!(migrated.public()["tasks"][2]["enabled"], true);
+        assert_eq!(migrated.public()["tasks"][2]["interval_seconds"], 21600);
+        assert_eq!(migrated.public()["tasks"][2]["last_run"], 42.0);
+        migrated
+            .update(
+                &json!({"tasks":[{"id":"inventory","enabled":false}]}),
+                101.0,
+            )
+            .unwrap();
+        let reloaded = Scheduler::new(path, 102.0, true).unwrap();
+        assert_eq!(reloaded.public()["tasks"][2]["enabled"], false);
     }
 
     #[test]

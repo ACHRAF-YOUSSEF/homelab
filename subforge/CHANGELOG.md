@@ -1,5 +1,13 @@
 # Subforge revisions
 
+## Unreleased
+
+- Enable scheduled media inventory refresh by default and migrate legacy task state once, while preserving later manual opt-outs.
+- Show Bazarr inventory age and restart-based staleness guidance, with an on-demand sync action.
+- Keep Library Fit at a 25-row minimum with a scrolling pane; add page selection and reviewed bulk conversion capped at 64 explicit media paths.
+- Unify settings, task-schedule, and worker-allocation saves with a shared sticky save/discard bar and unsaved-navigation warning.
+- Clarify global failed-file totals, task-result scope, and notification send timestamps, including limits of legacy records.
+
 ## 0.4.4 — 2026-10-16
 
 - Update locked rustls to 0.23.46, fixing RustSec advisories RUSTSEC-2026-0346 through RUSTSEC-2026-0349 without audit suppressions.

@@ -19,6 +19,7 @@
   state.folderRequest=0;
   state.inventoryPage=1;
   state.inventoryPageSize='auto';
+  state.selectedMedia=new Set();
   state.jobsPage=1;
   state.jobsPageSize='auto';
   state.tableAutoSizes={library:10,activity:10};
@@ -51,6 +52,9 @@
   state.tasksBusy=false;
   state.tasksLoadedAt=0;
   state.taskRequests=new Set();
+  let saveController;
+  const settingsDirty = () => {state.settingsDirty=true;saveController?.render();updateSettingsActions();};
+  const updateSettingsActions = () => {for(const button of $$('.test-integration,.refresh-integration')){button.disabled=state.settingsDirty;button.title=state.settingsDirty?'Save or discard your changes before using this connection':'Use the saved connection settings';}};
   const integrationDefaults = () => ({enabled:false,url:'',api_key:'',api_key_set:false,path_mappings:[]});
   const setText = (el, value) => { if (el) el.textContent = value == null ? '' : String(value); };
   const escStatus = value => String(value || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
@@ -112,12 +116,19 @@
     banner.classList.toggle('authority-error',blocked);
     const pendingCount=Array.isArray(authority.pending_srt_keys)?authority.pending_srt_keys.length:0;
     const pendingDetail=authority.verification_limited===true?' Some published outputs exceed the indexing verification limits.':pendingCount?` ${pendingCount.toLocaleString()} published SRT file${pendingCount===1?' is':'s are'} not yet confirmed by Bazarr.`:'';
-    setText(banner,bazarr?({ready:'Bazarr inventory is ready.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:`Bazarr inventory synced. Published subtitle indexing is still unconfirmed.${pendingDetail} Conversion is available; existing SRT files are checked before converting.`,reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(status!=='ready'&&authority.reason?` ${authority.reason}`:'')+(authority.error?` ${authority.error}`:''):state.status?'Filesystem inventory. Inspect media to update saved tracks and coverage.':'Checking library status…');
+    const updated=state.status?.inventory?.updated||state.inventoryUpdated;
+    const minutes=updated?Math.max(0,Math.floor((Date.now()-(updated<1e12?updated*1000:updated))/60000)):null;
+    const age=minutes===null?'Never synced':`Synced ${Math.floor(minutes/60)}h ${minutes%60}m ago`;
+    setText($('#inventory-authority-copy'),bazarr?({ready:'Bazarr inventory is ready.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:`Bazarr inventory synced. Published subtitle indexing is still unconfirmed.${pendingDetail} Conversion is available; existing SRT files are checked before converting.`,reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(status!=='ready'&&authority.reason?` ${authority.reason}`:'')+(authority.error?` ${authority.error}`:'')+` ${age}. Saved snapshots become stale when Subforge restarts; there is no age cutoff. A failed sync blocks conversion until a successful retry.`:state.status?'Filesystem inventory. Inspect media to update saved tracks and coverage.':'Checking library status…');
+    setText($('#inventory-sync-now'),bazarr?'Sync now':'Inspect now');
+    const syncing=jobList().some(job=>job.kind==='inspect'&&['queued','running'].includes(job.status));
+    $('#inventory-sync-now').disabled=syncing;$('#inventory-sync-now').title=syncing?'An inventory sync is already queued or running':'Refresh the complete inventory now';
     $$('[data-action="inspect"]').forEach(button=>setText(button,bazarr?'Sync Bazarr inventory':'Inspect media'));
     const overviewNotice=$('#overview-inventory-notice');
-    if(overviewNotice){overviewNotice.hidden=!bazarr||status==='ready';setText(overviewNotice,banner.textContent);}
+    if(overviewNotice){overviewNotice.hidden=!bazarr||status==='ready';overviewNotice.replaceChildren();const copy=document.createElement('span');copy.textContent=$('#inventory-authority-copy').textContent;const sync=document.createElement('button');sync.type='button';sync.className='text-button';sync.textContent='Sync now';sync.disabled=syncing;sync.title=$('#inventory-sync-now').title;sync.addEventListener('click',syncInventoryNow);overviewNotice.append(copy,sync);}
     $$('[data-action="scan"],#quick-form button[type="submit"]').forEach(button=>{button.disabled=blocked;button.title=blocked?'Sync Bazarr before starting automatic conversion':'';});
     updateLanguageLabels();
+    syncMediaSelection();
   };
   const trackFormat = track => {
     const codec=String(track.codec||track.codec_id||track.format||'').toLowerCase();
@@ -265,6 +276,8 @@
   };
   const fittedPageSize = (page,requested,measure=true) => {
     if(requested!=='auto')return requested;
+    // Library rows have natural, variable heights; keep pagination useful and scroll the pane.
+    if(page==='library'){setText($('#inventory-page-size option[value="auto"]'),'Fit (25)');return 25;}
     const pane=$(page==='library'?'.inventory-table-wrap':'.jobs-table-wrap');
     if(pane?.clientHeight>0){
       const table=$('table',pane),header=table?.tHead?.getBoundingClientRect().height||0;
@@ -461,6 +474,20 @@
     catch (error) { notify(error.message,'error'); return null; }
   };
   const selectedRootIds = selector => { const value=$(selector).value; return value ? [value] : []; };
+  const mediaSelectable = row => !!row.path&&!row.error&&!['covered','unavailable'].includes(coverageState(row));
+  const syncMediaSelection = () => {
+    for(const path of state.selectedMedia){if(!state.inventory.some(row=>row.path===path&&mediaSelectable(row)))state.selectedMedia.delete(path);}
+    const count=state.selectedMedia.size,boxes=$$('.media-select:not(:disabled)');
+    for(const box of boxes)box.checked=state.selectedMedia.has(box.value);
+    const all=$('#inventory-select-all');all.disabled=!boxes.length;all.title=boxes.length?'Select convertible media on this page, up to 64 total':'No convertible media on this page';all.checked=!!boxes.length&&boxes.every(box=>box.checked);all.indeterminate=boxes.some(box=>box.checked)&&!all.checked;
+    $('#inventory-bulk-bar').hidden=!count;setText($('#inventory-selection-count'),`${count} media selected · maximum 64`);
+    const blocked=usesBazarr()&&(state.inventorySource!=='bazarr'||!['ready','refresh_pending'].includes(state.inventoryAuthority?.status));
+    $('#inventory-bulk-convert').disabled=!count||blocked;$('#inventory-bulk-convert').title=blocked?'Sync Bazarr before converting selected media':'Review conversion for the selected files';
+  };
+  const syncInventoryNow = async () => {
+    const button=$('#inventory-sync-now');button.disabled=true;
+    try{await startJob({kind:'inspect'});}finally{renderInventoryAuthority();}
+  };
   const renderInventory = () => {
     const body=$('#inventory-body');
     const filter=$('#inventory-filter').value, root=$('#inventory-root').value, query=$('#inventory-search').value.trim().toLowerCase();
@@ -492,17 +519,22 @@
     setText($('#inventory-snapshot-note'),state.inventoryUpdated?`${refreshing?'Refreshing… Showing the saved inventory. ':''}${usesBazarr()?'Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}${state.status?.inventory?.partial?' · Partial inventory':''}`:refreshing?'Building your first inventory…':'');
     const emptyMessage=state.inventory.length?'No files match your search or filters.':'No inventory yet. Choose Inspect library to read available subtitle tracks.';
     const viewKey=JSON.stringify([visibleRows,visibleRows.length?'':emptyMessage]);
-    if (viewKey===state.inventoryViewKey) return;
+    if (viewKey===state.inventoryViewKey) {syncMediaSelection();return;}
     state.inventoryViewKey=viewKey;body.replaceChildren();
-    if (!count) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=5; td.className='table-empty'; td.textContent=emptyMessage; tr.append(td); body.append(tr); return; }
+    if (!count) { const tr=document.createElement('tr'),td=document.createElement('td'); td.colSpan=6; td.className='table-empty'; td.textContent=emptyMessage; tr.append(td); body.append(tr);syncMediaSelection(); return; }
     for (const row of visibleRows) {
       const tr=document.createElement('tr');tr.tabIndex=0;tr.classList.toggle('inventory-row-empty',!row.tracks?.length&&!row.error);tr.setAttribute('aria-label',`Subtitle details: ${row.name||row.path}`);tr.addEventListener('click',()=>openTrackDrawer(row));tr.addEventListener('keydown',event=>{if(event.target===tr&&['Enter',' '].includes(event.key)){event.preventDefault();openTrackDrawer(row);}});const name=document.createElement('td'); name.className='file-cell'; const fileIcon=document.createElement('span'); fileIcon.className=`file-icon ${row.type==='sidecar'?'srt':''}`;fileIcon.append(iconSvg('file')); const filename=document.createElement('span'); filename.className='file-name'; filename.textContent=row.name || row.path; filename.title=row.path || row.name; const copy=document.createElement('span');copy.className='file-cell-copy';copy.append(filename);const context=document.createElement('small');context.textContent=(row.path||'').replace(/[/\\][^/\\]+$/,'');copy.append(context);const fileContent=document.createElement('div');fileContent.className='file-cell-content';fileContent.append(fileIcon,copy);name.append(fileContent);
       const type=document.createElement('td');type.className='processing-cell';const badge=document.createElement('span'),processing=row.processing||{},coverage=coverageState(row),failed=coverage!=='covered'&&(!!row.error||!!processing.failed);badge.className=`status-pill ${coverage==='covered'?'completed':failed?'failed':coverage==='needed'?'queued':processing.pending_ocr?'queued':'cancelled'}`;badge.textContent=coverage==='covered'?'Already covered':failed?'Failed':coverage==='needed'?'Missing SRT':coverage==='unavailable'?'No matching source':processing.pending_ocr?'Awaiting OCR':processing.generated_srt_count>0?'Ready':row.metadata_pending?'Needs inspection':'Inspected';type.append(badge);if(row.coverage?.reason){const reason=document.createElement('small');reason.textContent=row.coverage.reason;reason.title=row.coverage.reason;type.append(reason);}const problem=failureMessage(row);if(failed&&problem){const hint=document.createElement('small');hint.textContent=problem.length>140?`${problem.slice(0,137)}…`:problem;hint.title=problem;type.append(hint);}
       const tracks=document.createElement('td');tracks.className='track-count';tracks.textContent=row.error ? row.error : `${(row.tracks || []).length} track${(row.tracks || []).length===1?'':'s'}`;
       const langCell=document.createElement('td');langCell.className='coverage-cell';const lang=document.createElement('div');lang.className='language-tags';langCell.append(lang);for(const target of rowExistingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-existing';pill.textContent=`${targetLabel(target)} · SRT exists`;lang.append(pill);}for(const target of rowMissingTargets(row)){const pill=document.createElement('span');pill.className='format-badge coverage-missing';pill.textContent=`${targetLabel(target)} · SRT missing`;lang.append(pill);}for(const track of (row.tracks||[]).slice(0,3))lang.append(trackBadge(track));if(row.tracks?.length>3){const more=document.createElement('span');more.className='muted';more.textContent=`+${row.tracks.length-3}`;lang.append(more);}if(!lang.childNodes.length)lang.textContent='—';
       const action=document.createElement('td'),button=document.createElement('button');action.className='file-action';button.type='button';button.className='row-action';button.textContent='Details';button.title='Review tracks and choose which to convert';button.addEventListener('click',event=>{event.stopPropagation();openTrackDrawer(row);});action.append(button);
-      tr.append(name,type,tracks,langCell,action); body.append(tr);
+      if(coverage==='unavailable'){
+        const retry=document.createElement('button');retry.type='button';retry.className='row-action retry-inventory';retry.textContent='Retry inventory';retry.title='Sync inventory and inspect this file again after adding a matching subtitle source';retry.addEventListener('click',async event=>{event.stopPropagation();retry.disabled=true;try{await startJob({kind:'inspect',paths:[row.path],rootIds:row.root_id?[row.root_id]:[]});}finally{retry.disabled=false;}});action.append(retry);
+      }
+      const selection=document.createElement('td'),check=document.createElement('input');selection.className='selection-cell';check.type='checkbox';check.className='media-select';check.value=row.path||'';check.disabled=!mediaSelectable(row);check.setAttribute('aria-label',`Select ${row.name||row.path}`);check.title=check.disabled?coverage==='covered'?'This media already has SRT coverage':coverage==='unavailable'?'Add a matching subtitle source, then retry inventory':'Inspect this media to resolve its error':'Select this media for conversion';selection.title=check.title;selection.append(check);selection.addEventListener('click',event=>event.stopPropagation());check.addEventListener('change',()=>{if(check.checked&&state.selectedMedia.size>=64){check.checked=false;notify('Select up to 64 media files per conversion.','error');}else if(check.checked)state.selectedMedia.add(row.path);else state.selectedMedia.delete(row.path);syncMediaSelection();});
+      tr.append(selection,name,type,tracks,langCell,action); body.append(tr);
     }
+    syncMediaSelection();
     scheduleTableFit();
   };
   const failureMessage = row => {
@@ -512,6 +544,7 @@
   };
   const syncDrawerSelection = () => {
     const count=state.drawerSelection.size;$('#convert-selected-tracks').disabled=!count||count>64;
+    $('#convert-selected-tracks').title=count>64?'Select up to 64 tracks per conversion':!count?'Select at least one supported track to convert':'Convert the selected subtitle tracks';
     setText($('#convert-selected-tracks'),`Convert ${count} track${count===1?'':'s'}`);
     const selected=$$('#track-drawer-list input:checked'),image=selected.some(input=>input.dataset.image==='true');
     setText($('#track-drawer-hint'),count>64?'Select up to 64 tracks per conversion.':!count&&coverageState(state.selectedFile||{})==='covered'?'No extraction needed: valid SRT files already cover the wanted languages.':`${count} selected · ${image?'Image tracks use the configured OCR backend; text tracks use CPU extraction.':'Text tracks use CPU extraction.'}`);
@@ -580,7 +613,8 @@
     $('.test-integration',card).addEventListener('click',()=>testIntegration(provider,card));
     $('.refresh-integration',card).addEventListener('click',()=>refreshIntegration(provider,card));
     $$('.load-libraries',card).forEach(button=>button.addEventListener('click',()=>loadLibraries(card)));
-    $('.add-path-map',card).addEventListener('click',()=>{const entries=readMappings(card); entries.push({remote:'',local:''});renderMappings(card,entries);});
+    $('.add-path-map',card).addEventListener('click',()=>{const entries=readMappings(card); entries.push({remote:'',local:''});renderMappings(card,entries);settingsDirty();});
+    card.addEventListener('input',settingsDirty);card.addEventListener('change',settingsDirty);
     card.dataset.collapse=`integration-${provider}`;makePanelCollapsible(card);return card;
   };
   const populateLibraryOptions = (card,movies,series,selectedMovies=movies,selectedSeries=series) => {
@@ -593,7 +627,7 @@
   const renderMappings = (card,entries) => {
     const list=$('.path-map-list',card); list.replaceChildren();
     for (const mapping of entries) {
-      const row=document.createElement('div'); row.className='path-map-row'; const remote=document.createElement('input'); remote.className='input map-remote'; remote.value=mapping.remote || ''; remote.placeholder='Remote path, e.g. /tv'; remote.setAttribute('aria-label','Remote path'); const arrow=document.createElement('span'); arrow.textContent='→'; const local=document.createElement('input'); local.className='input map-local'; local.value=mapping.local || ''; local.placeholder='Local path, e.g. /media/tv'; local.setAttribute('aria-label','Local path'); const remove=document.createElement('button'); remove.type='button'; remove.className='icon-button remove-map'; remove.setAttribute('aria-label','Remove path mapping'); remove.title='Remove path mapping';remove.textContent='×'; remove.addEventListener('click',()=>row.remove()); row.append(remote,arrow,local,remove); list.append(row);
+      const row=document.createElement('div'); row.className='path-map-row'; const remote=document.createElement('input'); remote.className='input map-remote'; remote.value=mapping.remote || ''; remote.placeholder='Remote path, e.g. /tv'; remote.setAttribute('aria-label','Remote path'); const arrow=document.createElement('span'); arrow.textContent='→'; const local=document.createElement('input'); local.className='input map-local'; local.value=mapping.local || ''; local.placeholder='Local path, e.g. /media/tv'; local.setAttribute('aria-label','Local path'); const remove=document.createElement('button'); remove.type='button'; remove.className='icon-button remove-map'; remove.setAttribute('aria-label','Remove path mapping'); remove.title='Remove path mapping';remove.textContent='×'; remove.addEventListener('click',()=>{row.remove();settingsDirty();}); row.append(remote,arrow,local,remove); list.append(row);
     }
   };
   const readMappings = card => $$('.path-map-row',card).map(row=>({remote:$('.map-remote',row).value.trim(),local:$('.map-local',row).value.trim()})).filter(item=>item.remote || item.local);
@@ -672,36 +706,36 @@
   };
   const saveSettings = async () => {
     const button=$('#save-settings'), note=$('#settings-save-note'); button.disabled=true; setText(note,'Saving…');
-    try { const data=await persistSettings(); for (const provider of ['sonarr','radarr','jellyfin','bazarr']) {const node=$(`#${provider}-settings`);node.replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider] || {})}));} state.defaultLanguages=data.languages||state.defaultLanguages;state.settingsDirty=false;$('#save-settings').textContent='Save changes';updateLanguageLabels();setText(note,'Changes saved'); notify('Settings saved.','success'); }
+    try { await persistSettings();discardSettings();notify('Settings saved.','success'); }
     catch(error) { setText(note,error.message); notify(`Settings not saved: ${error.message}`,'error'); }
-    finally { button.disabled=false; setTimeout(()=>setText(note,''),5000); }
+    finally { button.disabled=false;saveController?.render();setTimeout(()=>setText(note,''),5000); }
   };
   const rememberLibraries = libraries => {state.jellyfinLibraries=(libraries||[]).filter(item=>typeof item?.id==='string'&&typeof item.name==='string').slice(0,100).map(({id,name,type})=>({id,name,type}));try{sessionStorage.setItem('subforge.jellyfin-libraries',JSON.stringify(state.jellyfinLibraries));}catch{}};
   const setIntegrationResult = (node,text,kind) => {setText(node,text);node.className=`test-result integration-result result-${kind}`;node.setAttribute('role','status');};
   const updateIntegrationDots = () => {
     for(const dot of $$('[data-integration-dot]')){const provider=dot.dataset.integrationDot,config=state.settings?.integrations?.[provider]||state.status?.settings?.integrations?.[provider]||{},check=state.integrationChecks.get(provider);let latest=null;
-      for(const job of jobList()){const result=[...(job.notifications||[]),...(job.results||[])].find(item=>item?.provider===provider&&typeof item.ok==='boolean');if(result){latest={ok:result.ok,at:Number(job.finished||job.started||job.created||0)*1000};break;}}
-      const observed=check&&(!latest||check.at>=latest.at)?check:latest,kind=!config.enabled?'disabled':observed?observed.ok?'connected':'error':'unknown';dot.dataset.state=kind;const label=kind==='disabled'?'Integration disabled':observed?`Last connection request ${observed.ok?'succeeded':'failed'} · ${fmtDate(observed.at)}`:'Configured; connection has not been checked';dot.title=label;dot.setAttribute('aria-label',label);
+      for(const job of jobList()){for(const result of job.notifications||[]){const at=Number(result?.recorded_at||result?.sent_at||0)*1000;if(result?.provider===provider&&typeof result.ok==='boolean'&&at>0&&(!latest||at>latest.at))latest={ok:result.ok,at};}}
+      const observed=check&&(!latest||check.at>=latest.at)?check:latest,kind=!config.enabled?'disabled':observed?observed.ok?'connected':'error':'unknown';dot.dataset.state=kind;const label=kind==='disabled'?'Integration disabled':observed?`Last ${observed===check?'connection test':'notification result'} ${observed.ok?'succeeded':'failed'} · ${fmtDate(observed.at)}`:'Configured; connection has not been checked';dot.title=label;dot.setAttribute('aria-label',label);
     }
   };
   const testIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.test-integration',card); button.disabled=true;setIntegrationResult(result,'Testing…','pending');
-    try { await persistSettings(); const response=await api(`/api/integrations/${provider}/test`,{method:'POST',body:'{}'}),ok=response.connected!==false;state.integrationChecks.set(provider,{ok,at:Date.now()});setIntegrationResult(result,ok?`Connected · ${{sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'}[provider]}${response.version?` ${response.version}`:''}`:`Failed: ${response.message||'Connection rejected'}`,ok?'success':'error');if(provider==='jellyfin'&&Array.isArray(response.libraries)){rememberLibraries(response.libraries);const config=state.settings?.integrations?.jellyfin||{};populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]);} }
+    try { if(state.settingsDirty)throw new Error('Save or discard changes before using this connection.'); const response=await api(`/api/integrations/${provider}/test`,{method:'POST',body:'{}'}),ok=response.connected!==false;state.integrationChecks.set(provider,{ok,at:Date.now()});setIntegrationResult(result,ok?`Connected · ${{sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'}[provider]}${response.version?` ${response.version}`:''}`:`Failed: ${response.message||'Connection rejected'}`,ok?'success':'error');if(provider==='jellyfin'&&Array.isArray(response.libraries)){rememberLibraries(response.libraries);const config=state.settings?.integrations?.jellyfin||{};populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]);} }
     catch(error) {state.integrationChecks.set(provider,{ok:false,at:Date.now()});setIntegrationResult(result,`Failed: ${error.message}`,'error');}
-    finally { button.disabled=false;updateIntegrationDots(); }
+    finally { button.disabled=false;updateSettingsActions();updateIntegrationDots(); }
   };
   const refreshIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.refresh-integration',card); button.disabled=true; setText(result,'Queueing refresh…'); result.className='test-result muted';
-    try { await persistSettings(); const response=await api(`/api/integrations/${provider}/refresh`,{method:'POST',body:'{}'}); setText(result,response.message || 'Refresh job queued.'); result.className='test-result success-text'; notify(response.message || `${provider} refresh queued.`,'success'); await pollStatus(); }
+    try { if(state.settingsDirty)throw new Error('Save or discard changes before using this connection.'); const response=await api(`/api/integrations/${provider}/refresh`,{method:'POST',body:'{}'}); setText(result,response.message || 'Refresh job queued.'); result.className='test-result success-text'; notify(response.message || `${provider} refresh queued.`,'success'); await pollStatus(); }
     catch(error) { setText(result,error.message); result.className='test-result error-text'; notify(error.message,'error'); }
-    finally { button.disabled=false; }
+    finally { button.disabled=false;updateSettingsActions(); }
   };
   const loadLibraries = async card => { try { const data=await api('/api/integrations/jellyfin/libraries');rememberLibraries(data.libraries); const config=state.settings?.integrations?.jellyfin || {}; populateLibraryOptions(card,state.jellyfinLibraries.filter(x=>/movie/i.test(x.type)),state.jellyfinLibraries.filter(x=>/series|tv/i.test(x.type)),config.movie_libraries||[],config.series_libraries||[]); notify('Jellyfin libraries loaded.','success'); } catch(error) { notify(error.message,'error'); } };
   const updateHookStates = () => { const integrations=state.status?.settings?.integrations || state.settings?.integrations || {}; for(const name of ['sonarr','radarr']) { const enabled=!!integrations[name]?.webhook_enabled; const node=$(`#${name}-hook-state`); if(node){node.className=`connection-state ${enabled?'is-on':''}`;setText(node,enabled?'READY':'TOKEN REQUIRED');} } };
   const updateIntegrationUsage = () => {
     for(const provider of ['sonarr','radarr','jellyfin','bazarr']) {
       const node=$(`[data-provider="${provider}"] .integration-last-result`);if(!node)continue;
-      const jobs=jobList();let match=null;
-      for(const job of jobs){const result=[...(job.notifications||[]),...(job.results||[])].find(item=>item?.provider===provider&&typeof item.ok==='boolean');if(result){match={job,result};break;}}
-      setText(node,match?`Latest recorded request: ${match.result.ok?'Succeeded':'Failed'} · ${fmtDate(match.job.finished||match.job.started||match.job.created)}`:'No conversion notification recorded yet. Connection tests check access; they do not register import webhooks.');
+      const receipts=jobList().flatMap(job=>job.notifications||[]).filter(item=>item?.provider===provider&&typeof item.ok==='boolean'&&(!Object.hasOwn(item,'sent_at')||Number.isFinite(item.sent_at)&&item.sent_at>0));
+      receipts.sort((a,b)=>(b.sent_at||0)-(a.sent_at||0));const match=receipts[0];
+      setText(node,match?`Last notification sent: ${match.pending?'Indexing pending':match.ok?'Succeeded':'Failed'} · ${match.sent_at?fmtDate(match.sent_at):'Time unavailable (legacy record)'}`:'No notification sent yet. Connection tests and inventory reads are recorded separately.');
     }
   };
   const editionLabel = edition => ({cpu:'CPU only',cuda:'CUDA'})[edition] || 'Unavailable';
@@ -712,10 +746,12 @@
   };
   const updateVersion = (version,edition) => {updateEdition(edition);if(typeof version==='string'&&/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(version)){setText($('#version-label'),`v${version}`);$('#version-label').title=`Subforge ${version} (${editionLabel(state.edition)})`;$('.brand').title=$('#version-label').title;}};
   const intervalLabel = seconds => seconds%604800===0?`Every ${seconds/604800===1?'week':`${seconds/604800} weeks`}`:seconds%86400===0?`Every ${seconds/86400===1?'day':`${seconds/86400} days`}`:`Every ${seconds/3600===1?'hour':`${seconds/3600} hours`}`;
-  const markTasksDirty = () => {state.tasksDirty=true;$('#save-task-schedules').disabled=false;setText($('#task-schedule-note'),'Unsaved schedule changes. Manual Run uses the saved schedule and permissions.');};
+  const markTasksDirty = () => {state.tasksDirty=true;saveController?.render();};
   const renderTasks = () => {
     if(!state.tasks)return;
     updateVersion(state.tasks.version,state.tasks.edition);
+    const failed=state.tasks.pipeline?.failed_files??state.status?.pipeline?.failed_files;
+    setText($('#task-failure-scope'),`${Number.isFinite(failed)?failed.toLocaleString():'Unknown'} saved file failures across conversion state. Task results below count failures in that run only. Review saved failures →`);
     const paused=!!state.tasks.paused;setText($('#scheduler-state'),paused?'Paused':'Scheduled');$('#scheduler-state').className=`status-pill ${paused?'cancelled':'completed'}`;
     if(state.tasksDirty)return;
     $('#pause-schedules').checked=paused;
@@ -762,16 +798,18 @@
     if(!nodes.length){const hint=document.createElement('p');hint.className='muted';hint.textContent='No remote workers connected. Expand the setup instructions to add a machine.';target.append(hint);}
   };
   const loadWorkerNodes = async () => {try{renderWorkerNodes(await api('/api/nodes'));}catch(error){notify(`Could not load worker nodes: ${error.message}`,'error');}};
-  const reviewConversion = rootIds => {
-    state.pendingConversion={kind:'scan',rootIds,languages:[...state.selectedLanguages],includeOcr:state.settings?.permissions?.ocr===true};state.modalTrigger=document.activeElement;
+  const reviewConversion = (rootIds,paths=[]) => {
+    if(usesBazarr()&&(state.inventorySource!=='bazarr'||!['ready','refresh_pending'].includes(state.inventoryAuthority?.status))){notify('Sync Bazarr before converting.','error');return;}
+    state.pendingConversion={kind:'scan',rootIds,paths:[...paths],languages:[...state.selectedLanguages],includeOcr:state.settings?.permissions?.ocr===true};state.modalTrigger=document.activeElement;
     const scope=$('#conversion-scope');scope.replaceChildren();
     const roots=(state.status?.roots||[]).filter(root=>!rootIds.length||rootIds.includes(root.id));
+    if(paths.length){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent='Selected media';dd.textContent=`${paths.length} files: ${paths.map(path=>state.inventory.find(row=>row.path===path)?.name||path).join(', ')}`;scope.append(dt,dd);}
     for(const [key,value] of [['Folders',roots.map(root=>root.label||root.path||root.id).join(', ')||'All configured media folders'],['Languages',usesBazarr()&&isAll(state.selectedLanguages)?'Each media item’s Bazarr profile':languageDescription(state.selectedLanguages)],['Operation',usesBazarr()?'Fill missing SRT targets from Bazarr profiles; covered files are skipped':'Convert only languages not already covered by valid SRT files'],['Image subtitles',state.settings?.permissions?.ocr===true?'Run OCR using available CPU or GPU slots':'OCR is disabled by service permissions']]){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=key;dd.textContent=value;scope.append(dt,dd);}
     showDialog($('#conversion-modal'));$('#confirm-conversion').focus();
   };
   const workersVisible = () => state.currentPage==='overview'&&!document.hidden;
   const workerFields={cpu_workers:'#worker-cpu-count',ocr_workers:'#worker-ocr-count',gpu_workers:'#worker-gpu-count'};
-  const workerDirty = () => {state.workersDirty=true;$('#save-worker-allocation').disabled=state.workersSaving;setText($('#worker-allocation-note'),'Unsaved changes. Save to apply them to new files.');renderWorkerSteppers();};
+  const workerDirty = () => {state.workersDirty=true;saveController?.render();renderWorkerSteppers();};
   const renderWorkerSteppers = () => {
     const data=state.workersInfo;if(!data)return;
     for(const [kind,selector] of Object.entries(workerFields)){
@@ -826,6 +864,21 @@
     finally{state.workersSaving=false;$('#save-worker-allocation').disabled=!state.workersDirty;renderWorkers();if(systemVisible())loadSystem(true);}
   };
   const systemVisible = () => (state.currentPage==='overview'||state.currentPage==='settings'&&state.settingsSection==='status')&&!document.hidden;
+  const discardSettings = () => {
+    const data=state.settings;if(!data)return;
+    state.defaultLanguages=[...(data.languages||['*'])];state.settingsDirty=false;
+    for(const provider of ['sonarr','radarr','jellyfin','bazarr'])$(`#${provider}-settings`).replaceChildren(buildIntegrationCard(provider,{...integrationDefaults(),...(data.integrations?.[provider]||{})}));
+    setText($('#settings-save-note'),'');updateLanguageLabels();updateSettingsActions();updateIntegrationUsage();updateIntegrationDots();renderInventoryAuthority();
+  };
+  const createSaveController = () => {
+    const checkedSave = async (save,isDirty) => {await save();if(isDirty())throw new Error('Changes could not be saved. Review the error and try again.');};
+    saveController=SubforgeSettingsSave.create({groups:{
+      settings:{isDirty:()=>state.settingsDirty,save:()=>checkedSave(saveSettings,()=>state.settingsDirty),discard:discardSettings},
+      schedules:{isDirty:()=>state.tasksDirty,save:()=>checkedSave(saveTasks,()=>state.tasksDirty),discard:()=>{state.tasksDirty=false;renderTasks();}},
+      workers:{isDirty:()=>state.workersDirty,save:()=>checkedSave(()=>saveWorkers({preventDefault(){}}),()=>state.workersDirty),discard:()=>{state.workersDirty=false;renderWorkers();}}
+    },onError:error=>notify(error.message,'error'),onStateChange:({saving})=>{for(const node of $$('.settings-section,#worker-allocation-form'))node.inert=saving;updateSettingsActions();}});
+    saveController.render();
+  };
   const measuredNumber = value => typeof value==='number'&&Number.isFinite(value)&&value>=0?value:null;
   const formatBytes = value => {
     const bytes=measuredNumber(value);if(bytes===null)return 'Unavailable';
@@ -916,6 +969,7 @@
     const fromMobileMenu=$('#sidebar').classList.contains('mobile-open');
     const previousPage=document.activeElement.closest('.page');
     const changed=state.currentPage!==page||(page==='settings'&&state.settingsSection!==section);
+    if(changed&&saveController&&!saveController.guardNavigation()){history.replaceState(null,'',routeHash(state.currentPage,state.settingsSection));return;}
     state.currentPage=page;
     $('#workspace-scroll').classList.toggle('has-table-page',['library','activity'].includes(page));
     if(page==='settings')state.settingsSection=section;
@@ -932,7 +986,7 @@
       if(!state.settings)loadSettings();
       if(changed&&section==='media')loadRootFolders();
     }
-    const administration=page==='settings'&&['tasks','status','media'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
+    const administration=page==='settings'&&['tasks','status','media'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);
     if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else if(section!=='media')loadSystem();}
     if(page==='overview'&&state.csrf&&changed){loadSystem();loadWorkers();}
     if(page==='library'){renderInventory();if(state.status)void loadInventory(state.status.inventory);}if(page==='activity')renderJobs();scheduleTableFit();
@@ -951,6 +1005,7 @@
   };
   const cancelJob = async id => { try { const result=await api(`/api/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:'{}'}); notify(result.message || 'Cancellation requested.'); await pollStatus(); } catch(error) { notify(error.message,'error'); } };
   const bind = () => {
+    createSaveController();
     $$('.nav-link[data-page]').forEach(button=>$('.nav-icon',button)?.replaceChildren(iconSvg(button.dataset.page)));
     $$('button[aria-label]').forEach(button=>{if(!button.title)button.title=button.getAttribute('aria-label');});
     try{const libraries=JSON.parse(sessionStorage.getItem('subforge.jellyfin-libraries')||'[]');if(Array.isArray(libraries))rememberLibraries(libraries);}catch{}
@@ -964,27 +1019,33 @@
     $('#refresh-button').addEventListener('click',()=>{pollStatus();if(systemVisible())loadSystem();if(workersVisible())loadWorkers();if(state.currentPage==='settings'&&state.settingsSection==='tasks')loadTasks();if(state.currentPage==='settings'&&state.settingsSection==='media')loadRootFolders();}); $('#clear-view-button').addEventListener('click',()=>pollStatus());
     $$('[data-attention]').forEach(button=>button.addEventListener('click',()=>button.dataset.attention==='paths'?navigate('settings','media'):filterLibrary(button.dataset.attention)));
     $('#convert-selected-tracks').addEventListener('click',convertDrawerSelection);
+    $('#inventory-sync-now').addEventListener('click',syncInventoryNow);
+    $('#task-failure-scope').addEventListener('click',()=>filterLibrary('failed'));
+    $('#inventory-select-all').addEventListener('change',event=>{const checked=event.target.checked;for(const box of $$('.media-select:not(:disabled)')){if(!checked)state.selectedMedia.delete(box.value);else if(state.selectedMedia.size<64)state.selectedMedia.add(box.value);}syncMediaSelection();});
+    $('#inventory-clear-selection').addEventListener('click',()=>{state.selectedMedia.clear();syncMediaSelection();});
+    $('#inventory-bulk-convert').addEventListener('click',()=>{syncMediaSelection();if(state.selectedMedia.size)reviewConversion([],[...state.selectedMedia]);});
     $('#force-covered-tracks').addEventListener('change',()=>{const force=$('#force-covered-tracks').checked;$$('#track-drawer-list input').forEach(input=>{input.disabled=input.dataset.baseDisabled==='true'||input.dataset.covered==='true'&&!force;if(input.disabled&&input.checked){input.checked=false;state.drawerSelection.delete(input.dataset.trackKey==='source'?'source':Number(input.dataset.trackKey));}});syncDrawerSelection();});
     for(const [selector,checked] of [['#select-all-tracks',true],['#select-no-tracks',false]])$(selector).addEventListener('click',()=>{$$('#track-drawer-list input:not(:disabled)').forEach(input=>{if(input.checked!==checked){input.checked=checked;input.dispatchEvent(new Event('change'));}});});
     $('#inspect-drawer-file').addEventListener('click',async()=>{const row=state.selectedFile;if(!row)return;const result=await startJob({kind:'inspect',paths:[row.path],rootIds:row.root_id?[row.root_id]:[]});if(result)closeDialog($('#track-drawer-backdrop'));});
     $$('[data-action="scan"]').forEach(button=>button.addEventListener('click',()=>reviewConversion(selectedRootIds(state.currentPage==='library'?'#inventory-root':'#quick-root'))));
     $$('[data-action="inspect"]').forEach(button=>button.addEventListener('click',async()=>{const root=state.currentPage==='library'?$('#inventory-root').value:$('#quick-root').value;navigate('library');$('#inventory-root').value=root;await inspect();}));
     $('#quick-form').addEventListener('submit',event=>{event.preventDefault();reviewConversion(selectedRootIds('#quick-root'));});
-    $('#confirm-conversion').addEventListener('click',async()=>{if(!state.pendingConversion)return;const button=$('#confirm-conversion');button.disabled=true;try{const result=await startJob(state.pendingConversion);if(result){state.pendingConversion=null;closeDialog($('#conversion-modal'));}}finally{button.disabled=false;}});
+    $('#confirm-conversion').addEventListener('click',async()=>{if(!state.pendingConversion)return;const button=$('#confirm-conversion');button.disabled=true;try{const result=await startJob(state.pendingConversion);if(result){state.pendingConversion=null;state.selectedMedia.clear();syncMediaSelection();closeDialog($('#conversion-modal'));}}finally{button.disabled=false;}});
     const resetJobsPage=()=>{state.jobsPage=1;$('.jobs-table-wrap').scrollTop=0;renderJobs();saveJobsView();};
     $('#activity-status').addEventListener('change',resetJobsPage);$('#activity-kind').addEventListener('change',resetJobsPage);$('#refresh-worker-nodes').addEventListener('click',loadWorkerNodes);
     restoreJobsView();
     $('#jobs-page-size').addEventListener('change',()=>{const size=$('#jobs-page-size').value;state.jobsPageSize=size==='auto'?'auto':Number(size);resetJobsPage();});
     for(const [selector,delta] of [['#jobs-previous',-1],['#jobs-next',1]])$(selector).addEventListener('click',()=>{state.jobsPage+=delta;$('.jobs-table-wrap').scrollTop=0;renderJobs();saveJobsView();});
     restoreInventoryView();
-    const resetInventoryPage=()=>{state.inventoryPage=1;renderInventory();saveInventoryView();};
+    const resetInventoryPage=()=>{state.inventoryPage=1;$('.inventory-table-wrap').scrollTop=0;renderInventory();saveInventoryView();};
     $('#inventory-filter').addEventListener('change',resetInventoryPage); $('#inventory-root').addEventListener('change',resetInventoryPage); $('#inventory-search').addEventListener('input',resetInventoryPage);
     $('#inventory-page-size').addEventListener('change',()=>{const size=$('#inventory-page-size').value;state.inventoryPageSize=size==='auto'?'auto':Number(size);resetInventoryPage();});
-    $('#inventory-prev').addEventListener('click',()=>{state.inventoryPage--;renderInventory();saveInventoryView();});$('#inventory-next').addEventListener('click',()=>{state.inventoryPage++;renderInventory();saveInventoryView();});$('#inventory-page').addEventListener('change',()=>{state.inventoryPage=Number($('#inventory-page').value);renderInventory();saveInventoryView();});
+    const showInventoryPage = page => {state.inventoryPage=page;$('.inventory-table-wrap').scrollTop=0;renderInventory();saveInventoryView();};
+    $('#inventory-prev').addEventListener('click',()=>showInventoryPage(state.inventoryPage-1));$('#inventory-next').addEventListener('click',()=>showInventoryPage(state.inventoryPage+1));$('#inventory-page').addEventListener('change',()=>showInventoryPage(Number($('#inventory-page').value)));
     for(const selector of ['#jobs-list','#job-drawer-content'])$(selector).addEventListener('click',event=>{const button=event.target.closest('.cancel-job');if(button)cancelJob(button.dataset.jobId);});
-    $('#save-settings').addEventListener('click',saveSettings); $('#language-search').addEventListener('input',renderLanguageList); $('#add-language').addEventListener('click',addCustomLanguage); $('#custom-language').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addCustomLanguage();}});
+    $('#save-settings').addEventListener('click',()=>saveController.save()); $('#language-search').addEventListener('input',renderLanguageList); $('#add-language').addEventListener('click',addCustomLanguage); $('#custom-language').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addCustomLanguage();}});
     $$('[data-open-languages]').forEach(button=>button.addEventListener('click',()=>openLanguageDialog(button.dataset.openLanguages)));
-    $('#apply-languages').addEventListener('click',()=>{if(!state.draftLanguages.length){notify('Select at least one language or choose All languages.','error');return;}if(state.languageTarget==='settings'){state.defaultLanguages=[...state.draftLanguages];state.settingsDirty=true;$('#save-settings').textContent='Save changes •';setText($('#settings-save-note'),'Default languages have unsaved changes. Save changes to persist them.');}else{state.selectedLanguages=[...state.draftLanguages];state.quickLanguagesChanged=true;}updateLanguageLabels();closeDialog($('#language-modal'));});
+    $('#apply-languages').addEventListener('click',()=>{if(!state.draftLanguages.length){notify('Select at least one language or choose All languages.','error');return;}if(state.languageTarget==='settings'){state.defaultLanguages=[...state.draftLanguages];settingsDirty();}else{state.selectedLanguages=[...state.draftLanguages];state.quickLanguagesChanged=true;}updateLanguageLabels();closeDialog($('#language-modal'));});
     $$('.modal-close').forEach(button=>button.addEventListener('click',()=>closeDialog(button.closest('.modal-backdrop'))));
     $$('.modal-backdrop').forEach(backdrop=>backdrop.addEventListener('click',event=>{if(event.target===backdrop)closeDialog(backdrop);}));
     $('#add-root-folder').addEventListener('click',()=>openRootFolderDialog());$('#refresh-root-folders').addEventListener('click',loadRootFolders);
@@ -992,17 +1053,16 @@
     $('#folder-parent-button').addEventListener('click',()=>{if(state.folderParent)browseRootFolder(state.folderParent);});$('#select-root-folder').addEventListener('click',()=>{if(state.currentFolder)saveRootFolders([...state.rootFolders.roots.map(root=>root.path),state.currentFolder]);});
     $$('.settings-tab').forEach(button=>button.addEventListener('click',()=>navigate('settings',button.dataset.settingTab)));
     $('#refresh-system').addEventListener('click',()=>{if(state.settingsSection==='tasks')loadTasks();else{loadSystem();if(workersVisible())loadWorkers();}});
-    $('#worker-allocation-form').addEventListener('submit',saveWorkers);
+    $('#worker-allocation-form').addEventListener('submit',event=>{event.preventDefault();void saveController.save();});
     $('#worker-paused').addEventListener('change',workerDirty);
     for(const selector of Object.values(workerFields))$(selector).addEventListener('input',workerDirty);
     $$('[data-worker-step]').forEach(button=>button.addEventListener('click',()=>{const input=$(workerFields[button.dataset.workerStep]),next=Number(input.value)+Number(button.dataset.delta);input.value=String(Math.max(Number(input.min),Math.min(Number(input.max),next)));workerDirty();}));
     $('#pause-schedules').addEventListener('change',markTasksDirty);
-    $('#save-task-schedules').addEventListener('click',saveTasks);
+    $('#save-task-schedules').addEventListener('click',()=>saveController.save());
     window.addEventListener('popstate',restoreRoute);window.addEventListener('hashchange',restoreRoute);
     window.addEventListener('resize',scheduleTableFit);
     state.tableObserver=new ResizeObserver(scheduleTableFit);
     for(const pane of $$('.inventory-table-wrap,.jobs-table-wrap'))state.tableObserver.observe(pane);
-    window.addEventListener('beforeunload',event=>{if(state.settingsDirty||state.workersDirty||state.tasksDirty){event.preventDefault();event.returnValue='';}});
     document.addEventListener('keydown',event=>{
       const modal=$$('.modal-backdrop').find(item=>!item.classList.contains('hidden'));
       if(event.key==='Escape'){if(modal){event.preventDefault();closeDialog(modal);}else if($('#sidebar').classList.contains('mobile-open')){event.preventDefault();closeMobileMenu(true);}return;}

@@ -936,7 +936,22 @@ impl App {
     fn tasks(&self) -> Value {
         let mut value = lock(&self.scheduler).public();
         let runtime = lock(&self.runtime);
+        // Task results describe a single run; persisted conversion failures
+        // remain actionable even when a later task inspected no failed files.
+        value["pipeline"] = json!({"failed_files":runtime.pipeline_counts["failed_files"],"scope":"saved_conversion_state"});
         for task in value["tasks"].as_array_mut().into_iter().flatten() {
+            task["last_run_source"] = json!("task");
+            if task["id"] == "inventory" {
+                task["last_sync"] = json!(runtime.inventory_updated);
+                if runtime.inventory_updated > task["last_run"].as_f64().unwrap_or(0.0) {
+                    task["last_run"] = json!(runtime.inventory_updated);
+                    task["last_run_source"] = json!("inventory_sync");
+                    task["last_result"] = json!(
+                        "Inventory synchronized; this timestamp includes syncs from discovery and conversion."
+                    );
+                    task["status"] = json!("completed");
+                }
+            }
             let active = runtime
                 .running
                 .iter()
@@ -3333,8 +3348,14 @@ impl App {
         let verification =
             self.refresh_bazarr_after_publication(&mut integrations, &job, receipt.as_mut());
         let notice = match (verification, receipt) {
-            (Err(error), _) => {
-                json!({"provider":"bazarr","ok":false,"message":format!("SRT published; Bazarr inventory refresh failed: {}",log_text(&error,256))})
+            (Err(error), receipt) => {
+                let mut notice = receipt.unwrap_or_else(|| json!({"provider":"bazarr"}));
+                notice["ok"] = json!(false);
+                notice["message"] = json!(format!(
+                    "SRT published; Bazarr inventory refresh failed: {}",
+                    log_text(&error, 256)
+                ));
+                notice
             }
             (Ok(()), Some(receipt)) => receipt,
             _ => {
@@ -3783,7 +3804,12 @@ fn handle_uncompressed(app: &App, request: &Request) -> Reply {
             ),
             "/static/app.js" | "/app.js" => Reply::asset(
                 "text/javascript; charset=utf-8",
-                include_bytes!("../web/app.js"),
+                concat!(
+                    include_str!("../web/settings-save.js"),
+                    "\n",
+                    include_str!("../web/app.js")
+                )
+                .as_bytes(),
             ),
             "/static/app.min.js" => Reply::asset(
                 "text/javascript; charset=utf-8",
@@ -5538,6 +5564,11 @@ mod tests {
         for job in status["history"].as_array().unwrap() {
             assert_eq!(job["notifications"].as_array().unwrap().len(), 1);
             assert_eq!(job["notifications"][0]["provider"], "bazarr");
+            assert!(job["notifications"][0]["sent_at"].as_f64().unwrap() > 0.0);
+            assert!(
+                job["notifications"][0]["recorded_at"].as_f64().unwrap()
+                    >= job["notifications"][0]["sent_at"].as_f64().unwrap()
+            );
         }
         assert_eq!(status["history"][0]["status"], "failed");
         assert_eq!(status["history"][1]["status"], "cancelled");
@@ -5934,6 +5965,21 @@ mod tests {
         assert_eq!(app.inventory()["updated"], 10.0);
         assert_eq!(app.status()["history"][0]["results"], json!([]));
         assert!(app.status()["inventory"].get("items").is_none());
+        let tasks = app.tasks();
+        let inventory_task = tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "inventory")
+            .unwrap();
+        assert_eq!(inventory_task["last_run"], 10.0);
+        assert_eq!(inventory_task["last_sync"], 10.0);
+        assert_eq!(inventory_task["last_run_source"], "inventory_sync");
+        assert_eq!(inventory_task["status"], "completed");
+        assert_eq!(
+            tasks["pipeline"]["failed_files"],
+            app.status()["pipeline"]["failed_files"]
+        );
     }
     #[test]
     fn stored_inventory_is_bounded_and_stays_inside_mounts() {
