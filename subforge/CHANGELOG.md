@@ -7,6 +7,9 @@
 - Keep Library Fit at a 25-row minimum with a scrolling pane; add page selection and reviewed bulk conversion capped at 64 explicit media paths.
 - Unify settings, task-schedule, and worker-allocation saves with a shared sticky save/discard bar and unsaved-navigation warning.
 - Clarify global failed-file totals, task-result scope, and notification send timestamps, including limits of legacy records.
+- Show live connection state and update age from the latest valid status, system, or worker message received by the browser, with an absolute timestamp on hover. Live badges share that clock; stale resource status uses its own last-sample time.
+- Improve keyboard focus, compact text size, and Library filename wrapping; use explicit Hide/Show wording for the sidebar toggle, and show one edition badge in the header with plain-language System guidance. Explain SDH in desktop copy and the drawer, and spell it out in mobile coverage chips.
+- Group scan roots by available storage-volume identity. Generic groups use numbered **Storage volume** names and plain folder names; Windows drive labels remain recognizable. Optional `CONVERTER_*_SOURCE` hints only supply a validated Windows drive label; they do not grant host-path access or expose the configured host paths. Clarify that container limit changes require recreation, not restart.
 
 ## 0.4.4 — 2026-10-16
 

@@ -147,6 +147,11 @@ services:
       - /tmp:rw,nosuid,nodev,size=512m
     environment:
       - CONVERTER_SCAN_INTERVAL=${CONVERTER_SCAN_INTERVAL:-21600}
+      # Display-only mount metadata; does not grant access to host paths.
+      - CONVERTER_MOVIES_SOURCE=${CONVERTER_MOVIES_DIR:-D:/film}
+      - CONVERTER_MOVIES_C_SOURCE=${CONVERTER_MOVIES_C_DIR:-C:/film}
+      - CONVERTER_TV_SOURCE=${CONVERTER_TV_DIR:-D:/tv show}
+      - CONVERTER_TV_C_SOURCE=${CONVERTER_TV_C_DIR:-C:/tv show}
       - CONVERTER_MIN_AGE=${CONVERTER_MIN_AGE:-120}
       - CONVERTER_TIMEOUT=${CONVERTER_TIMEOUT:-7200}
       - CONVERTER_RETRY_INTERVAL=${CONVERTER_RETRY_INTERVAL:-3600}

@@ -505,6 +505,7 @@ pub struct App {
     pipeline_refresh: Mutex<()>,
     public_integrations: Mutex<Value>,
     mounts: Vec<PathBuf>,
+    root_display: crate::root_display::RootDisplay,
     data: PathBuf,
     password: Option<String>,
     csrf: String,
@@ -569,6 +570,20 @@ fn root_info(root: &Path, mounts: &[PathBuf]) -> Value {
     let available = root.is_dir() && !symlink_component(root);
     json!({"id":id,"path":path,"label":root.file_name().map(|name|name.to_string_lossy().into_owned()).unwrap_or_else(||path.clone()),
            "status":if available {"ready"} else {"unavailable"},"free_bytes":if available {fs2::available_space(root).ok()} else {None}})
+}
+fn displayed_root_info(
+    root: &Path,
+    mounts: &[PathBuf],
+    display: &crate::root_display::RootDisplay,
+) -> Value {
+    let mut info = root_info(root, mounts);
+    let display = display.describe(root, mounts, info["status"] == "ready");
+    if let Some(fields) = info.as_object_mut()
+        && let Value::Object(labels) = display
+    {
+        fields.extend(labels);
+    }
+    info
 }
 fn completed_status(job: &Value) -> &'static str {
     if job["error"]
@@ -712,6 +727,7 @@ impl App {
             scheduler.update(&json!({"tasks":[{"id":"discovery","enabled":true,"interval_seconds":interval.as_secs().min(2592000)}]}), now())?;
         }
         let integrations = Integrations::new(data.join("settings.json"))?;
+        let root_display = crate::root_display::RootDisplay::from_env();
         let mut runtime = Runtime {
             roots: mounts.clone(),
             languages: vec!["*".into()],
@@ -772,7 +788,7 @@ impl App {
         runtime.cached_roots = runtime
             .roots
             .iter()
-            .map(|root| root_info(root, &mounts))
+            .map(|root| displayed_root_info(root, &mounts, &root_display))
             .collect();
         runtime.pipeline_counts = converter.pipeline_counts();
         for job in &mut runtime.history {
@@ -842,6 +858,7 @@ impl App {
             inventory_persist: Mutex::new(()),
             pipeline_refresh: Mutex::new(()),
             mounts,
+            root_display,
             data,
             password,
             csrf: token(32),
@@ -1710,8 +1727,8 @@ impl App {
             self.mounts
                 .iter()
                 .map(|root| {
-                    let info = root_info(root, &self.mounts);
-                    json!({"path":info["path"],"label":info["label"],"status":info["status"]})
+                    let info = displayed_root_info(root, &self.mounts, &self.root_display);
+                    json!({"path":info["path"],"label":info["label"],"status":info["status"],"volume_id":info["volume_id"],"volume_label":info["volume_label"],"free_bytes":info["free_bytes"]})
                 })
                 .collect::<Vec<_>>()
         )
@@ -1721,7 +1738,7 @@ impl App {
         runtime.cached_roots = runtime
             .roots
             .iter()
-            .map(|root| root_info(root, &self.mounts))
+            .map(|root| displayed_root_info(root, &self.mounts, &self.root_display))
             .collect();
         json!({"roots":runtime.cached_roots,"mounts":self.mounts_value()})
     }
@@ -5935,6 +5952,33 @@ mod tests {
         fs::create_dir(&mount).expect("fixture");
         assert!(validate_root(&mount, std::slice::from_ref(&mount), true).is_ok());
         assert!(validate_root(temporary.path(), &[mount], true).is_err());
+    }
+    #[test]
+    fn root_volume_display_preserves_root_identity_and_mount_validation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mount = temporary.path().join("media");
+        let nested = mount.join("Archive");
+        fs::create_dir_all(&nested).unwrap();
+        let app = App::new(
+            vec![mount.clone()],
+            temporary.path().join("data"),
+            Duration::from_secs(60),
+            false,
+        )
+        .unwrap();
+        let roots = app.root_folders();
+        let root = &roots["roots"][0];
+        assert_eq!(root["id"], "0");
+        assert_eq!(root["path"], json!(mount));
+        assert_eq!(root["volume_id"], roots["mounts"][0]["volume_id"]);
+        assert!(root["volume_id"].as_str().unwrap().starts_with('v'));
+        assert!(root["free_bytes"].is_u64());
+        let nested_display = displayed_root_info(&nested, &app.mounts, &app.root_display);
+        assert_eq!(nested_display["id"], root_info(&nested, &app.mounts)["id"]);
+        assert_eq!(nested_display["volume_id"], root["volume_id"]);
+        assert_eq!(nested_display["label"], "Archive");
+        assert!(validate_root(&nested, &app.mounts, true).is_ok());
+        assert!(validate_root(temporary.path(), &app.mounts, true).is_err());
     }
     #[test]
     fn constant_time_comparison_handles_length_and_contents() {

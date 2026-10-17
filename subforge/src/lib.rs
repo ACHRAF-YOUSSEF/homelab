@@ -11,6 +11,7 @@ pub mod maintenance;
 pub mod metadata;
 pub mod remote;
 mod resources;
+mod root_display;
 pub mod server;
 pub mod tasks;
 pub mod util;

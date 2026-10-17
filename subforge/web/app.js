@@ -52,17 +52,32 @@
   state.tasksBusy=false;
   state.tasksLoadedAt=0;
   state.taskRequests=new Set();
+  state.liveMode='connecting';
+  state.statusReceivedAt=0;
+  state.receivedAt=0;
+  state.systemSampleAt=0;
   let saveController;
   const settingsDirty = () => {state.settingsDirty=true;saveController?.render();updateSettingsActions();};
   const updateSettingsActions = () => {for(const button of $$('.test-integration,.refresh-integration')){button.disabled=state.settingsDirty;button.title=state.settingsDirty?'Save or discard your changes before using this connection':'Use the saved connection settings';}};
   const integrationDefaults = () => ({enabled:false,url:'',api_key:'',api_key_set:false,path_mappings:[]});
   const setText = (el, value) => { if (el) el.textContent = value == null ? '' : String(value); };
   const escStatus = value => String(value || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
-  const fmtDate = value => { if (!value) return '—'; const parsed=typeof value==='number'?(value<1e12?value*1000:value):value; const date = new Date(parsed); return Number.isNaN(date.valueOf()) ? String(value) : new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}).format(date); };
+  const dateMillis = value => {if(!value)return null;const date=new Date(typeof value==='number'&&value<1e12?value*1000:value);return Number.isFinite(date.valueOf())?date.valueOf():null;};
+  const absoluteDate = value => {const at=dateMillis(value);return at===null?'Time unavailable':new Intl.DateTimeFormat(undefined,{year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit',timeZoneName:'short'}).format(at);};
+  const fmtDate = value => {
+    const at=dateMillis(value);if(at===null)return '—';const delta=Math.floor((Date.now()-at)/1000),seconds=Math.abs(delta);
+    if(seconds<10)return delta<0?'now':'just now';
+    const amount=seconds<60?`${seconds}s`:seconds<3600?`${Math.floor(seconds/60)}m`:seconds<86400?`${Math.floor(seconds/3600)}h`:seconds<604800?`${Math.floor(seconds/86400)}d`:seconds<2592000?`${Math.floor(seconds/604800)}w`:seconds<31536000?`${Math.floor(seconds/2592000)}mo`:`${Math.floor(seconds/31536000)}y`;
+    return delta<0?`in ${amount}`:`${amount} ago`;
+  };
+  const timeNode = value => {const node=document.createElement('time'),at=dateMillis(value);if(at===null){node.textContent='—';return node;}node.dataset.relativeTime=String(at);node.dateTime=new Date(at).toISOString();node.title=absoluteDate(at);node.textContent=fmtDate(at);return node;};
+  const timestamp = (node,value,prefix='',suffix='') => {node.replaceChildren(document.createTextNode(prefix),timeNode(value),document.createTextNode(suffix));};
+  const refreshTimes = () => {for(const node of $$('time[data-relative-time]'))setText(node,fmtDate(Number(node.dataset.relativeTime)));};
+  const plainCopy = value => String(value||'').replace(/\bocr-rs\b/gi,'subtitle recognition').replace(/\badmitted\b/gi,'started').replace(/\badmission\b/gi,'capacity checks').replace(/\bRust process\b/gi,'Subforge');
   const currentLabel = current => {
     if(!current)return '';if(typeof current!=='object')return String(current);
     const phase=({preparing:'Preparing job',discovering:'Discovering files',syncing_bazarr:'Syncing Bazarr inventory',checking_bazarr_coverage:'Checking subtitle coverage',notifying_bazarr:'Notifying Bazarr',waiting_for_worker:'Waiting for a worker',checking_gpu:'Checking GPU runtime',extracting:'Extracting text',ocr:'Recognizing images',validating:'Validating SRT',track_complete:'Track complete',processing:'Processing file',cached:'Already converted',pending:'Awaiting OCR',failed:'Failed'})[current.status]||current.stage||current.status||'Processing';
-    const backend=({ffmpeg:'FFmpeg / CPU',tesseract:'Tesseract / CPU',paddle:'PaddleOCR / GPU',ocr_rs_cpu:'ocr-rs / CPU',ocr_rs_cuda:'ocr-rs / GPU',seconv:'Subtitle Edit'})[current.backend];
+    const backend=({ffmpeg:'Text conversion / CPU',tesseract:'Image recognition / CPU',paddle:'Image recognition / GPU',ocr_rs_cpu:'Image recognition / CPU',ocr_rs_cuda:'Image recognition / GPU',seconv:'Subtitle conversion'})[current.backend];
     return [phase,backend,current.track!=null?`track ${current.track}`:'',shortPath(current.path||current.output||'')].filter(Boolean).join(' · ');
   };
   const shortPath = value => { const path = String(value || ''); return path.length > 80 ? `…${path.slice(-77)}` : path; };
@@ -106,7 +121,7 @@
   };
   const rowMissingTargets = row => row.coverage?.missing_targets||row.missing_targets||[];
   const rowExistingTargets = row => row.coverage?.existing_targets||row.existing_targets||[];
-  const targetLabel = target => `${languageCode(target.language).toUpperCase()}${target.forced?' forced':''}${target.hi?' SDH':''}`;
+  const targetLabel = target => `${languageCode(target.language).toUpperCase()}${target.forced?' forced':''}${target.hi?' SDH (deaf and hard of hearing)':''}`;
   const renderInventoryAuthority = () => {
     const bazarr=usesBazarr(),authority=state.inventoryAuthority||{},status=bazarr&&state.inventorySource!=='bazarr'?'stale':authority.status||'ready';
     setText($('#inventory-source'),bazarr?'Bazarr':'Filesystem');
@@ -119,6 +134,7 @@
     const updated=state.status?.inventory?.updated||state.inventoryUpdated;
     const minutes=updated?Math.max(0,Math.floor((Date.now()-(updated<1e12?updated*1000:updated))/60000)):null;
     const age=minutes===null?'Never synced':`Synced ${Math.floor(minutes/60)}h ${minutes%60}m ago`;
+    $('#inventory-authority-copy').title=updated?`Last successful inventory sync: ${absoluteDate(updated)}`:'No successful inventory sync recorded';
     setText($('#inventory-authority-copy'),bazarr?({ready:'Bazarr inventory is ready.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:`Bazarr inventory synced. Published subtitle indexing is still unconfirmed.${pendingDetail} Conversion is available; existing SRT files are checked before converting.`,reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(status!=='ready'&&authority.reason?` ${authority.reason}`:'')+(authority.error?` ${authority.error}`:'')+` ${age}. Saved snapshots become stale when Subforge restarts; there is no age cutoff. A failed sync blocks conversion until a successful retry.`:state.status?'Filesystem inventory. Inspect media to update saved tracks and coverage.':'Checking library status…');
     setText($('#inventory-sync-now'),bazarr?'Sync now':'Inspect now');
     const syncing=jobList().some(job=>job.kind==='inspect'&&['queued','running'].includes(job.status));
@@ -145,7 +161,7 @@
     setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));
     const inventoryStatus=$('#pipeline-status');
     const inventoryUpdated=state.status?.inventory?.updated??state.inventoryUpdated;
-    setText(inventoryStatus,inventoryUpdated?`${usesBazarr()?'Bazarr sync':'Inspected'} ${fmtDate(inventoryUpdated)}${state.status?.inventory?.truncated?' · Partial snapshot':''}`:'No inventory yet');
+    if(inventoryUpdated)timestamp(inventoryStatus,inventoryUpdated,`${usesBazarr()?'Bazarr sync':'Inspected'} `,state.status?.inventory?.truncated?' · Partial snapshot':'');else setText(inventoryStatus,'No inventory yet');
     if(inventoryStatus)inventoryStatus.title=usesBazarr()?'Bazarr profiles define the required languages. Open Library for verified SRT coverage.':'Inspect media to update the saved filesystem inventory.';
     setText($('#attention-pending'),count('pending_ocr_files'));setText($('#attention-failed'),count('failed_files'));setText($('#attention-unreachable'),count('unreachable_roots'));
     for(const [key,value] of [['pending',data.pending_ocr_files],['failed',data.failed_files],['paths',data.unreachable_roots]]){const button=$(`[data-attention="${key}"]`);button.classList.toggle('has-issues',Number(value)>0);button.classList.toggle('is-clear',value===0);button.title=key==='paths'?'Review unavailable media folders':key==='failed'?'Review failures saved in conversion state':'Review files awaiting image subtitle recognition';}
@@ -211,13 +227,15 @@
     const quick = $('#quick-root'), inventoryRoot = $('#inventory-root');
     const keepQuick = quick.value, keepInventory = state.inventoryRestoreRoot ?? inventoryRoot.value;
     quick.replaceChildren(new Option('All scan roots','')); inventoryRoot.replaceChildren(new Option('All roots',''));
+    const groups=new Map();
     for (const root of roots || []) {
       const label = root.label || root.path || root.id;
+      const key=root.volume_id||'unassigned';let group=groups.get(key);
+      if(!group){const section=document.createElement('section');section.className='root-volume-group';const heading=document.createElement('div');heading.className='root-volume-heading';const volume=document.createElement('strong');volume.textContent=root.volume_label==='Storage volume'?`Storage volume ${groups.size+1}`:root.volume_label||'Folders';heading.append(volume);section.append(heading);rootList.append(section);group=section;groups.set(key,group);}
+      if(root.volume_id&&Number.isFinite(root.free_bytes)&&!$('.root-volume-space',group)){const free=document.createElement('span');free.className='root-volume-space';free.textContent=`${formatSpace(root.free_bytes)} free`;$('.root-volume-heading',group).append(free);}
       const item = document.createElement('div'); item.className = 'root-item';
-      const dot = document.createElement('span'); dot.className = 'root-dot';
       const text = document.createElement('span'); text.className = 'root-item-text'; text.title = root.path || label; text.textContent = label;
-      const count = document.createElement('span'); count.className = 'root-count'; count.textContent = '';dot.title='Configured folder; health is shown in Media folders';
-      item.append(dot,text,count); rootList.append(item);
+      item.append(text); group.append(item);
       quick.add(new Option(label,root.id)); inventoryRoot.add(new Option(label,root.id));
     }
     if ([...quick.options].some(x=>x.value===keepQuick)) quick.value=keepQuick;
@@ -341,7 +359,7 @@
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
     const statusValue=jobStatus(job),pill = document.createElement('span'); pill.className=`status-pill ${statusValue.style}`; pill.textContent=statusValue.label;
-    const time=document.createElement('span'); time.className='job-time'; time.textContent=fmtDate(job.finished || job.telemetry?.heartbeat_at || job.started || job.created);
+    const time=timeNode(job.finished || job.telemetry?.heartbeat_at || job.started || job.created); time.className='job-time';
     status.append(pill,time);
     card.append(icon,detail,status);
     const executors=renderJobExecutors(job,compact);if(executors)card.append(executors);
@@ -402,7 +420,7 @@
       const live=['running','queued'].includes(job.status),copy=document.createElement('span');copy.className='job-result-copy';copy.textContent=live?jobProgressLabel(job):parts.join(', ')||((job.notifications||[]).some(item=>item?.pending===true)?'Indexing pending':job.error?'Review error details':'—');result.append(copy);
       if(live)result.append(jobProgressBar(job));
       const timing=jobTiming(job);if(timing){const info=document.createElement('small');info.className='job-timing';info.textContent=timing;result.append(info);}result.title=[copy.textContent,timing].filter(Boolean).join('\n');
-      const updated=cell('Updated','job-row-time');updated.textContent=fmtDate(job.finished||job.telemetry?.heartbeat_at||job.started||job.created);
+      const updated=cell('Updated','job-row-time');updated.append(timeNode(job.finished||job.telemetry?.heartbeat_at||job.started||job.created));
       const actionsCell=cell('Actions','job-row-actions'),actions=document.createElement('div');actions.className='job-actions';actionsCell.append(actions);const details=document.createElement('button');details.className='row-action';details.type='button';details.textContent='Details';details.dataset.viewJob=job.id;details.dataset.jobFocus=`${job.id}:details`;details.setAttribute('aria-label',`Details for ${jobTitle(job)}`);details.addEventListener('click',()=>openJobDetails(job));actions.append(details);
       if(['running','queued'].includes(job.status)&&job.id){const cancel=document.createElement('button');cancel.type='button';cancel.className='text-button cancel-job';cancel.textContent='Cancel';cancel.dataset.jobId=job.id;cancel.dataset.jobFocus=`${job.id}:cancel`;actions.append(cancel);}
       body.append(row);
@@ -431,14 +449,22 @@
     if (!entries.length) { const empty=document.createElement('div'); empty.className='log-empty'; empty.textContent='No recent converter events'; box.append(empty); return; }
     for (const entry of entries) {
       const row=document.createElement('div'); row.className='log-row';
-      const time=document.createElement('time'); const timestamp=typeof entry.time==='number'&&entry.time<1e12?entry.time*1000:entry.time;time.textContent=timestamp ? new Date(timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
+      const time=timeNode(entry.time);
       const level=document.createElement('span'); level.className=`log-level ${escStatus(entry.level)}`; level.textContent=(entry.level || 'INFO').toUpperCase();
-      const message=document.createElement('span'); message.className='log-message'; message.textContent=entry.message || '';
+      const message=document.createElement('span'); message.className='log-message'; message.textContent=plainCopy(entry.message);
       row.append(time,level,message); box.append(row);
     }
     if(atEnd)box.scrollTop=box.scrollHeight;
   };
-  const setConnection = good => { $('#connection-dot').classList.toggle('offline',!good); setText($('#connection-text'),good ? 'Service connected' : 'Service unavailable'); };
+  const renderLiveState = () => {
+    const mode=state.liveMode,at=state.receivedAt,label=({connected:'Live',connecting:'Connecting',reconnecting:'Reconnecting',paused:'Paused',unsupported:'Manual refresh',invalid:'Stale',offline:'Offline'})[mode]||'Offline';
+    const text=at?`${label} · ${fmtDate(at)}`:label,title=at?`Last dashboard update: ${absoluteDate(at)}`:'Waiting for the first dashboard update';
+    for(const node of [$('#last-updated'),$('#connection-text'),...$$('[data-live-state]')]){setText(node,text);node.title=title;node.dataset.liveMode=mode;}
+    $('#connection-dot').classList.toggle('offline',mode!=='connected');
+    const resources=$('#system-sample-state');
+    if(resources){const stale=mode==='connected'&&!state.systemSampleHealthy;setText(resources,stale?(state.systemSampleAt?`Stale · ${fmtDate(state.systemSampleAt)}`:'Waiting for measurements'):text);resources.title=state.systemSampleAt?`Last resource measurement: ${absoluteDate(state.systemSampleAt)}`:'Waiting for resource measurements';}
+  };
+  const setConnection = good => {state.liveMode=good?'connected':'offline';renderLiveState();};
   const loadInventory = async summary => {
     if(summary?.authority)state.inventoryAuthority=summary.authority;if(summary?.source)state.inventorySource=summary.source;renderInventoryAuthority();
     if(state.currentPage!=='library'||state.inventoryBusy)return;
@@ -456,8 +482,7 @@
   };
   const applyStatus = data => {
     clearTimeout(state.bootstrapFallback);
-    state.status=data;setConnection(true);renderRootSelectors(data.roots||[]);renderJobs();renderLogs(data.logs);renderPipeline();
-    setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
+    state.status=data;state.statusReceivedAt=Date.now();state.receivedAt=state.statusReceivedAt;renderLiveState();renderRootSelectors(data.roots||[]);renderJobs();renderLogs(data.logs);renderPipeline();
     void loadInventory(data.inventory);updateHookStates();updateIntegrationUsage();updateIntegrationDots();updateVersion(data.version,data.edition);
     if(data.tasks&&Array.isArray(data.tasks.tasks)){state.tasks=data.tasks;state.tasksLoadedAt=Date.now();renderTasks();}
   };
@@ -508,6 +533,7 @@
     setText($('#inventory-meta'),`${count.toLocaleString()} ${count===1?'match':'matches'} in ${state.inventory.length.toLocaleString()} ${usesBazarr()?'Bazarr media items':'inspected items'}`);
     const globalCount=filter==='failed'?state.status?.pipeline?.failed_files:filter==='pending'?state.status?.pipeline?.pending_ocr_files:null;
     setText($('#inventory-scope-note'),[state.inventoryTruncated?'The server reports a bounded partial inventory.':'',Number.isFinite(globalCount)?`${count.toLocaleString()} ${count===1?'match':'matches'} in this snapshot; ${globalCount.toLocaleString()} ${filter==='failed'?'failed':'awaiting OCR'} files across saved conversion state.`:'',state.inventoryUpdated?`${usesBazarr()?'Last Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}.`:''].filter(Boolean).join(' ')||(state.inventoryLoaded?'No saved inventory. Inspect media to load tracks.':'Loading saved inventory…'));
+    $('#inventory-scope-note').title=state.inventoryUpdated?absoluteDate(state.inventoryUpdated):'';
     const range=count?`${(start+1).toLocaleString()}–${(start+visibleRows.length).toLocaleString()} of ${count.toLocaleString()} items`:'0 items';
     if ($('#inventory-range').textContent!==range) setText($('#inventory-range'),range);
     const pageSelect=$('#inventory-page');
@@ -642,15 +668,19 @@
     const body=$('#root-folder-body');body.replaceChildren();
     const roots=state.rootFolders.roots || [];
     if(!roots.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=4;cell.className='table-empty';cell.textContent='No root folders selected. Add a folder to enable scanning.';row.append(cell);body.append(row);return;}
-    for(const root of roots){
+    const groups=new Map();for(const root of roots){const key=root.volume_id||root.id||root.path;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(root);}
+    let volumeNumber=0;for(const members of groups.values()){
+      volumeNumber++;const first=members[0],heading=document.createElement('tr'),summary=document.createElement('td');heading.className='root-volume-summary';summary.colSpan=4;const name=document.createElement('strong');name.textContent=first.volume_label==='Storage volume'?`Storage volume ${volumeNumber}`:first.volume_label||'Storage volume';const free=members.find(root=>Number.isFinite(root.free_bytes));summary.append(name,document.createTextNode(` · ${free?`${formatSpace(free.free_bytes)} free`:'Free space unavailable'} · ${members.length===1?'1 folder':`shared by ${members.length} folders`}`));heading.append(summary);body.append(heading);
+    for(const root of members){
       const row=document.createElement('tr'),path=document.createElement('td'),space=document.createElement('td'),status=document.createElement('td'),actions=document.createElement('td');
       const pathButton=document.createElement('button');pathButton.type='button';pathButton.className='root-folder-path';pathButton.textContent=root.path;pathButton.title='Browse this folder';pathButton.disabled=root.status!=='ready';pathButton.addEventListener('click',()=>openRootFolderDialog(root.path));path.append(pathButton);
-      space.textContent=formatSpace(root.free_bytes);
+      space.textContent=root.volume_label||'Storage volume';
       const badge=document.createElement('span');badge.className=`status-pill ${root.status==='ready'?'success':'failed'}`;badge.textContent=root.status==='ready'?'Available':'Unavailable';status.append(badge);
       const group=document.createElement('div');group.className='root-folder-actions';
       const scan=document.createElement('button');scan.type='button';scan.className='icon-button scan-root-folder';scan.textContent='↻';scan.title='Scan this folder';scan.setAttribute('aria-label',`Scan ${root.path}`);scan.disabled=root.status!=='ready';scan.addEventListener('click',()=>startJob({kind:'scan',rootIds:[root.id]}));
       const remove=document.createElement('button');remove.type='button';remove.className='icon-button remove-root-folder';remove.textContent='×';remove.title='Remove from scan folders';remove.setAttribute('aria-label',`Remove ${root.path}`);remove.addEventListener('click',()=>saveRootFolders(roots.filter(item=>item.path!==root.path).map(item=>item.path)));
       group.append(scan,remove);actions.append(group);row.append(path,space,status,actions);body.append(row);
+    }
     }
   };
   const loadRootFolders = async () => {
@@ -715,7 +745,7 @@
   const updateIntegrationDots = () => {
     for(const dot of $$('[data-integration-dot]')){const provider=dot.dataset.integrationDot,config=state.settings?.integrations?.[provider]||state.status?.settings?.integrations?.[provider]||{},check=state.integrationChecks.get(provider);let latest=null;
       for(const job of jobList()){for(const result of job.notifications||[]){const at=Number(result?.recorded_at||result?.sent_at||0)*1000;if(result?.provider===provider&&typeof result.ok==='boolean'&&at>0&&(!latest||at>latest.at))latest={ok:result.ok,at};}}
-      const observed=check&&(!latest||check.at>=latest.at)?check:latest,kind=!config.enabled?'disabled':observed?observed.ok?'connected':'error':'unknown';dot.dataset.state=kind;const label=kind==='disabled'?'Integration disabled':observed?`Last ${observed===check?'connection test':'notification result'} ${observed.ok?'succeeded':'failed'} · ${fmtDate(observed.at)}`:'Configured; connection has not been checked';dot.title=label;dot.setAttribute('aria-label',label);
+      const observed=check&&(!latest||check.at>=latest.at)?check:latest,kind=!config.enabled?'disabled':observed?observed.ok?'connected':'error':'unknown';dot.dataset.state=kind;dot.textContent=({connected:'✓',error:'!',disabled:'—',unknown:'?'})[kind];dot.setAttribute('role','img');const label=kind==='disabled'?'Integration disabled':observed?`Last ${observed===check?'connection test':'notification result'} ${observed.ok?'succeeded':'failed'} · ${absoluteDate(observed.at)}`:'Configured; connection has not been checked';dot.title=label;dot.setAttribute('aria-label',label);
     }
   };
   const testIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.test-integration',card); button.disabled=true;setIntegrationResult(result,'Testing…','pending');
@@ -735,14 +765,14 @@
       const node=$(`[data-provider="${provider}"] .integration-last-result`);if(!node)continue;
       const receipts=jobList().flatMap(job=>job.notifications||[]).filter(item=>item?.provider===provider&&typeof item.ok==='boolean'&&(!Object.hasOwn(item,'sent_at')||Number.isFinite(item.sent_at)&&item.sent_at>0));
       receipts.sort((a,b)=>(b.sent_at||0)-(a.sent_at||0));const match=receipts[0];
-      setText(node,match?`Last notification sent: ${match.pending?'Indexing pending':match.ok?'Succeeded':'Failed'} · ${match.sent_at?fmtDate(match.sent_at):'Time unavailable (legacy record)'}`:'No notification sent yet. Connection tests and inventory reads are recorded separately.');
+      if(match?.sent_at)timestamp(node,match.sent_at,`Last notification sent: ${match.pending?'Indexing pending':match.ok?'Succeeded':'Failed'} · `);else setText(node,match?`Last notification sent: ${match.ok?'Succeeded':'Failed'} · Time unavailable (legacy record)`:'No notification sent yet. Connection tests and inventory reads are recorded separately.');
     }
   };
   const editionLabel = edition => ({cpu:'CPU only',cuda:'CUDA'})[edition] || 'Unavailable';
   const updateEdition = edition => {
     if(!['cpu','cuda'].includes(edition))return;
     state.edition=edition;
-    for(const selector of ['#edition-label','#header-edition']){const node=$(selector);setText(node,editionLabel(edition));node.hidden=false;node.dataset.edition=edition;node.title=edition==='cuda'?'CUDA edition; GPU workers require a granted device and a saved allocation.':'CPU-only edition; GPU workers are unavailable.';}
+    const node=$('#header-edition');setText(node,editionLabel(edition));node.hidden=false;node.dataset.edition=edition;node.title=edition==='cuda'?'GPU processing is available when a device and worker slots are configured.':'CPU processing; GPU workers are unavailable.';
   };
   const updateVersion = (version,edition) => {updateEdition(edition);if(typeof version==='string'&&/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(version)){setText($('#version-label'),`v${version}`);$('#version-label').title=`Subforge ${version} (${editionLabel(state.edition)})`;$('.brand').title=$('#version-label').title;}};
   const intervalLabel = seconds => seconds%604800===0?`Every ${seconds/604800===1?'week':`${seconds/604800} weeks`}`:seconds%86400===0?`Every ${seconds/86400===1?'day':`${seconds/86400} days`}`:`Every ${seconds/3600===1?'hour':`${seconds/3600} hours`}`;
@@ -752,7 +782,7 @@
     updateVersion(state.tasks.version,state.tasks.edition);
     const failed=state.tasks.pipeline?.failed_files??state.status?.pipeline?.failed_files;
     setText($('#task-failure-scope'),`${Number.isFinite(failed)?failed.toLocaleString():'Unknown'} saved file failures across conversion state. Task results below count failures in that run only. Review saved failures →`);
-    const paused=!!state.tasks.paused;setText($('#scheduler-state'),paused?'Paused':'Scheduled');$('#scheduler-state').className=`status-pill ${paused?'cancelled':'completed'}`;
+    const paused=!!state.tasks.paused;setText($('#scheduler-state'),paused?'Automation paused':'Automation on');$('#scheduler-state').className=`status-pill ${paused?'cancelled':'completed'}`;
     if(state.tasksDirty)return;
     $('#pause-schedules').checked=paused;
     const body=$('#tasks-body');body.replaceChildren();
@@ -763,8 +793,8 @@
       const interval=document.createElement('select');interval.className='input compact-input task-interval';interval.setAttribute('aria-label',`${task.name} interval`);interval.disabled=task.available===false;
       const choices=[...new Set([3600,21600,43200,86400,172800,604800,1209600,2592000,task.interval_seconds])].filter(value=>value>=task.min_interval_seconds).sort((a,b)=>a-b);
       for(const value of choices)interval.add(new Option(intervalLabel(value),String(value)));interval.value=String(task.interval_seconds);enabled.addEventListener('change',markTasksDirty);interval.addEventListener('change',markTasksDirty);controls.append(label,interval);schedule.append(controls);
-      const next=document.createElement('td');next.dataset.label='Next execution';next.className='task-next';next.textContent=task.available===false?'Permission disabled':paused?'Paused':task.enabled?fmtDate(task.next_run):'Manual only';
-      const last=document.createElement('td');last.dataset.label='Last result';last.className='task-last-result';const result=document.createElement('span');result.textContent=task.last_result||'Not run yet';last.append(result);if(task.last_run){const time=document.createElement('small');time.textContent=fmtDate(task.last_run);last.append(document.createElement('br'),time);}
+      const next=document.createElement('td');next.dataset.label='Next execution';next.className='task-next';if(task.available!==false&&!paused&&task.enabled&&task.next_run)next.append(timeNode(task.next_run));else next.textContent=task.available===false?'Permission disabled':paused?'Paused':task.enabled?'Waiting for next run':'Manual only';
+      const last=document.createElement('td');last.dataset.label='Last result';last.className='task-last-result';const result=document.createElement('span');result.textContent=plainCopy(task.last_result)||'Not run yet';last.append(result);if(task.last_run)last.append(document.createElement('br'),timeNode(task.last_run));
       const action=document.createElement('td'),run=document.createElement('button');run.type='button';run.className='button button-secondary task-run';run.textContent=['running','queued'].includes(task.status)?'…':'▶';run.setAttribute('aria-label',`Run ${task.name}`);run.title=task.blocked_reason||`Run ${task.name} now`;run.disabled=task.available===false||['running','queued'].includes(task.status)||state.taskRequests.has(task.id);run.addEventListener('click',()=>runTask(task.id));action.append(run);row.append(name,schedule,next,last,action);body.append(row);
     }
     setText($('#task-schedule-note'),'Manual Run buttons remain available while schedules are paused. Pause does not cancel current work.');
@@ -826,17 +856,17 @@
     if(!state.workersDirty&&!state.workersSaving){for(const [kind,selector] of Object.entries(workerFields))$(selector).value=String(allocation[kind]??0);$('#worker-paused').checked=!!allocation.paused;}
     renderWorkerSteppers();
     const paused=!!allocation.paused,total=Number(active.cpu_workers||0)+Number(active.gpu_workers||0);
-    setText($('#worker-pool-state'),!state.workersSampleHealthy?'Sample stale':paused?'Paused':total?`${total} active`:'Ready');$('#worker-pool-state').className=`status-pill ${!state.workersSampleHealthy||paused?'cancelled':total?'running':'completed'}`;
+    setText($('#worker-pool-state'),!state.workersSampleHealthy?'Stale':paused?'Paused':total?`${total} active`:'Ready');$('#worker-pool-state').className=`status-pill ${!state.workersSampleHealthy||paused?'cancelled':total?'running':'completed'}`;
     const allowance=measuredNumber(cpu.effective_cores)??measuredNumber(detected.cpu_allowance_cores);
     setText($('#worker-cpu-allowance'),allowance===null?'Unavailable':`${allowance.toLocaleString()} CPU${allowance===1?'':'s'}`);
-    setText($('#worker-cpu-usage'),!state.systemSampleHealthy?'Sample stale · retrying':measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% in use`:'Sampling usage…');
-    setText($('#worker-ram'),!state.systemSampleHealthy?'Sample stale · retrying':measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
+    setText($('#worker-cpu-usage'),!state.systemSampleHealthy?'Stale · reconnecting':measuredNumber(cpu.quota_usage_percent)!==null?`${cpu.quota_usage_percent.toFixed(1)}% in use`:'Sampling usage…');
+    setText($('#worker-ram'),!state.systemSampleHealthy?'Stale · reconnecting':measuredNumber(memory.cgroup_current_bytes)===null?'Unavailable':`${formatBytes(memory.cgroup_current_bytes)}${measuredNumber(memory.cgroup_limit_bytes)!==null?` / ${formatBytes(memory.cgroup_limit_bytes)}`:''}`);
     const meter=$('#worker-memory-meter');meter.value=memory.cgroup_limit_bytes>0?Math.min(1,(memory.cgroup_current_bytes||0)/memory.cgroup_limit_bytes):0;meter.hidden=!state.systemSampleHealthy||measuredNumber(memory.cgroup_current_bytes)===null||!(memory.cgroup_limit_bytes>0);
-    setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'CUDA checked':'CUDA enabled'):'Unavailable');
-    const gpuReason=$('#worker-gpu-reason');setText(gpuReason,detected.gpu_available?'Verified before each OCR file':detected.gpu_reason||'GPU OCR is unavailable.');gpuReason.title=detected.gpu_reason||'CUDA, VRAM, and offline models are checked before each OCR file.';
+    setText($('#worker-gpu-availability'),data.edition==='cpu'?'CPU only':detected.gpu_available?(detected.gpu_verification==='verified'?'GPU ready':'GPU enabled'):'Unavailable');
+    const gpuReason=$('#worker-gpu-reason');setText(gpuReason,detected.gpu_available?'Verified before each image subtitle file':plainCopy(detected.gpu_reason)||'GPU recognition is unavailable.');gpuReason.title=plainCopy(detected.gpu_reason)||'The GPU, available memory, and recognition models are checked before each file.';
     for(const [kind,resource,selector,limit] of [['cpu_workers','cpu','#worker-cpu-capacity','cpu_limit_reason'],['ocr_workers','cpu_ocr','#worker-ocr-capacity','ocr_limit_reason'],['gpu_workers','gpu','#worker-gpu-capacity','gpu_limit_reason']]){
       const capacity=$(selector),admission=data.admission?.[resource],limited=Number(effective[kind]??0)<Number(allocation[kind]||0),reason=admission?.allowed===false?admission.reason:limited?data[limit]:'';
-      setText(capacity,`${active[kind]||0} active · ${effective[kind]??0} slots${reason?` · ${reason}`:''}`);capacity.classList.toggle('capacity-blocked',admission?.allowed===false);capacity.title=[`${allocation[kind]||0} requested`,data[limit],admission?.reason].filter(Boolean).join('. ');
+      setText(capacity,`${active[kind]||0} active · ${effective[kind]??0} slots${reason?` · ${plainCopy(reason)}`:''}`);capacity.classList.toggle('capacity-blocked',admission?.allowed===false);capacity.title=plainCopy([`${allocation[kind]||0} requested`,data[limit],admission?.reason].filter(Boolean).join('. '));
     }
     if(!state.workersDirty&&!state.workersSaving)setText($('#worker-allocation-note'),paused?'Paused. Resume and save to accept new files.':'Changes apply to new files. Running work keeps its allocation.');
     const body=$('#workers-body');body.replaceChildren();
@@ -850,7 +880,7 @@
   };
   const loadWorkers = async (quiet=false) => {
     if(!state.csrf||state.workersBusy||state.workersSaving)return;state.workersBusy=true;
-    try{state.workersInfo=await api('/api/workers');state.workersReceivedAt=performance.now();state.workersSampleHealthy=true;renderWorkers();renderWorkerNodes(state.workersInfo.remote);}
+    try{state.workersInfo=await api('/api/workers');state.workersReceivedAt=performance.now();state.workersSampleHealthy=true;state.receivedAt=Date.now();renderLiveState();renderWorkers();renderWorkerNodes(state.workersInfo.remote);}
     catch(error){state.workersSampleHealthy=false;renderWorkers();setText($('#worker-live-state'),'Disconnected · retrying');if(!quiet)notify(`Could not load workers: ${error.message}`,'error');}
     finally{state.workersBusy=false;}
   };
@@ -897,7 +927,7 @@
     if(state.workersSampleHealthy&&performance.now()-state.workersReceivedAt>15000){state.workersSampleHealthy=false;if(workersVisible())renderWorkers();}
     if(!state.systemSampleHealthy||!state.systemInfo)return;
     const elapsed=(performance.now()-state.systemReceivedAt)/1000;
-    if(elapsed>15){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Sample stale · retrying');if(workersVisible())renderWorkers();return;}
+    if(elapsed>15){state.systemSampleHealthy=false;renderLiveState();if(workersVisible())renderWorkers();return;}
     if(state.currentPage!=='settings'||state.settingsSection!=='status')return;
     setText($('#system-uptime'),formatUptime(Number(state.systemInfo.uptime_seconds||0)+elapsed));
   };
@@ -905,7 +935,7 @@
     const info=state.systemInfo,policy=info.resource_policy||{},usage=info.resource_usage||{},cpu=usage.cpu||{},memory=usage.memory||{},cache=usage.metadata_cache||{},worker=usage.worker||{};
     updateVersion(info.version,info.edition);
     renderSystemRows($('#system-about'),[
-      ['Subforge version',info.version?`v${info.version}`:'Unavailable'],['Image edition',editionLabel(info.edition)],['Runtime',info.runtime||'Unavailable'],
+      ['Subforge version',info.version?`v${info.version}`:'Unavailable'],
       ['Operating system',[info.os,info.arch].filter(Boolean).join(' · ')||'Unavailable'],
       ['Uptime',formatUptime(Number(info.uptime_seconds)||0),'system-uptime'],['Browser time zone',Intl.DateTimeFormat().resolvedOptions().timeZone]
     ]);
@@ -922,23 +952,23 @@
     setBar('cache',cache.max_bytes>0&&measuredNumber(cache.accounted_bytes)!==null?100*cache.accounted_bytes/cache.max_bytes:null);
     renderSystemRows($('#system-resource-usage'),[
       ['Effective CPU allowance',allowance,'system-cpu-allowance'],['Container CPU usage',cpuUsage,'system-cpu-usage'],
-      ['Container RAM',ram,'system-container-ram'],['Rust process RAM',formatBytes(memory.process_rss_bytes),'system-process-ram'],
+      ['Total memory use',ram,'system-container-ram'],['Subforge memory use',formatBytes(memory.process_rss_bytes),'system-process-ram'],
       ['Active file workers',measuredNumber(worker.active)===null?'Unavailable':`${worker.active} / ${Number(policy.conversion_workers||0)+Number(policy.gpu_workers||0)}${worker.kind?` · ${worker.kind}`:''}`,'system-active-workers'],
-      ['Rust process threads',measuredNumber(usage.process?.threads)??'Unavailable','system-process-threads'],
+      ['Subforge threads',measuredNumber(usage.process?.threads)??'Unavailable','system-process-threads'],
       ['Cached media files',cacheCount===null?'Unavailable':`${cacheCount.toLocaleString()} / ${cacheMaximum?.toLocaleString()??'—'}`,'system-cache-entries'],
-      ['Cache payload estimate',`${formatBytes(cache.accounted_bytes)}${measuredNumber(cache.max_bytes)!==null?` / ${formatBytes(cache.max_bytes)}`:''}`,'system-cache-bytes']
+      ['Estimated cache size',`${formatBytes(cache.accounted_bytes)}${measuredNumber(cache.max_bytes)!==null?` / ${formatBytes(cache.max_bytes)}`:''}`,'system-cache-bytes']
     ]);
     renderSystemRows($('#system-limits'),[
       ['Effective CPU workers',policy.conversion_workers??'Unavailable'],['Effective CPU OCR slots',policy.ocr_workers??'Unavailable'],['Effective GPU OCR slots',policy.gpu_workers??0],['CPU threads per tool',policy.ocr_threads??'Unavailable'],
       ['Metadata cache budget',`${formatBytes(policy.metadata_cache_max_bytes)} · ${measuredNumber(policy.metadata_cache_max_entries)?.toLocaleString()??'—'} files maximum`]
     ]);
-    setText($('#system-sample-state'),`Live · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
-    setText($('#system-policy'),`Set parallel file allocations on Overview. CPU OCR slots share the CPU pool; each tool uses one CPU thread. Docker's CPU and memory limits remain the hard ceiling, while memory admission may reduce simultaneous work. Discovery and import hooks convert text and queue new or changed image tracks for scheduled OCR${policy.ocr_permission?'':'; OCR is disabled by deployment permissions'}. Changing a Docker limit requires recreating the container. Unsupported measurements are shown as unavailable.`);
+    renderLiveState();
+    setText($('#system-policy'),`Set simultaneous file limits on Overview. CPU image recognition shares the CPU workers, and low memory can reduce how many files run at once. Automatic discovery converts text subtitles; image subtitles follow the OCR schedule.${policy.ocr_permission?'':' Image recognition is currently disabled.'} CPU and memory ceilings come from deployment settings. Recreate the container after changing those ceilings.`);
   };
   const loadSystem = async (quiet=false) => {
     if(!state.csrf||state.systemBusy)return;state.systemBusy=true;
-    try{state.systemInfo=await api('/api/system');state.systemReceivedAt=performance.now();state.systemSampleHealthy=true;renderSystem();if(workersVisible())renderWorkers();}
-    catch(error){state.systemSampleHealthy=false;setText($('#system-sample-state'),'Disconnected · retrying');if(workersVisible())renderWorkers();if(!quiet)notify(`Could not load system status: ${error.message}`,'error');}
+    try{state.systemInfo=await api('/api/system');state.systemReceivedAt=performance.now();state.systemSampleAt=Date.now();state.receivedAt=state.systemSampleAt;state.systemSampleHealthy=true;renderSystem();if(workersVisible())renderWorkers();}
+    catch(error){state.systemSampleHealthy=false;renderLiveState();if(workersVisible())renderWorkers();if(!quiet)notify(`Could not load system status: ${error.message}`,'error');}
     finally{state.systemBusy=false;}
   };
   const syncSystemMonitor = () => {
@@ -962,7 +992,7 @@
     } else if(parts.length===1)return {page,section:'general'};
     return {page:'overview',section:'general'};
   };
-  const syncNavigation = () => {const mobile=window.matchMedia('(max-width: 800px)').matches,open=$('#sidebar').classList.contains('mobile-open'),button=$('#mobile-menu'),collapse=$('#sidebar-collapse');$('.shell').classList.toggle('sidebar-collapsed',!mobile&&state.sidebarCollapsed);$('#sidebar').inert=mobile&&!open;const mobileLabel=open?'Close navigation':'Open navigation',desktopLabel=state.sidebarCollapsed?'Expand sidebar':'Collapse sidebar';button.setAttribute('aria-expanded',String(mobile&&open));button.setAttribute('aria-label',mobileLabel);button.title=mobileLabel;collapse.setAttribute('aria-expanded',String(!state.sidebarCollapsed));collapse.setAttribute('aria-label',desktopLabel);collapse.title=desktopLabel;};
+  const syncNavigation = () => {const mobile=window.matchMedia('(max-width: 800px)').matches,open=$('#sidebar').classList.contains('mobile-open'),button=$('#mobile-menu'),collapse=$('#sidebar-collapse');$('.shell').classList.toggle('sidebar-collapsed',!mobile&&state.sidebarCollapsed);$('#sidebar').inert=mobile&&!open;const mobileLabel=open?'Close navigation':'Open navigation',desktopLabel=state.sidebarCollapsed?'Show sidebar':'Hide sidebar';button.setAttribute('aria-expanded',String(mobile&&open));button.setAttribute('aria-label',mobileLabel);button.title=mobileLabel;collapse.setAttribute('aria-expanded',String(!state.sidebarCollapsed));collapse.setAttribute('aria-label',desktopLabel);collapse.title=`${desktopLabel}; stays on the current page`;};
   const closeMobileMenu = (restoreFocus=false) => { const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'); sidebar.classList.remove('mobile-open');backdrop.classList.remove('visible');backdrop.setAttribute('aria-hidden','true');syncNavigation();if(restoreFocus)button.focus(); };
   const toggleMobileMenu = () => {if(!window.matchMedia('(max-width: 800px)').matches){state.sidebarCollapsed=!state.sidebarCollapsed;try{localStorage.setItem('subforge.sidebar-collapsed',String(state.sidebarCollapsed));}catch{}syncNavigation();return;}const sidebar=$('#sidebar'),button=$('#mobile-menu'),backdrop=$('.sidebar-backdrop'),open=!sidebar.classList.contains('mobile-open');sidebar.classList.toggle('mobile-open',open);backdrop.classList.toggle('visible',open);backdrop.setAttribute('aria-hidden',String(!open));syncNavigation();if(open)$('.nav-link[data-page]',sidebar)?.focus();else button.focus();};
   const showRoute = ({page,section}) => {
@@ -978,7 +1008,7 @@
     $$('.settings-tab').forEach(node=>{const active=node.dataset.settingTab===state.settingsSection;node.classList.toggle('active',active);if(active)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
     $$('.settings-section').forEach(node=>node.classList.toggle('active',node.id===`settings-${state.settingsSection}`));
     setText($('#page-crumb'),page==='settings'?`Settings / ${$('.settings-tab.active')?.textContent||'Preferences'}`:pageNames[page]);closeMobileMenu();if(changed)$('#workspace-scroll').scrollTo({top:0,behavior:'instant'});
-    if(fromMobileMenu||(previousPage&&previousPage.id!==`page-${page}`)) {
+    if(changed||fromMobileMenu||(previousPage&&previousPage.id!==`page-${page}`)) {
       const heading=$(`#page-${page} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
     }
     if(changed)state.pendingConversion=null;
@@ -1006,6 +1036,8 @@
   const cancelJob = async id => { try { const result=await api(`/api/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:'{}'}); notify(result.message || 'Cancellation requested.'); await pollStatus(); } catch(error) { notify(error.message,'error'); } };
   const bind = () => {
     createSaveController();
+    renderLiveState();
+    setInterval(()=>{if(!document.hidden){refreshTimes();renderLiveState();tickSystemUptime();}},1000);
     $$('.nav-link[data-page]').forEach(button=>$('.nav-icon',button)?.replaceChildren(iconSvg(button.dataset.page)));
     $$('button[aria-label]').forEach(button=>{if(!button.title)button.title=button.getAttribute('aria-label');});
     try{const libraries=JSON.parse(sessionStorage.getItem('subforge.jellyfin-libraries')||'[]');if(Array.isArray(libraries))rememberLibraries(libraries);}catch{}
@@ -1073,13 +1105,12 @@
   };
   const dashboardLive = SubforgeLive.create({
     status: applyStatus,
-    system(data) {state.systemInfo=data;state.systemReceivedAt=performance.now();state.systemSampleHealthy=true;if(systemVisible())renderSystem();if(workersVisible())renderWorkers();},
-    workers(data) {if(state.workersSaving)return;state.workersInfo=data;state.workersReceivedAt=performance.now();state.workersSampleHealthy=true;if(workersVisible()){renderWorkers();renderWorkerNodes(data.remote);}},
+    system(data) {state.systemInfo=data;state.systemReceivedAt=performance.now();state.systemSampleAt=Date.now();state.receivedAt=state.systemSampleAt;state.systemSampleHealthy=true;renderLiveState();if(systemVisible())renderSystem();if(workersVisible())renderWorkers();},
+    workers(data) {if(state.workersSaving)return;state.workersInfo=data;state.workersReceivedAt=performance.now();state.receivedAt=Date.now();state.workersSampleHealthy=true;renderLiveState();if(workersVisible()){renderWorkers();renderWorkerNodes(data.remote);}},
     connection(mode) {
-      if(mode==='connected'){setConnection(true);return;}
-      setConnection(false);state.systemSampleHealthy=false;state.workersSampleHealthy=false;
-      setText($('#connection-text'),({paused:'Live updates paused',connecting:'Connecting live updates…',reconnecting:'Reconnecting live updates…',unsupported:'Live updates unavailable; use Refresh',invalid:'Invalid update · showing last data'})[mode]||'Live updates unavailable');
-      setText($('#system-sample-state'),mode==='paused'?'Updates paused':'Disconnected · showing last data');
+      state.liveMode=mode;
+      if(mode==='connected'){renderLiveState();return;}
+      state.systemSampleHealthy=false;state.workersSampleHealthy=false;renderLiveState();
       if(workersVisible())renderWorkers();
     }
   });

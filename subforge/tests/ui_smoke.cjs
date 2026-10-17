@@ -80,9 +80,14 @@ async function main() {
     await page.exposeFunction('__liveEventCount', type => liveEventCounts[type] || 0);
     page.on('pageerror', error => errors.push(error.stack || error.message));
     const now = Math.floor(Date.now() / 1000);
-    const roots = [{ id: 'movies', label: 'Movies', path: '/media/movies' }, { id: 'tv', label: 'Television', path: '/media/tv' }];
+    const roots = [
+      { id: 'movies', label: 'Movies (C:)', path: '/media/movies', volume_id: 'vol-c', volume_label: 'C:', free_bytes: 120000000000 },
+      { id: 'tv', label: 'Television (D:)', path: '/media/tv', volume_id: 'vol-d', volume_label: 'D:', free_bytes: 240000000000 },
+      { id: 'movies-c', label: 'Films (C:)', path: '/media/movies-archive', volume_id: 'vol-c', volume_label: 'C:', free_bytes: 120000000000 },
+      { id: 'tv-d', label: 'Series (D:)', path: '/media/tv-archive', volume_id: 'vol-d', volume_label: 'D:', free_bytes: 240000000000 },
+    ];
     let items = [
-      { name: 'Example movie.mkv', path: '/media/movies/Example movie.mkv', root_id: 'movies', type: 'video', tracks: [{ id: 3, language: 'en', codec: 'SubStationAlpha' }, { id: 4, language: 'fr', codec: 'PGS', image: true }], processing: { failed: true, last_error: 'Track 3: output has an invalid timestamp', pending_ocr: true } },
+      { name: 'Example movie.mkv', path: '/media/movies/Example movie.mkv', root_id: 'movies', type: 'video', tracks: [{ id: 3, language: 'en', codec: 'SubStationAlpha' }, { id: 4, language: 'fr', codec: 'PGS', image: true, hi: true }], missing_targets: [{ language: 'fr', hi: true }], processing: { failed: true, last_error: 'Track 3: output has an invalid timestamp', pending_ocr: true } },
       { name: 'Example show S01E01.mkv', path: '/media/tv/Example show S01E01.mkv', root_id: 'tv', type: 'video', tracks: [{ id: 2, language: 'en', codec: 'SRT' }], processing: { generated_srt_count: 1 } }
     ];
     const jobs = [
@@ -98,7 +103,7 @@ async function main() {
       { provider:'bazarr', ok:true, sent_at:now-14400 },
     ];
     let inventorySource = 'filesystem', inventoryAuthority = { status: 'ready' }, revision = 1;
-    const pipeline = { root_count: 2, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true };
+    const pipeline = { root_count: roots.length, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true };
     let holdInventory = false, releaseInventory, inventoryHeld = false;
     let holdSystem = false, releaseSystem, systemHeld = false, systemMemory = 1300000000;
     let failWorkers = false;
@@ -108,6 +113,7 @@ async function main() {
     await page.exposeFunction('__systemHeld',()=>systemHeld);
     await page.exposeFunction('__abortedSystemReads',()=>abortedSystemReads);
     let settings = { languages: ['*'], permissions: { ocr: true }, integrations: {} };
+    let disabledIntegration = '';
     let failSettings = false;
     const taskRows = [
       { id: 'discovery', name: 'Library discovery', description: 'Find media files and subtitle tracks.', enabled: true, interval_seconds: 21600, status: 'idle', last_result: 'Completed', last_run: now - 20700 },
@@ -121,7 +127,7 @@ async function main() {
     const longGpuAdmissionReason = 'GPU admission is paused because memory headroom is below the configured safety threshold and will retry when the next file starts.';
     let runningJob = null, activeJobs = [], queuedJobs = [], fileWorkers = [];
     const workerData = () => ({ edition: 'cuda', max_requested: 1000000, allocation, requested: allocation, effective: effectiveWorkers, active: { cpu_workers: fileWorkers.filter(worker => worker.resource !== 'gpu').length, ocr_workers: fileWorkers.filter(worker => worker.resource === 'cpu_ocr').length, gpu_workers: fileWorkers.filter(worker => worker.resource === 'gpu').length }, detected: { cpu_allowance_cores: 4, gpu_available: true, gpu_verification: 'verified', gpu_reason: 'CUDA runtime enabled' }, deployment: { max_cpu_workers: 32, max_ocr_workers: 16, max_gpu_workers: 4 }, admission: { gpu: { allowed: false, reason: longGpuAdmissionReason } }, workers: fileWorkers, remote });
-    const statusData = includeTasks => ({ edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline, ...(includeTasks ? { tasks: taskData() } : {}) });
+    const statusData = includeTasks => ({ edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], settings: { integrations: { sonarr: { enabled: true }, radarr: { enabled: true }, jellyfin: { enabled: true }, bazarr: { enabled: disabledIntegration !== 'bazarr' } } }, inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline, ...(includeTasks ? { tasks: taskData() } : {}) });
     const systemData = () => ({ edition: 'cuda', version: 'fixture', uptime_seconds: 120, resource_usage: { cpu: { effective_cores: 4 }, memory: { cgroup_current_bytes: systemMemory, cgroup_limit_bytes: 1610612736 } }, resources: {}, limits: {} });
     const writeEvent = (client, type, value) => {
       if (client.destroyed || !client.writable) return;
@@ -165,14 +171,44 @@ async function main() {
       else if (endpoint === '/api/nodes') value = remote;
       else if (endpoint === '/api/system') value = systemData();
       else if (endpoint === '/api/jobs') value = { message: 'Fixture job queued' };
-      else if (endpoint === '/api/root-folders') value = { roots: [], mounts: [] };
+      else if (endpoint === '/api/root-folders') value = { roots: roots.map(({ id, label, path, volume_id, volume_label, free_bytes }) => ({ id, label, path, volume_id, volume_label, free_bytes })), mounts: [] };
       else if (endpoint === '/api/tasks') value = taskData();
       else throw new Error(`Unexpected fixture API ${request.method()} ${endpoint}`);
       await route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) }).catch(error=>{if(!request.failure())throw error;});
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/#/overview`);
-    await page.getByText('Service connected', { exact: true }).waitFor();
+    await page.locator('#last-updated').getByText(/Live · (just now|\d+s ago)/i).waitFor();
     await page.locator('#pipeline-ready').getByText('11,326', { exact: true }).waitFor();
+    await page.locator('#root-list .root-volume-group').first().waitFor();
+    assert.equal(await page.locator('#header-edition').isVisible(), true, 'edition appears in the header');
+    assert(await page.locator('#edition-label').isHidden(), 'edition is not duplicated in the sidebar');
+    const volumeGroups = page.locator('#root-list .root-volume-group');
+    assert.equal(await volumeGroups.count(), 2, 'sidebar groups configured roots by opaque volume identity');
+    assert.deepEqual(await page.locator('#root-list .root-volume-heading strong').allTextContents(), ['C:', 'D:'], 'volume headings use configured friendly labels');
+    for (const group of await volumeGroups.all()) {
+      assert.equal(await group.locator('.root-volume-space').count(), 1, 'free space appears once per volume group');
+      assert.equal(await group.locator('.root-item').count(), 2, 'both configured roots remain listed under their volume');
+    }
+    const liveCopy = await page.evaluate(() => ({
+      updated: document.querySelector('#last-updated')?.textContent.trim(),
+      states: [...document.querySelectorAll('[data-live-state]')].map(node => node.textContent.trim()),
+    }));
+    assert.match(liveCopy.updated || '', /^Live · (just now|\d+s ago)$/i, 'header reports the received status age');
+    assert(liveCopy.states.length > 0 && liveCopy.states.every(text => text === liveCopy.updated), 'all live badges share the same received status and age');
+    assert.equal(await page.locator('#system-sample-state').textContent(), liveCopy.updated, 'resource freshness uses the same live age wording when samples are current');
+    assert.match(await page.locator('#header-edition').getAttribute('class'), /edition-chip/);
+    for (const [provider, glyph, label] of [['sonarr', '✓', /succeeded/i], ['radarr', '!', /failed/i], ['jellyfin', '?', /not been checked/i], ['bazarr', '✓', /succeeded/i]]) {
+      const dot = page.locator(`[data-integration-dot="${provider}"]`);
+      assert.equal(await dot.textContent(), glyph, `${provider} status includes a textual state glyph`);
+      assert.equal(await dot.getAttribute('role'), 'img', `${provider} status is exposed as an image role`);
+      assert.match(await dot.getAttribute('aria-label'), label, `${provider} status is accessible without color`);
+    }
+    disabledIntegration = 'bazarr'; pushStatus();
+    const disabledDot = page.locator('[data-integration-dot="bazarr"]');
+    await page.waitForFunction(() => document.querySelector('[data-integration-dot="bazarr"]').textContent === '—');
+    assert.equal(await disabledDot.getAttribute('aria-label'), 'Integration disabled', 'disabled integrations have a distinct accessible glyph label');
+    disabledIntegration = ''; pushStatus();
+    await page.waitForFunction(() => document.querySelector('[data-integration-dot="bazarr"]').textContent === '✓');
     await page.waitForFunction(async () => await window.__liveEventCount('workers') > 0);
     await page.locator('#pipeline-status').getByText(/Inspected/i).waitFor();
     // A pushed status snapshot updates counters without a click or blocking on inventory.
@@ -186,6 +222,8 @@ async function main() {
     assert.deepEqual(await page.evaluate(async () => await window.__snapshotReads()), readsBeforePush, 'SSE status updates do not trigger automatic status, system, or worker GETs');
     assert(!inventoryHeld, 'Overview does not download the detailed library inventory');
     await page.getByRole('button', { name: 'Library', exact: true }).click();
+    await page.waitForFunction(() => location.hash.includes('/library'));
+    await page.locator('#page-library').waitFor({ state: 'visible' });
     await page.waitForFunction(async()=>await window.__inventoryHeld());
     assert(inventoryHeld, 'inventory request remains pending while fresh counters are rendered');
     holdInventory=false;releaseInventory();
@@ -264,6 +302,7 @@ async function main() {
     await page.locator('#current-work-panel').getByText('2 jobs in progress', { exact: false }).waitFor();
     assert.equal(await page.locator('#workers-body tr').count(), 2, 'Overview exposes both active file workers');
     if (output) await page.screenshot({ path: path.join(output, 'overview-parallel-jobs.png'), style: '.toast { visibility: hidden; }' });
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.locator('#activity-kind').selectOption('all');
     await page.locator('#activity-status').selectOption('all');
@@ -344,8 +383,10 @@ async function main() {
     await page.reload();
     await page.locator('#pipeline-ready').getByText('11,326', { exact: true }).waitFor();
     assert.equal(await page.locator('#sidebar-collapse').getAttribute('aria-expanded'), 'false', 'collapsed state survives reload');
+    assert.equal(await page.locator('#sidebar-collapse').getAttribute('aria-label'), 'Show sidebar');
     await assertToggleGlyph();
     await page.locator('#sidebar-collapse').click();
+    assert.equal(await page.locator('#sidebar-collapse').getAttribute('aria-label'), 'Hide sidebar', 'expanded toggle names the action that collapses navigation');
     await assertToggleGlyph();
     await page.locator('[data-open-languages="quick"]').last().click();
     await page.locator('#language-list input[value="en"]').check();
@@ -367,11 +408,27 @@ async function main() {
     assert.match(await page.locator('#inventory-body').innerText(), /invalid timestamp/);
     await page.locator('#inventory-body .row-action').first().click();
     assert.match(await page.locator('#track-drawer-failure').innerText(), /invalid timestamp/);
+    assert(await page.locator('.drawer-sdh-note').isVisible(), 'track drawer explains the hearing-impaired subtitle marking');
     assert.equal(await page.locator('#track-drawer-list input:checked').count(), 1, 'track defaults respect selected languages');
     assert.equal(await page.locator('#convert-selected-tracks').textContent(), 'Convert 1 track');
     await page.getByRole('button', { name: 'Close track details' }).click();
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    const mouseNavigationFocus = await page.evaluate(() => ({ tag: document.activeElement?.tagName, visible: document.activeElement?.matches(':focus-visible'), outline: getComputedStyle(document.activeElement).outlineStyle }));
+    assert.equal(mouseNavigationFocus.tag, 'H1', 'mouse navigation moves focus to the new page heading');
+    assert.equal(mouseNavigationFocus.visible, false, 'mouse navigation does not show a keyboard focus ring on the heading');
+    assert.equal(mouseNavigationFocus.outline, 'none', 'programmatically focused heading has no outline');
+    await page.keyboard.press('Tab');
+    const keyboardFocus = await page.evaluate(() => ({ visible: document.activeElement?.matches(':focus-visible'), width: parseFloat(getComputedStyle(document.activeElement).outlineWidth) }));
+    assert.equal(keyboardFocus.visible, true, 'keyboard navigation marks its focused control as focus-visible');
+    assert(keyboardFocus.width >= 2, `keyboard-focused controls retain a visible focus ring (${keyboardFocus.width}px)`);
+    if (output) await page.screenshot({ path: path.join(output, 'activity-keyboard-focus.png'), style: '.toast { visibility: hidden; }' });
+    await page.locator('#workspace-scroll').focus();
+    assert.equal(await page.locator('#workspace-scroll').evaluate(el => getComputedStyle(el).outlineStyle), 'none', 'explicitly focused workspace does not show a mouse focus outline');
     await page.locator('#activity-kind').selectOption('subtitle');
+    const activityTime = page.locator('#jobs-list time[data-relative-time]').first();
+    await activityTime.waitFor();
+    assert(await activityTime.getAttribute('datetime'), 'job timestamps use machine-readable time elements');
+    assert(await activityTime.getAttribute('title'), 'job timestamps expose their absolute time on hover');
     assert.doesNotMatch(await page.locator('#jobs-list').innerText(), /State backup/);
     await page.locator('#activity-kind').selectOption('all');
     assert.match(await page.locator('#jobs-list').innerText(), /State backup/);
@@ -405,10 +462,31 @@ async function main() {
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     assert.equal(await page.locator('.settings-tab.active').getAttribute('aria-current'), 'page');
     await page.locator('[data-setting-tab="tasks"]').click();
+    await page.locator('[data-setting-tab="media"]').click();
+    await page.locator('#root-folder-body tr').first().waitFor();
+    assert.equal(await page.locator('#root-folder-body tr:not(.root-volume-summary)').count(), 4, 'Media folders lists all configured roots');
+    assert.equal(await page.locator('#root-folder-body .root-volume-summary').count(), 2, 'Media folders summarizes shared free space once per volume');
+    assert.equal(await page.locator('.root-folders-table thead th').nth(1).innerText(), 'VOLUME', 'Media folders labels the per-root volume column');
+    assert.deepEqual(await page.locator('#root-folder-body tr:not(.root-volume-summary) td:nth-child(2)').allTextContents(), ['C:', 'C:', 'D:', 'D:'], 'each root names its associated volume');
+    if (output) {
+      await page.screenshot({ path: path.join(output, 'settings-media-volumes-desktop.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.screenshot({ path: path.join(output, 'settings-media-volumes-mobile.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
+      await page.setViewportSize({ width: 1440, height: 960 });
+    }
+    await page.locator('[data-setting-tab="status"]').click();
+    await page.locator('#system-sample-state').getByText(/Live · (just now|\d+s ago)/i).waitFor();
+    assert.equal(await page.locator('#system-sample-state').innerText(), await page.locator('#last-updated').innerText(), 'System resource freshness shares the unified received-age wording');
+    if (output) await page.screenshot({ path: path.join(output, 'settings-system-live.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
+    await page.locator('[data-setting-tab="tasks"]').click();
     const inventoryTask = page.locator('#tasks-body tr').filter({ hasText: 'Media inventory' });
+    assert.equal(await page.locator('#scheduler-state').innerText(), 'Automation on', 'scheduler summary says whether automation runs, independently of per-task settings');
     assert(await inventoryTask.locator('.task-enabled').isChecked(), 'Media inventory defaults to Automatic');
     assert.doesNotMatch(await inventoryTask.innerText(), /Not run yet/, 'Media inventory has a recorded run when the library inventory has been synced');
     assert.match(await page.locator('#task-failure-scope').innerText(), /512 saved file failures.*Task results below count failures in that run only/i, 'Tasks distinguishes saved global failures from per-run failures');
+    const taskTime = page.locator('#tasks-body time[data-relative-time]').first();
+    await taskTime.waitFor();
+    assert(await taskTime.getAttribute('datetime') && await taskTime.getAttribute('title'), 'task timestamps retain an absolute hover value');
     await page.locator('#task-failure-scope').click();
     await page.waitForFunction(() => location.hash.includes('/library'));
     assert.match(await page.locator('#inventory-scope-note').innerText(), /512 failed files across saved conversion state/, 'saved-failure drill-down reports the global count and its scope');
@@ -417,6 +495,10 @@ async function main() {
       await page.locator(`[data-setting-tab="${provider}"]`).click();
       const notification = page.locator(`[data-provider="${provider}"] .integration-last-result`);
       assert.match(await notification.innerText(), expected, `${provider} uses its recorded notification result`);
+      if (provider === 'sonarr') {
+        const sentAt = notification.locator('time[data-relative-time]');
+        assert(await sentAt.getAttribute('datetime') && await sentAt.getAttribute('title'), 'notification timestamps expose machine-readable and absolute values');
+      }
     }
     await page.locator('[data-setting-tab="jellyfin"]').click();
     assert.match(await page.locator('[data-provider="jellyfin"] .integration-last-result').innerText(), /Last notification sent: Succeeded · Time unavailable \(legacy record\)/, 'legacy notification without sent_at is shown without borrowing the job timestamp');
@@ -516,6 +598,8 @@ async function main() {
     if (output) await page.screenshot({ path: path.join(output, 'overview-mobile.png'), fullPage: true, style: '.toast { visibility: hidden; }' });
     await page.locator('#mobile-menu').click();
     await page.getByRole('button', { name: 'Library', exact: true }).click();
+    assert(await page.locator('#page-library .sdh-note').isHidden(), 'narrow screens avoid taking a whole row for the SDH legend');
+    assert.match(await page.locator('#inventory-body').innerText(), /SDH \(deaf and hard of hearing\)/i, 'SDH chips spell out the hearing-impaired marking on narrow screens');
     assert.equal(await page.locator('#sidebar').evaluate(el => el.inert), true);
     assert.equal(await page.locator('#inventory-page-size').inputValue(), 'auto', 'Library starts with viewport-fitting Auto pagination');
     const table = await page.locator('.inventory-table').boundingBox();
@@ -825,6 +909,17 @@ async function main() {
     await page.locator('#inventory-filter').selectOption('all');
     await page.waitForFunction(() => document.querySelector('#inventory-range').textContent.includes('of 60'));
     await page.locator('#inventory-page-size').selectOption('25');
+    const filenameStyle = await page.locator('#inventory-body .file-cell-copy').first().evaluate(copy => {
+      const name = getComputedStyle(copy.querySelector('.file-name')), path = getComputedStyle(copy.querySelector('small'));
+      const luminance = color => {
+        const channels = color.match(/[\d.]+/g).slice(0, 3).map(Number).map(value => { const c = value / 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; });
+        return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+      };
+      const a = luminance(name.color), b = luminance(path.color);
+      return { size: parseFloat(name.fontSize), weight: parseInt(name.fontWeight, 10), contrast: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05) };
+    });
+    assert(filenameStyle.size >= 12, `filename text remains at least 12px (${filenameStyle.size}px)`);
+    assert(filenameStyle.contrast >= 1.2, `filename has stronger contrast than its directory path (${JSON.stringify(filenameStyle)})`);
     for (const [width, height] of [[1920, 960], [1440, 960], [768, 640], [390, 480], [320, 480]]) {
       await page.setViewportSize({ width, height });
       await assertViewport(`long library ${width}x${height}`);
@@ -841,13 +936,13 @@ async function main() {
     await page.locator('#refresh-button').click();
     await page.waitForFunction(async()=>await window.__systemHeld());
     await page.waitForFunction(async()=>await window.__abortedSystemReads()>0,null,{timeout:22000});
-    await page.locator('#worker-ram').getByText('Sample stale · retrying',{exact:true}).waitFor();
+    await page.locator('#worker-ram').getByText('Stale · reconnecting',{exact:true}).waitFor();
     assert(await page.locator('#worker-memory-meter').isHidden(),'stale RAM sample is not drawn as live');
     systemMemory=1500000000;holdSystem=false;releaseSystem();
     await page.locator('#worker-ram').getByText(/1\.4 GiB/).waitFor({timeout:10000});
     assert(await page.locator('#worker-memory-meter').isVisible(),'automatic sampling recovers after a read times out');
     failWorkers=true;
-    await page.locator('#worker-pool-state').getByText('Sample stale',{exact:true}).waitFor({timeout:20000});
+    await page.locator('#worker-pool-state').getByText('Stale',{exact:true}).waitFor({timeout:20000});
     failWorkers=false;
     await page.locator('#worker-pool-state').getByText('Ready',{exact:true}).waitFor({timeout:10000});
     const readsBeforeFallback=snapshotReads.status;
