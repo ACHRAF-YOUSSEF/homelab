@@ -10,6 +10,7 @@ const path = require('node:path');
 
 async function main() {
   const web = path.resolve(__dirname, '../web');
+  const appOverride = process.env.SUBFORGE_UI_APP_OVERRIDE && path.resolve(process.env.SUBFORGE_UI_APP_OVERRIDE);
   const output = process.env.SUBFORGE_UI_OUTPUT && path.resolve(process.env.SUBFORGE_UI_OUTPUT);
   if (output) await fs.mkdir(output, { recursive: true });
   const eventClients = new Set();
@@ -28,7 +29,7 @@ async function main() {
     if (!asset) { res.writeHead(404); res.end(); return; }
     const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' }[path.extname(asset)];
     res.writeHead(200, { 'Content-Type': mime });
-    res.end(await fs.readFile(path.join(web, asset)));
+    res.end(await fs.readFile(asset === 'app.js' && appOverride ? appOverride : path.join(web, asset)));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser, metricsTimer, statusHeartbeatTimer;
@@ -467,6 +468,61 @@ async function main() {
       await assertViewport(`library ${width}px`);
       await assertTablePane('library', width, 900);
     }
+    // A later tall metadata-failure row must not make Auto pagination oscillate
+    // between including and excluding that row as repeated live snapshots arrive.
+    await page.setViewportSize({ width: 1440, height: 720 });
+    const fitShortRows = Array.from({ length: 40 }, (_, index) => ({
+      name: `Auto fit short ${String(index + 1).padStart(2, '0')}.mkv`,
+      path: `/media/movies/auto-fit/short-${index + 1}.mkv`, root_id: 'movies', type: 'video', tracks: [],
+      coverage: { status: 'needs_conversion', reason: 'French subtitle is required', missing_targets: [{ language: 'fr' }] },
+      missing_srt: true, processing: {},
+    }));
+    items = fitShortRows; inventorySource = 'filesystem'; inventoryAuthority = { status: 'ready' }; revision++;
+    await page.locator('#inventory-filter').selectOption('needed');
+    await page.locator('#refresh-button').click();
+    await page.locator('#inventory-meta').getByText(/40 matches/).waitFor();
+    await page.waitForFunction(() => /Fit \(\d+\)/.test(document.querySelector('#inventory-page-size option[value="auto"]').textContent));
+    const fittedShortCount = Number((await page.locator('#inventory-page-size option[value="auto"]').textContent()).match(/Fit \((\d+)\)/)?.[1]);
+    assert(Number.isInteger(fittedShortCount) && fittedShortCount >= 2 && fittedShortCount < fitShortRows.length,
+      `the short rows prime a multirow Auto page (Fit ${fittedShortCount})`);
+    const metadataError = `Metadata failure: ${'invalid embedded metadata field; '.repeat(7)}`;
+    items = fitShortRows.slice();
+    items[fittedShortCount - 1] = {
+      ...fitShortRows[fittedShortCount - 1], name: 'Auto fit metadata failure row.mkv',
+      path: '/media/movies/auto-fit/metadata-failure-row.mkv', error: metadataError,
+      processing: { failed: true, last_error: metadataError }, metadata_pending: true,
+    };
+    const tallRowReload = page.waitForResponse(response => new URL(response.url()).pathname === '/api/inventory' && response.request().method() === 'GET');
+    revision++; pushStatus();
+    await tallRowReload;
+    await page.waitForFunction(() => /Fit \(\d+\)/.test(document.querySelector('#inventory-page-size option[value="auto"]').textContent));
+    const pulse = setInterval(pushStatus, 180);
+    let fitSamples;
+    try {
+      fitSamples = await page.evaluate(async () => {
+        const samples = [];
+        const option = document.querySelector('#inventory-page-size option[value="auto"]');
+        const pane = document.querySelector('.inventory-table-wrap');
+        for (let frame = 0; frame < 75; frame++) {
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const rows = [...document.querySelectorAll('#inventory-body > tr')];
+          const paneRect = pane.getBoundingClientRect();
+          samples.push({ range: document.querySelector('#inventory-range').textContent, fit: option.textContent,
+            rowCount: rows.length, lastRowFits: !rows.length || rows.at(-1).getBoundingClientRect().bottom <= paneRect.bottom + 1 });
+        }
+        return samples;
+      });
+    } finally { clearInterval(pulse); }
+    const settledFitSamples = fitSamples.slice(12);
+    const fitStates = new Set(settledFitSamples.map(sample => `${sample.range}|${sample.fit}|${sample.rowCount}`));
+    assert.equal(fitStates.size, 1, `Auto row count, range, and fitted size settle during repeated SSE updates: ${JSON.stringify([...fitStates])}`);
+    assert(settledFitSamples.every(sample => sample.lastRowFits), 'Auto-fitted rows stay inside the visible Library pane');
+    const settledFitSize = Number(settledFitSamples.at(-1).fit.match(/Fit \((\d+)\)/)?.[1]);
+    const metadataRowPage = Math.floor((fittedShortCount - 1) / settledFitSize) + 1;
+    await page.locator('#inventory-page').selectOption(String(metadataRowPage));
+    await page.getByText(/Auto fit metadata failure row\.mkv/).waitFor();
+    const tallRowHeight = await page.locator('#inventory-body tr').filter({ hasText: 'Auto fit metadata failure row.mkv' }).evaluate(row => row.getBoundingClientRect().height);
+    assert(tallRowHeight > 72, `metadata failure row exercises a taller-than-default table entry (${tallRowHeight}px)`);
     await page.locator('#inventory-page-size').selectOption('25');
     assert.equal(await page.locator('#inventory-page-size').inputValue(), '25');
     await page.locator('#inventory-page-size').selectOption('auto');

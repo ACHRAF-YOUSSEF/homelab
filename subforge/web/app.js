@@ -22,6 +22,7 @@
   state.jobsPage=1;
   state.jobsPageSize='auto';
   state.tableAutoSizes={library:10,activity:10};
+  state.tableFitMeasurements={};
   state.tableFrame=0;
   state.selectedJobId=null;
   state.inventoryTruncated=false;
@@ -260,15 +261,25 @@
     const pending=job.status==='completed'&&job.notifications?.some(item=>item?.pending===true);
     return {style:pending?'queued':escStatus(job.status),label:pending?'Converted · indexing pending':({completed_with_errors:'Completed with errors',running:'Running',queued:'Queued',completed:'Completed',failed:'Failed',cancelled:'Cancelled'})[job.status]||job.status||'Queued'};
   };
-  const fittedPageSize = (page,requested) => {
+  const fittedPageSize = (page,requested,measure=true) => {
     if(requested!=='auto')return requested;
     const pane=$(page==='library'?'.inventory-table-wrap':'.jobs-table-wrap');
     if(pane?.clientHeight>0){
       const table=$('table',pane),header=table?.tHead?.getBoundingClientRect().height||0;
-      const rows=$$('tbody > tr',pane).filter(row=>!$('.table-empty',row));
+      const rows=measure?$$('tbody > tr',pane).filter(row=>!$('.table-empty',row)):[];
       const measured=rows.length?Math.max(...rows.map(row=>row.getBoundingClientRect().height)):0;
+      const context=page==='library'
+        ?JSON.stringify([state.inventoryUpdated,state.inventoryRevision,$('#inventory-filter').value,$('#inventory-root').value,$('#inventory-search').value])
+        :JSON.stringify([$('#activity-status').value,$('#activity-kind').value]);
+      let fit=state.tableFitMeasurements[page];
+      if(!fit||fit.width!==pane.clientWidth||fit.context!==context){
+        fit={width:pane.clientWidth,context,rowHeight:0};
+        state.tableFitMeasurements[page]=fit;
+      }
+      // Keep tall rows in the estimate after pagination removes them, avoiding a resize/render loop.
+      fit.rowHeight=Math.max(fit.rowHeight,measured);
       const fallback=page==='library'?(innerWidth<=800?176:72):(innerWidth<=800?144:64);
-      const height=Math.max(measured,parseFloat(getComputedStyle(pane).getPropertyValue('--table-row-height'))||fallback);
+      const height=Math.max(fit.rowHeight,parseFloat(getComputedStyle(pane).getPropertyValue('--table-row-height'))||fallback);
       state.tableAutoSizes[page]=Math.max(1,Math.min(100,Math.floor((pane.clientHeight-header-2)/height)));
     }
     const size=state.tableAutoSizes[page];
@@ -390,7 +401,7 @@
     const jobs=jobList(),running=state.status?.running,maintenance=job=>['health','backup','cleanup'].includes(job.kind);
     const status=$('#activity-status').value,kind=$('#activity-kind').value;
     const filtered=jobs.filter(job=>(kind==='all'||(kind==='maintenance')===maintenance(job))&&(status==='all'||status==='issues'&&['failed','completed_with_errors'].includes(job.status)||status===job.status));
-    const size=fittedPageSize('activity',state.jobsPageSize),pages=Math.max(1,Math.ceil(filtered.length/size));state.jobsEffectiveSize=size;state.jobsPage=Math.max(1,Math.min(state.jobsPage,pages));const start=(state.jobsPage-1)*size,visible=filtered.slice(start,start+size);
+    const size=fittedPageSize('activity',state.jobsPageSize,false),pages=Math.max(1,Math.ceil(filtered.length/size));state.jobsEffectiveSize=size;state.jobsPage=Math.max(1,Math.min(state.jobsPage,pages));const start=(state.jobsPage-1)*size,visible=filtered.slice(start,start+size);
     renderJobRows(visible);
     setText($('#jobs-range'),filtered.length?`${start+1}–${start+visible.length} of ${filtered.length} jobs`:'0 jobs');setText($('#jobs-page-label'),`Page ${state.jobsPage} of ${pages}`);$('#jobs-previous').disabled=state.jobsPage===1;$('#jobs-next').disabled=state.jobsPage===pages;
     if(!$('#job-drawer-backdrop').classList.contains('hidden')){const selected=jobs.find(job=>job.id===state.selectedJobId)||state.selectedJobSnapshot;if(selected){setText($('#job-drawer-title'),jobTitle(selected));updateJobList($('#job-drawer-content'),[selected],false);}}
@@ -458,7 +469,7 @@
     if(filter==='ready')rows=rows.filter(row=>coverageState(row)==='covered'||row.processing?.generated_srt_count>0);
     if(filter==='metadata')rows=rows.filter(row=>row.metadata_pending);
     if (query) rows=rows.filter(row=>`${row.name || ''}\n${row.path || ''}`.toLowerCase().includes(query));
-    const pageSize=fittedPageSize('library',state.inventoryPageSize);state.inventoryEffectiveSize=pageSize;
+    const pageSize=fittedPageSize('library',state.inventoryPageSize,false);state.inventoryEffectiveSize=pageSize;
     const count=rows.length, pages=Math.max(1,Math.ceil(count/pageSize));
     if(state.inventoryLoaded)state.inventoryPage=Math.max(1,Math.min(state.inventoryPage,pages));
     const start=(state.inventoryPage-1)*pageSize, visibleRows=rows.slice(start,start+pageSize);
