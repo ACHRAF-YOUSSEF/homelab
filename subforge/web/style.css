@@ -458,7 +458,12 @@ tbody tr:last-child td { border-bottom: 0; }
 .path-map-row { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr) 40px; gap: 7px; }
 .remove-map { width: 40px; height: 40px; color: var(--error); }
 .switch { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
-.switch input { width: 17px; height: 17px; accent-color: var(--accent); }
+.switch input { appearance: none; position: relative; flex: 0 0 36px; width: 36px; height: 22px; margin: 0; border: 1px solid var(--line-strong); border-radius: 99px; background: #33445C; cursor: pointer; }
+.switch input::before { content: ''; position: absolute; width: 16px; height: 16px; top: 2px; left: 2px; border-radius: 50%; background: #E5ECF5; }
+.switch input:checked { background: #4783D6; border-color: #8BB2FF; }
+.switch input:checked::before { transform: translateX(14px); }
+.switch input:disabled { opacity: .5; cursor: not-allowed; }
+.switch > span:empty { display: none; }
 .library-picker { padding: 10px 0; border-top: 1px solid var(--line); }
 .picker-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .picker-heading strong { font-size: 13px; }
@@ -1108,6 +1113,88 @@ h2 { font-size: 17px; }
 .sdh-note { margin: 0; padding: 7px 16px; color: #C4D2E5; background: #19283A; border-bottom: 1px solid var(--line); font-size: 12px; line-height: 1.4; }
 .drawer-sdh-note { padding-inline: 18px; }
 .inventory-table tbody tr:focus-visible { outline: 2px solid #A9C7FF; outline-offset: -2px; }
+
+/* Settings section labels are headings, not controls that resemble tabs. */
+.settings-nav { align-items: stretch; }
+.settings-group-label { flex: 0 0 100%; padding: 9px 9px 3px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.settings-group-label:not(:first-child) { margin: 8px 0 0; padding: 10px 9px 3px; border: 0; border-top: 1px solid var(--line); }
+.settings-tab { flex: 0 0 auto; }
+.worker-system-link, .settings-overview-link { display: inline-flex; margin-top: 5px; font-size: 12px; }
+#worker-policy-explainer { margin: 0 16px 8px; }
+.activity-cap-note { margin: -4px 0 8px; }
+.overview-language-field #quick-language-policy { margin: 0; font-size: 12px; line-height: 1.35; }
+.activity-log-panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.activity-log-panel > .collapsible-content { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.activity-log-panel > .collapsible-content[hidden] { display: none; }
+.activity-log-panel .log-window { flex: 1 1 auto; min-height: 0; max-height: none; overflow: auto; }
+.activity-cap-note { flex: 0 0 auto; line-height: 1.5; }
+.tracked-output-note { margin: 6px 0 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+.api-key-entry { display: flex; align-items: center; gap: 9px; min-height: 42px; }
+.api-key-entry .integration-key { flex: 1 1 240px; min-width: 0; }
+.api-key-saved { color: var(--text); font-size: 13px; white-space: nowrap; }
+.api-key-entry .replace-integration-key { flex: 0 0 auto; }
+.api-key-entry .managed-lock, .integration-url-field .managed-lock { margin-left: 4px; color: var(--muted); }
+.path-map-heading { display: grid; grid-template-columns: minmax(190px, .8fr) minmax(0,1fr); align-items: end; gap: 12px; }
+.path-map-column-headings { display: grid; grid-template-columns: minmax(0,1fr) 22px minmax(0,1fr) 40px; gap: 7px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.path-map-column-headings span:last-child { grid-column: 4; }
+.path-map-row { grid-template-columns: minmax(0,1fr) 22px minmax(0,1fr) 40px; align-items: center; }
+.path-map-row > span { display: block; color: var(--accent); text-align: center; font-size: 18px; }
+.mapping-test { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); align-items: end; gap: 9px; padding: 8px 0 2px; border-top: 1px solid var(--line); }
+.mapping-test .form-field { margin: 0; }
+.mapping-test-result { min-width: 0; padding-bottom: 10px; font-size: 12px; overflow-wrap: anywhere; }
+.jellyfin-callout { margin: 10px 0; padding: 11px 13px; border: 1px solid #8A5B19; border-left: 3px solid #F0B24A; border-radius: 7px; background: #30230F; color: #F5D8A5; font-size: 13px; line-height: 1.45; }
+.refresh-library-toggle { display: flex; width: 100%; min-height: 40px; padding: 5px 2px; }
+.refresh-library-toggle b { font-weight: 500; }
+.library-type-label { display: block; font-size: 13px; margin-top: 10px; color: var(--muted); }
+.backup-location-line, .backup-sensitive-note { margin: 0; padding: 0 16px 8px; }
+.backup-location-line code { overflow-wrap: anywhere; }
+.backup-sensitive-note { padding-bottom: 12px; }
+.backup-list { display: grid; gap: 0; padding: 0 16px 12px; }
+.backup-row { display: flex; align-items: center; gap: 10px; padding: 12px 0; border-top: 1px solid var(--line); }
+.backup-row > div { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.backup-row small { color: var(--muted); font-size: 12px; }
+.task-calendar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; }
+.task-calendar[hidden],.task-interval[hidden] { display: none; }
+.task-calendar .input { width: auto; max-width: 150px; }
+.task-calendar > small { font-size: 12px; width: 100%; }
+.task-weekdays { display: flex; flex-wrap: wrap; gap: 4px 10px; width: 100%; }
+.task-weekdays label { display: inline-flex; align-items: center; gap: 4px; min-height: 30px; color: var(--text); font-size: 12px; }
+.task-retry-choice { align-items: flex-start; line-height: 1.5; margin-top: 8px; }
+.task-retry-choice input { flex: 0 0 auto; margin-top: 3px; }
+.language-policy-hint { margin: 0; padding: 0 16px 16px; line-height: 1.55; }
+.integration-dot[data-state="stale"] { color: #FFC857; border-color: #74410f; background: #451A03; }
+.path-map-heading { grid-template-columns: minmax(0,1fr); }
+.path-map-column-headings { width: 100%; }
+.jobs-table th:nth-child(1) { width: 22%; }
+.jobs-table th:nth-child(2) { width: 12%; }
+.jobs-table th:nth-child(3) { width: 11%; }
+.jobs-table th:nth-child(4) { width: 17%; }
+.jobs-table th:nth-child(5) { width: 11%; }
+.jobs-table th:nth-child(6) { width: 10%; }
+.jobs-table th:nth-child(7) { width: 11%; }
+.jobs-table th:nth-child(8) { width: 6%; }
+.jobs-table td { height: auto; padding-block: 12px; }
+.jobs-table .job-row-status .status-pill { width: auto; white-space: normal; overflow: visible; line-height: 1.4; }
+.jobs-table .job-row-workers, .jobs-table .job-row-result, .jobs-table .job-result-copy { white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+@media (min-width: 801px) { .jobs-table { min-width: 900px; } }
+@media (max-width: 700px) {
+  .settings-nav { flex-wrap: wrap; overflow: visible; }
+  .settings-group-label { flex-basis: 100%; }
+  .path-map-heading { grid-template-columns: minmax(0,1fr); }
+  .path-map-column-headings { display: none; }
+  .path-map-row { grid-template-columns: minmax(0,1fr) 24px minmax(0,1fr) 40px; }
+  .mapping-test { grid-template-columns: minmax(0,1fr); align-items: stretch; }
+  .mapping-test-result { padding: 0; }
+  .jobs-table { min-width: 0; }
+  .api-key-entry { flex-wrap: wrap; }
+}
+@media (max-width: 800px) {
+  .jobs-table tbody tr { grid-template-areas: "job status" "worker result" "started wait" "time actions"; }
+  .jobs-table .job-row-started { grid-area: started; }
+  .jobs-table .job-row-wait { grid-area: wait; text-align: right; }
+  .backup-row { flex-wrap: wrap; }
+  .backup-row > div { flex-basis: 100%; }
+}
 @media (max-width: 520px) {
   /* Small screens explain SDH in the coverage chips themselves and in the track drawer. */
   #page-library .sdh-note { display: none; }

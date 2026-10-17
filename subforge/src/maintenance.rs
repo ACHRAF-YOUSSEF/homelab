@@ -139,7 +139,271 @@ pub fn backup(data: &Path, stop: &AtomicBool) -> Result<Value, String> {
         let remove = validate_delete_target(&backups, &remove)?;
         fs::remove_dir_all(remove).map_err(|_| "Expired backup could not be removed")?;
     }
-    Ok(json!({"files":copied,"count_bytes":total,"retained":managed.len()}))
+    Ok(
+        json!({"id":final_path.file_name().and_then(|name| name.to_str()),"files":copied,"count_bytes":total,"retained":managed.len()}),
+    )
+}
+
+fn selected_backup(data: &Path, id: &str) -> Result<PathBuf, String> {
+    if !id.starts_with(BACKUP_PREFIX)
+        || id.len() > 96
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("Invalid backup selection".into());
+    }
+    let backups = data.join("backups");
+    let selected = validate_delete_target(&backups, &backups.join(id))?;
+    validate_backup_contents(&selected)?;
+    Ok(selected)
+}
+
+fn file_sizes(path: &Path) -> Result<(u64, usize), String> {
+    let mut total = 0_u64;
+    let mut count = 0;
+    for name in FILES {
+        let file = path.join(name);
+        let metadata = match fs::symlink_metadata(file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("Backup file could not be inspected".into()),
+        };
+        if is_link_or_reparse(&metadata) || !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+            return Err("Backup file is unsafe or exceeds its size limit".into());
+        }
+        total = total
+            .checked_add(metadata.len())
+            .ok_or("Backup size limit")?;
+        if total > MAX_TOTAL_BYTES {
+            return Err("Backup exceeds its size limit".into());
+        }
+        count += 1;
+    }
+    Ok((total, count))
+}
+
+pub fn list(data: &Path) -> Result<Value, String> {
+    let backups = data.join("backups");
+    if !backups.exists() {
+        return Ok(
+            json!({"location":backups,"items":[],"restore_requires_restart":true,"contains_credentials":true}),
+        );
+    }
+    if fs::symlink_metadata(&backups)
+        .is_ok_and(|metadata| is_link_or_reparse(&metadata) || !metadata.is_dir())
+    {
+        return Err("Backup storage must be a real directory".into());
+    }
+    let mut items = Vec::new();
+    for path in managed_backup_paths(&backups)? {
+        let id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("Invalid backup name")?;
+        let selected = selected_backup(data, id)?;
+        let (bytes, count) = file_sizes(&selected)?;
+        let created_at = fs::metadata(&selected)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|time| time.as_secs_f64());
+        items.push(json!({"id":id,"created_at":created_at,"count_bytes":bytes,"file_count":count}));
+    }
+    items.sort_by(|left, right| right["id"].as_str().cmp(&left["id"].as_str()));
+    Ok(
+        json!({"location":backups,"items":items,"restore_requires_restart":true,"contains_credentials":true,"restore_mode":"overlay_saved_files","retention_count":RETAIN}),
+    )
+}
+
+struct BoundedArchive(Vec<u8>);
+impl Write for BoundedArchive {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > (MAX_TOTAL_BYTES as usize + 1024 * 1024).saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("Backup archive exceeds size limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Export only known regular files. We never unpack arbitrary archives; restore
+/// operates on validated server-owned backup directories instead.
+pub fn download(data: &Path, id: &str) -> Result<Vec<u8>, String> {
+    let selected = selected_backup(data, id)?;
+    file_sizes(&selected)?;
+    let mut gzip = flate2::write::GzEncoder::new(
+        BoundedArchive(Vec::with_capacity(4096)),
+        flate2::Compression::fast(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut total = 0_u64;
+    for name in FILES {
+        let source = selected.join(name);
+        if !source.exists() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&source).map_err(|_| "Backup file is unavailable")?;
+        if is_link_or_reparse(&metadata) || !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+            return Err("Unsafe backup file".into());
+        }
+        let size = metadata.len();
+        total = total.checked_add(size).ok_or("Backup size limit")?;
+        if total > MAX_TOTAL_BYTES {
+            return Err("Backup size limit".into());
+        }
+        let mut header = [0_u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000600\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        gzip.write_all(&header)
+            .map_err(|_| "Cannot encode backup archive")?;
+        let mut source = File::open(source).map_err(|_| "Backup source unavailable")?;
+        let mut remaining = size;
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err("Backup download exceeded its time limit".into());
+            }
+            let length = buffer.len().min(remaining as usize);
+            let bytes = source
+                .read(&mut buffer[..length])
+                .map_err(|_| "Cannot read backup archive")?;
+            if bytes == 0 {
+                return Err("Backup file changed while downloading".into());
+            }
+            gzip.write_all(&buffer[..bytes])
+                .map_err(|_| "Cannot encode backup archive")?;
+            remaining -= bytes as u64;
+        }
+        if source
+            .read(&mut [0_u8; 1])
+            .map_err(|_| "Cannot inspect backup archive")?
+            != 0
+        {
+            return Err("Backup file changed while downloading".into());
+        }
+        let padding = (512 - size % 512) % 512;
+        gzip.write_all(&[0_u8; 512][..padding as usize])
+            .map_err(|_| "Cannot encode backup archive")?;
+    }
+    gzip.write_all(&[0_u8; 1024])
+        .map_err(|_| "Cannot finish backup archive")?;
+    gzip.finish()
+        .map(|writer| writer.0)
+        .map_err(|_| "Cannot finish backup archive".into())
+}
+
+fn copy_restore_files(
+    source: &Path,
+    destination: &Path,
+    validate_json: bool,
+) -> Result<usize, String> {
+    validate_backup_contents(source)?;
+    file_sizes(source)?;
+    let mut count = 0;
+    for name in FILES {
+        let source_path = source.join(name);
+        if !source_path.exists() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        File::open(&source_path)
+            .map_err(|_| "Restore source unavailable")?
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Restore source unreadable")?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err("Restore file exceeds its limit".into());
+        }
+        if validate_json && name != "ui-password" {
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|_| "Backup contains invalid saved JSON")?;
+            if (name == "jobs.json" && !value.is_array())
+                || (name != "jobs.json" && !value.is_object())
+            {
+                return Err("Backup contains unsupported saved state".into());
+            }
+        }
+        if name == "ui-password" {
+            let password = std::str::from_utf8(&bytes)
+                .map_err(|_| "Backup contains invalid dashboard credentials")?
+                .trim();
+            if bytes.len() > 1024
+                || !(12..=256).contains(&password.len())
+                || password.chars().any(char::is_control)
+            {
+                return Err("Backup contains invalid dashboard credentials".into());
+            }
+        }
+        let target = destination.join(name);
+        if fs::symlink_metadata(&target)
+            .is_ok_and(|metadata| is_link_or_reparse(&metadata) || !metadata.is_file())
+        {
+            return Err("Restore target must be a regular file".into());
+        }
+        let mut staged = tempfile::NamedTempFile::new_in(destination)
+            .map_err(|_| "Cannot stage restore file")?;
+        staged
+            .write_all(&bytes)
+            .map_err(|_| "Cannot write restore file")?;
+        staged
+            .as_file()
+            .sync_all()
+            .map_err(|_| "Cannot synchronize restore file")?;
+        staged
+            .persist(&target)
+            .map_err(|_| "Cannot publish restore file")?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub fn stage_restore(data: &Path, id: &str) -> Result<Value, String> {
+    let source = selected_backup(data, id)?;
+    let target = data.join("pending-restore");
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err("A restore is already pending; restart Subforge first".into());
+    }
+    let staged = tempfile::tempdir_in(data).map_err(|_| "Cannot stage restore")?;
+    let files = copy_restore_files(&source, staged.path(), true)?;
+    if files == 0 {
+        return Err("Backup contains no saved files".into());
+    }
+    fs::rename(staged.keep(), &target).map_err(|_| "Cannot publish pending restore")?;
+    Ok(
+        json!({"id":id,"staged":true,"file_count":files,"restart_required":true,"message":"Restore staged. Restart Subforge to apply the saved files. Current files absent from the backup are preserved; backed-up dashboard credentials may replace the current login."}),
+    )
+}
+
+pub fn apply_pending_restore(data: &Path) -> Result<(), String> {
+    let pending = data.join("pending-restore");
+    if fs::symlink_metadata(&pending).is_err() {
+        return Ok(());
+    }
+    // Keep the validated source until every replacement succeeds; interrupted
+    // startup retries the same complete overlay instead of accepting partial state.
+    copy_restore_files(&pending, data, true)?;
+    for name in FILES {
+        let path = pending.join(name);
+        if path.exists() {
+            fs::remove_file(path).map_err(|_| "Cannot complete pending restore")?;
+        }
+    }
+    fs::remove_dir(&pending).map_err(|_| "Cannot finish pending restore")?;
+    Ok(())
 }
 
 fn unique_backup_path(backups: &Path) -> Result<PathBuf, String> {
@@ -267,6 +531,84 @@ fn validate_backup_contents(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn managed_backup_download_is_a_gzip_tar_and_restore_waits_for_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("preferences.json"), br#"{"languages":["fr"]}"#).unwrap();
+        fs::write(data.join("media.srt"), b"unrelated media").unwrap();
+        let made = backup(&data, &AtomicBool::new(false)).unwrap();
+        let id = made["id"].as_str().unwrap();
+        let listed = list(&data).unwrap();
+        assert_eq!(listed["items"][0]["id"], id);
+        assert_eq!(listed["items"][0]["file_count"], 1);
+        let bytes = download(&data, id).unwrap();
+        let mut archive = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut archive)
+            .unwrap();
+        assert_eq!(&archive[..16], b"preferences.json");
+        assert!(!String::from_utf8_lossy(&archive).contains("unrelated media"));
+        fs::write(data.join("preferences.json"), br#"{"languages":["en"]}"#).unwrap();
+        stage_restore(&data, id).unwrap();
+        assert!(
+            String::from_utf8(fs::read(data.join("preferences.json")).unwrap())
+                .unwrap()
+                .contains("en")
+        );
+        apply_pending_restore(&data).unwrap();
+        assert!(
+            String::from_utf8(fs::read(data.join("preferences.json")).unwrap())
+                .unwrap()
+                .contains("fr")
+        );
+        assert_eq!(
+            fs::read(data.join("media.srt")).unwrap(),
+            b"unrelated media"
+        );
+        assert!(!data.join("pending-restore").exists());
+    }
+
+    #[test]
+    fn restore_and_download_reject_traversal_unexpected_entries_and_invalid_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("state.json"), b"invalid JSON").unwrap();
+        let made = backup(&data, &AtomicBool::new(false)).unwrap();
+        let id = made["id"].as_str().unwrap();
+        assert!(download(&data, "../outside").is_err());
+        assert!(stage_restore(&data, "../outside").is_err());
+        assert!(stage_restore(&data, id).is_err());
+        assert!(!data.join("pending-restore").exists());
+        fs::write(
+            data.join("backups").join(id).join("unexpected"),
+            b"not allowed",
+        )
+        .unwrap();
+        assert!(list(&data).is_err());
+        assert!(download(&data, id).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_restore_rejects_symlinks_before_modifying_live_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("state.json"), b"{}").unwrap();
+        fs::write(data.join("state.json"), br#"{"preserved":true}"#).unwrap();
+        std::os::unix::fs::symlink(&outside, data.join("pending-restore")).unwrap();
+        assert!(apply_pending_restore(&data).is_err());
+        assert_eq!(
+            fs::read(data.join("state.json")).unwrap(),
+            br#"{"preserved":true}"#
+        );
+    }
 
     #[test]
     fn copies_only_allowlisted_files_and_retains_three() {

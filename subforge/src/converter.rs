@@ -997,7 +997,7 @@ impl Converter {
             pending += u64::from(file_pending);
             failed += u64::from(file_failed);
         }
-        json!({"generated_srt_count":if output_count_available {Some(outputs.len())}else{None},"pending_ocr_files":pending,"failed_files":failed,"generated_srt_count_available":output_count_available})
+        json!({"generated_srt_count":if output_count_available {Some(outputs.len())}else{None},"pending_ocr_files":pending,"failed_files":failed,"generated_srt_count_available":output_count_available,"generated_srt_count_scope":"saved_publication_receipts","generated_srt_filesystem_verified":false})
     }
 
     pub fn file_processing(&self, path: &str) -> Value {
@@ -3866,6 +3866,28 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn generated_totals_count_distinct_saved_receipts_without_claiming_file_existence() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("media");
+        fs::create_dir(&root).unwrap();
+        let first = root.join("first.mkv").to_string_lossy().into_owned();
+        let second = root.join("second.mkv").to_string_lossy().into_owned();
+        let mut converter =
+            Converter::new(vec![root.clone()], fixture.path().join("state.json")).unwrap();
+        converter.state = json!({first.clone():{"outputs":["old.en.srt","old.fr.srt"]},second.clone():{"outputs":["old.en.srt"]}});
+        assert!(!root.join("old.en.srt").exists());
+        let pipeline = converter.pipeline_counts();
+        assert_eq!(pipeline["generated_srt_count"], 2);
+        assert_eq!(
+            pipeline["generated_srt_count_scope"],
+            "saved_publication_receipts"
+        );
+        assert_eq!(pipeline["generated_srt_filesystem_verified"], false);
+        assert_eq!(converter.file_processing(&first)["generated_srt_count"], 2);
+        assert_eq!(converter.file_processing(&second)["generated_srt_count"], 1);
     }
 
     #[test]

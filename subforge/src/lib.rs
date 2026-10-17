@@ -13,6 +13,7 @@ pub mod remote;
 mod resources;
 mod root_display;
 pub mod server;
+mod task_schedule;
 pub mod tasks;
 pub mod util;
 mod workers;

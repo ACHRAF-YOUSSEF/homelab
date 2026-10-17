@@ -7,6 +7,11 @@
 - Keep Library Fit at a 25-row minimum with a scrolling pane; add page selection and reviewed bulk conversion capped at 64 explicit media paths.
 - Unify settings, task-schedule, and worker-allocation saves with a shared sticky save/discard bar and unsaved-navigation warning.
 - Clarify global failed-file totals, task-result scope, and notification send timestamps, including limits of legacy records.
+- Use canonical job names and per-run task results; label the Overview total as tracked SRT outputs, a deduplicated saved publication-receipt count that can include deleted outputs or sources outside the current inventory.
+- Add fixed-UTC-offset weekday schedules with explicit daylight-saving adjustment, and move OCR retry choice into the OCR task row.
+- Add managed-key replacement, path-mapping draft tests, Jellyfin library selection and broad-refresh confirmation, and a warning about independent Bazarr subtitle downloads.
+- List and download the latest three credential-bearing application-state backups as `.tar.gz`; stage allowlisted restores for the next restart only when jobs and queue are idle, preserving state files absent from the archive.
+- Show readable media names and full-path tooltips in Activity, with start/queue timing and actual results; retain up to 100 finished jobs plus active and queued work. Keep the operation log in Activity and link worker nodes with CPU/GPU/OCR explanations.
 - Show live connection state and update age from the latest valid status, system, or worker message received by the browser, with an absolute timestamp on hover. Live badges share that clock; stale resource status uses its own last-sample time.
 - Improve keyboard focus, compact text size, and Library filename wrapping; use explicit Hide/Show wording for the sidebar toggle, and show one edition badge in the header with plain-language System guidance. Explain SDH in desktop copy and the drawer, and spell it out in mobile coverage chips.
 - Group scan roots by available storage-volume identity. Generic groups use numbered **Storage volume** names and plain folder names; Windows drive labels remain recognizable. Optional `CONVERTER_*_SOURCE` hints only supply a validated Windows drive label; they do not grant host-path access or expose the configured host paths. Clarify that container limit changes require recreation, not restart.

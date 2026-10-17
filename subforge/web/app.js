@@ -52,6 +52,7 @@
   state.tasksBusy=false;
   state.tasksLoadedAt=0;
   state.taskRequests=new Set();
+  state.retryFailedTracks=false;
   state.liveMode='connecting';
   state.statusReceivedAt=0;
   state.receivedAt=0;
@@ -159,6 +160,7 @@
     const data=state.status?.pipeline||{},available=data.available||{},active=activeJobs(),running=active[0],queued=(state.status?.queue||[]).length;
     const count=key=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
     setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));
+    $('#pipeline-ready').parentElement.title='Distinct published-output receipts in saved conversion state. Existence is not rescanned here; includes older sources outside the current inventory. This is not a current disk count or an average per inspected item. Library coverage checks current SRT targets.';
     const inventoryStatus=$('#pipeline-status');
     const inventoryUpdated=state.status?.inventory?.updated??state.inventoryUpdated;
     if(inventoryUpdated)timestamp(inventoryStatus,inventoryUpdated,`${usesBazarr()?'Bazarr sync':'Inspected'} `,state.status?.inventory?.truncated?' · Partial snapshot':'');else setText(inventoryStatus,'No inventory yet');
@@ -244,8 +246,12 @@
     setText($('#stat-roots'),(roots || []).length);
   };
   const updateLanguageLabels = () => {
-    setText($('#quick-languages'),usesBazarr()&&isAll(state.selectedLanguages)?'Bazarr profile languages':languageDescription(state.selectedLanguages));
-    setText($('#settings-languages'),languageDescription(state.defaultLanguages));
+    const describe=list=>usesBazarr()&&isAll(list)?'Bazarr profile languages':isAll(list)?'All tagged languages':languageDescription(list);
+    setText($('#quick-languages'),describe(state.selectedLanguages));
+    setText($('#settings-languages'),describe(state.defaultLanguages));
+    const policy=usesBazarr()?'Bazarr profiles set required languages and normal, forced, and SDH variants. Your language selection filters those targets; it cannot add languages outside a profile.':'All tagged languages exports detected languages; untagged tracks require explicit selection.';
+    setText($('#language-policy-hint'),`${policy} Preferences supply the default for scheduled scans and Quick conversion. A Quick selection overrides that default for manual jobs in this browser session.`);
+    setText($('#quick-language-policy'),`${state.quickLanguagesChanged?'Using your Quick selection.':'Using saved Preferences.'} ${policy} Existing valid SRT targets are skipped.`);
     setText($('#stat-languages'),isAll(state.selectedLanguages)?'All':state.selectedLanguages.length);
   };
   const jobPercent = job => {
@@ -283,7 +289,20 @@
     bar.setAttribute('aria-label',Number(job.total)>0?`${job.processed||0} of ${job.total} files processed`:'Preparing job; progress not yet available');
     return bar;
   };
-  const jobTitle = job => job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider]||'Integration'} ${job.provider==='bazarr'?'inventory check':'library refresh'}`:({scan:job.include_ocr===true?'Convert missing subtitles':'Scan and convert text',inspect:'Inspect subtitle tracks',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind]||'Converter job';
+  const jobTitle = job => job.kind==='refresh'?`${({sonarr:'Sonarr',radarr:'Radarr',jellyfin:'Jellyfin',bazarr:'Bazarr'})[job.provider]||'Integration'} ${job.provider==='bazarr'?'inventory check':'library refresh'}`:job.task_id==='inventory'?'Media inventory':({scan:'Library discovery',inspect:'Media inventory',extract:'Convert selected subtitles',ocr:'Subtitle OCR',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[job.kind]||'Converter job';
+  const mediaJobLabel = path => {
+    const name=String(path||'').split(/[\\/]/).pop()?.replace(/\.[^.]+$/,'')||'';
+    const episode=name.match(/^(.*?)[ ._-]+(S\d{1,3}E\d{1,3}(?:E\d{1,3})?)/i);
+    return episode?`${episode[1].replace(/[._]/g,' ').trim()} · ${episode[2].toUpperCase()}`:name.replace(/[._]/g,' ');
+  };
+  const maintenanceResult = job => {
+    const result=job.maintenance||job.result||{};
+    if(typeof result.message==='string')return result.message;
+    if(job.kind==='backup'&&Number.isFinite(result.count_bytes))return `Backup created · ${formatSpace(result.count_bytes)}`;
+    if(job.kind==='cleanup'&&Number.isFinite(result.removed))return `${result.removed} stale cache entries removed`;
+    if(job.kind==='health'&&Array.isArray(result.checks))return `${result.checks.length} checks completed`;
+    return '';
+  };
   const jobStatus = job => {
     if(job.status==='running'){
       const health=({waiting:['queued','Waiting'],stalled:['queued','Possibly stalled'],unresponsive:['failed','Unresponsive']})[job.telemetry?.liveness];
@@ -355,13 +374,14 @@
     const icon = document.createElement('div'),type=job.kind==='extract'?'convert':job.kind; icon.className = `job-icon job-${escStatus(type)}`; icon.append(iconSvg(type));
     const detail = document.createElement('div'); detail.className = 'job-detail';
     const title = document.createElement('strong'); title.textContent = jobTitle(job);
-    const sub = document.createElement('span'); sub.className = 'job-subtitle'; sub.textContent = (['running','queued'].includes(job.status)?'':currentLabel(job.current)) || shortPath(job.current?.path||job.paths?.[0]) || job.root_label || 'All scan roots';
+    const sub = document.createElement('span'); sub.className = 'job-subtitle'; const mediaPath=job.current?.path||job.paths?.[0];sub.textContent=mediaPath?mediaJobLabel(mediaPath):job.root_label||'All media folders';sub.title=mediaPath||'';
     detail.append(title,sub);
     const status = document.createElement('div'); status.className = 'job-status-block';
     const statusValue=jobStatus(job),pill = document.createElement('span'); pill.className=`status-pill ${statusValue.style}`; pill.textContent=statusValue.label;
     const time=timeNode(job.finished || job.telemetry?.heartbeat_at || job.started || job.created); time.className='job-time';
     status.append(pill,time);
     card.append(icon,detail,status);
+    if(job.result_text||maintenanceResult(job)){const result=document.createElement('p');result.className='job-result';result.textContent=job.result_text||maintenanceResult(job);card.append(result);}
     const executors=renderJobExecutors(job,compact);if(executors)card.append(executors);
     const timing=jobTiming(job);if(timing){const info=document.createElement('p');info.className='job-timing';info.textContent=timing;card.append(info);}
     if (job.status === 'running' || job.status === 'queued') {
@@ -407,19 +427,21 @@
     if(body.jobSignature===signature)return;
     const focus=body.contains(document.activeElement)?document.activeElement.dataset.jobFocus:null;
     body.jobSignature=signature;body.replaceChildren();
-    if(!jobs.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=6;cell.className='table-empty';cell.textContent='No jobs match these filters.';row.append(cell);body.append(row);return;}
+    if(!jobs.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=8;cell.className='table-empty';cell.textContent='No jobs match these filters.';row.append(cell);body.append(row);return;}
     for(const job of jobs){
       const row=document.createElement('tr');row.className='job-row';row.dataset.jobId=job.id;
       const cell=(name,className)=>{const value=document.createElement('td');value.dataset.label=name;value.className=className;row.append(value);return value;};
-      const name=cell('Job','job-name'),title=document.createElement('strong'),scope=document.createElement('small');title.textContent=jobTitle(job);scope.textContent=job.paths?.length?shortPath(job.paths[0]):job.root_label||'All media folders';scope.title=job.paths?.[0]||job.root_label||'';name.append(title,scope);
+      const name=cell('Job','job-name'),title=document.createElement('strong'),scope=document.createElement('small');title.textContent=jobTitle(job);scope.textContent=job.paths?.length?mediaJobLabel(job.paths[0])+(job.paths.length>1?` +${job.paths.length-1} files`:''):job.root_label||'All media folders';scope.title=job.paths?.[0]||job.root_label||'';name.append(title,scope);
       const status=cell('Status','job-row-status'),value=jobStatus(job),pill=document.createElement('span');pill.className=`status-pill ${value.style}`;pill.textContent=value.label;status.append(pill);
       const workers=cell('Worker','job-row-workers'),executors=(Array.isArray(job.executors)?job.executors.slice(0,64):[]).filter(item=>item&&['cpu','cpu_ocr','gpu'].includes(item.resource)&&['local','remote'].includes(item.execution)&&typeof item.node_name==='string'&&item.node_name.trim());
-      const workerLabels=executors.map(item=>`${({cpu:'CPU',cpu_ocr:'CPU OCR',gpu:'GPU OCR'})[item.resource]} · ${item.node_name}`);workers.textContent=workerLabels.slice(0,2).join(', ')+(workerLabels.length>2?` +${workerLabels.length-2}`:'')||'—';workers.title=workerLabels.join('\n');
+      const workerLabels=executors.map(item=>`${({cpu:'CPU',cpu_ocr:'CPU OCR',gpu:'GPU OCR'})[item.resource]} · ${item.node_name}`);workers.textContent=workerLabels.slice(0,2).join(', ')+(workerLabels.length>2?` +${workerLabels.length-2}`:'')||(['backup','health','cleanup'].includes(job.kind)?'Local maintenance':job.status==='queued'?'Awaiting assignment':'Not recorded');workers.title=workerLabels.join('\n');
       const result=cell('Result','job-row-result'),summary=job.summary||{},parts=[];
       for(const [key,label] of [['converted','converted'],['cached','ready'],['inspected','inspected'],['failed','failed']])if(Number(summary[key]))parts.push(`${Number(summary[key]).toLocaleString()} ${label}`);
-      const live=['running','queued'].includes(job.status),copy=document.createElement('span');copy.className='job-result-copy';copy.textContent=live?jobProgressLabel(job):parts.join(', ')||((job.notifications||[]).some(item=>item?.pending===true)?'Indexing pending':job.error?'Review error details':'—');result.append(copy);
+      const live=['running','queued'].includes(job.status),copy=document.createElement('span');copy.className='job-result-copy';copy.textContent=live?jobProgressLabel(job):job.result_text||maintenanceResult(job)||parts.join(', ')||((job.notifications||[]).some(item=>item?.pending===true)?'Indexing pending':job.error?'Review error details':job.kind==='refresh'?(job.results||[]).map(item=>item.message).filter(Boolean).join('; ')||'Refresh completed':job.status==='cancelled'?'Cancelled before completion':job.status==='failed'?'Review error details':'No subtitle changes');result.append(copy);
       if(live)result.append(jobProgressBar(job));
       const timing=jobTiming(job);if(timing){const info=document.createElement('small');info.className='job-timing';info.textContent=timing;result.append(info);}result.title=[copy.textContent,timing].filter(Boolean).join('\n');
+      const started=cell('Started','job-row-started');if(job.started)started.append(timeNode(job.started));else started.textContent=job.status==='queued'?'Waiting':'Not recorded';
+      const wait=cell('Queue wait','job-row-wait'),waitSeconds=job.telemetry?.queue_wait_seconds??(job.started&&job.created?Math.max(0,job.started-job.created):null);wait.textContent=Number.isFinite(waitSeconds)?duration(waitSeconds):job.status==='queued'?duration(Date.now()/1000-Number(job.created||Date.now()/1000)):'Not recorded';
       const updated=cell('Updated','job-row-time');updated.append(timeNode(job.finished||job.telemetry?.heartbeat_at||job.started||job.created));
       const actionsCell=cell('Actions','job-row-actions'),actions=document.createElement('div');actions.className='job-actions';actionsCell.append(actions);const details=document.createElement('button');details.className='row-action';details.type='button';details.textContent='Details';details.dataset.viewJob=job.id;details.dataset.jobFocus=`${job.id}:details`;details.setAttribute('aria-label',`Details for ${jobTitle(job)}`);details.addEventListener('click',()=>openJobDetails(job));actions.append(details);
       if(['running','queued'].includes(job.status)&&job.id){const cancel=document.createElement('button');cancel.type='button';cancel.className='text-button cancel-job';cancel.textContent='Cancel';cancel.dataset.jobId=job.id;cancel.dataset.jobFocus=`${job.id}:cancel`;actions.append(cancel);}
@@ -596,7 +618,7 @@
   const inspect = async () => { const result=await startJob({kind:'inspect',rootIds:selectedRootIds('#inventory-root')}); if (!result) return; if (Array.isArray(result.results)) { state.inventory=result.results; state.inventoryTruncated=!!result.truncated; renderInventory(); } };
   const renderLanguageList = () => {
     const list=$('#language-list'), term=$('#language-search').value.trim().toLowerCase(); list.replaceChildren();
-    const allLabel=document.createElement('label'); allLabel.className='language-option all-option'; const all=document.createElement('input'); all.type='checkbox'; all.checked=isAll(state.draftLanguages); all.addEventListener('change',()=>{state.draftLanguages=all.checked?['*']:[];renderLanguageList();}); const allCopy=document.createElement('span'); const allTitle=document.createElement('strong'); allTitle.textContent=usesBazarr()?'Bazarr profile languages':'All tagged languages'; const allHint=document.createElement('small'); allHint.textContent=usesBazarr()?'Fill only missing SRT targets from each media profile':'Use tagged tracks; untagged tracks require explicit selection'; allCopy.append(allTitle,allHint); allLabel.append(all,allCopy); list.append(allLabel);
+    const allLabel=document.createElement('label'); allLabel.className='language-option all-option'; const all=document.createElement('input'); all.type='checkbox'; all.checked=isAll(state.draftLanguages); all.addEventListener('change',()=>{state.draftLanguages=all.checked?['*']:[];renderLanguageList();}); const allCopy=document.createElement('span'); const allTitle=document.createElement('strong'); allTitle.textContent=usesBazarr()?'Bazarr profile languages':'All tagged languages'; const allHint=document.createElement('small'); allHint.textContent=usesBazarr()?'Fill missing language and normal / forced / SDH targets from each media profile':'Use tagged tracks; untagged tracks require explicit selection'; allCopy.append(allTitle,allHint); allLabel.append(all,allCopy); list.append(allLabel);
     const codes=new Set(languages.map(x=>x[0].toLowerCase())); for (const code of state.draftLanguages) if (code!=='*' && !codes.has(code.toLowerCase())) languages.push([code,`${langLabel(code)} · ${code.toUpperCase()}`]);
     for (const [code,name] of languages) {
       if (term && !`${name} ${code}`.toLowerCase().includes(term)) continue;
@@ -604,9 +626,9 @@
     }
     updateLanguageCount();
   };
-  const updateLanguageCount = () => {setText($('#language-count'),isAll(state.draftLanguages)?'All languages selected':`${state.draftLanguages.length} language${state.draftLanguages.length===1?'':'s'} selected`);$('#apply-languages').disabled=!state.draftLanguages.length;};
+  const updateLanguageCount = () => {setText($('#language-count'),isAll(state.draftLanguages)?usesBazarr()?'Bazarr profile targets selected':'All tagged languages selected':`${state.draftLanguages.length} language${state.draftLanguages.length===1?'':'s'} selected`);$('#apply-languages').disabled=!state.draftLanguages.length;};
   const showDialog = backdrop => {backdrop.classList.remove('hidden');$('.shell').inert=true;document.body.classList.add('modal-open');};
-  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...(target==='settings'?state.defaultLanguages:state.selectedLanguages)];setText($('#apply-languages'),target==='settings'?'Apply default languages':'Use for this conversion'); $('#language-search').value='';showDialog($('#language-modal')); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
+  const openLanguageDialog = target => { state.languageTarget=target; state.modalTrigger=document.activeElement; state.draftLanguages=[...(target==='settings'?state.defaultLanguages:state.selectedLanguages)];setText($('#apply-languages'),target==='settings'?'Apply default languages':'Use for this conversion');setText($('#language-modal .modal-copy'),usesBazarr()?'Bazarr profiles define required language and normal, forced, and SDH targets. Select all profile languages, or narrow the targets to specific languages.':'Select tagged languages to convert. Untagged tracks require explicit selection. Existing valid SRT targets are skipped.'); $('#language-search').value='';showDialog($('#language-modal')); renderLanguageList(); $('#language-list').scrollTop=0; $('.language-modal-body').scrollTop=0; $('#language-search').focus(); };
   const closeDialog = backdrop => { if (!backdrop || backdrop.classList.contains('hidden')) return; backdrop.classList.add('hidden');$('.shell').inert=false;document.body.classList.remove('modal-open'); const jobTrigger=backdrop.id==='job-drawer-backdrop'?$$('#jobs-list [data-view-job]').find(button=>button.dataset.viewJob===state.selectedJobId):null;if (state.modalTrigger?.isConnected) state.modalTrigger.focus();else if(jobTrigger)jobTrigger.focus({preventScroll:true});else{const heading=$(`#page-${state.currentPage} h1`);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});} };
   const addCustomLanguage = () => { const input=$('#custom-language'), code=input.value.trim().toLowerCase(); if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/.test(code)) { notify('Enter a valid ISO language code, such as pl or pt-BR.','error'); return; } languages.push([code,code.toUpperCase()]); state.draftLanguages=isAll(state.draftLanguages)?[code]:[...new Set([...state.draftLanguages,code])]; input.value=''; renderLanguageList(); };
   const buildIntegrationCard = (provider, config={}) => {
@@ -618,15 +640,17 @@
     const usageCopy=document.createElement('p');usageCopy.className='field-explainer';usageCopy.textContent={sonarr:'An optional Sonarr Connect webhook starts conversion when episodes are imported or renamed. New SRT files trigger a rescan of the matching series.',radarr:'An optional Radarr Connect webhook starts conversion when movies are imported or renamed. New SRT files trigger a rescan of the matching movie.',jellyfin:'New SRT files trigger metadata refreshes within your selected movie and series libraries. Refresh selected libraries runs a broader manual refresh.',bazarr:'Profiles define the wanted subtitle languages and variants. New SRT files trigger a scan of matching media and an inventory refresh. Check inventory reads Bazarr and reports its current media counts.'}[provider];
     const last=document.createElement('p');last.className='field-explainer integration-last-result';last.textContent='No conversion notification recorded yet.';usage.append(usageTitle,usageCopy,last);$('.integration-fields',card).append(usage);
     $('.integration-enabled',card).checked=!!config.enabled; $('.integration-url',card).value=config.url || '';
-    $('.integration-key',card).value=config.api_key || ''; setText($('.api-key-hint',card),config.api_key_set?'A key is saved. Leave blank to keep it.':'');
+    const key=$('.integration-key',card),saved=$('.api-key-saved',card),replace=$('.replace-integration-key',card);key.value='';key.classList.toggle('hidden',!!config.api_key_set);saved?.classList.toggle('hidden',!config.api_key_set);setText(saved,config.api_key_set?'••••• saved':'');replace?.classList.toggle('hidden',!config.api_key_set);setText($('.api-key-hint',card),'');
+    replace?.addEventListener('click',()=>{key.classList.remove('hidden');saved.classList.add('hidden');replace.classList.add('hidden');key.placeholder='Enter replacement API key';key.focus();});
     if (provider==='jellyfin') {
       $('.api-key-field',card).querySelector('span').childNodes[0].textContent='API key ';
       $('.integration-url',card).placeholder='http://jellyfin:8096'; $('.integration-key',card).placeholder='Jellyfin API key';
       $('.jellyfin-fields',card).classList.remove('hidden');
       $('.integration-url',card).readOnly=true; $('.integration-key',card).readOnly=true;
-      $('.integration-key',card).value=config.api_key_set?'••••••••••••••••':'Not configured';
-      $('.integration-key',card).type='text'; $('.integration-key',card).classList.add('managed-value');
-      setText($('.api-key-hint',card),`Managed by JELLYFIN_INTERNAL_URL and JELLYFIN_API_KEY · ${config.api_key_set?'key configured':'key missing'}`);
+      key.value='';key.classList.add('managed-value','hidden');saved?.classList.remove('hidden');setText(saved,config.api_key_set?'••••• saved · managed by environment':'Not configured · managed by environment');replace?.classList.add('hidden');
+      for(const input of [$('.integration-url',card),key]){input.setAttribute('aria-readonly','true');input.title='Locked: managed by deployment environment';}
+      for(const lock of $$('.managed-lock',card)){lock.classList.remove('hidden');lock.title='Managed by deployment environment';}
+      setText($('.api-key-hint',card),'URL and key are managed by JELLYFIN_INTERNAL_URL and JELLYFIN_API_KEY.');
       renderMappings(card,(state.settings?.path_mappings || []).filter(item=>!item.provider || item.provider==='jellyfin'));
       populateLibraryOptions(card,state.jellyfinLibraries.length?state.jellyfinLibraries.filter(item=>/movie/i.test(item.type)):config.movie_libraries || [],state.jellyfinLibraries.length?state.jellyfinLibraries.filter(item=>/series|tv/i.test(item.type)):config.series_libraries || [],config.movie_libraries || [],config.series_libraries || []);
       $('.refresh-movies',card).checked=!!config.refresh_movies; $('.refresh-series',card).checked=!!config.refresh_series; $('.refresh-mode',card).value=config.refresh_mode || 'immediate';
@@ -636,18 +660,21 @@
       $('.integration-key',card).placeholder='API key'; renderMappings(card,(state.settings?.path_mappings || []).filter(item=>!item.provider || item.provider===provider));
       if(provider==='bazarr')$('.refresh-integration',card).textContent='Check inventory';
     }
+    if(provider==='bazarr'){const callout=$('.bazarr-auto-download-note',card);callout.classList.remove('hidden');callout.setAttribute('role','note');callout.textContent='Bazarr may automatically download subtitles. After conversion, Subforge asks Bazarr to scan affected media. Downloads follow Bazarr’s profiles and download rules; review those in Bazarr if you only want local conversion.';}
     $('.test-integration',card).addEventListener('click',()=>testIntegration(provider,card));
     $('.refresh-integration',card).addEventListener('click',()=>refreshIntegration(provider,card));
     $$('.load-libraries',card).forEach(button=>button.addEventListener('click',()=>loadLibraries(card)));
     $('.add-path-map',card).addEventListener('click',()=>{const entries=readMappings(card); entries.push({remote:'',local:''});renderMappings(card,entries);settingsDirty();});
-    card.addEventListener('input',settingsDirty);card.addEventListener('change',settingsDirty);
+    $('.test-path-mapping',card)?.addEventListener('click',()=>testPathMapping(provider,card));
+    const trackEdit=event=>{if(!event.target.matches('.mapping-test-path'))settingsDirty();};card.addEventListener('input',trackEdit);card.addEventListener('change',trackEdit);
+    for(const input of $$('.switch input',card))input.setAttribute('role','switch');
     card.dataset.collapse=`integration-${provider}`;makePanelCollapsible(card);return card;
   };
   const populateLibraryOptions = (card,movies,series,selectedMovies=movies,selectedSeries=series) => {
     for (const [selector,values,selected] of [['.movie-libraries',movies,selectedMovies],['.series-libraries',series,selectedSeries]]) {
       const container=$(selector,card); container.replaceChildren();
       if (!values.length) { const muted=document.createElement('span'); muted.className='muted'; muted.textContent='Load libraries to choose where refreshes apply.'; container.append(muted); continue; }
-      for (const item of values) { const label=document.createElement('label'); label.className='library-check'; const input=document.createElement('input'); input.type='checkbox'; input.value=typeof item==='string'?item:item.id; input.checked=selected.some(value=>(typeof value==='string'?value:value.id)===input.value);const cached=state.jellyfinLibraries.find(library=>library.id===input.value),copy=document.createElement('span'),text=document.createElement('strong'),helper=document.createElement('small');text.textContent=(typeof item==='object'?item.name:null)||cached?.name||(selector==='.movie-libraries'?'Movie library':'TV library');helper.className='library-id';helper.textContent=input.value;copy.append(text,helper);label.append(input,copy); container.append(label); }
+      for (const [index,item] of values.entries()) { const label=document.createElement('label'); label.className='library-check'; const input=document.createElement('input'); input.type='checkbox'; input.value=typeof item==='string'?item:item.id; input.checked=selected.some(value=>(typeof value==='string'?value:value.id)===input.value);const cached=state.jellyfinLibraries.find(library=>library.id===input.value),copy=document.createElement('span'),text=document.createElement('strong');text.textContent=(typeof item==='object'?item.name:null)||cached?.name||`${selector==='.movie-libraries'?'Movie library':'TV library'} ${index+1} (load names)`;copy.append(text);label.append(input,copy); container.append(label); }
     }
   };
   const renderMappings = (card,entries) => {
@@ -657,6 +684,13 @@
     }
   };
   const readMappings = card => $$('.path-map-row',card).map(row=>({remote:$('.map-remote',row).value.trim(),local:$('.map-local',row).value.trim()})).filter(item=>item.remote || item.local);
+  const testPathMapping = async (provider,card) => {
+    const button=$('.test-path-mapping',card),result=$('.mapping-test-result',card),path=$('.mapping-test-path',card).value.trim();
+    if(!path){setText(result,'Enter a full file path as reported by the server.');return;}
+    button.disabled=true;setText(result,'Testing draft mapping…');
+    try{const data=await api(`/api/integrations/${provider}/mapping-test`,{method:'POST',body:JSON.stringify({path,mappings:readMappings(card)})});setText(result,data.matched?`${data.mapped_path} · ${data.accessible?'Accessible in a configured media folder':'Not accessible in configured media folders'}`:'No mapping matches this path. Check the server path prefix.');}
+    catch(error){setText(result,error.message);}finally{button.disabled=false;}
+  };
   const readSelectedLibraries = (card,selector) => $(`${selector}`,card) ? $$('.library-check input:checked',$(selector,card)).map(input=>input.value) : [];
   const formatSpace = bytes => {
     if(typeof bytes!=='number'||!Number.isFinite(bytes)||bytes<0)return '—';
@@ -712,7 +746,7 @@
     if(mount)select.value=mount.path;
     showDialog($('#root-folder-modal'));$('#folder-path').focus();await browseRootFolder(selected);
   };
-  const persistSettings = async () => { const data=await api('/api/settings',{method:'PUT',body:JSON.stringify(gatherSettings())}); state.settings=data; return data; };
+  const persistSettings = async () => { const data=await api('/api/settings',{method:'PUT',body:JSON.stringify(gatherSettings())}); state.settings=data;if(state.status)state.status.settings={...state.status.settings,integrations:data.integrations};state.integrationChecks.clear(); return data; };
   const loadSettings = async () => {
     try {
       const data=await api('/api/settings'); state.settings=data;state.defaultLanguages=data.languages||['*'];if(!state.quickLanguagesChanged)state.selectedLanguages=[...state.defaultLanguages];
@@ -743,9 +777,9 @@
   const rememberLibraries = libraries => {state.jellyfinLibraries=(libraries||[]).filter(item=>typeof item?.id==='string'&&typeof item.name==='string').slice(0,100).map(({id,name,type})=>({id,name,type}));try{sessionStorage.setItem('subforge.jellyfin-libraries',JSON.stringify(state.jellyfinLibraries));}catch{}};
   const setIntegrationResult = (node,text,kind) => {setText(node,text);node.className=`test-result integration-result result-${kind}`;node.setAttribute('role','status');};
   const updateIntegrationDots = () => {
-    for(const dot of $$('[data-integration-dot]')){const provider=dot.dataset.integrationDot,config=state.settings?.integrations?.[provider]||state.status?.settings?.integrations?.[provider]||{},check=state.integrationChecks.get(provider);let latest=null;
+    for(const dot of $$('[data-integration-dot]')){const provider=dot.dataset.integrationDot,config=state.status?.settings?.integrations?.[provider]||state.settings?.integrations?.[provider]||{},check=state.integrationChecks.get(provider);let latest=null;
       for(const job of jobList()){for(const result of job.notifications||[]){const at=Number(result?.recorded_at||result?.sent_at||0)*1000;if(result?.provider===provider&&typeof result.ok==='boolean'&&at>0&&(!latest||at>latest.at))latest={ok:result.ok,at};}}
-      const observed=check&&(!latest||check.at>=latest.at)?check:latest,kind=!config.enabled?'disabled':observed?observed.ok?'connected':'error':'unknown';dot.dataset.state=kind;dot.textContent=({connected:'✓',error:'!',disabled:'—',unknown:'?'})[kind];dot.setAttribute('role','img');const label=kind==='disabled'?'Integration disabled':observed?`Last ${observed===check?'connection test':'notification result'} ${observed.ok?'succeeded':'failed'} · ${absoluteDate(observed.at)}`:'Configured; connection has not been checked';dot.title=label;dot.setAttribute('aria-label',label);
+      const observed=check&&(!latest||check.at>=latest.at)?check:latest,stale=state.liveMode!=='connected'||!state.statusReceivedAt||Date.now()-state.statusReceivedAt>30000||observed&&Date.now()-observed.at>300000||provider==='bazarr'&&state.inventoryAuthority?.status!=='ready',kind=!config.enabled?'disabled':observed?observed.ok?stale?'stale':'connected':'error':'unknown';dot.dataset.state=kind;dot.textContent=({connected:'✓',stale:'!',error:'!',disabled:'—',unknown:'?'})[kind];dot.setAttribute('role','img');const label=kind==='disabled'?'Integration disabled':observed?`Last ${observed===check?'connection test':'notification result'} ${observed.ok?'succeeded':'failed'} · ${absoluteDate(observed.at)}. ${kind==='stale'?'Status is stale; test again.':'Green means a successful response within 5 minutes, with current dashboard data; it does not guarantee future requests.'}`:'Configured; connection has not been checked';dot.title=label;dot.setAttribute('aria-label',label);
     }
   };
   const testIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.test-integration',card); button.disabled=true;setIntegrationResult(result,'Testing…','pending');
@@ -753,7 +787,7 @@
     catch(error) {state.integrationChecks.set(provider,{ok:false,at:Date.now()});setIntegrationResult(result,`Failed: ${error.message}`,'error');}
     finally { button.disabled=false;updateSettingsActions();updateIntegrationDots(); }
   };
-  const refreshIntegration = async (provider,card) => { const result=$('.test-result',card),button=$('.refresh-integration',card); button.disabled=true; setText(result,'Queueing refresh…'); result.className='test-result muted';
+  const refreshIntegration = async (provider,card) => { if(provider==='jellyfin'&&!window.confirm('Refresh all selected Jellyfin libraries? This can trigger a broad metadata scan and increase server load.'))return;const result=$('.test-result',card),button=$('.refresh-integration',card); button.disabled=true; setText(result,'Queueing refresh…'); result.className='test-result muted';
     try { if(state.settingsDirty)throw new Error('Save or discard changes before using this connection.'); const response=await api(`/api/integrations/${provider}/refresh`,{method:'POST',body:'{}'}); setText(result,response.message || 'Refresh job queued.'); result.className='test-result success-text'; notify(response.message || `${provider} refresh queued.`,'success'); await pollStatus(); }
     catch(error) { setText(result,error.message); result.className='test-result error-text'; notify(error.message,'error'); }
     finally { button.disabled=false;updateSettingsActions(); }
@@ -783,19 +817,26 @@
     const failed=state.tasks.pipeline?.failed_files??state.status?.pipeline?.failed_files;
     setText($('#task-failure-scope'),`${Number.isFinite(failed)?failed.toLocaleString():'Unknown'} saved file failures across conversion state. Task results below count failures in that run only. Review saved failures →`);
     const paused=!!state.tasks.paused;setText($('#scheduler-state'),paused?'Automation paused':'Automation on');$('#scheduler-state').className=`status-pill ${paused?'cancelled':'completed'}`;
-    if(state.tasksDirty)return;
+    if(state.tasksDirty){for(const task of state.tasks.tasks||[]){const run=$(`#tasks-body tr[data-task-id="${task.id}"] .task-run`);if(run){run.disabled=task.available===false||['running','queued'].includes(task.status)||state.taskRequests.has(task.id);run.textContent=state.taskRequests.has(task.id)?'Queueing…':task.status==='running'?'Running…':task.status==='queued'?'Queued':'Run now';}}return;}
     $('#pause-schedules').checked=paused;
+    const retry=$('#ocr-retry-failed');if(retry)state.retryFailedTracks=retry.checked;
+    const retryBox=$('.task-retry-controls');if(retryBox)retryBox.remove();
     const body=$('#tasks-body');body.replaceChildren();
     for(const task of state.tasks.tasks || []) {
       const row=document.createElement('tr');row.dataset.taskId=task.id;
-      const name=document.createElement('td'),copy=document.createElement('div');copy.className='task-name';const title=document.createElement('strong'),description=document.createElement('small');title.textContent=task.name;description.textContent=task.description;copy.append(title,description);name.append(copy);
-      const schedule=document.createElement('td'),controls=document.createElement('div');schedule.dataset.label='Schedule';controls.className='task-schedule';const label=document.createElement('label');label.className='check-row';const enabled=document.createElement('input');enabled.type='checkbox';enabled.className='task-enabled';enabled.checked=!!task.enabled;enabled.disabled=task.available===false;enabled.setAttribute('aria-label',`Automatically run ${task.name}`);const labelText=document.createElement('span');labelText.textContent='Automatic';label.append(enabled,labelText);
+      const name=document.createElement('td'),copy=document.createElement('div');copy.className='task-name';const title=document.createElement('strong'),description=document.createElement('small');title.textContent=({discovery:'Library discovery',ocr:'Subtitle OCR',inventory:'Media inventory',health:'Health check',cleanup:'Cache cleanup',backup:'State backup'})[task.id]||task.name;description.textContent=task.description;copy.append(title,description);name.append(copy);
+      if(task.id==='ocr'){const label=document.createElement('label'),check=document.createElement('input'),text=document.createElement('span');label.className='check-row task-retry-choice';check.type='checkbox';check.id='ocr-retry-failed';check.checked=state.retryFailedTracks;check.addEventListener('change',()=>{state.retryFailedTracks=check.checked;});text.textContent='Retry unchanged failed tracks in this manual run';label.title='Automatic OCR always skips unchanged failures. Retrying can repeat costly recognition work.';label.append(check,text);copy.append(label);}
+      const schedule=document.createElement('td'),controls=document.createElement('div');schedule.dataset.label='Schedule';controls.className='task-schedule';const label=document.createElement('label');label.className='switch';const enabled=document.createElement('input');enabled.type='checkbox';enabled.setAttribute('role','switch');enabled.className='task-enabled';enabled.checked=!!task.enabled;enabled.disabled=task.available===false;enabled.setAttribute('aria-label',`Automatically run ${task.name}`);const labelText=document.createElement('b');labelText.textContent='Automatic';label.append(enabled,document.createElement('span'),labelText);
       const interval=document.createElement('select');interval.className='input compact-input task-interval';interval.setAttribute('aria-label',`${task.name} interval`);interval.disabled=task.available===false;
       const choices=[...new Set([3600,21600,43200,86400,172800,604800,1209600,2592000,task.interval_seconds])].filter(value=>value>=task.min_interval_seconds).sort((a,b)=>a-b);
-      for(const value of choices)interval.add(new Option(intervalLabel(value),String(value)));interval.value=String(task.interval_seconds);enabled.addEventListener('change',markTasksDirty);interval.addEventListener('change',markTasksDirty);controls.append(label,interval);schedule.append(controls);
+      for(const value of choices)interval.add(new Option(intervalLabel(value),String(value)));interval.value=String(task.interval_seconds);enabled.addEventListener('change',markTasksDirty);interval.addEventListener('change',markTasksDirty);controls.append(label);
+      const mode=document.createElement('select');mode.className='input compact-input task-schedule-mode';mode.setAttribute('aria-label',`${task.name} schedule type`);mode.add(new Option('Repeat interval','interval'));mode.add(new Option('Days and time','calendar'));mode.value=task.schedule?'calendar':'interval';mode.disabled=task.available===false;controls.append(mode,interval);
+      const calendar=document.createElement('div');calendar.className='task-calendar';const at=document.createElement('input');at.type='time';at.className='input task-time';at.value=task.schedule?.time_of_day||'03:00';at.setAttribute('aria-label',`${task.name} time of day`);calendar.append(at);
+      const offset=document.createElement('select');offset.className='input task-offset';offset.setAttribute('aria-label',`${task.name} fixed UTC offset`);const currentOffset=task.schedule?.utc_offset_minutes??-new Date().getTimezoneOffset();for(const value of [...new Set([...Array.from({length:113},(_,i)=>i*15-840),currentOffset])].sort((a,b)=>a-b)){offset.add(new Option(`UTC${value<0?'−':'+'}${String(Math.floor(Math.abs(value)/60)).padStart(2,'0')}:${String(Math.abs(value)%60).padStart(2,'0')}`,String(value)));}offset.value=String(currentOffset);calendar.append(offset);
+      const days=document.createElement('div');days.className='task-weekdays';for(const [day,text] of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].entries()){const dayLabel=document.createElement('label'),check=document.createElement('input');check.type='checkbox';check.value=String(day);check.className='task-day';check.checked=(task.schedule?.days_of_week||[0,1,2,3,4,5,6]).includes(day);check.setAttribute('aria-label',`${task.name} on ${text}`);dayLabel.append(check,document.createTextNode(text));days.append(dayLabel);}calendar.append(days);const offsetHint=document.createElement('small');offsetHint.textContent='Fixed UTC offset; adjust for daylight saving time.';calendar.append(offsetHint);controls.append(calendar);const toggleMode=()=>{calendar.hidden=mode.value!=='calendar';interval.hidden=mode.value==='calendar';};toggleMode();mode.addEventListener('change',()=>{toggleMode();markTasksDirty();});calendar.addEventListener('change',markTasksDirty);for(const input of $$('input,select',calendar))input.disabled=task.available===false;schedule.append(controls);
       const next=document.createElement('td');next.dataset.label='Next execution';next.className='task-next';if(task.available!==false&&!paused&&task.enabled&&task.next_run)next.append(timeNode(task.next_run));else next.textContent=task.available===false?'Permission disabled':paused?'Paused':task.enabled?'Waiting for next run':'Manual only';
       const last=document.createElement('td');last.dataset.label='Last result';last.className='task-last-result';const result=document.createElement('span');result.textContent=plainCopy(task.last_result)||'Not run yet';last.append(result);if(task.last_run)last.append(document.createElement('br'),timeNode(task.last_run));
-      const action=document.createElement('td'),run=document.createElement('button');run.type='button';run.className='button button-secondary task-run';run.textContent=['running','queued'].includes(task.status)?'…':'▶';run.setAttribute('aria-label',`Run ${task.name}`);run.title=task.blocked_reason||`Run ${task.name} now`;run.disabled=task.available===false||['running','queued'].includes(task.status)||state.taskRequests.has(task.id);run.addEventListener('click',()=>runTask(task.id));action.append(run);row.append(name,schedule,next,last,action);body.append(row);
+      const action=document.createElement('td'),run=document.createElement('button');run.type='button';run.className='button button-secondary task-run';run.textContent=state.taskRequests.has(task.id)?'Queueing…':task.status==='running'?'Running…':task.status==='queued'?'Queued':'Run now';run.setAttribute('aria-label',`Run ${task.name}`);run.title=task.blocked_reason||`Run ${task.name} now`;run.disabled=task.available===false||['running','queued'].includes(task.status)||state.taskRequests.has(task.id);run.addEventListener('click',()=>runTask(task.id));action.append(run);row.append(name,schedule,next,last,action);body.append(row);
     }
     setText($('#task-schedule-note'),'Manual Run buttons remain available while schedules are paused. Pause does not cancel current work.');
   };
@@ -805,15 +846,25 @@
     catch(error){notify(`Could not load scheduled tasks: ${error.message}`,'error');}
     finally{state.tasksBusy=false;}
   };
+  const loadBackups = async () => {
+    const list=$('#backup-list');if(!list||state.backupsBusy)return;state.backupsBusy=true;
+    try{const data=await api('/api/backups');setText($('#backup-location'),data.location||'/data/backups');list.replaceChildren();
+      if(data.restore_pending){const pending=document.createElement('p');pending.className='backup-restore-status';pending.setAttribute('role','status');pending.textContent='Restore staged. Restart Subforge to apply it. Changes and new jobs are blocked until restart; the backup may replace dashboard credentials.';list.append(pending);}
+      const note=document.createElement('p');note.className='form-hint';note.textContent='The latest 3 local backups are retained. Restore requires idle workers and a service restart; files absent from the backup are preserved. Media files are unchanged.';list.append(note);
+      for(const item of data.items||[]){const row=document.createElement('div');row.className='backup-row';const copy=document.createElement('div'),name=document.createElement('strong'),detail=document.createElement('small');name.append(timeNode(item.created_at));detail.textContent=`${formatSpace(item.count_bytes)} · ${item.file_count} files`;copy.append(name,detail);const download=document.createElement('a');download.className='button button-secondary backup-download';download.textContent='Download';download.href=`/api/backups/${encodeURIComponent(item.id)}/download`;download.setAttribute('download','');const restore=document.createElement('button');restore.type='button';restore.className='button button-secondary backup-restore';restore.textContent='Restore';restore.addEventListener('click',async()=>{if(state.settingsDirty||state.tasksDirty||state.workersDirty){notify('Save or discard unsaved changes before restoring a backup.','error');return;}if(!window.confirm(`Restore the backup from ${absoluteDate(item.created_at)}? It replaces saved application state at the next service restart. Newer settings and conversion history will be replaced. Media files are unchanged.`))return;restore.disabled=true;try{const result=await api(`/api/backups/${encodeURIComponent(item.id)}/restore`,{method:'POST',body:JSON.stringify({confirm:item.id})});notify(result.message||'Restore staged. Restart Subforge to apply it.','success');const status=document.createElement('p');status.className='form-hint backup-restore-status';status.setAttribute('role','status');status.textContent=result.message||'Restore staged. Restart Subforge to apply this backup.';list.prepend(status);}catch(error){notify(error.message,'error');}finally{restore.disabled=false;}});row.append(copy,download,restore);list.append(row);}
+      if(!(data.items||[]).length){const empty=document.createElement('p');empty.textContent='No backups yet. Run State backup above to create one.';list.append(empty);}
+    }catch(error){setText(list,`Could not load backups: ${error.message}`);}finally{state.backupsBusy=false;}
+  };
   const saveTasks = async () => {
-    const tasks=$$('#tasks-body tr[data-task-id]').map(row=>({id:row.dataset.taskId,enabled:$('.task-enabled',row).checked,interval_seconds:Number($('.task-interval',row).value)}));
+    const tasks=$$('#tasks-body tr[data-task-id]').map(row=>({id:row.dataset.taskId,enabled:$('.task-enabled',row).checked,interval_seconds:Number($('.task-interval',row).value),schedule:$('.task-schedule-mode',row).value==='calendar'?{time_of_day:$('.task-time',row).value,days_of_week:$$('.task-day:checked',row).map(input=>Number(input.value)),utc_offset_minutes:Number($('.task-offset',row).value)}:null}));
     $('#save-task-schedules').disabled=true;
     try{state.tasks=await api('/api/tasks',{method:'PUT',body:JSON.stringify({paused:$('#pause-schedules').checked,tasks})});state.tasksDirty=false;renderTasks();notify('Task schedules saved.','success');}
     catch(error){$('#save-task-schedules').disabled=false;notify(error.message,'error');}
   };
   const runTask = async id => {
+    if(['discovery','ocr','inventory'].includes(id)&&!window.confirm(`${({discovery:'Run Library discovery across all media folders? This scans files and converts missing text subtitles.',ocr:`Run Subtitle OCR across all media folders? Image recognition can take a long time.${state.retryFailedTracks?' Unchanged failed tracks will be retried.':''}`,inventory:'Refresh the entire media inventory? This scans all configured folders and may take time.'})[id]}`))return;
     if(state.taskRequests.has(id))return;state.taskRequests.add(id);renderTasks();
-    try{const body=id==='ocr'?{retry:$('#ocr-retry-failed').checked}:{};const result=await api(`/api/tasks/${encodeURIComponent(id)}/run`,{method:'POST',body:JSON.stringify(body)});if(id==='ocr')$('#ocr-retry-failed').checked=false;notify(result.message||'Task queued.');await pollStatus();await loadTasks();}
+    try{const body=id==='ocr'?{retry:state.retryFailedTracks}:{};const result=await api(`/api/tasks/${encodeURIComponent(id)}/run`,{method:'POST',body:JSON.stringify(body)});if(id==='ocr'){state.retryFailedTracks=false;$('#ocr-retry-failed').checked=false;}notify(result.message||'Task queued.');await pollStatus();await loadTasks();if(id==='backup')await loadBackups();}
     catch(error){notify(error.message,'error');}
     finally{state.taskRequests.delete(id);renderTasks();}
   };
@@ -963,7 +1014,7 @@
       ['Metadata cache budget',`${formatBytes(policy.metadata_cache_max_bytes)} · ${measuredNumber(policy.metadata_cache_max_entries)?.toLocaleString()??'—'} files maximum`]
     ]);
     renderLiveState();
-    setText($('#system-policy'),`Set simultaneous file limits on Overview. CPU image recognition shares the CPU workers, and low memory can reduce how many files run at once. Automatic discovery converts text subtitles; image subtitles follow the OCR schedule.${policy.ocr_permission?'':' Image recognition is currently disabled.'} CPU and memory ceilings come from deployment settings. Recreate the container after changing those ceilings.`);
+    setText($('#system-policy'),`Active file workers counts running files across CPU and GPU slots (${Number(policy.conversion_workers||0)} CPU + ${Number(policy.gpu_workers||0)} GPU). Effective CPU workers counts only CPU slots; CPU OCR shares those slots. Low memory can reduce parallel work. Set simultaneous file limits on Overview. Automatic discovery converts text subtitles; image subtitles follow the OCR schedule.${policy.ocr_permission?'':' Image recognition is currently disabled.'} CPU and memory ceilings come from deployment settings. Recreate the container after changing those ceilings.`);
   };
   const loadSystem = async (quiet=false) => {
     if(!state.csrf||state.systemBusy)return;state.systemBusy=true;
@@ -999,7 +1050,8 @@
     const fromMobileMenu=$('#sidebar').classList.contains('mobile-open');
     const previousPage=document.activeElement.closest('.page');
     const changed=state.currentPage!==page||(page==='settings'&&state.settingsSection!==section);
-    if(changed&&saveController&&!saveController.guardNavigation()){history.replaceState(null,'',routeHash(state.currentPage,state.settingsSection));return;}
+    const leavesSettings=state.currentPage!=='settings'||page!=='settings';
+    if(changed&&leavesSettings&&saveController&&!saveController.guardNavigation()){history.replaceState(null,'',routeHash(state.currentPage,state.settingsSection));return;}
     state.currentPage=page;
     $('#workspace-scroll').classList.toggle('has-table-page',['library','activity'].includes(page));
     if(page==='settings')state.settingsSection=section;
@@ -1017,7 +1069,7 @@
       if(changed&&section==='media')loadRootFolders();
     }
     const administration=page==='settings'&&['tasks','status','media'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);
-    if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else if(section!=='media')loadSystem();}
+    if(administration&&state.csrf&&changed){if(section==='tasks'){loadTasks();loadBackups();}else if(section!=='media')loadSystem();}
     if(page==='overview'&&state.csrf&&changed){loadSystem();loadWorkers();}
     if(page==='library'){renderInventory();if(state.status)void loadInventory(state.status.inventory);}if(page==='activity')renderJobs();scheduleTableFit();
     syncSystemMonitor();
@@ -1037,7 +1089,10 @@
   const bind = () => {
     createSaveController();
     renderLiveState();
-    setInterval(()=>{if(!document.hidden){refreshTimes();renderLiveState();tickSystemUptime();}},1000);
+    setInterval(()=>{if(!document.hidden){refreshTimes();renderLiveState();updateIntegrationDots();tickSystemUptime();}},1000);
+    $('#refresh-backups')?.addEventListener('click',loadBackups);
+    $('#view-operation-log')?.addEventListener('click',()=>{const panel=$('#activity-log-panel'),open=panel.classList.contains('hidden');panel.classList.toggle('hidden',!open);$('.jobs-panel').classList.toggle('hidden',open);$('.activity-filters').classList.toggle('hidden',open);setText($('#view-operation-log'),open?'View jobs':'View operation log');$('#view-operation-log').setAttribute('aria-expanded',String(open));if(open&&panel.classList.contains('is-collapsed'))$('.collapse-toggle',panel)?.click();scheduleTableFit();});
+    for(const input of $$('.switch input'))input.setAttribute('role','switch');
     $$('.nav-link[data-page]').forEach(button=>$('.nav-icon',button)?.replaceChildren(iconSvg(button.dataset.page)));
     $$('button[aria-label]').forEach(button=>{if(!button.title)button.title=button.getAttribute('aria-label');});
     try{const libraries=JSON.parse(sessionStorage.getItem('subforge.jellyfin-libraries')||'[]');if(Array.isArray(libraries))rememberLibraries(libraries);}catch{}
@@ -1128,7 +1183,7 @@
         if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers();
       }
       if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();
-      if(state.currentPage==='settings'&&state.settingsSection==='tasks')await loadTasks();
+      if(state.currentPage==='settings'&&state.settingsSection==='tasks')await Promise.all([loadTasks(),loadBackups()]);
     } catch(error) {setConnection(false);notify(`Service initialization failed: ${error.message}`,'error');}
     dashboardLive.start();syncSystemMonitor();
     document.addEventListener('visibilitychange',()=>syncSystemMonitor());

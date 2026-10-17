@@ -813,11 +813,65 @@ impl Integrations {
             .or_else(|| norm_path(path).map(|_| path.into()))
     }
     fn map(&self, path: &str, provider: &str, remote_to_local: bool) -> Option<String> {
+        Self::map_with_mappings(
+            &self.settings["path_mappings"],
+            path,
+            provider,
+            remote_to_local,
+        )
+    }
+    pub fn test_mapping(&self, provider: &str, body: &Value) -> Result<Value, String> {
+        let input = body.as_object().ok_or("Expected mapping test object")?;
+        if input
+            .keys()
+            .any(|key| !["path", "mappings"].contains(&key.as_str()))
+            || !PROVIDERS.contains(&provider)
+        {
+            return Err("Invalid mapping test".into());
+        }
+        let path = body["path"]
+            .as_str()
+            .filter(|path| path.len() <= 4096 && norm_path(path).is_some())
+            .ok_or("Choose a valid absolute remote path")?;
+        let mappings = body["mappings"]
+            .as_array()
+            .filter(|items| items.len() <= 100)
+            .ok_or("Choose at most 100 mappings")?;
+        for item in mappings {
+            let row = item.as_object().ok_or("Invalid path mapping")?;
+            if row
+                .keys()
+                .any(|key| !["remote", "local", "provider"].contains(&key.as_str()))
+                || ["remote", "local"].iter().any(|key| {
+                    !item[key]
+                        .as_str()
+                        .is_some_and(|path| path.len() <= 4096 && norm_path(path).is_some())
+                })
+                || item.get("provider").is_some_and(|value| {
+                    !value
+                        .as_str()
+                        .is_some_and(|provider| PROVIDERS.contains(&provider))
+                })
+            {
+                return Err(
+                    "Path mappings require valid absolute paths and a known provider".into(),
+                );
+            }
+        }
+        let mapped = Self::map_with_mappings(&body["mappings"], path, provider, true);
+        Ok(json!({"matched":mapped.is_some(),"mapped_path":mapped}))
+    }
+    fn map_with_mappings(
+        mapping_values: &Value,
+        path: &str,
+        provider: &str,
+        remote_to_local: bool,
+    ) -> Option<String> {
         if !PROVIDERS.contains(&provider) {
             return None;
         }
         let p = norm_path(path)?;
-        let mappings = self.settings["path_mappings"].as_array()?;
+        let mappings = mapping_values.as_array()?;
         let mut selected: Option<(usize, String, String)> = None;
         for item in mappings {
             if item
@@ -1826,5 +1880,38 @@ mod tests {
         assert_eq!(cancelled, 0);
         server.join().unwrap();
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn draft_mapping_preview_uses_production_longest_prefix_and_does_not_persist() {
+        let (_dir, path) = temp();
+        let integration = Integrations::new(path.clone()).unwrap();
+        let mappings = json!([{"remote":"Z:\\Media","local":"/movies"},{"remote":"Z:\\Media\\TV","local":"/tv"}]);
+        let preview = integration
+            .test_mapping(
+                "sonarr",
+                &json!({"path":"z:/media/tv/Show/episode.mkv","mappings":mappings}),
+            )
+            .unwrap();
+        assert_eq!(preview["mapped_path"], "/tv/Show/episode.mkv");
+        assert_eq!(preview["matched"], true);
+        assert_eq!(integration.public_settings()["path_mappings"], json!([]));
+        assert_eq!(
+            integration
+                .test_mapping(
+                    "sonarr",
+                    &json!({"path":"Z:/MediaOther/file.mkv","mappings":mappings})
+                )
+                .unwrap()["matched"],
+            false
+        );
+        assert!(
+            integration
+                .test_mapping(
+                    "sonarr",
+                    &json!({"path":"Z:/Media/../private","mappings":mappings})
+                )
+                .is_err()
+        );
+        assert!(!path.exists());
     }
 }

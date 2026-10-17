@@ -503,6 +503,8 @@ pub struct App {
     inventory_sync: Mutex<()>,
     inventory_persist: Mutex<()>,
     pipeline_refresh: Mutex<()>,
+    maintenance: Mutex<()>,
+    restore_pending: AtomicBool,
     public_integrations: Mutex<Value>,
     mounts: Vec<PathBuf>,
     root_display: crate::root_display::RootDisplay,
@@ -697,6 +699,7 @@ impl App {
         }
         fs::create_dir_all(&data)
             .map_err(|_| "State storage must be writable by the process user")?;
+        crate::maintenance::apply_pending_restore(&data)?;
         for mount in &mounts {
             if !mount.is_absolute()
                 || mount.parent().is_none()
@@ -857,6 +860,8 @@ impl App {
             inventory_sync: Mutex::new(()),
             inventory_persist: Mutex::new(()),
             pipeline_refresh: Mutex::new(()),
+            maintenance: Mutex::new(()),
+            restore_pending: AtomicBool::new(false),
             mounts,
             root_display,
             data,
@@ -958,6 +963,37 @@ impl App {
         value["pipeline"] = json!({"failed_files":runtime.pipeline_counts["failed_files"],"scope":"saved_conversion_state"});
         for task in value["tasks"].as_array_mut().into_iter().flatten() {
             task["last_run_source"] = json!("task");
+            if matches!(task["id"].as_str(), Some("health" | "backup" | "cleanup")) {
+                let latest = runtime
+                    .history
+                    .iter()
+                    .filter(|job| job["kind"] == task["id"])
+                    .max_by(|a, b| {
+                        a["finished"]
+                            .as_f64()
+                            .unwrap_or(0.0)
+                            .total_cmp(&b["finished"].as_f64().unwrap_or(0.0))
+                    });
+                if let Some(job) = latest.filter(|job| {
+                    job["finished"].as_f64().unwrap_or(0.0)
+                        >= task["last_run"].as_f64().unwrap_or(0.0)
+                }) {
+                    if let Some(result) = job["error"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| crate::job_activity::result_text(job))
+                    {
+                        task["last_result"] = json!(result);
+                    }
+                } else if task["status"] == "completed"
+                    && task["last_result"]
+                        .as_str()
+                        .is_some_and(|result| result.contains("processed "))
+                {
+                    task["last_result"] =
+                        json!("Completed · details unavailable for this older run");
+                }
+            }
             if task["id"] == "inventory" {
                 task["last_sync"] = json!(runtime.inventory_updated);
                 if runtime.inventory_updated > task["last_run"].as_f64().unwrap_or(0.0) {
@@ -1010,6 +1046,36 @@ impl App {
         let mut value = lock(&self.workers).public(&sample);
         value["remote"] = lock(&self.remote).public();
         value
+    }
+
+    fn restore_backup(&self, id: &str) -> Result<Value, (u16, String)> {
+        let _dispatch = lock(&self.dispatch);
+        let _maintenance = lock(&self.maintenance);
+        // Admission guards run before taking these locks. A concurrent restore
+        // may have staged while this request was waiting; never clear its flag.
+        if self.restore_pending.load(Ordering::Relaxed) {
+            return Err((
+                409,
+                "A restore is already staged; restart Subforge first".into(),
+            ));
+        }
+        let runtime = lock(&self.runtime);
+        if runtime.running.is_some() || !runtime.active_jobs.is_empty() || !runtime.queue.is_empty()
+        {
+            return Err((
+                409,
+                "Wait for all queued and running jobs before restoring a backup".into(),
+            ));
+        }
+        self.restore_pending.store(true, Ordering::Relaxed);
+        drop(runtime);
+        match crate::maintenance::stage_restore(&self.data, id) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.restore_pending.store(false, Ordering::Relaxed);
+                Err((400, error))
+            }
+        }
     }
 
     fn update_workers(&self, data: &Value) -> Result<Value, String> {
@@ -1827,6 +1893,9 @@ impl App {
         Ok(json!({"path":root,"parent":parent,"folders":folders,"truncated":truncated}))
     }
     fn enqueue(&self, data: &Value, origin: &str) -> Result<Option<Value>, String> {
+        if self.restore_pending.load(Ordering::Relaxed) {
+            return Err("A restore is staged; restart Subforge before starting work".into());
+        }
         let kind = data["kind"].as_str().unwrap_or("scan");
         if kind == "ocr" && !self.ocr_permission {
             return Err("OCR is disabled by deployment permissions".into());
@@ -1843,6 +1912,9 @@ impl App {
             return Err("Unknown integration".into());
         }
         let mut runtime = lock(&self.runtime);
+        if self.restore_pending.load(Ordering::Relaxed) {
+            return Err("A restore is staged; restart Subforge before starting work".into());
+        }
         let task_id = if ["schedule", "task_manual"].contains(&origin) {
             data["task_id"].as_str().unwrap_or("")
         } else {
@@ -2937,7 +3009,10 @@ impl App {
         if ["health", "cleanup", "backup"].contains(&job["kind"].as_str().unwrap_or("")) {
             let result = match job["kind"].as_str().unwrap_or("") {
                 "cleanup" => lock(&self.converter).compact_cache()?,
-                "backup" => crate::maintenance::backup(&self.data, &self.cancellation())?,
+                "backup" => {
+                    let _maintenance = lock(&self.maintenance);
+                    crate::maintenance::backup(&self.data, &self.cancellation())?
+                }
                 _ => {
                     let unavailable = self
                         .mounts
@@ -2954,8 +3029,25 @@ impl App {
                 self.root_folders();
             }
             if let Some(running) = lock(&self.runtime).current_job_mut() {
+                let failed = if job["kind"] == "health" {
+                    count(&result["unavailable_mounts"])
+                        + u64::from(result["state_directory_available"] != true)
+                } else {
+                    0
+                };
+                let summary = match job["kind"].as_str() {
+                    Some("backup") => {
+                        json!({"backup_bytes":result["count_bytes"],"backup_files":result["files"].as_array().map_or(0,Vec::len),"retained_backups":result["retained"]})
+                    }
+                    Some("cleanup") => {
+                        json!({"state_entries_removed":result["state_entries_removed"],"metadata_entries_removed":result["metadata_entries_removed"]})
+                    }
+                    _ => {
+                        json!({"mounts_checked":result["configured_mounts"],"unavailable_mounts":result["unavailable_mounts"],"state_directory_available":result["state_directory_available"],"network_checks":0,"failed":failed})
+                    }
+                };
                 running["results"] = json!([result]);
-                running["summary"] = json!({"processed":1});
+                running["summary"] = summary;
                 running["processed"] = json!(1);
                 running["total"] = json!(1);
             }
@@ -3131,6 +3223,7 @@ impl App {
                 let message = finished["error"]
                     .as_str()
                     .map(str::to_owned)
+                    .or_else(|| crate::job_activity::result_text(&finished))
                     .unwrap_or_else(|| {
                         format!(
                             "{}; processed {}, failed {}",
@@ -3782,6 +3875,12 @@ fn guard(app: &App, request: &Request) -> Option<Reply> {
             "Reload the dashboard before making changes",
         ));
     }
+    if request.method != "GET" && app.restore_pending.load(Ordering::Relaxed) {
+        return Some(Reply::error(
+            409,
+            "A restore is staged; restart Subforge before making changes",
+        ));
+    }
     None
 }
 fn handle(app: &App, request: &Request) -> Reply {
@@ -3859,6 +3958,36 @@ fn handle_uncompressed(app: &App, request: &Request) -> Reply {
             "/api/session" => Reply::json(200, json!({"csrf_token":app.csrf})),
             "/api/status" => Reply::json(200, app.status()),
             "/api/tasks" => Reply::json(200, app.tasks()),
+            "/api/backups" => {
+                let _maintenance = lock(&app.maintenance);
+                match crate::maintenance::list(&app.data) {
+                    Ok(mut value) => {
+                        value["restore_pending"] =
+                            json!(app.restore_pending.load(Ordering::Relaxed));
+                        Reply::json(200, value)
+                    }
+                    Err(error) => Reply::error(400, &error),
+                }
+            }
+            target if target.starts_with("/api/backups/") && target.ends_with("/download") => {
+                let parts: Vec<_> = target.split('/').collect();
+                if parts.len() != 5 {
+                    return Reply::error(404, "Not found");
+                }
+                let _maintenance = lock(&app.maintenance);
+                match crate::maintenance::download(&app.data, parts[3]) {
+                    Ok(body) => Reply {
+                        status: 200,
+                        body,
+                        content: "application/gzip",
+                        extra: vec![(
+                            "Content-Disposition",
+                            format!("attachment; filename=\"{}.tar.gz\"", parts[3]),
+                        )],
+                    },
+                    Err(error) => Reply::error(400, &error),
+                }
+            }
             "/api/system" => Reply::json(200, app.system()),
             "/api/workers" => Reply::json(200, app.workers()),
             "/api/nodes" => Reply::json(200, lock(&app.remote).public()),
@@ -3915,6 +4044,18 @@ fn handle_uncompressed(app: &App, request: &Request) -> Reply {
                 .update(&data, now())
                 .map(|value| (200, value)),
             _ => return Reply::error(404, "Not found"),
+        }
+    } else if request.target.starts_with("/api/backups/") && request.target.ends_with("/restore") {
+        let parts: Vec<_> = request.target.split('/').collect();
+        if parts.len() != 5
+            || data.as_object().is_none_or(|body| body.len() != 1)
+            || data["confirm"].as_str() != Some(parts[3])
+        {
+            return Reply::error(400, "Confirm the exact backup ID to restore");
+        }
+        match app.restore_backup(parts[3]) {
+            Ok(value) => Ok((202, value)),
+            Err((status, error)) => return Reply::error(status, &error),
         }
     } else if request.target.starts_with("/api/remote/") {
         lock(&app.remote)
@@ -3977,6 +4118,19 @@ fn handle_uncompressed(app: &App, request: &Request) -> Reply {
             return Reply::error(404, "Not found");
         }
         match parts[4] {
+            "mapping-test" => {
+                let mut preview = match lock(&app.integrations).test_mapping(parts[3], &data) {
+                    Ok(preview) => preview,
+                    Err(error) => return Reply::error(400, &error),
+                };
+                let roots = lock(&app.runtime).roots.clone();
+                preview["accessible"] =
+                    json!(preview["mapped_path"].as_str().is_some_and(|path| {
+                        Converter::safe_path(path, &roots).is_ok()
+                            || validate_root(Path::new(path), &roots, true).is_ok()
+                    }));
+                Ok((200, preview))
+            }
             "test" => Ok((200, lock(&app.integrations).test(parts[3]))),
             "refresh" => app
                 .enqueue(&json!({"kind":"refresh","provider":parts[3]}), "manual")
@@ -5932,6 +6086,50 @@ mod tests {
             system["resource_usage"]["metadata_cache"]["byte_accounting"],
             "serialized_entries"
         );
+    }
+
+    #[test]
+    fn concurrent_restore_admissions_preserve_the_successful_pending_flag() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mount = fixture.path().join("media");
+        fs::create_dir(&mount).unwrap();
+        let app = App::new(
+            vec![mount],
+            fixture.path().join("data"),
+            Duration::from_secs(60),
+            false,
+        )
+        .unwrap();
+        let backup = crate::maintenance::backup(&app.data, &AtomicBool::new(false)).unwrap();
+        let id = backup["id"].as_str().unwrap().to_owned();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let app = Arc::clone(&app);
+                let id = id.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    app.restore_backup(&id)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err((409, _))))
+                .count(),
+            1
+        );
+        assert!(app.restore_pending.load(Ordering::Relaxed));
+        assert!(app.data.join("pending-restore").is_dir());
+        assert!(app.enqueue(&json!({"kind":"health"}), "manual").is_err());
     }
 
     #[test]

@@ -301,6 +301,7 @@ impl Workers {
             json!({"allowed":reason.is_none(),"reason":reason.unwrap_or("Ready for another worker; runtime checks still apply")})
         };
         json!({"edition":crate::edition::NAME,"allocation":self.allocation,"requested":self.allocation,"effective":effective,
+            "metrics":{"active_file_workers":self.active.len(),"total_file_slots":effective.cpu_workers+effective.gpu_workers,"cpu_slots_including_ocr":effective.cpu_workers,"ocr_slots_within_cpu":effective.ocr_workers,"gpu_slots":effective.gpu_workers,"scope":"local_workers","cpu_and_gpu_slots_are_additive":true,"ocr_is_a_subset_of_cpu":true},
             "max_requested":MAX_REQUESTED,
             "admission":{"cpu":admission("cpu"),"cpu_ocr":admission("cpu_ocr"),"gpu":admission("gpu")},
             "configuration_path":"/data/workers.conf",
@@ -564,5 +565,20 @@ mod tests {
         );
         let recovered = sample.with_memory_current(128 * 1024 * 1024);
         assert!(workers.can_start_resource(&recovered, "gpu"));
+    }
+    #[test]
+    fn public_file_capacity_adds_cpu_and_gpu_but_never_double_counts_ocr() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workers = Workers::new(dir.path().join("workers.conf"), true).unwrap();
+        workers.allocation.cpu_workers = 2;
+        workers.allocation.ocr_workers = 1;
+        workers.allocation.gpu_workers = 1;
+        workers.gpu.eligible = true;
+        workers.gpu.max_workers = 1;
+        let public = workers.public(&Snapshot::fixture(8.0, Some(8 * 1024 * 1024 * 1024)));
+        assert_eq!(public["metrics"]["total_file_slots"], 3);
+        assert_eq!(public["metrics"]["cpu_slots_including_ocr"], 2);
+        assert_eq!(public["metrics"]["ocr_slots_within_cpu"], 1);
+        assert_eq!(public["metrics"]["active_file_workers"], 0);
     }
 }

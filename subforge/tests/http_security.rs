@@ -15,6 +15,165 @@ const PASSWORD: &str = "fixture-password-long-enough";
 const WIDGET_TOKEN: &str = "fixture-widget-token-01234567890";
 const WEBHOOK_TOKEN: &str = "fixture-webhook-token-0123456789";
 
+#[test]
+fn managed_backups_enforce_auth_csrf_idle_confirmation_and_restart_boundary() {
+    let mut server = Server::start();
+    let auth = server.auth_header();
+    let csrf = server.csrf();
+    assert_eq!(
+        server
+            .request("GET", "/api/backups", &[], None)
+            .unwrap()
+            .status,
+        401
+    );
+    let made =
+        subforge::maintenance::backup(&server.data, &std::sync::atomic::AtomicBool::new(false))
+            .unwrap();
+    let id = made["id"].as_str().unwrap();
+    let download = format!("/api/backups/{id}/download");
+    let restore = format!("/api/backups/{id}/restore");
+    assert_eq!(
+        server.request("GET", &download, &[], None).unwrap().status,
+        401
+    );
+    assert_eq!(
+        server
+            .request("GET", &download, &[("Authorization", &auth)], None)
+            .unwrap()
+            .status,
+        200
+    );
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                &restore,
+                &[
+                    ("Authorization", &auth),
+                    ("Content-Type", "application/json")
+                ],
+                Some(&json!({"confirm":id}).to_string())
+            )
+            .unwrap()
+            .status,
+        403
+    );
+    assert_eq!(
+        server
+            .json_request("POST", &restore, &csrf, &json!({"confirm":"wrong"}))
+            .status,
+        400
+    );
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                "/api/backups/../download",
+                &[("Authorization", &auth)],
+                None
+            )
+            .unwrap()
+            .status,
+        400
+    );
+    server.json_request(
+        "PUT",
+        "/api/workers",
+        &csrf,
+        &json!({"cpu_workers":1,"ocr_workers":0,"gpu_workers":0,"paused":true}),
+    );
+    let queued = server.json_request("POST", "/api/jobs", &csrf, &json!({"kind":"health"}));
+    assert_eq!(queued.status, 202);
+    assert_eq!(
+        server
+            .json_request("POST", &restore, &csrf, &json!({"confirm":id}))
+            .status,
+        409
+    );
+    let job_id = queued.body["id"]
+        .as_str()
+        .or_else(|| queued.body["job"]["id"].as_str())
+        .unwrap();
+    assert_eq!(
+        server
+            .json_request(
+                "POST",
+                &format!("/api/jobs/{job_id}/cancel"),
+                &csrf,
+                &json!({})
+            )
+            .status,
+        200
+    );
+    let staged = server.json_request("POST", &restore, &csrf, &json!({"confirm":id}));
+    assert_eq!(staged.status, 202);
+    assert_eq!(staged.body["restart_required"], true);
+    assert_eq!(
+        server
+            .json_request("POST", "/api/jobs", &csrf, &json!({"kind":"health"}))
+            .status,
+        409
+    );
+    assert_eq!(
+        server
+            .json_request("PUT", "/api/settings", &csrf, &json!({"languages":["fr"]}))
+            .status,
+        409
+    );
+    server.restart();
+    assert!(!server.data.join("pending-restore").exists());
+    let listed = server
+        .request("GET", "/api/backups", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(listed.status, 200);
+    assert_eq!(listed.body["restore_pending"], false);
+}
+
+#[test]
+fn mapping_preview_checks_drafts_boundaries_permissions_and_does_not_save() {
+    let server = Server::start();
+    let csrf = server.csrf();
+    let local = utf8_path(&server.root);
+    let path = server.root.join("existing.mkv");
+    fs::write(&path, b"fixture").unwrap();
+    let mappings = json!([{"remote":"Z:/Media","local":local}]);
+    let preview = server.json_request(
+        "POST",
+        "/api/integrations/bazarr/mapping-test",
+        &csrf,
+        &json!({"path":"z:/media/existing.mkv","mappings":mappings}),
+    );
+    assert_eq!(preview.status, 200);
+    assert_eq!(preview.body["matched"], true);
+    assert_eq!(preview.body["accessible"], true);
+    let outside=server.json_request("POST","/api/integrations/bazarr/mapping-test",&csrf,&json!({"path":"Z:/Media/existing.mkv","mappings":[{"remote":"Z:/Media","local":utf8_path(server._temp.path())}]}));
+    assert_eq!(outside.body["accessible"], false);
+    assert_eq!(
+        server
+            .json_request(
+                "POST",
+                "/api/integrations/bazarr/mapping-test",
+                &csrf,
+                &json!({"path":"Z:/Media/../private","mappings":mappings})
+            )
+            .status,
+        400
+    );
+    let unmatched = server.json_request(
+        "POST",
+        "/api/integrations/bazarr/mapping-test",
+        &csrf,
+        &json!({"path":"Z:/MediaOther/file","mappings":mappings}),
+    );
+    assert_eq!(unmatched.body["matched"], false);
+    let auth = server.auth_header();
+    let settings = server
+        .request("GET", "/api/settings", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(settings.body["path_mappings"], json!([]));
+}
+
 struct Server {
     _temp: TempDir,
     child: Child,

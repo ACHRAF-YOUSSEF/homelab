@@ -92,15 +92,16 @@ async function main() {
     ];
     const jobs = [
       { id: 'failed-1', kind: 'extract', status: 'completed_with_errors', created: now, finished: now, paths: [items[0].path], summary: { failed: 1 }, file_errors: [{ message: items[0].processing.last_error, count: 1, examples: [items[0].name] }], failed_paths: [items[0].path] },
-      { id: 'executors-1', kind: 'extract', status: 'completed', created: now - 30, finished: now - 30, paths: ['/media/movies/executors-fixture.mkv'], summary: { converted: 6 }, executors: [{ node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu_ocr', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }], executors_truncated: true },
+      { id: 'executors-1', kind: 'extract', status: 'completed', created: now - 45, started:now - 30, finished: now - 20, paths: ['/media/movies/executors-fixture.mkv'], summary: { converted: 6 }, result_text: 'One media item produced six SRT files.', executors: [{ node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu_ocr', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }, { node_name: 'Local', resource: 'cpu', execution: 'local' }, { node_name: 'Studio GPU', resource: 'gpu', execution: 'remote' }], executors_truncated: true },
+      { id: 'episode-1', kind: 'extract', status: 'completed', created: now - 55, started:now - 45, finished: now - 40, paths: ['/media/tv/Example.Show.S01E01.mkv'], summary: { converted: 1 }, result_text: 'One subtitle created.' },
       { id: 'backup-1', kind: 'backup', status: 'completed', created: now - 60, summary: {} }
     ];
     jobs[0].executors=[null,{resource:'unknown',node_name:'Invalid',execution:'remote'},{resource:'cpu',node_name:'',execution:'local'}];
     jobs[0].notifications=[
-      { provider:'sonarr', ok:true, sent_at:now-3600 },
-      { provider:'radarr', ok:false, sent_at:now-7200 },
+      { provider:'sonarr', ok:true, sent_at:now-30 },
+      { provider:'radarr', ok:false, sent_at:now-60 },
       { provider:'jellyfin', ok:true },
-      { provider:'bazarr', ok:true, sent_at:now-14400 },
+      { provider:'bazarr', ok:true, sent_at:now-90 },
     ];
     let inventorySource = 'filesystem', inventoryAuthority = { status: 'ready' }, revision = 1;
     const pipeline = { root_count: roots.length, files_inspected: 2, pending_ocr_files: 37, failed_files: 512, generated_srt_count: 11326, unreachable_roots: 0, inventory_truncated: true };
@@ -112,20 +113,36 @@ async function main() {
     await page.exposeFunction('__inventoryHeld',()=>inventoryHeld);
     await page.exposeFunction('__systemHeld',()=>systemHeld);
     await page.exposeFunction('__abortedSystemReads',()=>abortedSystemReads);
-    let settings = { languages: ['*'], permissions: { ocr: true }, integrations: {} };
-    let disabledIntegration = '';
+    let settings = {
+      languages: ['*'], permissions: { ocr: true },
+      integrations: {
+        sonarr: { enabled: true, url: 'http://sonarr:8989', api_key_set: true },
+        radarr: { enabled: true, url: 'http://radarr:7878', api_key_set: false },
+        jellyfin: { enabled: true, url: 'http://jellyfin:8096', api_key_set: true, movie_libraries: ['movies'], series_libraries: ['tv'], refresh_movies: false, refresh_series: true, refresh_mode: 'immediate' },
+        bazarr: { enabled: false, url: 'http://bazarr:6767', api_key_set: false },
+      },
+      path_mappings: [
+        { provider: 'sonarr', remote: '/remote/tv', local: '/media/tv' },
+        { provider: 'jellyfin', remote: '/jf/movies', local: '/media/movies' },
+      ],
+    };
     let failSettings = false;
     const taskRows = [
-      { id: 'discovery', name: 'Library discovery', description: 'Find media files and subtitle tracks.', enabled: true, interval_seconds: 21600, status: 'idle', last_result: 'Completed', last_run: now - 20700 },
-      { id: 'inventory', name: 'Media inventory', description: 'Refresh the media inventory.', enabled: true, interval_seconds: 86400, status: 'idle', last_result: 'Completed', last_run: now - 20700 },
+      { id: 'discovery', name: 'Library discovery', description: 'Find media files and subtitle tracks.', enabled: true, min_interval_seconds:21600, interval_seconds: 21600, status: 'idle', last_result: 'Completed', last_run: now - 20700 },
+      { id: 'ocr', name: 'Subtitle OCR', description: 'Recognize image subtitles in new or changed media.',enabled:true,min_interval_seconds:21600,interval_seconds:86400,status:'completed',last_result:'Completed · 2 image tracks converted',last_run:now-600 },
+      { id: 'inventory', name: 'Media inventory', description: 'Refresh the media inventory.', enabled: true, min_interval_seconds:21600, interval_seconds: 86400, schedule: { time_of_day: '03:33', days_of_week: [0, 2, 4], utc_offset_minutes: 0 }, status: 'idle', last_result: 'Completed · 0 failed · 6 SRT files from 1 media item', last_run: now - 20700, next_run: now + 60000 },
+      { id:'health',name:'Health check',description:'Check mounted paths and state storage.',enabled:true,min_interval_seconds:3600,interval_seconds:21600,status:'completed',last_result:'4 mounts checked · 0 unavailable · state storage available · no network checks',last_run:now-600 },
+      { id:'cleanup',name:'Cache cleanup',description:'Remove stale cache entries.',enabled:true,min_interval_seconds:86400,interval_seconds:86400,status:'completed',last_result:'Removed 3 state entries and 8 metadata entries',last_run:now-600 },
+      { id:'backup',name:'State backup',description:'Back up application state.',enabled:true,min_interval_seconds:86400,interval_seconds:604800,status:'completed',last_result:'Backup created · 4.2 MB · 4 files',last_run:now-600 },
     ];
     let tasksPaused = false;
     const taskData = () => ({ tasks: taskRows, paused: tasksPaused });
+    const backups = { location: '/fixture/backups', restore_requires_restart: true, items: [{ id: 'fixture-20261017', created_at: now - 3600, count_bytes: 786432, file_count: 4 }] };
     let allocation = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1, paused: false };
     let effectiveWorkers = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1 };
     const remote = { enabled: true, nodes: [{ id: 'node-1', name: 'Studio GPU', resource: 'gpu', last_seen_seconds: 2, active: 1, status: 'busy' }], pending: 0, active: 1 };
     const longGpuAdmissionReason = 'GPU admission is paused because memory headroom is below the configured safety threshold and will retry when the next file starts.';
-    let runningJob = null, activeJobs = [], queuedJobs = [], fileWorkers = [];
+    let runningJob = null, activeJobs = [], queuedJobs = [], fileWorkers = [], disabledIntegration = '';
     const workerData = () => ({ edition: 'cuda', max_requested: 1000000, allocation, requested: allocation, effective: effectiveWorkers, active: { cpu_workers: fileWorkers.filter(worker => worker.resource !== 'gpu').length, ocr_workers: fileWorkers.filter(worker => worker.resource === 'cpu_ocr').length, gpu_workers: fileWorkers.filter(worker => worker.resource === 'gpu').length }, detected: { cpu_allowance_cores: 4, gpu_available: true, gpu_verification: 'verified', gpu_reason: 'CUDA runtime enabled' }, deployment: { max_cpu_workers: 32, max_ocr_workers: 16, max_gpu_workers: 4 }, admission: { gpu: { allowed: false, reason: longGpuAdmissionReason } }, workers: fileWorkers, remote });
     const statusData = includeTasks => ({ edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], settings: { integrations: { sonarr: { enabled: true }, radarr: { enabled: true }, jellyfin: { enabled: true }, bazarr: { enabled: disabledIntegration !== 'bazarr' } } }, inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline, ...(includeTasks ? { tasks: taskData() } : {}) });
     const systemData = () => ({ edition: 'cuda', version: 'fixture', uptime_seconds: 120, resource_usage: { cpu: { effective_cores: 4 }, memory: { cgroup_current_bytes: systemMemory, cgroup_limit_bytes: 1610612736 } }, resources: {}, limits: {} });
@@ -171,6 +188,12 @@ async function main() {
       else if (endpoint === '/api/nodes') value = remote;
       else if (endpoint === '/api/system') value = systemData();
       else if (endpoint === '/api/jobs') value = { message: 'Fixture job queued' };
+      else if (endpoint === '/api/backups' && request.method() === 'GET') value = backups;
+      else if (/^\/api\/backups\/[^/]+\/restore$/.test(endpoint) && request.method() === 'POST') value = { message: 'Fixture restore staged. Restart Subforge to apply it.' };
+      else if (/^\/api\/integrations\/(sonarr|radarr|jellyfin|bazarr)\/mapping-test$/.test(endpoint) && request.method() === 'POST') value = { matched: true, mapped_path: '/media/tv/Example show S01E01.mkv', accessible: true };
+      else if (/^\/api\/integrations\/(sonarr|radarr|jellyfin|bazarr)\/test$/.test(endpoint) && request.method() === 'POST') value = { connected: true, version: 'fixture', libraries: [{ id: 'movies', name: 'Movies', type: 'Movie' }, { id: 'tv', name: 'Television', type: 'Series' }] };
+      else if (/^\/api\/integrations\/(sonarr|radarr|jellyfin|bazarr)\/refresh$/.test(endpoint) && request.method() === 'POST') value = { message: 'Fixture library refresh queued.' };
+      else if (/^\/api\/tasks\/(discovery|ocr|inventory|health|cleanup|backup)\/run$/.test(endpoint) && request.method() === 'POST') value = { message: 'Fixture task queued.' };
       else if (endpoint === '/api/root-folders') value = { roots: roots.map(({ id, label, path, volume_id, volume_label, free_bytes }) => ({ id, label, path, volume_id, volume_label, free_bytes })), mounts: [] };
       else if (endpoint === '/api/tasks') value = taskData();
       else throw new Error(`Unexpected fixture API ${request.method()} ${endpoint}`);
@@ -199,7 +222,7 @@ async function main() {
     assert.match(await page.locator('#header-edition').getAttribute('class'), /edition-chip/);
     for (const [provider, glyph, label] of [['sonarr', '✓', /succeeded/i], ['radarr', '!', /failed/i], ['jellyfin', '?', /not been checked/i], ['bazarr', '✓', /succeeded/i]]) {
       const dot = page.locator(`[data-integration-dot="${provider}"]`);
-      assert.equal(await dot.textContent(), glyph, `${provider} status includes a textual state glyph`);
+      assert.equal(await dot.textContent(), glyph, `${provider} status includes a textual state glyph (state=${await dot.getAttribute('data-state')}; label=${await dot.getAttribute('aria-label')})`);
       assert.equal(await dot.getAttribute('role'), 'img', `${provider} status is exposed as an image role`);
       assert.match(await dot.getAttribute('aria-label'), label, `${provider} status is accessible without color`);
     }
@@ -209,6 +232,12 @@ async function main() {
     assert.equal(await disabledDot.getAttribute('aria-label'), 'Integration disabled', 'disabled integrations have a distinct accessible glyph label');
     disabledIntegration = ''; pushStatus();
     await page.waitForFunction(() => document.querySelector('[data-integration-dot="bazarr"]').textContent === '✓');
+    jobs[0].notifications[0].sent_at = now - 600; pushStatus();
+    await page.waitForFunction(() => document.querySelector('[data-integration-dot="sonarr"]').dataset.state === 'stale');
+    assert.equal(await page.locator('[data-integration-dot="sonarr"]').textContent(), '!', 'old successful integration checks use the stale glyph');
+    assert.match(await page.locator('[data-integration-dot="sonarr"]').getAttribute('aria-label'), /Status is stale; test again/i);
+    jobs[0].notifications[0].sent_at = now - 30; pushStatus();
+    await page.waitForFunction(() => document.querySelector('[data-integration-dot="sonarr"]').dataset.state === 'connected');
     await page.waitForFunction(async () => await window.__liveEventCount('workers') > 0);
     await page.locator('#pipeline-status').getByText(/Inspected/i).waitFor();
     // A pushed status snapshot updates counters without a click or blocking on inventory.
@@ -306,13 +335,14 @@ async function main() {
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.locator('#activity-kind').selectOption('all');
     await page.locator('#activity-status').selectOption('all');
+    await page.locator('#jobs-page-size').selectOption('25');
     await page.locator('#refresh-button').click();
-    const parallelRowA = page.locator('#jobs-list .job-row').filter({ hasText: 'Parallel A.mkv' });
-    const parallelRowB = page.locator('#jobs-list .job-row').filter({ hasText: 'Parallel B.mkv' });
+    const parallelRowA = page.locator('#jobs-list .job-row').filter({ hasText: 'Parallel A' });
+    const parallelRowB = page.locator('#jobs-list .job-row').filter({ hasText: 'Parallel B' });
     await parallelRowA.waitFor(); await parallelRowB.waitFor();
     assert.equal(await parallelRowA.count(), 1, 'running alias does not duplicate active job A in Activity');
     assert.equal(await parallelRowB.count(), 1, 'active job B appears once in Activity');
-    assert.equal(await page.locator('#jobs-list .job-row').count(), 5, 'active jobs, queue, and history are merged without duplicates');
+    assert.equal(await page.locator('#jobs-list .job-row').count(), 6, 'active jobs, queue, and history are merged without duplicates');
     assert.match(await parallelRowA.innerText(), /Elapsed 20s.*~1m 0s remaining/);
     assert.equal(await parallelRowA.locator('progress').getAttribute('value'), '25');
     assert.match(await parallelRowB.innerText(), /Elapsed 1m 30s.*ETA estimating/);
@@ -394,7 +424,7 @@ async function main() {
     assert.equal(await page.locator('#language-count').textContent(), '1 language selected');
     await page.locator('#apply-languages').click();
     assert.match(await page.locator('#quick-languages').textContent(), /English/);
-    assert.equal(await page.locator('#settings-languages').textContent(), 'All languages', 'one-job choice must not edit defaults');
+    assert.equal(await page.locator('#settings-languages').textContent(), 'All tagged languages', 'one-job choice must not edit defaults');
     await page.locator('#quick-root').selectOption('movies');
     await page.locator('#quick-form').getByRole('button', { name: 'Review conversion' }).click();
     assert.equal(writes.length, 0, 'scope review must not start a job');
@@ -429,10 +459,28 @@ async function main() {
     await activityTime.waitFor();
     assert(await activityTime.getAttribute('datetime'), 'job timestamps use machine-readable time elements');
     assert(await activityTime.getAttribute('title'), 'job timestamps expose their absolute time on hover');
+    const activityColumns = await page.locator('.jobs-table thead th').allTextContents();
+    assert.deepEqual(activityColumns.slice(0, 7), ['Job', 'Status', 'Worker', 'Result', 'Started', 'Queue wait', 'Updated'], 'Activity labels its timing and result columns explicitly');
+    const readableJob = page.locator('#jobs-list .job-row').filter({ hasText: 'executors-fixture' });
+    assert.equal(await readableJob.locator('.job-name strong').innerText(), 'Convert selected subtitles', 'Activity uses a canonical job name');
+    assert.equal(await readableJob.locator('.job-name small').innerText(), 'executors-fixture', 'media scope omits the file extension');
+    assert.equal(await readableJob.locator('.job-result-copy').innerText(), 'One media item produced six SRT files.', 'the saved result text takes precedence over generic counters');
+    assert.equal(await readableJob.locator('.job-row-wait').innerText(),'15s','queue wait uses created-to-start time independently of execution duration');
+    assert(await readableJob.locator('.job-row-started time').getAttribute('title'),'Started exposes its absolute timestamp');
+    const episodeJob = page.locator('#jobs-list .job-row').filter({ hasText: 'Example Show · S01E01' });
+    assert.equal(await episodeJob.locator('.job-name small').innerText(), 'Example Show · S01E01', 'episode paths are presented as a readable series and episode');
+    const activityLogTime = page.locator('#live-logs time[data-relative-time]').first();
+    assert(await activityLogTime.getAttribute('datetime') && await activityLogTime.getAttribute('title'), 'Activity log times expose absolute details on hover');
+    if(output) await page.screenshot({path:path.join(output,'activity-results-and-timing.png'),style:'.toast { visibility: hidden; }'});
+    await page.locator('#view-operation-log').click();
+    assert(await page.locator('#activity-log-panel').isVisible(),'Activity opens the operation log directly');
+    assert(await page.locator('.jobs-panel').isHidden(),'log view uses the table area without squeezing job rows');
+    if(output) await page.screenshot({path:path.join(output,'activity-operation-log.png'),style:'.toast { visibility: hidden; }'});
+    await page.locator('#view-operation-log').click();
     assert.doesNotMatch(await page.locator('#jobs-list').innerText(), /State backup/);
     await page.locator('#activity-kind').selectOption('all');
     assert.match(await page.locator('#jobs-list').innerText(), /State backup/);
-    const executorRow=page.locator('#jobs-list .job-row').filter({ hasText: 'executors-fixture.mkv' });
+    const executorRow=page.locator('#jobs-list .job-row').filter({ hasText: 'executors-fixture' });
     assert.equal(await executorRow.count(),1,'persisted activity includes the completed multiworker job');
     await executorRow.locator('[data-view-job]').click();
     const executorCard=page.locator('#job-drawer-content .job-card');
@@ -457,8 +505,8 @@ async function main() {
     assert.deepEqual(await executorCard.locator('.job-executors-more ul li').allTextContents(),['CPU · Local','GPU OCR · Studio GPU (remote)']);
     assert.match(await executorCard.locator('.job-executors').innerText(),/Additional workers not shown/);
     await page.getByRole('button', { name: 'Close job details' }).click();
-    const legacyRow=page.locator('#jobs-list .job-row').filter({ hasText: 'Example movie.mkv' });
-    assert.equal(await legacyRow.locator('.job-row-workers').innerText(),'—','legacy history does not invent executor hardware');
+    const legacyRow=page.locator('#jobs-list .job-row').filter({ hasText: 'Example movie' });
+    assert.equal(await legacyRow.locator('.job-row-workers').innerText(),'Not recorded','legacy history does not invent executor hardware');
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     assert.equal(await page.locator('.settings-tab.active').getAttribute('aria-current'), 'page');
     await page.locator('[data-setting-tab="tasks"]').click();
@@ -482,11 +530,52 @@ async function main() {
     const inventoryTask = page.locator('#tasks-body tr').filter({ hasText: 'Media inventory' });
     assert.equal(await page.locator('#scheduler-state').innerText(), 'Automation on', 'scheduler summary says whether automation runs, independently of per-task settings');
     assert(await inventoryTask.locator('.task-enabled').isChecked(), 'Media inventory defaults to Automatic');
+    assert.equal(await inventoryTask.locator('.task-enabled').getAttribute('role'), 'switch', 'Automatic is announced as a switch');
+    assert.equal(await page.locator('tr[data-task-id="ocr"] #ocr-retry-failed').count(),1,'failed-track retry is scoped to the OCR row');
+    assert.match(await page.locator('tr[data-task-id="backup"] .task-last-result').innerText(),/Backup created · 4.2 MB/);
+    assert.match(await page.locator('tr[data-task-id="cleanup"] .task-last-result').innerText(),/Removed 3 state entries and 8 metadata entries/);
+    assert.match(await page.locator('tr[data-task-id="health"] .task-last-result').innerText(),/4 mounts checked · 0 unavailable/);
+    assert.equal(await inventoryTask.locator('.task-schedule-mode').inputValue(), 'calendar', 'calendar schedules retain their saved mode');
+    assert.equal(await inventoryTask.locator('.task-time').inputValue(), '03:33');
+    assert.deepEqual(await inventoryTask.locator('.task-day:checked').evaluateAll(nodes => nodes.map(node => Number(node.value))), [0, 2, 4]);
+    assert.equal(await inventoryTask.locator('.task-offset').inputValue(), '0', 'calendar schedule carries its fixed UTC offset');
+    assert.match(await inventoryTask.locator('.task-last-result').innerText(), /0 failed.*6 SRT files from 1 media item/, 'task row preserves its per-run failure and output summary');
     assert.doesNotMatch(await inventoryTask.innerText(), /Not run yet/, 'Media inventory has a recorded run when the library inventory has been synced');
     assert.match(await page.locator('#task-failure-scope').innerText(), /512 saved file failures.*Task results below count failures in that run only/i, 'Tasks distinguishes saved global failures from per-run failures');
     const taskTime = page.locator('#tasks-body time[data-relative-time]').first();
     await taskTime.waitFor();
     assert(await taskTime.getAttribute('datetime') && await taskTime.getAttribute('title'), 'task timestamps retain an absolute hover value');
+    await inventoryTask.locator('.task-time').fill('04:15');
+    await inventoryTask.locator('.task-offset').selectOption('60');
+    await inventoryTask.locator('.task-day[value="0"]').uncheck();
+    await inventoryTask.locator('.task-day[value="1"]').check();
+    const scheduleSaveBar = page.locator('.settings-save-bar');
+    assert(await scheduleSaveBar.isVisible(), 'task schedule edits use the shared dirty-state save bar');
+    await scheduleSaveBar.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.getByText('Task schedules saved.', { exact: true }).waitFor();
+    assert.equal(writes.at(-1).endpoint, '/api/tasks', 'shared Save submits task changes to the schedule API');
+    assert.deepEqual(writes.at(-1).body.tasks.find(task => task.id === 'inventory').schedule, { time_of_day: '04:15', days_of_week: [1, 2, 4], utc_offset_minutes: 60 }, 'calendar schedule persists local time, selected weekdays, and fixed UTC offset');
+    await page.locator('#backup-list .backup-row').waitFor();
+    if(output) await page.screenshot({path:path.join(output,'tasks-calendar-and-backups.png'),style:'.toast { visibility: hidden; }'});
+    assert.equal(await page.locator('#backup-location').innerText(), '/fixture/backups');
+    assert.match(await page.locator('.backup-download').getAttribute('href'), /\/api\/backups\/fixture-20261017\/download$/);
+    const restoreButton = page.locator('.backup-restore').first(), writesBeforeRestore = writes.length;
+    let restorePrompt;
+    page.once('dialog', async dialog => { restorePrompt = dialog.message(); await dialog.dismiss(); });
+    await restoreButton.click();
+    assert.match(restorePrompt || '', /next service restart.*Newer settings and conversion history.*Media files are unchanged/i, 'backup restore explains replacement scope and restart timing');
+    assert.equal(writes.length, writesBeforeRestore, 'cancelled backup restore sends no request');
+    page.once('dialog', dialog => dialog.accept());
+    await restoreButton.click();
+    await page.locator('.backup-restore-status').getByText(/Fixture restore staged/).waitFor();
+    assert.equal(writes.at(-1).endpoint, '/api/backups/fixture-20261017/restore');
+    assert.deepEqual(writes.at(-1).body, { confirm: 'fixture-20261017' }, 'restore request repeats the selected backup id as confirmation');
+    const writesBeforeTaskRun = writes.length;
+    let taskPrompt;
+    page.once('dialog', async dialog => { taskPrompt = dialog.message(); await dialog.dismiss(); });
+    await inventoryTask.getByRole('button', { name: 'Run Media inventory' }).click();
+    assert.match(taskPrompt || '', /Refresh the entire media inventory.*may take time/i, 'manual inventory run warns before scanning every configured folder');
+    assert.equal(writes.length, writesBeforeTaskRun, 'cancelled full inventory run sends no task request');
     await page.locator('#task-failure-scope').click();
     await page.waitForFunction(() => location.hash.includes('/library'));
     assert.match(await page.locator('#inventory-scope-note').innerText(), /512 failed files across saved conversion state/, 'saved-failure drill-down reports the global count and its scope');
@@ -500,9 +589,49 @@ async function main() {
         assert(await sentAt.getAttribute('datetime') && await sentAt.getAttribute('title'), 'notification timestamps expose machine-readable and absolute values');
       }
     }
+    await page.locator('[data-setting-tab="sonarr"]').click();
+    const sonarrCard = page.locator('[data-provider="sonarr"]');
+    assert.equal(await sonarrCard.locator('.integration-enabled').getAttribute('role'), 'switch', 'integration enable control is announced as a switch');
+    assert(await sonarrCard.locator('.api-key-saved').isVisible(), 'saved API keys are represented without returning their value');
+    const sonarrKey = sonarrCard.locator('.integration-key');
+    assert(await sonarrKey.isHidden(), 'saved key field stays hidden until replacement is requested');
+    await sonarrCard.locator('.replace-integration-key').click();
+    assert(await sonarrKey.isVisible());
+    assert.equal(await sonarrKey.getAttribute('placeholder'), 'Enter replacement API key');
+    assert.equal(await sonarrKey.inputValue(), '', 'Replace reveals an empty key field instead of exposing the saved secret');
+    const mappingPath = sonarrCard.locator('.mapping-test-path');
+    await mappingPath.fill('/remote/tv/Show/Show.S01E01.mkv');
+    await sonarrCard.locator('.test-path-mapping').click();
+    await sonarrCard.locator('.mapping-test-result').getByText(/Accessible in a configured media folder/).waitFor();
+    assert.match(await sonarrCard.locator('.mapping-test-result').innerText(), /\/media\/tv\/Example show S01E01\.mkv · Accessible/i);
+    assert.equal(writes.at(-1).endpoint, '/api/integrations/sonarr/mapping-test');
+    assert.deepEqual(writes.at(-1).body, { path: '/remote/tv/Show/Show.S01E01.mkv', mappings: [{ remote: '/remote/tv', local: '/media/tv' }] }, 'path test checks the draft server-to-local mapping');
     await page.locator('[data-setting-tab="jellyfin"]').click();
     assert.match(await page.locator('[data-provider="jellyfin"] .integration-last-result').innerText(), /Last notification sent: Succeeded · Time unavailable \(legacy record\)/, 'legacy notification without sent_at is shown without borrowing the job timestamp');
+    const jellyfinCard = page.locator('[data-provider="jellyfin"]');
+    assert(await jellyfinCard.locator('.integration-url').isEditable().then(editable => !editable), 'Jellyfin URL is read-only because deployment owns it');
+    assert(await jellyfinCard.locator('.integration-key').isEditable().then(editable => !editable), 'Jellyfin key is read-only because deployment owns it');
+    assert.equal(await jellyfinCard.locator('.integration-url').getAttribute('aria-readonly'), 'true');
+    assert.equal(await jellyfinCard.locator('.integration-key').getAttribute('aria-readonly'), 'true');
+    assert.equal(await jellyfinCard.locator('.managed-lock:visible').count(), 2, 'managed Jellyfin connection fields show locks');
+    assert.deepEqual(await jellyfinCard.locator('.movie-libraries input:checked').evaluateAll(nodes => nodes.map(node => node.value)), ['movies']);
+    assert.deepEqual(await jellyfinCard.locator('.series-libraries input:checked').evaluateAll(nodes => nodes.map(node => node.value)), ['tv']);
+    const jellyfinRefresh = jellyfinCard.locator('.refresh-integration'), writesBeforeJellyfinRefresh = writes.length;
+    let jellyfinPrompt;
+    page.once('dialog', async dialog => { jellyfinPrompt = dialog.message(); await dialog.dismiss(); });
+    await jellyfinRefresh.click();
+    assert.match(jellyfinPrompt || '', /Refresh all selected Jellyfin libraries.*broad metadata scan.*increase server load/i, 'broad Jellyfin refresh explains its cost before running');
+    assert.equal(writes.length, writesBeforeJellyfinRefresh, 'cancelled broad Jellyfin refresh sends no request');
+    page.once('dialog', dialog => dialog.accept());
+    await jellyfinRefresh.click();
+    await jellyfinCard.locator('.test-result').getByText(/Fixture library refresh queued/).waitFor();
+    assert.equal(writes.at(-1).endpoint, '/api/integrations/jellyfin/refresh');
+    await jellyfinCard.locator('.refresh-movies').check();
+    await jellyfinCard.locator('.refresh-series').uncheck();
+    await jellyfinCard.locator('.refresh-mode').selectOption('async');
     await page.locator('[data-setting-tab="general"]').click();
+    assert.equal(await page.locator('[data-setting-tab="general"]').getAttribute('aria-current'),'page','settings sections can be edited together without discarding unsaved fields');
+    assert.match(await page.locator('#language-policy-hint').innerText(), /Preferences supply the default for scheduled scans and Quick conversion.*Quick selection overrides.*browser session/i, 'language policy explains default and manual precedence');
     await page.locator('[data-open-languages="settings"]').click();
     await page.locator('#language-list input[value="fr"]').check();
     await page.locator('#apply-languages').click();
@@ -519,6 +648,7 @@ async function main() {
     await saveBar.getByRole('button', { name: 'Save', exact: true }).click();
     await page.getByText('Settings saved.', { exact: true }).waitFor();
     assert.deepEqual(writes.at(-1).body.languages, ['fr']);
+    assert.equal(writes.at(-1).body.integrations.jellyfin.refresh_movies,true,'one save includes pending integration and language edits');
     await page.locator('[data-open-languages="settings"]').click();
     await page.locator('#language-list input[value="ar"]').check();
     await page.locator('#apply-languages').click();
@@ -853,7 +983,7 @@ async function main() {
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.locator('#activity-kind').selectOption('all');
     await page.locator('#refresh-button').click();
-    await page.waitForFunction(() => document.querySelector('#jobs-range').textContent.includes('of 25 jobs'));
+    await page.waitForFunction(total => document.querySelector('#jobs-range').textContent.includes('of '+total+' jobs'),jobs.length);
     await page.locator('#jobs-page-size').selectOption('10');
     assert.match(await page.locator('#jobs-range').textContent(), /^1–10 of/);
     assert.equal(await page.locator('#jobs-list .job-row').count(),10);
@@ -895,7 +1025,7 @@ async function main() {
     assert.notEqual(selectStyles.optionBackground, 'rgb(255, 255, 255)', 'select options use the dark palette');
     await page.locator('#jobs-page-size').selectOption('auto');
     await page.locator('#jobs-page-size').selectOption('25');
-    assert.equal(await page.locator('#jobs-list .job-row').count(),25,'manual page size shows all 25 fixture rows');
+    assert.equal(await page.locator('#jobs-list .job-row').count(),25,'manual page size shows 25 fixture rows');
     await page.locator('#jobs-page-size').selectOption('auto');
     await page.setViewportSize({ width: 1440, height: 960 });
     if (output) await page.screenshot({ path: path.join(output, 'activity-table-desktop.png'), style: '.toast { visibility: hidden; }' });

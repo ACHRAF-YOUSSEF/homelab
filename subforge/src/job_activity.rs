@@ -61,12 +61,88 @@ pub(crate) fn heartbeat(
 pub(crate) fn public(job: &Value, at: f64) -> Value {
     let mut result = job.clone();
     result["telemetry"] = telemetry(job, at);
+    result["result_text"] = json!(result_text(job));
     result
+}
+
+pub(crate) fn result_text(job: &Value) -> Option<String> {
+    let empty = Value::Null;
+    let result = job["results"]
+        .as_array()
+        .and_then(|items| items.first())
+        .unwrap_or(&empty);
+    let summary = &job["summary"];
+    let concrete = match job["kind"].as_str() {
+        Some("backup") => result["count_bytes"]
+            .as_u64()
+            .or_else(|| summary["backup_bytes"].as_u64())
+            .map(|bytes| {
+                format!(
+                    "Backup created · {:.1} MB · {} files",
+                    bytes as f64 / 1_048_576.0,
+                    result["files"]
+                        .as_array()
+                        .map(Vec::len)
+                        .map(|count| count as u64)
+                        .or_else(|| summary["backup_files"].as_u64())
+                        .unwrap_or(0)
+                )
+            }),
+        Some("cleanup") => {
+            let source = if result["state_entries_removed"].is_u64() {
+                result
+            } else {
+                summary
+            };
+            source["state_entries_removed"]
+                .as_u64()
+                .zip(source["metadata_entries_removed"].as_u64())
+                .map(|(state, metadata)| {
+                    format!(
+                        "Removed {} state entries and {} metadata entries",
+                        state, metadata
+                    )
+                })
+        }
+        Some("health") => {
+            let checked = result["configured_mounts"]
+                .as_u64()
+                .or_else(|| summary["mounts_checked"].as_u64());
+            let source = if result["unavailable_mounts"].is_u64() {
+                result
+            } else {
+                summary
+            };
+            checked
+                .zip(source["unavailable_mounts"].as_u64())
+                .zip(source["state_directory_available"].as_bool())
+                .map(|((checked, unavailable), available)| {
+                    format!(
+                        "{} mounts checked · {} unavailable · state storage {} · no network checks",
+                        checked,
+                        unavailable,
+                        if available {
+                            "available"
+                        } else {
+                            "unavailable"
+                        }
+                    )
+                })
+        }
+        Some("refresh") => result["message"].as_str().map(str::to_owned),
+        _ => None,
+    };
+    concrete.or_else(|| {
+        (matches!(job["kind"].as_str(), Some("backup" | "cleanup" | "health"))
+            && job["status"] == "completed")
+            .then(|| "Completed · details unavailable for this older run".into())
+    })
 }
 
 // Live widget polling must not clone potentially large per-file result histories.
 fn telemetry(job: &Value, at: f64) -> Value {
     let started = timestamp(&job["started"]);
+    let created = timestamp(&job["created"]);
     let finished = timestamp(&job["finished"]);
     let elapsed = seconds_since(finished.unwrap_or(at), started);
     let heartbeat_at = timestamp(&job["heartbeat_at"]).or(started);
@@ -110,6 +186,7 @@ fn telemetry(job: &Value, at: f64) -> Value {
         None
     };
     json!({
+        "started_at":started,"queue_wait_seconds":seconds_since(started.unwrap_or(at), created),
         "elapsed_seconds":elapsed,"progress_percent":percentage,"eta_seconds":eta,
         "heartbeat_at":heartbeat_at,"heartbeat_age_seconds":heartbeat_age,
         "last_progress_at":last_progress_at,"idle_seconds":idle,
@@ -376,5 +453,42 @@ mod tests {
             job["telemetry"].is_null(),
             "read snapshots must not mutate persisted state"
         );
+    }
+    #[test]
+    fn queue_wait_is_distinct_from_run_time_and_maintenance_results_are_concrete() {
+        let job = json!({"kind":"backup","created":100.0,"started":130.0,"finished":140.0,"status":"completed","results":[{"count_bytes":4_194_304,"files":["state.json","preferences.json"]}]});
+        let snapshot = public(&job, 1000.0);
+        assert_eq!(snapshot["telemetry"]["queue_wait_seconds"], 30);
+        assert_eq!(snapshot["telemetry"]["elapsed_seconds"], 10);
+        assert_eq!(snapshot["telemetry"]["started_at"], 130.0);
+        assert_eq!(snapshot["result_text"], "Backup created · 4.0 MB · 2 files");
+        assert_eq!(
+            public(&json!({"status":"queued","created":100.0}), 145.0)["telemetry"]["queue_wait_seconds"],
+            45
+        );
+        assert!(
+            public(&json!({"status":"queued"}), 145.0)["telemetry"]["queue_wait_seconds"].is_null()
+        );
+    }
+
+    #[test]
+    fn legacy_maintenance_results_use_retained_facts_without_inventing_zero_counts() {
+        let backup = json!({"kind":"backup","status":"completed","summary":{"backup_bytes":1048576,"backup_files":3}});
+        assert_eq!(
+            result_text(&backup).as_deref(),
+            Some("Backup created · 1.0 MB · 3 files")
+        );
+        for kind in ["backup", "cleanup", "health"] {
+            let legacy =
+                json!({"kind":kind,"status":"completed","results":[{}],"summary":{"failed":0}});
+            assert_eq!(
+                result_text(&legacy).as_deref(),
+                Some("Completed · details unavailable for this older run")
+            );
+            assert!(
+                result_text(&json!({"kind":kind,"status":"failed","error":"Could not run"}))
+                    .is_none()
+            );
+        }
     }
 }

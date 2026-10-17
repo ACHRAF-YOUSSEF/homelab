@@ -1,3 +1,4 @@
+use crate::task_schedule::CalendarSchedule;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ const TASKS: [(&str, &str, &str, bool, u64, u64); 6] = [
     ),
     (
         "cleanup",
-        "Cleanup",
+        "Cache cleanup",
         "Remove stale entries from the metadata cache.",
         true,
         86_400,
@@ -48,7 +49,7 @@ const TASKS: [(&str, &str, &str, bool, u64, u64); 6] = [
     ),
     (
         "backup",
-        "Backup",
+        "State backup",
         "Create a local application state backup.",
         true,
         604_800,
@@ -65,6 +66,7 @@ struct Task {
     last_run: Option<f64>,
     last_result: String,
     status: String,
+    schedule: Option<CalendarSchedule>,
 }
 
 pub struct Scheduler {
@@ -96,6 +98,7 @@ impl Scheduler {
                 last_run: None,
                 last_result: String::new(),
                 status: "idle".into(),
+                schedule: None,
             })
             .collect();
         let mut paused = false;
@@ -119,6 +122,17 @@ impl Scheduler {
                         // Upgrade once; subsequent manual opt-outs persist.
                         task.enabled = (id == "inventory" && migrate_inventory_default) || enabled;
                     }
+                    task.schedule = value
+                        .get("schedule")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            serde_json::from_value::<CalendarSchedule>(value.clone())
+                                .map_err(|_| "Invalid saved calendar schedule")
+                        })
+                        .transpose()?;
+                    if let Some(schedule) = &task.schedule {
+                        schedule.validate()?;
+                    }
                     if let Some(interval) = value
                         .get("interval_seconds")
                         .and_then(Value::as_u64)
@@ -126,11 +140,17 @@ impl Scheduler {
                     {
                         task.interval = interval;
                     }
-                    task.next_run = value
+                    task.next_run = match value
                         .get("next_run")
                         .and_then(Value::as_f64)
                         .filter(|v| v.is_finite() && *v >= 0.0)
-                        .unwrap_or(now + task.interval as f64);
+                    {
+                        Some(next) => next,
+                        None => match &task.schedule {
+                            Some(schedule) => schedule.next_after(now)?,
+                            None => now + task.interval as f64,
+                        },
+                    };
                     task.last_run = value
                         .get("last_run")
                         .and_then(Value::as_f64)
@@ -176,7 +196,7 @@ impl Scheduler {
     }
 
     fn state_value(tasks: &[Task], paused: bool) -> Value {
-        json!({"defaults_version":DEFAULTS_VERSION,"paused": paused, "tasks": tasks.iter().map(|t| json!({"id":t.id,"enabled":t.enabled,"interval_seconds":t.interval,"next_run":t.next_run,"last_run":t.last_run,"last_result":t.last_result,"status":t.status})).collect::<Vec<_>>()})
+        json!({"defaults_version":DEFAULTS_VERSION,"paused": paused, "tasks": tasks.iter().map(|t| json!({"id":t.id,"enabled":t.enabled,"interval_seconds":t.interval,"schedule":t.schedule,"next_run":t.next_run,"last_run":t.last_run,"last_result":t.last_result,"status":t.status})).collect::<Vec<_>>()})
     }
 
     fn persist(&self, tasks: &[Task], paused: bool) -> Result<(), String> {
@@ -187,7 +207,7 @@ impl Scheduler {
         json!({"version": env!("CARGO_PKG_VERSION"), "edition": crate::edition::NAME, "paused": self.paused, "tasks": self.tasks.iter().map(|t| {
             let spec = TASKS.iter().find(|s| s.0 == t.id).expect("fixed task");
             let available = t.id != "ocr" || self.ocr_available;
-            let mut item = json!({"id":t.id,"name":spec.1,"description":spec.2,"enabled":t.enabled,"interval_seconds":t.interval,"min_interval_seconds":spec.5,"next_run":t.next_run,"last_run":t.last_run,"last_result":t.last_result,"status":t.status,"available":available});
+            let mut item = json!({"id":t.id,"name":spec.1,"description":spec.2,"enabled":t.enabled,"interval_seconds":t.interval,"schedule":t.schedule,"schedule_timezone":"fixed_utc_offset","min_interval_seconds":spec.5,"next_run":t.next_run,"last_run":t.last_run,"last_result":t.last_result,"status":t.status,"available":available});
             if !available { item["blocked_reason"] = json!("OCR is disabled by deployment permissions"); }
             item
         }).collect::<Vec<_>>()})
@@ -214,10 +234,9 @@ impl Scheduler {
             let mut seen = HashSet::new();
             for patch in patches {
                 let patch = patch.as_object().ok_or("Task update must be an object")?;
-                if patch
-                    .keys()
-                    .any(|k| !["id", "enabled", "interval_seconds"].contains(&k.as_str()))
-                {
+                if patch.keys().any(|k| {
+                    !["id", "enabled", "interval_seconds", "schedule"].contains(&k.as_str())
+                }) {
                     return Err("Unknown task setting".into());
                 }
                 let id = patch
@@ -233,6 +252,17 @@ impl Scheduler {
                     .ok_or("Unknown task id")?;
                 let was_enabled = tasks[index].enabled;
                 let previous_interval = tasks[index].interval;
+                let previous_schedule = tasks[index].schedule.clone();
+                if let Some(value) = patch.get("schedule") {
+                    tasks[index].schedule = if value.is_null() {
+                        None
+                    } else {
+                        let schedule: CalendarSchedule = serde_json::from_value(value.clone())
+                            .map_err(|_| "Invalid calendar schedule")?;
+                        schedule.validate()?;
+                        Some(schedule)
+                    };
+                }
                 if let Some(v) = patch.get("enabled") {
                     tasks[index].enabled = v.as_bool().ok_or("enabled must be a boolean")?;
                 }
@@ -245,9 +275,19 @@ impl Scheduler {
                     tasks[index].interval = interval;
                 }
                 if tasks[index].interval != previous_interval
+                    || tasks[index].schedule != previous_schedule
                     || (!was_enabled && tasks[index].enabled)
                 {
-                    tasks[index].next_run = now + tasks[index].interval as f64;
+                    tasks[index].next_run = match &tasks[index].schedule {
+                        Some(schedule) => schedule.next_after(
+                            tasks[index]
+                                .last_run
+                                .map(|last| last + TASKS[index].5 as f64 - 1.0)
+                                .unwrap_or(now)
+                                .max(now),
+                        )?,
+                        None => now + tasks[index].interval as f64,
+                    };
                 }
             }
         }
@@ -287,7 +327,17 @@ impl Scheduler {
         }
         task.status = "running".into();
         task.last_run = Some(now);
-        task.next_run = now + task.interval as f64;
+        task.next_run = match &task.schedule {
+            Some(schedule) => schedule.next_after(
+                now + TASKS
+                    .iter()
+                    .find(|spec| spec.0 == id)
+                    .expect("fixed task")
+                    .5 as f64
+                    - 1.0,
+            )?,
+            None => now + task.interval as f64,
+        };
         self.persist(&tasks, self.paused)?;
         self.tasks = tasks;
         Ok(())
@@ -395,6 +445,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(scheduler.public()["tasks"][0]["interval_seconds"], 21600);
+    }
+
+    #[test]
+    fn calendar_updates_persist_recompute_and_validate_transactionally() {
+        let (dir, mut scheduler) = scheduler();
+        scheduler.update(&json!({"tasks":[{"id":"inventory","schedule":{"time_of_day":"03:30","days_of_week":[4],"utc_offset_minutes":60}}]}),100.0).unwrap();
+        assert_eq!(scheduler.public()["tasks"][2]["next_run"], 9000.0);
+        let original = std::fs::read(dir.path().join("tasks.json")).unwrap();
+        assert!(scheduler.update(&json!({"tasks":[{"id":"inventory","schedule":{"time_of_day":"24:00","days_of_week":[4],"utc_offset_minutes":60}}]}),100.0).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("tasks.json")).unwrap(),
+            original
+        );
+        let loaded = Scheduler::new(dir.path().join("tasks.json"), 101.0, true).unwrap();
+        assert_eq!(
+            loaded.public()["tasks"][2]["schedule"]["time_of_day"],
+            "03:30"
+        );
+        scheduler.start("inventory", 9000.0).unwrap();
+        assert_eq!(scheduler.public()["tasks"][2]["next_run"], 613800.0);
+        scheduler
+            .update(
+                &json!({"tasks":[{"id":"inventory","schedule":null}]}),
+                10000.0,
+            )
+            .unwrap();
+        assert!(scheduler.public()["tasks"][2]["schedule"].is_null());
     }
 
     #[test]
