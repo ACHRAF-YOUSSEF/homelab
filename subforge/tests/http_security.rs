@@ -3,7 +3,7 @@
 use base64::Engine;
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -23,6 +23,333 @@ struct Server {
     data: PathBuf,
     ffprobe: Option<PathBuf>,
     mkvmerge: Option<PathBuf>,
+}
+
+struct EventStream {
+    reader: BufReader<TcpStream>,
+}
+impl EventStream {
+    fn next(&mut self) -> (String, Value) {
+        let mut event = String::new();
+        let mut data = String::new();
+        loop {
+            let mut line = String::new();
+            let bytes = self
+                .reader
+                .read_line(&mut line)
+                .expect("bounded native SSE read");
+            assert!(bytes > 0, "native SSE connection closed before a frame");
+            assert!(line.len() <= 4 * 1024 * 1024, "bounded native SSE frame");
+            if line == "\n" {
+                if !data.is_empty() {
+                    return (event, serde_json::from_str(&data).expect("native SSE JSON"));
+                }
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("event: ") {
+                event = value.trim().into();
+            }
+            if let Some(value) = line.strip_prefix("data: ") {
+                data.push_str(value.trim_end());
+            }
+        }
+    }
+    fn until(&mut self, name: &str, predicate: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let (event, data) = self.next();
+            if event == name && predicate(&data) {
+                return data;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native SSE {name} mutation did not arrive"
+            );
+        }
+    }
+}
+
+impl Server {
+    fn events(&self, path: &str, authorization: &str) -> (u16, EventStream) {
+        let mut socket = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            socket,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: {authorization}\r\n\r\n",
+            self.port
+        )
+        .unwrap();
+        let mut reader = BufReader::new(socket);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let status = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let mut bytes = line.len();
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            bytes += line.len();
+            assert!(bytes < 16 * 1024);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        (status, EventStream { reader })
+    }
+}
+
+#[test]
+fn native_sse_requires_separate_auth_and_preserves_host_origin_and_method_guards() {
+    let server = Server::start();
+    let basic = server.auth_header();
+    let bearer = format!("Bearer {WIDGET_TOKEN}");
+    for (path, authorization) in [
+        ("/api/events", bearer.as_str()),
+        ("/api/widget/events", basic.as_str()),
+        ("/api/widget/events", "Bearer wrong"),
+    ] {
+        assert_eq!(
+            server
+                .request("GET", path, &[("Authorization", authorization)], None)
+                .unwrap()
+                .status,
+            401
+        );
+    }
+    for (path, authorization) in [
+        ("/api/events", basic.as_str()),
+        ("/api/widget/events", bearer.as_str()),
+    ] {
+        assert_eq!(
+            server
+                .request(
+                    "GET",
+                    path,
+                    &[
+                        ("Authorization", authorization),
+                        ("Origin", "https://elsewhere.invalid")
+                    ],
+                    None
+                )
+                .unwrap()
+                .status,
+            403
+        );
+        assert_eq!(
+            server
+                .request(
+                    "GET",
+                    path,
+                    &[
+                        ("Authorization", authorization),
+                        ("Host", "elsewhere.invalid")
+                    ],
+                    None
+                )
+                .unwrap()
+                .status,
+            403
+        );
+        assert_eq!(
+            server
+                .request(
+                    "GET",
+                    path,
+                    &[
+                        ("Authorization", authorization),
+                        ("Sec-Fetch-Site", "same-site")
+                    ],
+                    None
+                )
+                .unwrap()
+                .status,
+            403
+        );
+        assert_eq!(
+            server
+                .request(
+                    "GET",
+                    path,
+                    &[("Authorization", authorization)],
+                    Some("unexpected")
+                )
+                .unwrap()
+                .status,
+            400
+        );
+    }
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                "/api/widget/events",
+                &[("Authorization", &bearer)],
+                None
+            )
+            .unwrap()
+            .status,
+        401
+    );
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                "/api/events",
+                &[("Authorization", &basic), ("X-CSRF-Token", &server.csrf())],
+                None
+            )
+            .unwrap()
+            .status,
+        405
+    );
+}
+
+#[test]
+fn native_sse_sends_direct_snapshots_and_pushes_settings_and_queue_mutations() {
+    let server = Server::start();
+    let bearer = format!("Bearer {WIDGET_TOKEN}");
+    let (status, mut widget) = server.events("/api/widget/events", &bearer);
+    assert_eq!(status, 200);
+    let (event, initial) = widget.next();
+    assert_eq!(event, "widget");
+    assert_eq!(initial["active_jobs"], json!([]));
+    assert_eq!(initial["active_job_count"], 0);
+    assert!(initial.get("tasks").is_none());
+    for private in [
+        PASSWORD,
+        WIDGET_TOKEN,
+        WEBHOOK_TOKEN,
+        &utf8_path(&server.root),
+    ] {
+        assert!(!initial.to_string().contains(private));
+    }
+    let (status, mut dashboard) = server.events("/api/events", &server.auth_header());
+    assert_eq!(status, 200);
+    let (event, initial_status) = dashboard.next();
+    assert_eq!(event, "status");
+    assert!(initial_status["tasks"]["tasks"].is_array());
+    assert_eq!(dashboard.next().0, "system");
+    assert_eq!(dashboard.next().0, "workers");
+    let csrf = server.csrf();
+    let changed = server.json_request("PUT", "/api/settings", &csrf, &json!({"languages":["fr"]}));
+    assert_eq!(changed.status, 200);
+    let started = Instant::now();
+    widget.until("widget", |data| {
+        data["selected_languages"] == changed.body["languages"]
+    });
+    dashboard.until("status", |data| {
+        data["settings"]["languages"] == changed.body["languages"]
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "changes must be event driven"
+    );
+    let paused = server.json_request(
+        "PUT",
+        "/api/workers",
+        &csrf,
+        &json!({"cpu_workers":1,"ocr_workers":0,"gpu_workers":0,"paused":true}),
+    );
+    assert_eq!(paused.status, 200);
+    let queued = server.json_request("POST", "/api/jobs", &csrf, &json!({"kind":"health"}));
+    assert_eq!(queued.status, 202);
+    widget.until("widget", |data| data["queued_count"] == 1);
+    let status = dashboard.until("status", |data| {
+        data["queue"].as_array().is_some_and(|jobs| jobs.len() == 1)
+    });
+    for secret in [PASSWORD, WIDGET_TOKEN, WEBHOOK_TOKEN] {
+        assert!(!status.to_string().contains(secret));
+    }
+    let metrics = dashboard.until("workers", |data| data["allocation"]["paused"] == true);
+    assert_eq!(metrics["allocation"]["paused"], true);
+}
+
+#[test]
+fn native_sse_slots_are_bounded_without_consuming_normal_http_workers_and_disconnect_releases_capacity()
+ {
+    let server = Server::start();
+    let bearer = format!("Bearer {WIDGET_TOKEN}");
+    let mut streams = Vec::new();
+    for _ in 0..4 {
+        let (status, mut stream) = server.events("/api/widget/events", &bearer);
+        assert_eq!(status, 200);
+        assert_eq!(stream.next().0, "widget");
+        streams.push(stream);
+    }
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                "/api/events",
+                &[("Authorization", &server.auth_header())],
+                None
+            )
+            .unwrap()
+            .status,
+        503
+    );
+    assert_eq!(
+        server.request("GET", "/health", &[], None).unwrap().status,
+        200
+    );
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                "/api/status",
+                &[("Authorization", &server.auth_header())],
+                None
+            )
+            .unwrap()
+            .status,
+        200
+    );
+    drop(streams.pop());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (status, mut replacement) = server.events("/api/widget/events", &bearer);
+        if status == 200 {
+            assert_eq!(replacement.next().0, "widget");
+            break;
+        }
+        assert_eq!(status, 503);
+        assert!(
+            Instant::now() < deadline,
+            "disconnected stream did not release its slot"
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn native_sse_idle_widget_sends_a_heartbeat_snapshot_without_dashboard_metrics() {
+    let server = Server::start();
+    let bearer = format!("Bearer {WIDGET_TOKEN}");
+    let (status, mut widget) = server.events("/api/widget/events", &bearer);
+    assert_eq!(status, 200);
+    let (event, initial) = widget.next();
+    assert_eq!(event, "widget");
+    widget
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let started = Instant::now();
+    let (event, heartbeat) = widget.next();
+    assert_eq!(
+        event, "widget",
+        "widget auth must never expose dashboard metrics"
+    );
+    assert_eq!(heartbeat, initial);
+    assert!(
+        started.elapsed() >= Duration::from_secs(14),
+        "pure idle reads must not trigger revision feedback"
+    );
+    assert!(started.elapsed() < Duration::from_secs(18));
 }
 
 impl Drop for Server {

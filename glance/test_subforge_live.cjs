@@ -78,9 +78,13 @@ function fixture() {
   const originalEventSource = global.EventSource;
   const originalSetInterval = global.setInterval;
   const originalClearInterval = global.clearInterval;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
   const originalPerformance = global.performance;
   const streams = [];
   const cleared = [];
+  const retries = new Map();
+  let nextRetry = 1;
   let now = 1000;
   class FakeEventSource {
     constructor(url) { this.url = url; this.listeners = {}; this.closeCount = 0; streams.push(this); }
@@ -91,12 +95,14 @@ function fixture() {
   global.EventSource = FakeEventSource;
   global.setInterval = () => streams.length;
   global.clearInterval = id => cleared.push(id);
+  global.setTimeout = (callback, delay) => { const id = nextRetry++; retries.set(id, { callback, delay }); return id; };
+  global.clearTimeout = id => retries.delete(id);
   global.performance = { now: () => now };
   const mounted = client.mount(content, 'https://glance.example.test/gateway');
   const byId = id => content.querySelectorAll('article').find(row => row.dataset.jobId === id);
   const allText = node => [node.textContent, ...node.children.map(allText)].filter(Boolean).join(' ');
   return {
-    doc, host, content, mounted, streams, cleared,
+    doc, host, content, mounted, streams, cleared, retries,
     setNow(value) { now = value; },
     byId,
     rows: () => content.querySelectorAll('article'),
@@ -106,6 +112,8 @@ function fixture() {
       global.EventSource = originalEventSource;
       global.setInterval = originalSetInterval;
       global.clearInterval = originalClearInterval;
+      global.setTimeout = originalSetTimeout;
+      global.clearTimeout = originalClearTimeout;
       global.performance = originalPerformance;
     },
   };
@@ -122,6 +130,39 @@ const data = (jobs = []) => ({
 });
 const snapshot = (jobs = [], options = {}) => ({ status: 'ok', data: data(jobs), updatedAt: '2026-10-17T10:00:00Z', ...options });
 const send = (page, message) => page.streams.at(-1).emit('subforge', message);
+
+test('terminal stream errors retry with bounded backoff and lifecycle cleanup', t => {
+  const page = fixture();
+  t.after(() => page.restore());
+  const first = page.streams[0];
+  first.readyState = 0;
+  first.onerror();
+  assert.equal(page.retries.size, 0, 'ordinary native reconnect stays in charge');
+  for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000]) {
+    const current = page.streams.at(-1);
+    current.readyState = 2;
+    current.onerror();
+    assert.equal(page.retries.size, 1);
+    const [id, retry] = [...page.retries][0];
+    assert.equal(retry.delay, delay);
+    page.retries.delete(id);
+    retry.callback();
+  }
+  send(page, snapshot([job('live-job')]));
+  first.emit('subforge', snapshot([]));
+  assert.equal(page.rows().length, 1, 'closed stream cannot overwrite current jobs');
+  page.streams.at(-1).readyState = 2;
+  page.streams.at(-1).onerror();
+  assert.equal([...page.retries.values()][0].delay, 1000, 'healthy data resets backoff');
+  page.host.listeners.pagehide();
+  assert.equal(page.retries.size, 0);
+  const count = page.streams.length;
+  page.doc.listeners.visibilitychange();
+  assert.equal(page.streams.length, count, 'pagehide prevents premature reopen');
+  page.host.listeners.pageshow();
+  assert.equal(page.streams.length, count + 1);
+  page.mounted.close();
+});
 
 test('jobs keep independent progress and timing labels, keyed by stable IDs', t => {
   const page = fixture();
@@ -182,11 +223,11 @@ test('timing interpolates from the snapshot for at most 15 seconds and then free
   page.mounted.tick();
   assert.equal(row.children[3].textContent, frozen);
   assert.equal(page.status().textContent, 'Live');
-  page.setNow(61000);
+  page.setNow(31000);
   page.mounted.tick();
   assert.equal(page.status().textContent, 'Live');
   assert.equal(row.children[3].textContent, frozen);
-  page.setNow(81001);
+  page.setNow(41001);
   page.mounted.tick();
   assert.match(page.status().textContent, /Updates delayed/);
 });

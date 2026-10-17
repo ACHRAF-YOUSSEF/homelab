@@ -79,9 +79,9 @@ if [ ! -f .env ]; then cp .env.example .env; fi
 | Template group | Configure |
 | --- | --- |
 | Host and browser service addresses | `TZ`, `HOMELAB_URL`, and `*_PUBLIC_URL` browser destinations, which may use local or reverse-proxy routes and do not publish services |
-| LAN binding and live refresh | `GLANCE_BIND_ADDRESS` defaults to `127.0.0.1`; set the Docker host's LAN interface address privately for LAN clients. Compose adds that address to the gateway host allowlist. If browsers use a LAN DNS name, add it to comma-separated `GLANCE_LIVE_ALLOWED_HOSTS`. `GLANCE_LIVE_QBITTORRENT_INTERVAL` defaults to 2 seconds; `GLANCE_LIVE_JELLYFIN_INTERVAL` to 5 seconds; `GLANCE_LIVE_SUBFORGE_INTERVAL` to 2 seconds. `GLANCE_LIVE_JELLYFIN_WS` enables Jellyfin WebSocket events with REST reconciliation/fallback. These polling intervals apply while a matching page is open and visible. |
-| Private credentials | `JELLYFIN_API_KEY`, optional `QBITTORRENT_USERNAME` plus `QBITTORRENT_PASSWORD`, `SONARR_API_KEY`, `RADARR_API_KEY`, `SEERR_API_KEY`, and `CONVERTER_WIDGET_TOKEN` for server-side requests |
-| Subforge widget | `CONVERTER_WIDGET_TOKEN`, a dedicated random bearer token shared with Subforge; blank disables the read-only widget endpoint |
+| LAN binding and live refresh | `GLANCE_BIND_ADDRESS` defaults to `127.0.0.1`; set the Docker host's LAN interface address privately for LAN clients. Compose adds that address to the gateway host allowlist. If browsers use a LAN DNS name, add it to comma-separated `GLANCE_LIVE_ALLOWED_HOSTS`. `GLANCE_LIVE_QBITTORRENT_INTERVAL` defaults to 2 seconds; `GLANCE_LIVE_JELLYFIN_INTERVAL` to 5 seconds. `GLANCE_LIVE_JELLYFIN_WS` enables Jellyfin WebSocket events with REST reconciliation/fallback. These polling intervals apply while a matching page is open and visible. Subforge updates use native server-sent events and have no gateway polling interval. |
+| Private credentials | `JELLYFIN_API_KEY`, optional `QBITTORRENT_USERNAME` plus `QBITTORRENT_PASSWORD`, `SONARR_API_KEY`, `RADARR_API_KEY`, and `SEERR_API_KEY` for server-side requests |
+| Subforge widget | `CONVERTER_WIDGET_TOKEN`, a dedicated random bearer token used by Subforge and the `glance-live` gateway; blank disables the read-only widget stream |
 | Docker API proxies | `GLANCE_DOCKER_HOST` for the internal read-only Docker proxy |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values for checks and the counts helper |
 | Glance appearance | `GLANCE_APP_NAME`, `GLANCE_LOGO_TEXT`, and `GLANCE_WEATHER_LOCATION` |
@@ -156,28 +156,27 @@ The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
 | [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Same-origin `/live/calendar` gateway route backed by Sonarr and Radarr `/api/v3/calendar`; renders day, Monday-first week, month, or year views | Browser refresh every `30s` while visible |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
-| [Subforge](config/widgets/subforge.yml) | Same-origin SSE topic backed by Subforge `/api/widget`; processed-file totals and up to 32 concurrent job summaries with progress, elapsed time, approximate ETA, liveness, and generic wait status | `15s` initial Glance fallback; live REST polling every `2s` by default while subscribed |
+| [Subforge](config/widgets/subforge.yml) | JavaScript-rendered, same-origin SSE topic backed by Subforge's authenticated `/api/widget/events`; processed-file totals and up to 32 concurrent job summaries with progress, elapsed time, approximate ETA, liveness, and generic wait status | Native SSE while the Media page is visible; no browser REST fallback |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
 
 The Subforge widget is optional. The `subforge` service starts with
-the regular Compose stack after its selected local image has been built. The
-token only enables the widget endpoint. Set a private random
-`CONVERTER_WIDGET_TOKEN` of 32–256 characters in the ignored root `.env`; the
-same variable is supplied to Glance and
-Subforge. It is separate from dashboard, webhook, and media-server credentials.
-The widget endpoint returns only aggregate status and does not expose media
-paths or credentials, and it does not accept actions. It includes
+the regular Compose stack after its selected local image has been built. Set a
+private random `CONVERTER_WIDGET_TOKEN` of 32–256 characters in the ignored root
+`.env`; Compose supplies it only to the `glance-live` gateway and Subforge. It
+is separate from dashboard, webhook, and media-server credentials. The widget
+stream returns only aggregate status and does not expose media paths or
+credentials, and it does not accept actions. It includes
 `active_jobs` (up to 32, oldest first) and `active_job_count`, while retaining
 `current_run` for compatibility with older clients. Glance uses the active job
 list to show concurrent work and displays safe job IDs, phase/status, file
 progress when available, elapsed time, nullable ETA, liveness, and a generic
-wait reason. Glance caches the initial server-rendered fallback for 15 seconds;
-the same-origin SSE view replaces it after receiving data. The estimate
+wait reason. The HTML shell requires JavaScript and EventSource; it has no REST
+fallback or initial server-rendered widget data. The estimate
 uses completed-file throughput and has the same limits as Subforge's dashboard:
 a single-file job has no ETA until the file completes, and quiet OCR may look
 possibly stalled while it is working. These states are diagnostic; they do not
-fail jobs automatically. The fallback remains visible until live data arrives. Elapsed
-time and known ETA are interpolated for at most 15 seconds after a snapshot;
+fail jobs automatically. Elapsed time and known ETA are interpolated for at
+most 15 seconds after a snapshot;
 the displayed ETA remains approximate.
 Its link uses `SUBFORGE_PUBLIC_URL` (default
 `http://localhost:8100`); its server-side request uses
@@ -250,10 +249,12 @@ Media-page connection at `/live/events?page=media&topic=subforge`; thus a Media
 page with both widgets uses two streams. The gateway sends an initial snapshot,
 then updates; EventSource reconnects after a disconnect. Only one collector per
 topic runs while at least one browser subscribes, and it stops when the last
-client leaves. Subforge polls its read-only `/api/widget` endpoint every
-`GLANCE_LIVE_SUBFORGE_INTERVAL` seconds (default `2`, accepted range `0.5`–`60`)
-only while subscribed. The stream sends keepalives and closes after its
-configured maximum connection lifetime so browsers reconnect periodically.
+client leaves. For Subforge, the gateway opens one authenticated upstream
+`/api/widget/events` SSE connection per subscribed topic; Subforge sends an
+initial snapshot, coalesced updates after changes, and 15-second heartbeats.
+The stream closes after its 15-minute maximum lifetime so browsers reconnect
+periodically. The gateway bounds upstream records and normalized snapshots,
+does not follow redirects, and backs off from 500 ms to 30 seconds on errors.
 Hidden tabs close the live stream; returning to the page reconnects and receives
 a fresh snapshot.
 Upstream failures retain the last successful Subforge snapshot and mark it

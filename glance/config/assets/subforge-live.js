@@ -31,7 +31,7 @@
       return element;
     };
     const publicLink = content.querySelector("[data-subforge-link]")?.getAttribute("href");
-    let stream, ticker, ui, healthy = false, receivedAt = 0;
+    let stream, ticker, retry, ui, suspended = false, healthy = false, receivedAt = 0, retryDelay = 1000;
     const rows = new Map();
     const status = node("p", "glance-live-status color-subdue size-h6", "Connecting to live updates…");
     status.setAttribute("role", "status");
@@ -139,7 +139,10 @@
           receivedAt = performance.now();
         }
         healthy = snapshot.status === "ok";
-        setStatus(healthy ? "Live" : ui ? "Updates unavailable · showing last data" : "Waiting for Subforge…", !healthy && !!ui);
+        if (healthy) retryDelay = 1000;
+        setStatus(healthy ? "Live" : snapshot.status === "stale"
+          ? ui ? "Updates unavailable · showing last data" : "Subforge updates unavailable. Check the gateway and widget token."
+          : "Waiting for Subforge…", snapshot.status === "stale");
         status.title = snapshot.updatedAt ? `Updated ${new Date(snapshot.updatedAt).toLocaleTimeString()}` : "";
       } catch {
         healthy = false;
@@ -149,8 +152,8 @@
     function tick() {
       if (!healthy || doc.hidden) return;
       const age = Math.max(0, performance.now() - receivedAt);
-      // Polling is configurable up to 60s; allow its 15s request timeout plus margin.
-      if (age > 80000) { healthy = false; setStatus("Updates delayed · showing last data", true); return; }
+      // Native Subforge SSE emits state heartbeats every 15s; allow the upstream idle bound.
+      if (age > 40000) { healthy = false; setStatus("Updates delayed · showing last data", true); return; }
       if (age > 15000) return;
       for (const row of rows.values()) timing(row, Math.floor(age / 1000));
     }
@@ -159,22 +162,34 @@
       stream = undefined;
       healthy = false;
       clearInterval(ticker);
+      clearTimeout(retry);
     }
     function connect() {
-      if (doc.hidden || stream || !content.isConnected) return;
+      if (doc.hidden || suspended || stream || !content.isConnected) return;
       if (typeof EventSource === "undefined") { setStatus("Live updates require EventSource", true); return; }
       const base = String(baseURL || "").replace(/\/$/, "");
-      stream = new EventSource(`${base}/live/events?page=media&topic=subforge`);
-      stream.addEventListener("subforge", receive);
-      stream.onerror = () => { healthy = false; setStatus(ui ? "Reconnecting… · showing last data" : "Reconnecting…", true); };
+      const current = new EventSource(`${base}/live/events?page=media&topic=subforge`);
+      stream = current;
+      current.addEventListener("subforge", event => { if (stream === current) receive(event); });
+      current.onerror = () => {
+        if (stream !== current) return;
+        healthy = false;
+        setStatus(ui ? "Reconnecting… · showing last data" : "Reconnecting…", true);
+        // Native reconnect handles dropped connections; HTTP rejection can close it permanently.
+        if (current.readyState === 2) {
+          close();
+          retry = setTimeout(connect, retryDelay);
+          retryDelay = Math.min(30000, retryDelay * 2);
+        }
+      };
       ticker = setInterval(tick, 1000);
     }
     doc.addEventListener("visibilitychange", () => {
       if (doc.hidden) { close(); setStatus("Updates paused"); }
       else connect();
     });
-    host?.addEventListener("pagehide", close);
-    host?.addEventListener("pageshow", connect);
+    host?.addEventListener("pagehide", () => { suspended = true; close(); });
+    host?.addEventListener("pageshow", () => { suspended = false; connect(); });
     connect();
     return { receive, tick, connect, close };
   }

@@ -12,15 +12,26 @@ async function main() {
   const web = path.resolve(__dirname, '../web');
   const output = process.env.SUBFORGE_UI_OUTPUT && path.resolve(process.env.SUBFORGE_UI_OUTPUT);
   if (output) await fs.mkdir(output, { recursive: true });
+  const eventClients = new Set();
+  let publishSnapshot = () => {};
   const server = http.createServer(async (req, res) => {
-    const asset = { '/': 'index.html', '/static/app.js': 'app.js', '/static/style.css': 'style.css', '/static/icon.svg': 'icon.svg' }[req.url];
+    const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
+    if (pathname === '/api/events' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.flushHeaders();
+      eventClients.add(res);
+      res.on('close', () => eventClients.delete(res));
+      publishSnapshot(res);
+      return;
+    }
+    const asset = { '/': 'index.html', '/static/live.js': 'live.js', '/static/app.js': 'app.js', '/static/style.css': 'style.css', '/static/icon.svg': 'icon.svg' }[pathname];
     if (!asset) { res.writeHead(404); res.end(); return; }
     const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' }[path.extname(asset)];
     res.writeHead(200, { 'Content-Type': mime });
     res.end(await fs.readFile(path.join(web, asset)));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  let browser;
+  let browser, metricsTimer, statusHeartbeatTimer;
   try {
     browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
@@ -59,8 +70,12 @@ async function main() {
     };
     const errors = [], writes = [];
     let workerReads = 0;
+    const snapshotReads = { status: 0, system: 0, workers: 0 };
+    const liveEventCounts = { status: 0, system: 0, workers: 0 };
     await page.exposeFunction('__workerReads', () => workerReads);
-    page.on('pageerror', error => errors.push(error.message));
+    await page.exposeFunction('__snapshotReads', () => ({ ...snapshotReads }));
+    await page.exposeFunction('__liveEventCount', type => liveEventCounts[type] || 0);
+    page.on('pageerror', error => errors.push(error.stack || error.message));
     const now = Math.floor(Date.now() / 1000);
     const roots = [{ id: 'movies', label: 'Movies', path: '/media/movies' }, { id: 'tv', label: 'Television', path: '/media/tv' }];
     let items = [
@@ -85,14 +100,37 @@ async function main() {
     await page.exposeFunction('__abortedSystemReads',()=>abortedSystemReads);
     let settings = { languages: ['*'], permissions: { ocr: true }, integrations: {} };
     let allocation = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1, paused: false };
+    let effectiveWorkers = { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1 };
     const remote = { enabled: true, nodes: [{ id: 'node-1', name: 'Studio GPU', resource: 'gpu', last_seen_seconds: 2, active: 1, status: 'busy' }], pending: 0, active: 1 };
     const longGpuAdmissionReason = 'GPU admission is paused because memory headroom is below the configured safety threshold and will retry when the next file starts.';
     let runningJob = null, activeJobs = [], queuedJobs = [], fileWorkers = [];
-    const workerData = () => ({ edition: 'cuda', max_requested: 1000000, allocation, requested: allocation, effective: { cpu_workers: 4, ocr_workers: 1, gpu_workers: 1 }, active: { cpu_workers: fileWorkers.filter(worker => worker.resource !== 'gpu').length, ocr_workers: fileWorkers.filter(worker => worker.resource === 'cpu_ocr').length, gpu_workers: fileWorkers.filter(worker => worker.resource === 'gpu').length }, detected: { cpu_allowance_cores: 4, gpu_available: true, gpu_verification: 'verified', gpu_reason: 'CUDA runtime enabled' }, deployment: { max_cpu_workers: 32, max_ocr_workers: 16, max_gpu_workers: 4 }, admission: { gpu: { allowed: false, reason: longGpuAdmissionReason } }, workers: fileWorkers, remote });
+    const workerData = () => ({ edition: 'cuda', max_requested: 1000000, allocation, requested: allocation, effective: effectiveWorkers, active: { cpu_workers: fileWorkers.filter(worker => worker.resource !== 'gpu').length, ocr_workers: fileWorkers.filter(worker => worker.resource === 'cpu_ocr').length, gpu_workers: fileWorkers.filter(worker => worker.resource === 'gpu').length }, detected: { cpu_allowance_cores: 4, gpu_available: true, gpu_verification: 'verified', gpu_reason: 'CUDA runtime enabled' }, deployment: { max_cpu_workers: 32, max_ocr_workers: 16, max_gpu_workers: 4 }, admission: { gpu: { allowed: false, reason: longGpuAdmissionReason } }, workers: fileWorkers, remote });
+    const statusData = includeTasks => ({ edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline, ...(includeTasks ? { tasks: { tasks: [], paused: false } } : {}) });
+    const systemData = () => ({ edition: 'cuda', version: 'fixture', uptime_seconds: 120, resource_usage: { cpu: { effective_cores: 4 }, memory: { cgroup_current_bytes: systemMemory, cgroup_limit_bytes: 1610612736 } }, resources: {}, limits: {} });
+    const writeEvent = (client, type, value) => {
+      if (client.destroyed || !client.writable) return;
+      client.write(`event: ${type}\ndata: ${JSON.stringify(value)}\n\n`);
+      liveEventCounts[type]++;
+    };
+    const publishEvent = (type, value) => { for (const client of eventClients) writeEvent(client, type, value); };
+    publishSnapshot = client => {
+      writeEvent(client, 'status', statusData(true));
+      writeEvent(client, 'system', systemData());
+      writeEvent(client, 'workers', workerData());
+    };
+    metricsTimer = setInterval(() => {
+      if (!holdSystem) publishEvent('system', systemData());
+      if (!failWorkers) publishEvent('workers', workerData());
+    }, 3000);
+    statusHeartbeatTimer = setInterval(() => publishEvent('status', statusData(true)), 15000);
+    const pushStatus = () => publishEvent('status', statusData(true));
     await page.route('**/api/**', async route => {
       const request = route.request(), endpoint = new URL(request.url()).pathname;
+      if (request.method() === 'GET' && endpoint === '/api/events') { await route.continue(); return; }
       let value;
-      if(request.method()==='GET'&&endpoint==='/api/workers')workerReads++;
+      if(request.method()==='GET'&&endpoint==='/api/workers') { workerReads++; snapshotReads.workers++; }
+      if(request.method()==='GET'&&endpoint==='/api/status')snapshotReads.status++;
+      if(request.method()==='GET'&&endpoint==='/api/system')snapshotReads.system++;
       if(endpoint==='/api/inventory'&&holdInventory){inventoryHeld=true;await new Promise(resolve=>{releaseInventory=resolve;});}
       if(endpoint==='/api/system'&&holdSystem){systemHeld=true;await new Promise(resolve=>{releaseSystem=resolve;});}
       if(endpoint==='/api/workers'&&failWorkers){await route.fulfill({status:503,contentType:'application/json',body:'{"error":"Fixture unavailable"}'});return;}
@@ -102,12 +140,12 @@ async function main() {
         if (endpoint === '/api/settings') settings = { ...settings, ...body };
       }
       if (endpoint === '/api/session') value = { csrf_token: 'disposable-ui-fixture' };
-      else if (endpoint === '/api/status') value = { edition: 'cuda', version: 'fixture', roots, running: runningJob, active_jobs: activeJobs, queue: queuedJobs, history: jobs, logs: [{ time: now, level: 'INFO', message: 'Fixture operation completed' }], inventory: { updated: now, state_revision: revision, partial: true, source: inventorySource, authority: inventoryAuthority }, pipeline };
+      else if (endpoint === '/api/status') value = statusData(false);
       else if (endpoint === '/api/inventory') value = { items, updated: now, state_revision: revision, truncated: inventorySource !== 'bazarr', source: inventorySource, authority: inventoryAuthority };
       else if (endpoint === '/api/settings') value = settings;
       else if (endpoint === '/api/workers') value = workerData();
       else if (endpoint === '/api/nodes') value = remote;
-      else if (endpoint === '/api/system') value = { edition: 'cuda', version: 'fixture', uptime_seconds: 120, resource_usage: { cpu: { effective_cores: 4 }, memory: { cgroup_current_bytes: systemMemory, cgroup_limit_bytes: 1610612736 } }, resources: {}, limits: {} };
+      else if (endpoint === '/api/system') value = systemData();
       else if (endpoint === '/api/jobs') value = { message: 'Fixture job queued' };
       else if (endpoint === '/api/root-folders') value = { roots: [], mounts: [] };
       else if (endpoint === '/api/tasks') value = { tasks: [], paused: false };
@@ -119,10 +157,15 @@ async function main() {
     await page.locator('#pipeline-ready').getByText('11,326', { exact: true }).waitFor();
     await page.waitForFunction(async () => await window.__workerReads() > 0);
     await page.locator('#pipeline-status').getByText(/Inspected/i).waitFor();
-    // Idle polling updates counters without a click or waiting for a large inventory response.
+    // A pushed status snapshot updates counters without a click or blocking on inventory.
+    const readsBeforePush = await page.evaluate(async () => await window.__snapshotReads());
+    const statusEventsBeforePush = await page.evaluate(async () => await window.__liveEventCount('status'));
     holdInventory = true; revision++; pipeline.generated_srt_count++; pipeline.failed_files--;
+    pushStatus();
     await page.locator('#pipeline-ready').getByText('11,327', {exact:true}).waitFor({timeout:22000});
     await page.locator('#attention-failed').getByText('511', {exact:true}).waitFor();
+    await page.waitForFunction(async previous => await window.__liveEventCount('status') > previous, statusEventsBeforePush);
+    assert.deepEqual(await page.evaluate(async () => await window.__snapshotReads()), readsBeforePush, 'SSE status updates do not trigger automatic status, system, or worker GETs');
     await page.waitForFunction(async()=>await window.__inventoryHeld());
     assert(inventoryHeld, 'inventory request remains pending while fresh counters are rendered');
     holdInventory=false;releaseInventory();
@@ -220,19 +263,19 @@ async function main() {
     assert.match(await parallelCard.innerText(), /Running/);
     for(const [liveness,label,detail] of [['waiting','Waiting','Waiting for CPU capacity'],['stalled','Possibly stalled','No progress for 6m 0s'],['unresponsive','Unresponsive','No heartbeat for 1m 15s']]){
       Object.assign(parallelB.telemetry,{liveness,wait_reason:liveness==='waiting'?detail:null,idle_seconds:360,heartbeat_age_seconds:liveness==='unresponsive'?75:1});
-      await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+      pushStatus();
       await parallelCard.getByText(label,{exact:true}).waitFor();
       assert((await parallelCard.innerText()).includes(detail), `${liveness} explains job health`);
       assert((await parallelRowB.innerText()).includes(label), `${liveness} appears in Activity row`);
     }
     parallelB.telemetry.liveness='running';
     parallelB.total=0;parallelB.telemetry.progress_percent=null;parallelB.current={status:'preparing'};
-    await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+    pushStatus();
     await parallelCard.getByText('Preparing job',{exact:true}).waitFor();
     assert.equal(await parallelCard.locator('progress').getAttribute('value'),null,'unknown totals use indeterminate progress');
     assert.doesNotMatch(await parallelRowB.locator('.job-result-copy').innerText(),/0%|Waiting to start/,'preparation does not claim measured 0%');
     parallelB.total=3;parallelB.telemetry.progress_percent=0;parallelB.current={status:'ocr',path:parallelB.paths[0]};
-    await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+    pushStatus();
     await parallelCard.getByText('Running',{exact:true}).waitFor();
     for(const width of [1440,320]){
       await page.setViewportSize({width,height:640});
@@ -245,7 +288,7 @@ async function main() {
     activeJobs = [parallelB]; runningJob = parallelB;
     jobs.unshift({ ...parallelA, status: 'completed', finished: now + 3, summary: { converted: 1 }, current: undefined });
     fileWorkers = [fileWorkers[1]];
-    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    pushStatus();
     await page.locator('#job-drawer-content .job-card').getByText('Running', { exact: true }).waitFor();
     assert.equal(await parallelRowA.count(), 1);
     assert.match(await parallelRowA.locator('.job-row-status').innerText(), /Completed/);
@@ -330,7 +373,7 @@ async function main() {
     assert.equal(await executorCard.locator('.job-executors-more summary').textContent(),'2 more workers');
     await executorCard.locator('.job-executors-more summary').click();
     jobs.find(job => job.id === 'executors-1').summary.converted++;
-    await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+    pushStatus();
     await executorCard.locator('.job-summary').getByText('7 converted', { exact: true }).waitFor();
     assert.equal(await executorCard.locator('.job-executors-more details').evaluate(details=>details.open),true,'worker disclosure remains open after a status update');
     assert.deepEqual(await executorCard.locator('.job-executors-more ul li').allTextContents(),['CPU · Local','GPU OCR · Studio GPU (remote)']);
@@ -373,10 +416,19 @@ async function main() {
     assert(admissionLayout.height > admissionLayout.lineHeight * 1.5, 'long GPU admission reason wraps into visible lines');
     assert.match(admissionLayout.text, /will retry when the next file starts/, 'GPU admission reason retains its full guidance');
     await page.locator('#overview-workers #worker-cpu-count').fill('999');
+    allocation = { ...allocation, cpu_workers: 3 };
+    effectiveWorkers = { ...effectiveWorkers, cpu_workers: 3 };
+    const readsBeforeWorkerPush = await page.evaluate(async () => await window.__snapshotReads());
+    const workerEventsBeforePush = await page.evaluate(async () => await window.__liveEventCount('workers'));
+    publishEvent('workers', workerData());
+    await page.waitForFunction(async previous => await window.__liveEventCount('workers') > previous, workerEventsBeforePush);
+    await page.locator('#worker-cpu-capacity').getByText(/3 slots/).waitFor();
+    assert.equal(await page.locator('#overview-workers #worker-cpu-count').inputValue(), '999', 'pushed worker updates preserve an unsaved user edit');
+    assert.deepEqual(await page.evaluate(async () => await window.__snapshotReads()), readsBeforeWorkerPush, 'worker SSE updates do not trigger automatic snapshot GETs');
     const readsBeforeOverviewRefresh=workerReads;
     await page.locator('#refresh-button').click();
     await page.waitForFunction(async previous=>await window.__workerReads()>previous,readsBeforeOverviewRefresh);
-    assert.equal(await page.locator('#overview-workers #worker-cpu-count').inputValue(),'999','worker polling preserves an unsaved user edit');
+    assert.equal(await page.locator('#overview-workers #worker-cpu-count').inputValue(),'999','manual worker refresh preserves an unsaved user edit');
     assert.match(await page.locator('#worker-allocation-note').textContent(), /Unsaved/);
     assert(workerReads>readsBeforeOverviewRefresh,'overview refresh reloads persisted worker allocation');
     await page.locator('#overview-workers #worker-cpu-count').fill('1000');
@@ -536,7 +588,7 @@ async function main() {
     }
     pendingNotice.ok = true; pendingNotice.pending = false; pendingNotice.uncertain = false;
     pendingNotice.message = 'Published SRT files confirmed by a later Bazarr inventory sync';
-    await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+    pushStatus();
     await pendingCard.getByText(pendingNotice.message, { exact: true }).waitFor();
     assert.equal(await pendingCard.locator('.result-pending, .job-error').count(), 0);
     await pendingCard.getByText('Completed', { exact: true }).waitFor();
@@ -616,6 +668,7 @@ async function main() {
     await page.getByRole('button', {name:'Overview',exact:true}).click();
     await page.locator('#worker-ram').getByText(/1\.21 GiB/).waitFor();
     holdSystem=true;
+    await page.locator('#refresh-button').click();
     await page.waitForFunction(async()=>await window.__systemHeld());
     await page.waitForFunction(async()=>await window.__abortedSystemReads()>0,null,{timeout:22000});
     await page.locator('#worker-ram').getByText('Sample stale · retrying',{exact:true}).waitFor();
@@ -624,14 +677,18 @@ async function main() {
     await page.locator('#worker-ram').getByText(/1\.4 GiB/).waitFor({timeout:10000});
     assert(await page.locator('#worker-memory-meter').isVisible(),'automatic sampling recovers after a read times out');
     failWorkers=true;
-    await page.locator('#worker-pool-state').getByText('Sample stale',{exact:true}).waitFor({timeout:10000});
+    await page.locator('#worker-pool-state').getByText('Sample stale',{exact:true}).waitFor({timeout:20000});
     failWorkers=false;
     await page.locator('#worker-pool-state').getByText('Ready',{exact:true}).waitFor({timeout:10000});
     assert.deepEqual(errors, [], 'browser must have no uncaught errors');
     console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, executor metadata, keyboard, Bazarr coverage/authority, and pending indexing confirmation regressions');
     await context.close();
   } finally {
+    clearInterval(metricsTimer);
+    clearInterval(statusHeartbeatTimer);
     if (browser) await browser.close();
+    for (const client of eventClients) client.end();
+    eventClients.clear();
     await new Promise(resolve => server.close(resolve));
   }
 }

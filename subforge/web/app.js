@@ -426,9 +426,16 @@
   const restoreInventoryView = () => {
     try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:'auto';$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','needed','covered','unavailable','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
   };
+  const applyStatus = data => {
+    state.status=data;setConnection(true);renderRootSelectors(data.roots||[]);renderJobs();renderLogs(data.logs);renderPipeline();
+    setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
+    void loadInventory(data.inventory);updateHookStates();updateIntegrationUsage();updateIntegrationDots();updateVersion(data.version,data.edition);
+    if(data.tasks&&Array.isArray(data.tasks.tasks)){state.tasks=data.tasks;state.tasksLoadedAt=Date.now();renderTasks();}
+  };
+  // One-shot snapshots support initialization, explicit refresh, and completed user actions.
   const pollStatus = async () => {
     if (state.pollBusy) return; state.pollBusy=true;
-    try { if(!state.csrf){const session=await api('/api/session');state.csrf=session.csrf_token||'';if(!state.csrf)throw new Error('Session is unavailable');} state.status=await api('/api/status'); setConnection(true); renderRootSelectors(state.status.roots || []); renderJobs(); renderLogs(state.status.logs); renderPipeline(); setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`); void loadInventory(state.status.inventory); updateHookStates(); updateIntegrationUsage(); updateIntegrationDots(); updateVersion(state.status.version,state.status.edition); if(state.currentPage==='settings'&&state.settingsSection==='tasks'&&Date.now()-state.tasksLoadedAt>10000)void loadTasks(); }
+    try { if(!state.csrf){const session=await api('/api/session');state.csrf=session.csrf_token||'';if(!state.csrf)throw new Error('Session is unavailable');} applyStatus(await api('/api/status')); }
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
@@ -869,7 +876,6 @@
     clearTimeout(state.systemTimer);clearInterval(state.systemClock);
     if(!systemVisible())return;
     tickSystemUptime();state.systemClock=setInterval(tickSystemUptime,1000);
-    state.systemTimer=setTimeout(async()=>{await Promise.all([loadSystem(true),workersVisible()?loadWorkers(true):Promise.resolve()]);syncSystemMonitor();},3000);
   };
   const pageNames={overview:'Overview',library:'Library',activity:'Activity',settings:'Settings'};
   const settingsSections=['general','media','tasks','status','sonarr','radarr','jellyfin','bazarr'];
@@ -989,7 +995,30 @@
       if($('#sidebar').classList.contains('mobile-open')){const focusable=$$('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled)', $('#sidebar')).filter(node=>!node.closest('[inert]')&&node.getClientRects().length);if(!focusable.length)return;const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}
     });
   };
-  const scheduleStatusPoll = () => {clearTimeout(state.pollTimer);const busy=activeJobs().length>0||!!state.status?.queue?.length;state.pollTimer=setTimeout(async()=>{await pollStatus();scheduleStatusPoll();},document.hidden?60000:busy?3000:15000);};
-  const initialize = async () => { bind();restoreRoute(); try { const session=await api('/api/session'); state.csrf=session.csrf_token || ''; await Promise.all([pollStatus(),loadSettings()]);if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();if(state.currentPage==='settings'&&state.settingsSection==='tasks')await loadTasks();if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers(); } catch(error) { setConnection(false); notify(`Service initialization failed: ${error.message}`,'error'); } scheduleStatusPoll();syncSystemMonitor();document.addEventListener('visibilitychange',async()=>{syncSystemMonitor();if(!document.hidden){await pollStatus();if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers();}scheduleStatusPoll();}); };
+  const dashboardLive = SubforgeLive.create({
+    status: applyStatus,
+    system(data) {state.systemInfo=data;state.systemReceivedAt=performance.now();state.systemSampleHealthy=true;if(systemVisible())renderSystem();if(workersVisible())renderWorkers();},
+    workers(data) {if(state.workersSaving)return;state.workersInfo=data;state.workersReceivedAt=performance.now();state.workersSampleHealthy=true;if(workersVisible()){renderWorkers();renderWorkerNodes(data.remote);}},
+    connection(mode) {
+      if(mode==='connected'){setConnection(true);return;}
+      setConnection(false);state.systemSampleHealthy=false;state.workersSampleHealthy=false;
+      setText($('#connection-text'),({paused:'Live updates paused',connecting:'Connecting live updates…',reconnecting:'Reconnecting live updates…',unsupported:'Live updates unavailable; use Refresh',invalid:'Invalid update · showing last data'})[mode]||'Live updates unavailable');
+      setText($('#system-sample-state'),mode==='paused'?'Updates paused':'Disconnected · showing last data');
+      if(workersVisible())renderWorkers();
+    }
+  });
+  const initialize = async () => {
+    bind();restoreRoute();
+    try {
+      const session=await api('/api/session');state.csrf=session.csrf_token||'';
+      await Promise.all([pollStatus(),loadSettings()]);
+      if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();
+      if(state.currentPage==='settings'&&state.settingsSection==='tasks')await loadTasks();
+      // Bootstrap snapshots also keep the dashboard usable in browsers without EventSource.
+      if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers();
+    } catch(error) {setConnection(false);notify(`Service initialization failed: ${error.message}`,'error');}
+    dashboardLive.start();syncSystemMonitor();
+    document.addEventListener('visibilitychange',()=>syncSystemMonitor());
+  };
   initialize();
 })();

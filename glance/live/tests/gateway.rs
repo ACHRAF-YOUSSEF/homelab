@@ -1,14 +1,14 @@
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use glance_live::{
     config::{Config, base},
     gateway,
     relay::{Relay, Topic},
 };
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
     Request, Response, StatusCode,
-    body::Incoming,
+    body::{Frame, Incoming},
     header::{HeaderValue, SET_COOKIE},
     server::conn::http1,
     service::service_fn,
@@ -27,17 +27,31 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{Message, handshake::server::create_response, protocol::Role},
 };
 
 type Handler = Arc<
-    dyn Fn(Request<Incoming>) -> Pin<Box<dyn Future<Output = Response<Full<Bytes>>> + Send>>
+    dyn Fn(Request<Incoming>) -> Pin<Box<dyn Future<Output = Response<TestBody>> + Send>>
         + Send
         + Sync,
 >;
+
+type TestBody = UnsyncBoxBody<Bytes, Infallible>;
+
+fn stream_body<S>(stream: S) -> TestBody
+where
+    S: Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + 'static,
+{
+    BodyExt::boxed_unsync(StreamBody::new(stream))
+}
 
 async fn http_server(handler: Handler) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -63,13 +77,13 @@ async fn http_server(handler: Handler) -> (SocketAddr, JoinHandle<()>) {
     (addr, task)
 }
 
-fn response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(body.into()));
+fn response(status: StatusCode, body: impl Into<Bytes>) -> Response<TestBody> {
+    let mut response = Response::new(BodyExt::boxed_unsync(Full::new(body.into())));
     *response.status_mut() = status;
     response
 }
 
-fn json_response(value: Value) -> Response<Full<Bytes>> {
+fn json_response(value: Value) -> Response<TestBody> {
     let mut response = response(StatusCode::OK, Bytes::from(value.to_string()));
     response
         .headers_mut()
@@ -84,6 +98,66 @@ fn event_json(frame: &[u8]) -> Value {
         .find_map(|line| line.strip_prefix("data: "))
         .unwrap();
     serde_json::from_str(data).unwrap()
+}
+
+type UpstreamFrame = Result<Frame<Bytes>, Infallible>;
+type UpstreamSender = mpsc::UnboundedSender<UpstreamFrame>;
+
+fn subforge_event(widget: Value) -> Bytes {
+    Bytes::from(format!("event: widget\ndata: {}\n\n", widget))
+}
+
+fn subforge_stream_response(
+    receiver: mpsc::UnboundedReceiver<UpstreamFrame>,
+) -> Response<TestBody> {
+    let body = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|frame| (frame, receiver))
+    });
+    let mut response = Response::new(stream_body(body));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+fn subforge_bytes_response(status: StatusCode, body: impl Into<Bytes>) -> Response<TestBody> {
+    let mut response = response(status, body);
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+async fn wait_for_senders(senders: &Arc<Mutex<Vec<UpstreamSender>>>, count: usize) {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if senders.lock().unwrap().len() >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Subforge event stream did not connect");
+}
+
+async fn wait_for_subforge_snapshot(
+    rx: &mut tokio::sync::watch::Receiver<Bytes>,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    timeout(Duration::from_secs(4), async {
+        loop {
+            rx.changed().await.unwrap();
+            let snapshot = event_json(&rx.borrow_and_update());
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+        }
+    })
+    .await
+    .expect("expected Subforge snapshot was not published")
 }
 
 struct Fixture {
@@ -114,7 +188,6 @@ impl Fixture {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             qb_interval: Duration::from_millis(500),
             jellyfin_interval: Duration::from_secs(1),
-            subforge_interval: Duration::from_millis(500),
             jellyfin_ws: false,
             max_connections: 8,
             max_http_connections: 16,
@@ -1167,38 +1240,49 @@ fn subforge_widget() -> Value {
 #[tokio::test(flavor = "current_thread")]
 async fn subforge_shared_collector_projects_multiple_jobs_and_stops_without_subscribers() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let captured = calls.clone();
+    let captured_calls = calls.clone();
+    let senders = Arc::new(Mutex::new(Vec::<UpstreamSender>::new()));
+    let captured_senders = senders.clone();
     let handler: Handler = Arc::new(move |request| {
-        let calls = captured.clone();
+        let calls = captured_calls.clone();
+        let senders = captured_senders.clone();
         Box::pin(async move {
-            assert_eq!(request.uri().path(), "/subforge/api/widget");
+            assert_eq!(request.uri().path(), "/subforge/api/widget/events");
             assert_eq!(
                 request.headers().get("authorization").unwrap(),
                 "Bearer fixture-widget-token"
             );
             assert!(request.headers().get("cookie").is_none());
+            assert!(
+                request
+                    .headers()
+                    .get("accept")
+                    .is_some_and(|value| value.to_str().unwrap().contains("text/event-stream"))
+            );
             calls.fetch_add(1, Ordering::SeqCst);
-            let mut widget = subforge_widget();
-            widget["active_jobs"][0]["current"] =
-                json!({"path":"/private/movie.mkv","error":"private-diagnostic"});
-            json_response(widget)
+            let (sender, receiver) = mpsc::unbounded_channel();
+            senders.lock().unwrap().push(sender);
+            subforge_stream_response(receiver)
         })
     });
     let fixture = Fixture::start(handler, |_| {}).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let mut first = fixture.relay.subscribe(Topic::Subforge).unwrap();
     let mut second = fixture.relay.subscribe(Topic::Subforge).unwrap();
-    timeout(Duration::from_secs(2), first.rx.changed())
-        .await
-        .unwrap()
+    wait_for_senders(&senders, 1).await;
+    let sender = senders.lock().unwrap()[0].clone();
+    let mut widget = subforge_widget();
+    widget["active_jobs"][0]["current"] =
+        json!({"path":"/private/movie.mkv","error":"private-diagnostic"});
+    sender
+        .send(Ok(Frame::data(subforge_event(widget))))
         .unwrap();
-    timeout(Duration::from_secs(2), second.rx.changed())
-        .await
-        .unwrap()
-        .unwrap();
-    let snapshot = event_json(&first.rx.borrow_and_update());
+    let snapshot =
+        wait_for_subforge_snapshot(&mut first.rx, |snapshot| snapshot["status"] == "ok").await;
+    let shared_snapshot =
+        wait_for_subforge_snapshot(&mut second.rx, |snapshot| snapshot["status"] == "ok").await;
     assert_eq!(snapshot["status"], "ok");
-    assert_eq!(snapshot["source"], "rest");
+    assert_eq!(shared_snapshot["data"], snapshot["data"]);
     assert_eq!(snapshot["data"]["activeJobCount"], 2);
     assert_eq!(snapshot["data"]["jobs"][0]["etaSeconds"], 20);
     assert!(snapshot["data"]["jobs"][1]["etaSeconds"].is_null());
@@ -1207,79 +1291,176 @@ async fn subforge_shared_collector_projects_multiple_jobs_and_stops_without_subs
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "subscribers must share one collector"
+        "subscribers must share one upstream event stream, without REST polling"
+    );
+    let mut update = subforge_widget();
+    update["converted_count"] = json!(6);
+    sender
+        .send(Ok(Frame::data(subforge_event(update))))
+        .unwrap();
+    let updated = wait_for_subforge_snapshot(&mut first.rx, |snapshot| {
+        snapshot["data"]["convertedCount"] == 6
+    })
+    .await;
+    let shared_update = wait_for_subforge_snapshot(&mut second.rx, |snapshot| {
+        snapshot["data"]["convertedCount"] == 6
+    })
+    .await;
+    assert_eq!(updated["data"]["convertedCount"], 6);
+    assert_eq!(shared_update["data"], updated["data"]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "updates must arrive on the open stream"
     );
     drop(first);
     drop(second);
-    let stopped_at = calls.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(650)).await;
-    assert_eq!(calls.load(Ordering::SeqCst), stopped_at);
+    timeout(Duration::from_secs(2), async {
+        while !sender.is_closed() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the upstream stream should stop when its last subscriber leaves");
     let mut restarted = fixture.relay.subscribe(Topic::Subforge).unwrap();
-    timeout(Duration::from_secs(2), restarted.rx.changed())
-        .await
-        .unwrap()
+    wait_for_senders(&senders, 2).await;
+    let restart_sender = senders.lock().unwrap()[1].clone();
+    restart_sender
+        .send(Ok(Frame::data(subforge_event(subforge_widget()))))
         .unwrap();
-    assert_eq!(
-        event_json(&restarted.rx.borrow_and_update())["status"],
-        "ok"
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), stopped_at + 1);
+    let restarted_snapshot =
+        wait_for_subforge_snapshot(&mut restarted.rx, |snapshot| snapshot["status"] == "ok").await;
+    assert_eq!(restarted_snapshot["status"], "ok",);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     drop(restarted);
     fixture.close().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn subforge_failures_oversize_bad_shapes_and_redirects_retain_the_last_good_snapshot() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let leaks = Arc::new(AtomicUsize::new(0));
-    let captured_calls = calls.clone();
-    let captured_leaks = leaks.clone();
-    let handler: Handler = Arc::new(move |request| {
-        let calls = captured_calls.clone();
-        let leaks = captured_leaks.clone();
-        Box::pin(async move {
-            if request.uri().path() == "/leak" {
-                leaks.fetch_add(1, Ordering::SeqCst);
-                return json_response(json!({}));
-            }
-            match calls.fetch_add(1, Ordering::SeqCst) {
-                0 => json_response(subforge_widget()),
-                1 => response(StatusCode::UNAUTHORIZED, "not authorized"),
-                2 => response(StatusCode::OK, Bytes::from(vec![b'x'; 2048])),
-                3 => json_response(json!({"jobs":[],"paths":["private-provider-path"]})),
-                _ => {
-                    let mut result = response(StatusCode::FOUND, "redirect");
-                    result
-                        .headers_mut()
-                        .insert("location", HeaderValue::from_static("/leak"));
-                    result
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Unauthorized,
+        Oversized,
+        InvalidFrame,
+        MalformedJson,
+        BadShape,
+        Redirect,
+    }
+    let failures = [
+        Failure::Unauthorized,
+        Failure::Oversized,
+        Failure::InvalidFrame,
+        Failure::MalformedJson,
+        Failure::BadShape,
+        Failure::Redirect,
+    ];
+    for failure in failures {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let leaks = Arc::new(AtomicUsize::new(0));
+        let senders = Arc::new(Mutex::new(Vec::<UpstreamSender>::new()));
+        let captured_calls = calls.clone();
+        let captured_leaks = leaks.clone();
+        let captured_senders = senders.clone();
+        let handler: Handler = Arc::new(move |request| {
+            let calls = captured_calls.clone();
+            let leaks = captured_leaks.clone();
+            let senders = captured_senders.clone();
+            Box::pin(async move {
+                if request.uri().path() == "/leak" {
+                    leaks.fetch_add(1, Ordering::SeqCst);
+                    return json_response(json!({}));
                 }
+                assert_eq!(request.uri().path(), "/subforge/api/widget/events");
+                assert_eq!(
+                    request.headers().get("authorization").unwrap(),
+                    "Bearer fixture-widget-token"
+                );
+                assert!(request.headers().get("cookie").is_none());
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let (sender, receiver) = mpsc::unbounded_channel();
+                        senders.lock().unwrap().push(sender);
+                        subforge_stream_response(receiver)
+                    }
+                    _ => match failure {
+                        Failure::Unauthorized => {
+                            subforge_bytes_response(StatusCode::UNAUTHORIZED, "not authorized")
+                        }
+                        Failure::Oversized => {
+                            subforge_bytes_response(StatusCode::OK, Bytes::from(vec![b'x'; 2048]))
+                        }
+                        Failure::InvalidFrame => subforge_bytes_response(
+                            StatusCode::OK,
+                            Bytes::from_static(b"event: widget\ndata: \xff\n\n"),
+                        ),
+                        Failure::MalformedJson => subforge_bytes_response(
+                            StatusCode::OK,
+                            Bytes::from_static(b"event: widget\ndata: {invalid json}\n\n"),
+                        ),
+                        Failure::BadShape => subforge_bytes_response(
+                            StatusCode::OK,
+                            Bytes::from(format!(
+                                "event: widget\ndata: {}\n\n",
+                                json!({"active_jobs":"invalid","selected_languages":[]})
+                            )),
+                        ),
+                        Failure::Redirect => {
+                            let mut result = response(StatusCode::FOUND, "redirect");
+                            result
+                                .headers_mut()
+                                .insert("location", HeaderValue::from_static("/leak"));
+                            result
+                        }
+                    },
+                }
+            })
+        });
+        let fixture = Fixture::start(handler, |config| config.provider_bytes = 1024).await;
+        let mut subscription = fixture.relay.subscribe(Topic::Subforge).unwrap();
+        wait_for_senders(&senders, 1).await;
+        let sender = senders.lock().unwrap()[0].clone();
+        sender
+            .send(Ok(Frame::data(subforge_event(subforge_widget()))))
+            .unwrap();
+        let first =
+            wait_for_subforge_snapshot(&mut subscription.rx, |snapshot| snapshot["status"] == "ok")
+                .await;
+        assert_eq!(first["data"]["activeJobCount"], 2);
+        drop(sender); // EOF is also a failure and must preserve the last good value.
+        senders.lock().unwrap().clear();
+        let eof = wait_for_subforge_snapshot(&mut subscription.rx, |snapshot| {
+            snapshot["status"] == "stale"
+        })
+        .await;
+        assert_eq!(eof["data"], first["data"]);
+        assert_eq!(eof["updatedAt"], first["updatedAt"]);
+
+        timeout(Duration::from_secs(3), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-    });
-    let fixture = Fixture::start(handler, |config| config.provider_bytes = 1024).await;
-    let mut subscription = fixture.relay.subscribe(Topic::Subforge).unwrap();
-    timeout(Duration::from_secs(2), subscription.rx.changed())
         .await
-        .unwrap()
-        .unwrap();
-    let first = event_json(&subscription.rx.borrow_and_update());
-    assert_eq!(first["status"], "ok");
-    for _ in 0..4 {
-        timeout(Duration::from_secs(2), subscription.rx.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        let failed = event_json(&subscription.rx.borrow_and_update());
+        .expect("collector did not reconnect after stream EOF");
+        let failed = timeout(Duration::from_secs(3), async {
+            subscription.rx.changed().await.unwrap();
+            event_json(&subscription.rx.borrow_and_update())
+        })
+        .await
+        .expect("failure did not update the stale snapshot");
         assert_eq!(failed["status"], "stale");
         assert_eq!(failed["data"], first["data"]);
         assert_eq!(failed["updatedAt"], first["updatedAt"]);
         assert!(!failed.to_string().contains("private"));
+        assert_eq!(
+            leaks.load(Ordering::SeqCst),
+            0,
+            "redirects must not be followed"
+        );
+        drop(subscription);
+        fixture.close().await;
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
-    assert_eq!(leaks.load(Ordering::SeqCst), 0);
-    drop(subscription);
-    fixture.close().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1287,9 +1468,17 @@ async fn subforge_blank_tokens_do_not_make_requests_and_snapshot_limits_fail_clo
     for blank_token in [true, false] {
         let calls = Arc::new(AtomicUsize::new(0));
         let captured = calls.clone();
-        let handler: Handler = Arc::new(move |_request| {
+        let senders = Arc::new(Mutex::new(Vec::<UpstreamSender>::new()));
+        let captured_senders = senders.clone();
+        let handler: Handler = Arc::new(move |request| {
+            assert_eq!(request.uri().path(), "/subforge/api/widget/events");
             captured.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { json_response(subforge_widget()) })
+            let senders = captured_senders.clone();
+            Box::pin(async move {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                senders.lock().unwrap().push(sender);
+                subforge_stream_response(receiver)
+            })
         });
         let fixture = Fixture::start(handler, |config| {
             if blank_token {
@@ -1300,11 +1489,21 @@ async fn subforge_blank_tokens_do_not_make_requests_and_snapshot_limits_fail_clo
         })
         .await;
         let mut subscription = fixture.relay.subscribe(Topic::Subforge).unwrap();
-        timeout(Duration::from_secs(2), subscription.rx.changed())
+        let snapshot = if blank_token {
+            wait_for_subforge_snapshot(&mut subscription.rx, |snapshot| {
+                snapshot["status"] == "stale"
+            })
             .await
-            .unwrap()
-            .unwrap();
-        let snapshot = event_json(&subscription.rx.borrow_and_update());
+        } else {
+            wait_for_senders(&senders, 1).await;
+            senders.lock().unwrap()[0]
+                .send(Ok(Frame::data(subforge_event(subforge_widget()))))
+                .unwrap();
+            wait_for_subforge_snapshot(&mut subscription.rx, |snapshot| {
+                snapshot["status"] == "stale"
+            })
+            .await
+        };
         assert_eq!(snapshot["status"], "stale");
         assert!(snapshot["data"].is_null());
         assert_eq!(calls.load(Ordering::SeqCst), usize::from(!blank_token));
@@ -1335,17 +1534,38 @@ async fn subforge_sse_requires_media_authorization_and_allows_only_matching_page
                     "page auth",
                 );
             }
-            assert_eq!(request.uri().path(), "/subforge/api/widget");
+            assert_eq!(request.uri().path(), "/subforge/api/widget/events");
             assert_eq!(
                 request.headers().get("authorization").unwrap(),
                 "Bearer fixture-widget-token"
             );
             assert!(request.headers().get("cookie").is_none());
             calls.fetch_add(1, Ordering::SeqCst);
-            json_response(subforge_widget())
+            let (sender, receiver) = mpsc::unbounded_channel();
+            sender
+                .send(Ok(Frame::data(subforge_event(subforge_widget()))))
+                .unwrap();
+            subforge_stream_response(receiver)
         })
     });
     let fixture = Fixture::start(handler, |_| {}).await;
+    let unauthorized_page = fixture
+        .client
+        .get(fixture.url("/api/pages/media/content/"))
+        .header("host", "localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_page.status(), StatusCode::UNAUTHORIZED);
+    let authorized_page = fixture
+        .client
+        .get(fixture.url("/api/pages/media/content/"))
+        .header("host", "localhost")
+        .header("cookie", "auth=valid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized_page.status(), StatusCode::OK);
     for query in [
         "page=downloads&topic=subforge",
         "page=media&topic=qbittorrent",

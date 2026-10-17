@@ -3,6 +3,7 @@ use crate::{
     config::{Config, endpoint},
     model::{QbState, normalize_sessions},
     subforge::normalize as normalize_subforge,
+    subforge_events::Decoder as SubforgeDecoder,
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -267,19 +268,37 @@ impl Relay {
         channel.tx.send_replace(snapshot.frame(topic));
     }
 
-    async fn reconcile_subforge(&self) -> Result<(), Error> {
-        let response = self
-            .http
-            .get(endpoint(&self.config.subforge, "/api/widget"))
+    async fn stream_subforge(&self, http: &Client) -> Result<(), Error> {
+        let mut response = http
+            .get(endpoint(&self.config.subforge, "/api/widget/events"))
             .bearer_auth(&self.config.subforge_token)
+            .header("accept", "text/event-stream")
             .send()
             .await
             .map_err(|_| Error::Upstream)?;
-        if response.status() != StatusCode::OK {
+        if response.status() != StatusCode::OK
+            || !response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .eq_ignore_ascii_case("text/event-stream")
+                })
+        {
             return Err(Error::Upstream);
         }
-        let body = bounded_body(response, self.config.provider_bytes).await?;
-        self.publish(Topic::Subforge, normalize_subforge(&body)?, "rest")
+        let mut decoder = SubforgeDecoder::new(self.config.provider_bytes);
+        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Upstream)? {
+            for frame in decoder.feed(&chunk)? {
+                self.publish(Topic::Subforge, normalize_subforge(&frame)?, "sse")?;
+            }
+        }
+        Err(Error::Upstream)
     }
 
     async fn collect_subforge(&self) {
@@ -287,15 +306,29 @@ impl Relay {
             self.fail(Topic::Subforge);
             return;
         }
-        let delay = self
-            .config
-            .subforge_interval
-            .clamp(Duration::from_millis(500), Duration::from_secs(60));
+        // Streaming uses its own idle/lifetime bounds rather than the REST client's 15s total timeout.
+        let Ok(http) = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(35))
+            .timeout(Duration::from_secs(925))
+            .pool_max_idle_per_host(1)
+            .build()
+        else {
+            self.fail(Topic::Subforge);
+            return;
+        };
+        let mut delay = Duration::from_millis(500);
         loop {
-            if self.reconcile_subforge().await.is_err() {
-                self.fail(Topic::Subforge);
+            let started = Instant::now();
+            let _ = self.stream_subforge(&http).await;
+            self.fail(Topic::Subforge);
+            if started.elapsed() >= Duration::from_secs(30) {
+                delay = Duration::from_millis(500);
             }
             sleep(delay).await;
+            delay = delay.saturating_mul(2).min(Duration::from_secs(30));
         }
     }
 

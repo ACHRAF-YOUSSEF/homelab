@@ -125,11 +125,11 @@ The Library inventory, Activity's Jobs list, scheduled tasks, System panels, and
 
 ### Glance status widget
 
-The Glance **Media** page includes a Subforge status widget. Its read-only `/api/widget` endpoint reports `current_run` for older clients and adds `active_jobs` (up to 32, oldest first) and `active_job_count` for concurrent jobs. Each job reports a safe ID, phase/status, file progress when available, elapsed time, nullable ETA, liveness, and an optional generic wait reason. It exposes no media paths or credentials and cannot start or change jobs. Glance's server-rendered fallback caches for 15 seconds; while the Media page is visible, a same-origin SSE stream replaces it with live snapshots. The gateway polls `/api/widget` every two seconds by default, only while a browser is subscribed, and stops after the last subscriber leaves. The browser retains the last successful snapshot during errors, closes the stream when the page is hidden or unloaded, and reconnects when it becomes visible again. Elapsed time and known ETA interpolate for at most 15 seconds after a snapshot. ETA still uses completed-file throughput: a single-file job has no ETA until it completes, and quiet OCR may appear possibly stalled while still working. These are diagnostic states and do not fail jobs automatically. The widget uses the copied [Subforge SVG icon](../glance/config/assets/subforge.svg) in the dashboard service list.
+The Glance **Media** page includes a Subforge status widget. Its authenticated, read-only `/api/widget/events` SSE endpoint reports `current_run` for older clients and adds `active_jobs` (up to 32, oldest first) and `active_job_count` for concurrent jobs. Each job reports a safe ID, phase/status, file progress when available, elapsed time, nullable ETA, liveness, and an optional generic wait reason. It exposes no media paths or credentials and cannot start or change jobs. The Glance widget is a JavaScript-rendered shell with no REST fallback; while the Media page is visible, its same-origin SSE topic receives live snapshots. The gateway maintains one authenticated connection to Subforge's `/api/widget/events` stream per subscribed topic; Subforge sends an initial snapshot, change-driven updates coalesced over 250 ms, and 15-second heartbeats. The native stream is limited to four concurrent connections, 128 KiB widget frames, and 15 minutes per connection. The browser retains the last successful snapshot during errors, closes the stream when the page is hidden or unloaded, and reconnects when it becomes visible again. Elapsed time and known ETA interpolate for at most 15 seconds after a snapshot. ETA still uses completed-file throughput: a single-file job has no ETA until it completes, and quiet OCR may appear possibly stalled while still working. These are diagnostic states and do not fail jobs automatically. The widget uses the copied [Subforge SVG icon](../glance/config/assets/subforge.svg) in the dashboard service list.
 
-The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. Compose passes this dedicated token to Glance, Subforge, and `glance-live`. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is the gateway's container-to-container base URL and defaults to `http://subforge:8100`. `GLANCE_LIVE_SUBFORGE_INTERVAL` sets the gateway polling interval (default 2 seconds; accepted range 0.5–60 seconds).
+The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. Compose passes this dedicated token only to Subforge and `glance-live`. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is the gateway's container-to-container base URL and defaults to `http://subforge:8100`. The gateway consumes the native SSE endpoint; there is no Subforge polling-interval setting.
 
-Subforge is part of the regular Compose stack and starts after its selected local image has been built. After changing the token, rebuild the gateway and selected Subforge image, then recreate the three services so they receive the same value. The default CPU image can be built from the repository root with:
+Subforge is part of the regular Compose stack and starts after its selected local image has been built. After changing the token or SSE code, rebuild the gateway and selected Subforge image, then recreate the gateway, Glance, and Subforge so the updated shell and server are used. The default CPU image can be built from the repository root with:
 
 ```shell
 docker build --file subforge/Dockerfile --tag homelab-subforge:0.4.4-cpu subforge
@@ -153,11 +153,18 @@ named `subtitle_converter_data` volume. Do not use `down -v`.
 Browser and gateway fixture checks, from the repository root:
 
 ```shell
+node --test subforge/tests/live_frontend.cjs
 node --test glance/test_subforge_live.cjs
 cargo test --locked --manifest-path glance/live/Cargo.toml
+cargo test --locked --manifest-path subforge/Cargo.toml
 ```
 
-After changing only either URL, recreate Glance. A `404` status means the widget endpoint is disabled; `401` means the tokens do not match. A connection error usually means Subforge is stopped or `GLANCE_SUBFORGE_INTERNAL_URL` cannot reach it on the Compose network.
+After changing `SUBFORGE_PUBLIC_URL`, recreate Glance. After changing
+`GLANCE_SUBFORGE_INTERNAL_URL` or the widget token, recreate `glance-live` and
+Subforge; recreate Glance as well after widget-shell changes. A `404` response
+means the native widget stream is disabled; `401` means the gateway token does
+not match. A connection error usually means Subforge is stopped or
+`GLANCE_SUBFORGE_INTERNAL_URL` cannot reach it on the Compose network.
 
 ## What it converts
 
@@ -201,9 +208,23 @@ The four `CONVERTER_*_DIR` paths are required Compose inputs. Authentication is 
 
 For example, to use `/srv/media/movies` as the first movie library on Linux, set `CONVERTER_MOVIES_DIR=/srv/media/movies` in `.env`; the container will still see it at `/movies`. On Windows, use a drive path available to Docker Desktop, such as the example `D:/film`. The mounted host folders must be writable by container UID/GID 1000 so the converter can create SRT sidecars. Keep them aligned with Bazarr and media-manager access. In Subforge, **Settings → Media folders** lets you select which mounted folders or subfolders to scan; add, browse, scan, or remove roots there. This selection is saved immediately and applies to future scans. Folder browsing is restricted to the configured mounts. Changing a `CONVERTER_*_DIR` changes the host folder behind its corresponding mount; changing container-side destinations instead requires updating the Compose mount and matching `subforge --root` arguments. The `subtitle_converter_data` named volume mounted at `/data` separately persists the generated dashboard password, settings, selected scan roots, job history, and scan state across rebuilds. `.env.example` keeps API-key entries blank; store real service keys and any chosen dashboard or webhook passwords only in the ignored `.env`.
 
+## Live dashboard updates
+
+The dashboard opens authenticated `/api/events` with `EventSource` while the
+page is visible. Status changes are coalesced for up to 250 ms; status events
+include an optional task snapshot and receive 15-second heartbeats. A dashboard
+stream also sends system and worker snapshots every three seconds. These
+server-sent events replace automatic status, system, and worker GET polling;
+bootstrap and manual refresh GET requests remain. Inventory is fetched again
+when a status update shows its revision changed. The stream is limited to four
+concurrent connections, 15 minutes per connection, and bounded event sizes; it
+uses dedicated stream workers, not the normal HTTP worker pool. Reconnecting
+clients receive a fresh snapshot, and unsaved form drafts are preserved during
+updates.
+
 ## Status and resource readings
 
-**Settings → System** has separate About, Live resources, and Execution limits panels. While **Overview** or **Settings → System** is visible in a visible browser tab, resource and worker readings refresh every three seconds; the displayed uptime advances locally once per second on System. These timers stop when neither view is visible or the tab is hidden. Dashboard status polling remains independent: it polls every three seconds while work is active, every 15 seconds while idle, and every 60 seconds in a hidden tab. Dashboard read-only GET requests time out after 15 seconds so a stuck request cannot prevent a later poll; successful samples restore the live state. Resource and worker indicators are marked stale after a failed or overdue sample and remain stale until a later read succeeds. The top bar's **Updated** time includes seconds. `/api/system` uses the dashboard's existing authentication behavior. Execution limits reflect effective worker admission, while **Overview** shows requested targets, ceilings, measured CPU/RAM headroom, active files, and connected worker nodes.
+**Settings → System** has separate About, Live resources, and Execution limits panels. While the dashboard SSE stream is open, it sends resource and worker samples every three seconds for display on Overview and **Settings → System**; the displayed uptime advances locally once per second on System. These updates stop when the browser tab is hidden. The dashboard keeps bootstrap and manual read-only GET snapshots; those requests time out after 15 seconds. Resource and worker indicators are marked stale after a failed or overdue sample and remain stale until a later read succeeds. The top bar's **Updated** time includes seconds. `/api/system` uses the dashboard's existing authentication behavior. Execution limits reflect effective worker admission, while **Overview** shows requested targets, ceilings, measured CPU/RAM headroom, active files, and connected worker nodes.
 
 The readings are observations, not scheduling controls. On supported Linux Docker deployments, CPU and memory usage come from the container cgroup and include conversion child processes; Rust process RSS and thread count cover only the Subforge server process. CPU usage is shown as a percentage of the effective CPU allowance, where 100% means the full allowance (the panel also shows CPU equivalents used). The allowance reflects the visible cgroup quota and process CPU affinity. It may not include ancestor limits outside the container's visible cgroup namespace. The first CPU sample, a counter reset, or an unsupported source can leave a reading unavailable; the UI reports that state instead of showing a fabricated zero. Native Windows kernel resource readings are unavailable. Linux process RSS and thread readings may still be available when cgroup metrics are unavailable, such as a shared-host Linux setup whose cgroup namespace does not expose the process container root.
 

@@ -2,6 +2,7 @@
 //! prevent request traffic from allocating a thread or unbounded input buffer.
 
 use crate::converter::{Converter, Workload};
+use crate::events::{self, Events, Kind as EventKind, Lockable, Observed};
 use crate::integrations::Integrations;
 use crate::tasks::Scheduler;
 use crate::util::{constant_equal, now, read_json, token, write_private};
@@ -313,10 +314,8 @@ enum FileEvent {
     },
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock<L: Lockable>(mutex: &L) -> L::Guard<'_> {
+    mutex.acquire()
 }
 fn strings(value: &Value) -> Vec<String> {
     value
@@ -454,7 +453,8 @@ struct Publications {
     limited: bool,
 }
 pub struct App {
-    runtime: Mutex<Runtime>,
+    runtime: Observed<Runtime>,
+    events: Arc<Events>,
     converter: Mutex<Converter>,
     metadata_usage: Arc<crate::metadata::CacheUsage>,
     resources: Mutex<crate::resources::Sampler>,
@@ -788,9 +788,11 @@ impl App {
             .map(|host| host.trim().to_lowercase())
             .filter(|host| !host.is_empty())
             .collect();
+        let events = Arc::new(Events::default());
         let app = Arc::new(Self {
             public_integrations: Mutex::new(integrations.public_settings()),
-            runtime: Mutex::new(runtime),
+            runtime: Observed::new(runtime, events.clone()),
+            events,
             converter: Mutex::new(converter),
             metadata_usage,
             resources: Mutex::new(crate::resources::Sampler::default()),
@@ -3422,7 +3424,7 @@ impl App {
             if drained {
                 self.flush_publications();
             }
-            let runtime = lock(&self.runtime);
+            let runtime = lock(&self.runtime.value);
             let _guard = self.wake.wait_timeout(runtime, Duration::from_millis(100));
         }
         for active in lock(&self.runtime).active_jobs.values() {
@@ -3635,7 +3637,10 @@ fn guard(app: &App, request: &Request) -> Option<Reply> {
         }
         return None;
     }
-    if request.target == "/api/widget" {
+    if matches!(
+        request.target.as_str(),
+        "/api/widget" | "/api/widget/events"
+    ) {
         if app.widget.is_empty() {
             return Some(Reply::error(404, "Not found"));
         }
@@ -3694,6 +3699,12 @@ fn handle(app: &App, request: &Request) -> Reply {
     if let Some(reply) = guard(app, request) {
         return reply;
     }
+    if events::Kind::route(&request.target).is_some() {
+        return Reply::error(
+            if request.method == "GET" { 503 } else { 405 },
+            "Event stream is unavailable",
+        );
+    }
     if request.method == "GET" {
         return match request.target.as_str() {
             "/" => Reply::asset(
@@ -3703,6 +3714,10 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/static/app.js" | "/app.js" => Reply::asset(
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/app.js"),
+            ),
+            "/static/live.js" | "/live.js" => Reply::asset(
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/live.js"),
             ),
             "/static/style.css" | "/style.css" => Reply::asset(
                 "text/css; charset=utf-8",
@@ -3859,6 +3874,7 @@ fn handle(app: &App, request: &Request) -> Reply {
     };
     match result {
         Ok((status, value)) => {
+            app.events.notify();
             if let Some(operation) = operation {
                 app.log("INFO", &format!("{operation} processed"));
             }
@@ -3900,6 +3916,107 @@ fn send(socket: &mut TcpStream, reply: Reply) -> std::io::Result<()> {
     socket.write_all(&reply.body)?;
     socket.flush()
 }
+
+struct StreamTask {
+    socket: TcpStream,
+    kind: EventKind,
+    _permit: events::Permit,
+}
+
+/// Read/authenticate on the ordinary worker, then transfer long-lived sockets
+/// to the separate fixed SSE pool. Neither pool can allocate arbitrary threads.
+fn connection(app: &Arc<App>, mut socket: TcpStream, streams: &mpsc::SyncSender<StreamTask>) {
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = socket.set_write_timeout(Some(Duration::from_secs(10)));
+    let request = match read_request(&mut socket) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = send(&mut socket, Reply::error(400, &error));
+            return;
+        }
+    };
+    if let Some(kind) = EventKind::route(&request.target) {
+        if let Some(reply) = guard(app, &request) {
+            let _ = send(&mut socket, reply);
+            return;
+        }
+        if request.method != "GET" {
+            let _ = send(&mut socket, Reply::error(405, "Method is not allowed"));
+            return;
+        }
+        if !request.body.is_empty() {
+            let _ = send(
+                &mut socket,
+                Reply::error(400, "Event requests must not have a body"),
+            );
+            return;
+        }
+        if request
+            .headers
+            .get("sec-fetch-site")
+            .is_some_and(|value| !matches!(value.as_str(), "same-origin" | "none"))
+        {
+            let _ = send(
+                &mut socket,
+                Reply::error(403, "Cross-origin requests are not allowed"),
+            );
+            return;
+        }
+        let Some(permit) = app.events.permit() else {
+            let _ = send(
+                &mut socket,
+                Reply::error(503, "Event stream capacity reached"),
+            );
+            return;
+        };
+        let task = StreamTask {
+            socket,
+            kind,
+            _permit: permit,
+        };
+        if let Err(error) = streams.try_send(task) {
+            let mut task = match error {
+                mpsc::TrySendError::Full(task) | mpsc::TrySendError::Disconnected(task) => task,
+            };
+            let _ = send(
+                &mut task.socket,
+                Reply::error(503, "Event stream capacity reached"),
+            );
+        }
+        return;
+    }
+    let _ = send(&mut socket, handle(app, &request));
+}
+
+fn stream_worker(app: Arc<App>, receiver: Arc<Mutex<mpsc::Receiver<StreamTask>>>) {
+    loop {
+        let task = lock(&receiver).recv();
+        let Ok(mut task) = task else {
+            break;
+        };
+        if app.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = events::stream(
+            &mut task.socket,
+            &app.events,
+            &app.shutdown,
+            task.kind,
+            |kind| match kind {
+                EventKind::Widget => app.widget(),
+                EventKind::Status => {
+                    // Snapshot methods acquire Runtime independently; never nest them.
+                    let mut status = app.status();
+                    status["tasks"] = app.tasks();
+                    status
+                }
+                EventKind::System => app.system(),
+                EventKind::Workers => app.workers(),
+            },
+        );
+    }
+}
+
 pub fn run(arguments: Vec<String>) -> Result<(), String> {
     let mut host = "127.0.0.1".to_string();
     let mut port = 8100_u16;
@@ -3956,9 +4073,11 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
         .map_err(|_| "Cannot configure listener")?;
     let shutdown = app.shutdown.clone();
     let cancel = app.cancel.clone();
+    let events = app.events.clone();
     ctrlc::set_handler(move || {
         shutdown.store(true, Ordering::Relaxed);
         cancel.store(true, Ordering::Relaxed);
+        events.notify();
     })
     .map_err(|_| "Cannot install shutdown handler")?;
     let worker_app = app.clone();
@@ -3966,23 +4085,32 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
     let (sender, receiver) = mpsc::sync_channel::<TcpStream>(16);
     let receiver = Arc::new(Mutex::new(receiver));
     let mut handlers = Vec::new();
+    let (stream_sender, stream_receiver) = mpsc::sync_channel::<StreamTask>(events::STREAM_LIMIT);
+    let stream_receiver = Arc::new(Mutex::new(stream_receiver));
+    let mut stream_handlers = Vec::with_capacity(events::STREAM_LIMIT);
+    for _ in 0..events::STREAM_LIMIT {
+        let app = app.clone();
+        let receiver = stream_receiver.clone();
+        stream_handlers.push(
+            std::thread::Builder::new()
+                .name("subforge-events".into())
+                .stack_size(512 * 1024)
+                .spawn(move || stream_worker(app, receiver))
+                .map_err(|_| "Cannot start bounded event workers")?,
+        );
+    }
     for _ in 0..HTTP_WORKERS {
         let receiver = receiver.clone();
         let app = app.clone();
+        let streams = stream_sender.clone();
         handlers.push(std::thread::spawn(move || {
             loop {
                 if app.shutdown.load(Ordering::Relaxed) {
                     break;
                 }
                 let socket = lock(&receiver).recv();
-                let Ok(mut socket) = socket else { break };
-                let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
-                let _ = socket.set_write_timeout(Some(Duration::from_secs(10)));
-                let reply = match read_request(&mut socket) {
-                    Ok(request) => handle(&app, &request),
-                    Err(error) => Reply::error(400, &error),
-                };
-                let _ = send(&mut socket, reply);
+                let Ok(socket) = socket else { break };
+                connection(&app, socket, &streams);
             }
         }));
     }
@@ -4011,9 +4139,14 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
     app.cancel.store(true, Ordering::Relaxed);
     app.shutdown.store(true, Ordering::Relaxed);
     app.wake.notify_all();
+    app.events.notify();
     drop(sender);
     let _ = conversion.join();
     for handler in handlers {
+        let _ = handler.join();
+    }
+    drop(stream_sender);
+    for handler in stream_handlers {
         let _ = handler.join();
     }
     Ok(())

@@ -2,6 +2,7 @@
 
 pub mod converter;
 pub mod edition;
+mod events;
 mod gpu;
 pub mod integrations;
 mod job_activity;
