@@ -105,10 +105,16 @@ impl Fixture {
             jellyfin: base(&upstream_url, "JELLYFIN_INTERNAL_URL").unwrap(),
             sonarr: base(&format!("http://{upstream}/sonarr"), "SONARR_INTERNAL_URL").unwrap(),
             radarr: base(&format!("http://{upstream}/radarr"), "RADARR_INTERNAL_URL").unwrap(),
+            subforge: base(
+                &format!("http://{upstream}/subforge"),
+                "GLANCE_SUBFORGE_INTERNAL_URL",
+            )
+            .unwrap(),
             allowed_hosts: HashSet::from(["localhost".to_owned(), "127.0.0.1".to_owned()]),
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             qb_interval: Duration::from_millis(500),
             jellyfin_interval: Duration::from_secs(1),
+            subforge_interval: Duration::from_millis(500),
             jellyfin_ws: false,
             max_connections: 8,
             max_http_connections: 16,
@@ -122,6 +128,7 @@ impl Fixture {
             jellyfin_key: "fixture-key".into(),
             sonarr_key: "fixture-sonarr-key".into(),
             radarr_key: "fixture-radarr-key".into(),
+            subforge_token: "fixture-widget-token".into(),
         };
         configure(&mut config);
         let relay = Relay::new(config).unwrap();
@@ -1147,5 +1154,258 @@ async fn calendar_bounds_concurrent_provider_requests() {
     for task in pending {
         assert_eq!(task.await.unwrap().status(), StatusCode::OK);
     }
+    fixture.close().await;
+}
+
+fn subforge_widget() -> Value {
+    json!({"converted_count":5,"queued_count":2,"configured_root_count":1,"recent_failures_count":0,"selected_languages":["eng"],"active_job_count":2,"active_jobs":[
+        {"id":"0123456789abcdef","kind":"extract","status":"running","phase":"extracting","processed":1,"total":3,"progress_percent":33,"elapsed_seconds":10,"eta_seconds":20,"liveness":"running","wait_reason":null},
+        {"id":"fedcba9876543210","kind":"ocr","status":"running","phase":"ocr_progress","processed":0,"total":1,"progress_percent":0,"elapsed_seconds":12,"eta_seconds":null,"liveness":"running","wait_reason":null}
+    ]})
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subforge_shared_collector_projects_multiple_jobs_and_stops_without_subscribers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured = calls.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let calls = captured.clone();
+        Box::pin(async move {
+            assert_eq!(request.uri().path(), "/subforge/api/widget");
+            assert_eq!(
+                request.headers().get("authorization").unwrap(),
+                "Bearer fixture-widget-token"
+            );
+            assert!(request.headers().get("cookie").is_none());
+            calls.fetch_add(1, Ordering::SeqCst);
+            let mut widget = subforge_widget();
+            widget["active_jobs"][0]["current"] =
+                json!({"path":"/private/movie.mkv","error":"private-diagnostic"});
+            json_response(widget)
+        })
+    });
+    let fixture = Fixture::start(handler, |_| {}).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let mut first = fixture.relay.subscribe(Topic::Subforge).unwrap();
+    let mut second = fixture.relay.subscribe(Topic::Subforge).unwrap();
+    timeout(Duration::from_secs(2), first.rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(2), second.rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = event_json(&first.rx.borrow_and_update());
+    assert_eq!(snapshot["status"], "ok");
+    assert_eq!(snapshot["source"], "rest");
+    assert_eq!(snapshot["data"]["activeJobCount"], 2);
+    assert_eq!(snapshot["data"]["jobs"][0]["etaSeconds"], 20);
+    assert!(snapshot["data"]["jobs"][1]["etaSeconds"].is_null());
+    assert!(!snapshot.to_string().contains("private"));
+    assert!(!snapshot.to_string().contains("fixture-widget-token"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "subscribers must share one collector"
+    );
+    drop(first);
+    drop(second);
+    let stopped_at = calls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), stopped_at);
+    let mut restarted = fixture.relay.subscribe(Topic::Subforge).unwrap();
+    timeout(Duration::from_secs(2), restarted.rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        event_json(&restarted.rx.borrow_and_update())["status"],
+        "ok"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), stopped_at + 1);
+    drop(restarted);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subforge_failures_oversize_bad_shapes_and_redirects_retain_the_last_good_snapshot() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let leaks = Arc::new(AtomicUsize::new(0));
+    let captured_calls = calls.clone();
+    let captured_leaks = leaks.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let calls = captured_calls.clone();
+        let leaks = captured_leaks.clone();
+        Box::pin(async move {
+            if request.uri().path() == "/leak" {
+                leaks.fetch_add(1, Ordering::SeqCst);
+                return json_response(json!({}));
+            }
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => json_response(subforge_widget()),
+                1 => response(StatusCode::UNAUTHORIZED, "not authorized"),
+                2 => response(StatusCode::OK, Bytes::from(vec![b'x'; 2048])),
+                3 => json_response(json!({"jobs":[],"paths":["private-provider-path"]})),
+                _ => {
+                    let mut result = response(StatusCode::FOUND, "redirect");
+                    result
+                        .headers_mut()
+                        .insert("location", HeaderValue::from_static("/leak"));
+                    result
+                }
+            }
+        })
+    });
+    let fixture = Fixture::start(handler, |config| config.provider_bytes = 1024).await;
+    let mut subscription = fixture.relay.subscribe(Topic::Subforge).unwrap();
+    timeout(Duration::from_secs(2), subscription.rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let first = event_json(&subscription.rx.borrow_and_update());
+    assert_eq!(first["status"], "ok");
+    for _ in 0..4 {
+        timeout(Duration::from_secs(2), subscription.rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = event_json(&subscription.rx.borrow_and_update());
+        assert_eq!(failed["status"], "stale");
+        assert_eq!(failed["data"], first["data"]);
+        assert_eq!(failed["updatedAt"], first["updatedAt"]);
+        assert!(!failed.to_string().contains("private"));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_eq!(leaks.load(Ordering::SeqCst), 0);
+    drop(subscription);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subforge_blank_tokens_do_not_make_requests_and_snapshot_limits_fail_closed() {
+    for blank_token in [true, false] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let handler: Handler = Arc::new(move |_request| {
+            captured.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { json_response(subforge_widget()) })
+        });
+        let fixture = Fixture::start(handler, |config| {
+            if blank_token {
+                config.subforge_token.clear();
+            } else {
+                config.snapshot_bytes = 64;
+            }
+        })
+        .await;
+        let mut subscription = fixture.relay.subscribe(Topic::Subforge).unwrap();
+        timeout(Duration::from_secs(2), subscription.rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = event_json(&subscription.rx.borrow_and_update());
+        assert_eq!(snapshot["status"], "stale");
+        assert!(snapshot["data"].is_null());
+        assert_eq!(calls.load(Ordering::SeqCst), usize::from(!blank_token));
+        drop(subscription);
+        fixture.close().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subforge_sse_requires_media_authorization_and_allows_only_matching_page_topics() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured = calls.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let calls = captured.clone();
+        Box::pin(async move {
+            if request.uri().path() == "/api/pages/media/content/" {
+                assert!(request.headers().get("authorization").is_none());
+                return response(
+                    if request
+                        .headers()
+                        .get("cookie")
+                        .is_some_and(|value| value == "auth=valid")
+                    {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    },
+                    "page auth",
+                );
+            }
+            assert_eq!(request.uri().path(), "/subforge/api/widget");
+            assert_eq!(
+                request.headers().get("authorization").unwrap(),
+                "Bearer fixture-widget-token"
+            );
+            assert!(request.headers().get("cookie").is_none());
+            calls.fetch_add(1, Ordering::SeqCst);
+            json_response(subforge_widget())
+        })
+    });
+    let fixture = Fixture::start(handler, |_| {}).await;
+    for query in [
+        "page=downloads&topic=subforge",
+        "page=media&topic=qbittorrent",
+        "page=media&topic=subforge&topic=jellyfin",
+        "page=media&topic=subforge&page=downloads",
+    ] {
+        let denied = fixture
+            .client
+            .get(fixture.url(&format!("/live/events?{query}")))
+            .header("host", "localhost")
+            .header("cookie", "auth=valid")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+    }
+    for (cookie, origin, expected) in [
+        (None, None, StatusCode::UNAUTHORIZED),
+        (
+            Some("auth=valid"),
+            Some("https://elsewhere.example"),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let mut request = fixture
+            .client
+            .get(fixture.url("/live/events?page=media&topic=subforge"))
+            .header("host", "localhost");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        assert_eq!(request.send().await.unwrap().status(), expected);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let result = fixture
+        .client
+        .get(fixture.url("/live/events?page=media&topic=subforge"))
+        .header("host", "localhost")
+        .header("cookie", "auth=valid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), StatusCode::OK);
+    let mut chunks = result.bytes_stream();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let chunk = chunks.next().await.unwrap().unwrap();
+            let text = String::from_utf8_lossy(&chunk);
+            assert!(text.starts_with("event: subforge\n"));
+            if text.contains("\"status\":\"ok\"") {
+                assert!(text.contains("\"activeJobCount\":2"));
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(chunks);
     fixture.close().await;
 }

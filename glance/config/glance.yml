@@ -9,6 +9,7 @@ document:
     <link rel="stylesheet" href="/assets/media-calendar.css">
     <script defer src="/assets/media-live.js"></script>
     <script defer src="/assets/widget-live.js"></script>
+    <script defer src="/assets/subforge-live.js"></script>
     <link rel="stylesheet" href="/assets/widget-live.css">
 
 branding:

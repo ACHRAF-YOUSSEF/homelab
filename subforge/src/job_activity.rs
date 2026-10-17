@@ -60,6 +60,12 @@ pub(crate) fn heartbeat(
 /// presented as a percentage of a whole, possibly multi-track file.
 pub(crate) fn public(job: &Value, at: f64) -> Value {
     let mut result = job.clone();
+    result["telemetry"] = telemetry(job, at);
+    result
+}
+
+// Live widget polling must not clone potentially large per-file result histories.
+fn telemetry(job: &Value, at: f64) -> Value {
     let started = timestamp(&job["started"]);
     let finished = timestamp(&job["finished"]);
     let elapsed = seconds_since(finished.unwrap_or(at), started);
@@ -103,7 +109,7 @@ pub(crate) fn public(job: &Value, at: f64) -> Value {
     } else {
         None
     };
-    result["telemetry"] = json!({
+    json!({
         "elapsed_seconds":elapsed,"progress_percent":percentage,"eta_seconds":eta,
         "heartbeat_at":heartbeat_at,"heartbeat_age_seconds":heartbeat_age,
         "last_progress_at":last_progress_at,"idle_seconds":idle,
@@ -112,15 +118,55 @@ pub(crate) fn public(job: &Value, at: f64) -> Value {
         "stall_after_seconds":stall_after,
         "heartbeat_timeout_seconds":heartbeat_timeout,
         "eta_basis":"completed_files"
-    });
-    result
+    })
 }
 
 /// The separately authenticated widget must never expose raw job metadata or
 /// diagnostics: persisted wait reasons can contain private paths or addresses.
 pub(crate) fn widget(job: &Value, at: f64) -> Value {
-    let snapshot = public(job, at);
-    let telemetry = &snapshot["telemetry"];
+    let telemetry = telemetry(job, at);
+    let id = job["id"]
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+        .unwrap_or("legacy-current");
+    let phases = [
+        "preparing",
+        "syncing_bazarr",
+        "checking_bazarr_coverage",
+        "waiting_for_worker",
+        "discovering",
+        "notifying_bazarr",
+        "inspecting",
+        "extracting",
+        "ocr",
+        "ocr_progress",
+        "processing",
+        "checking_gpu",
+        "validating",
+        "track_complete",
+        "converted",
+        "cached",
+        "failed",
+        "skipped",
+        "pending",
+        "dispatched",
+        "refreshing",
+        "remote_queued",
+        "remote_retry",
+        "inspected",
+        "metadata_pending",
+    ];
+    let phase = job["current"]["status"]
+        .as_str()
+        .filter(|phase| phases.contains(phase))
+        .or_else(|| job["phase"].as_str().filter(|phase| phases.contains(phase)))
+        .unwrap_or("preparing");
     let wait_reason = telemetry["wait_reason"].as_str().map(|reason| {
         [
             "Waiting for Bazarr inventory sync",
@@ -139,6 +185,7 @@ pub(crate) fn widget(job: &Value, at: f64) -> Value {
         .unwrap_or("Waiting for worker capacity")
     });
     json!({
+        "id":id,"phase":phase,
         "kind":job["kind"],"status":job["status"],
         "processed":job["processed"].as_u64().unwrap_or(0),
         "total":job["total"].as_u64().unwrap_or(0),
@@ -171,7 +218,7 @@ mod tests {
         assert_eq!(snapshot["eta_seconds"], 160);
         assert_eq!(snapshot["progress_percent"], 20);
         assert_eq!(snapshot["liveness"], "running");
-        assert_eq!(snapshot.as_object().unwrap().len(), 9);
+        assert_eq!(snapshot.as_object().unwrap().len(), 11);
         assert!(!snapshot.to_string().contains("private"));
         assert_eq!(job["heartbeat_at"], 1030.0);
 
@@ -181,6 +228,22 @@ mod tests {
             assert_eq!(snapshot["liveness"], expected);
             assert!(snapshot["eta_seconds"].is_null());
         }
+    }
+
+    #[test]
+    fn widget_identity_and_phase_never_copy_paths_or_unrecognized_diagnostics() {
+        let mut job = job();
+        job["id"] = json!("/private/file.mkv");
+        job["phase"] = json!("private diagnostics");
+        job["current"] = json!({"status":"https://private.invalid","path":"/private/file.mkv"});
+        let projected = widget(&job, 1040.0);
+        assert_eq!(projected["id"], "legacy-current");
+        assert_eq!(projected["phase"], "preparing");
+        assert!(!projected.to_string().contains("private"));
+        job["id"] = json!("ab12cd34");
+        job["current"]["status"] = json!("ocr_progress");
+        assert_eq!(widget(&job, 1040.0)["phase"], "ocr_progress");
+        assert_eq!(widget(&job, 1040.0)["id"], "ab12cd34");
     }
 
     #[test]

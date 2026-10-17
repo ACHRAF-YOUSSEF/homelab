@@ -5,6 +5,7 @@ pub mod config;
 pub mod gateway;
 pub mod model;
 pub mod relay;
+mod subforge;
 
 /// Errors intentionally contain no request URLs, credentials, or provider data.
 #[derive(Debug)]

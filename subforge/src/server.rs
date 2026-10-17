@@ -1609,16 +1609,33 @@ impl App {
     }
     fn widget(&self) -> Value {
         let runtime = lock(&self.runtime);
+        let at = now();
         let current = runtime
             .primary_job()
-            .map(|job| crate::job_activity::widget(job, now()));
+            .map(|job| crate::job_activity::widget(job, at));
+        let mut active: Vec<_> = runtime
+            .running
+            .iter()
+            .chain(runtime.active_jobs.values().map(|active| &active.job))
+            .collect();
+        active.sort_by(|a, b| {
+            a["started"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .total_cmp(&b["started"].as_f64().unwrap_or(0.0))
+        });
+        let active: Vec<_> = active
+            .into_iter()
+            .take(ACTIVE_JOB_LIMIT)
+            .map(|job| crate::job_activity::widget(job, at))
+            .collect();
         let scan = runtime
             .running
             .iter()
             .chain(runtime.history.iter().rev())
             .find(|job| ["scan", "extract", "ocr"].contains(&job["kind"].as_str().unwrap_or("")));
         let failures = scan.map_or(0, |job| count(&job["summary"]["failed"]));
-        json!({"converted_count":runtime.converted.len(),"current_run":current,"queued_count":runtime.queue.len(),"configured_root_count":runtime.roots.len(),"selected_languages":runtime.languages,"recent_failures_count":failures})
+        json!({"converted_count":runtime.converted.len(),"current_run":current,"active_job_count":active.len(),"active_jobs":active,"queued_count":runtime.queue.len(),"configured_root_count":runtime.roots.len(),"selected_languages":runtime.languages,"recent_failures_count":failures})
     }
     fn mounts_value(&self) -> Value {
         json!(
@@ -4758,6 +4775,43 @@ mod tests {
             result.unwrap_err(),
             "Cancelled while waiting for Bazarr inventory sync"
         );
+    }
+
+    #[test]
+    fn widget_lists_simultaneous_jobs_oldest_first_without_private_metadata() {
+        let (_temporary, app, _paths, _gate) = gated_workers_fixture();
+        let at = now();
+        {
+            let mut runtime = lock(&app.runtime);
+            runtime.running = None;
+            for (id, age, processed) in [("newer", 10.0, 0), ("older", 30.0, 1)] {
+                runtime.active_jobs.insert(
+                    id.into(),
+                    ActiveJob {
+                        owner: None,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        job: json!({"id":id,"kind":"extract","status":"running","started":at-age,
+                        "heartbeat_at":at,"last_progress_at":at,"work_started_at":at-age,
+                        "phase":"extracting","total":2,"processed":processed,
+                        "paths":["/private/media.mkv"],"error":"private diagnostics"}),
+                    },
+                );
+            }
+        }
+        let widget = app.widget();
+        assert_eq!(widget["active_job_count"], 2);
+        assert_eq!(widget["active_jobs"][0]["id"], "older");
+        assert_eq!(widget["active_jobs"][1]["id"], "newer");
+        assert_eq!(widget["active_jobs"][0]["progress_percent"], 50);
+        assert!(widget["active_jobs"][0]["eta_seconds"].as_u64().is_some());
+        assert!(widget["active_jobs"][1]["eta_seconds"].is_null());
+        assert_eq!(widget["current_run"]["id"], "older");
+        assert!(!widget.to_string().contains("private"));
+        lock(&app.runtime).active_jobs.remove("older");
+        assert_eq!(app.widget()["active_job_count"], 1);
+        lock(&app.runtime).active_jobs.clear();
+        assert_eq!(app.widget()["active_jobs"], json!([]));
+        assert!(app.widget()["current_run"].is_null());
     }
 
     #[test]

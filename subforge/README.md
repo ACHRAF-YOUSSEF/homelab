@@ -125,18 +125,37 @@ The Library inventory, Activity's Jobs list, scheduled tasks, System panels, and
 
 ### Glance status widget
 
-The Glance **Media** page includes a Subforge custom API widget. It displays the processed-file count, queue length, configured scan-root count, recent failures, current run and progress, elapsed time, approximate ETA when available, waiting/liveness state, and selected languages. The current-run aggregate includes nullable `elapsed_seconds` and `eta_seconds`, a `liveness` state (`running`, `waiting`, `stalled`, `unresponsive`, or `queued`), and an optional generic sanitized `wait_reason`. Glance displays elapsed time, an approximate ETA or an unavailable state, and explicit waiting, possibly stalled, or unresponsive status. ETA uses completed-file throughput and shares the dashboard limits: a single-file job has no ETA until it completes, and quiet OCR may appear possibly stalled while still working. These are diagnostic states and do not fail jobs automatically. The widget only reads the aggregate `/api/widget` endpoint; its response exposes no media paths or credentials and cannot start or change jobs. Glance caches the snapshot for 15 seconds. The widget uses the copied [Subforge SVG icon](../glance/config/assets/subforge.svg) in the dashboard service list.
+The Glance **Media** page includes a Subforge status widget. Its read-only `/api/widget` endpoint reports `current_run` for older clients and adds `active_jobs` (up to 32, oldest first) and `active_job_count` for concurrent jobs. Each job reports a safe ID, phase/status, file progress when available, elapsed time, nullable ETA, liveness, and an optional generic wait reason. It exposes no media paths or credentials and cannot start or change jobs. Glance's server-rendered fallback caches for 15 seconds; while the Media page is visible, a same-origin SSE stream replaces it with live snapshots. The gateway polls `/api/widget` every two seconds by default, only while a browser is subscribed, and stops after the last subscriber leaves. The browser retains the last successful snapshot during errors, closes the stream when the page is hidden or unloaded, and reconnects when it becomes visible again. Elapsed time and known ETA interpolate for at most 15 seconds after a snapshot. ETA still uses completed-file throughput: a single-file job has no ETA until it completes, and quiet OCR may appear possibly stalled while still working. These are diagnostic states and do not fail jobs automatically. The widget uses the copied [Subforge SVG icon](../glance/config/assets/subforge.svg) in the dashboard service list.
 
-The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. The Compose file passes this dedicated token only to Glance and Subforge. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is Glance's container-to-container base URL and defaults to `http://subforge:8100`.
+The widget is optional and disabled while `CONVERTER_WIDGET_TOKEN` is blank. To enable it, create a private random token between 32 and 256 characters and set the same value for `CONVERTER_WIDGET_TOKEN` in the ignored root `.env`; never put it in `.env.example`, YAML, or shared documentation. Compose passes this dedicated token to Glance, Subforge, and `glance-live`. It is separate from the dashboard password, webhook token, and media-server API keys. `SUBFORGE_PUBLIC_URL` controls the link opened in a browser and defaults to `http://localhost:8100`; `GLANCE_SUBFORGE_INTERNAL_URL` is the gateway's container-to-container base URL and defaults to `http://subforge:8100`. `GLANCE_LIVE_SUBFORGE_INTERVAL` sets the gateway polling interval (default 2 seconds; accepted range 0.5–60 seconds).
 
-Subforge is part of the regular Compose stack and starts after its selected local image has been built. The widget token only enables the read-only widget endpoint. After changing the token, recreate both containers so each receives the same value:
+Subforge is part of the regular Compose stack and starts after its selected local image has been built. After changing the token, rebuild the gateway and selected Subforge image, then recreate the three services so they receive the same value. The default CPU image can be built from the repository root with:
 
 ```shell
-docker compose up -d --force-recreate glance subforge
+docker build --file subforge/Dockerfile --tag homelab-subforge:0.4.4-cpu subforge
+docker compose build glance-live
+docker compose up -d --force-recreate glance-live glance subforge
 ```
 
-For a CUDA deployment, add `-f compose/subforge.cuda.yml` after
-`docker-compose.yml` to both this command and the CUDA service start command.
+For CUDA, build the selected image and apply the same Compose override:
+
+```shell
+docker build --platform linux/amd64 --file subforge/Dockerfile.cuda --tag homelab-subforge:0.4.4-cuda subforge
+docker compose -f docker-compose.yml -f compose/subforge.cuda.yml build glance-live
+docker compose -f docker-compose.yml -f compose/subforge.cuda.yml up -d --force-recreate glance-live glance subforge
+```
+
+Run these commands from the repository root in PowerShell, Bash, or Zsh. Build
+before applying the update and wait for active conversion jobs to finish;
+Subforge shutdown cancels in-memory jobs. Recreating the service preserves the
+named `subtitle_converter_data` volume. Do not use `down -v`.
+
+Browser and gateway fixture checks, from the repository root:
+
+```shell
+node --test glance/test_subforge_live.cjs
+cargo test --locked --manifest-path glance/live/Cargo.toml
+```
 
 After changing only either URL, recreate Glance. A `404` status means the widget endpoint is disabled; `401` means the tokens do not match. A connection error usually means Subforge is stopped or `GLANCE_SUBFORGE_INTERNAL_URL` cannot reach it on the Compose network.
 

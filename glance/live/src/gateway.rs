@@ -101,14 +101,33 @@ fn same_origin(headers: &HeaderMap, host: &str) -> bool {
     matches!((authority(raw), authority(host)), (Ok(a), Ok(b)) if a == b)
 }
 
+fn event_topic(query: &str) -> Result<(&'static str, Topic), Error> {
+    if query.len() > 128 {
+        return Err(Error::InvalidData);
+    }
+    let (mut page, mut topic) = (None, None);
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let target = match name.as_ref() {
+            "page" => &mut page,
+            "topic" => &mut topic,
+            _ => return Err(Error::InvalidData),
+        };
+        if target.is_some() {
+            return Err(Error::InvalidData);
+        }
+        *target = Some(value);
+    }
+    match (page.as_deref(), topic.as_deref()) {
+        (Some("media"), None | Some("jellyfin")) => Ok(("media", Topic::Jellyfin)),
+        (Some("media"), Some("subforge")) => Ok(("media", Topic::Subforge)),
+        (Some("downloads"), None | Some("qbittorrent")) => Ok(("downloads", Topic::Qbittorrent)),
+        _ => Err(Error::InvalidData),
+    }
+}
+
 async fn events(request: Request<Incoming>, relay: Arc<Relay>, host: &str) -> Response<Body> {
-    let page = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
-        .find(|(name, _)| name == "page")
-        .map(|(_, value)| value.into_owned());
-    let (page, topic) = match page.as_deref() {
-        Some("media") => ("media", Topic::Jellyfin),
-        Some("downloads") => ("downloads", Topic::Qbittorrent),
-        _ => return response(StatusCode::BAD_REQUEST, "page must be media or downloads"),
+    let Ok((page, topic)) = event_topic(request.uri().query().unwrap_or_default()) else {
+        return response(StatusCode::BAD_REQUEST, "unsupported page or topic");
     };
     if !same_origin(request.headers(), host) {
         return response(StatusCode::FORBIDDEN, "forbidden");
@@ -514,6 +533,33 @@ pub async fn healthcheck(config: &Config) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topics_are_bound_to_authorized_pages_and_default_urls_remain_compatible() {
+        assert!(matches!(
+            event_topic("page=media"),
+            Ok(("media", Topic::Jellyfin))
+        ));
+        assert!(matches!(
+            event_topic("page=downloads"),
+            Ok(("downloads", Topic::Qbittorrent))
+        ));
+        assert!(matches!(
+            event_topic("page=media&topic=subforge"),
+            Ok(("media", Topic::Subforge))
+        ));
+        for query in [
+            "topic=subforge",
+            "page=downloads&topic=subforge",
+            "page=media&topic=qbittorrent",
+            "page=media&topic=",
+            "page=media&topic=subforge&topic=jellyfin",
+            "page=media&page=downloads",
+            "page=media&url=http://elsewhere",
+        ] {
+            assert!(event_topic(query).is_err(), "{query}");
+        }
+    }
 
     #[test]
     fn origin_and_fetch_metadata_reject_cross_origin_requests() {

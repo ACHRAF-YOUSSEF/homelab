@@ -9,10 +9,12 @@ pub struct Config {
     pub jellyfin: Url,
     pub sonarr: Url,
     pub radarr: Url,
+    pub subforge: Url,
     pub allowed_hosts: HashSet<String>,
     pub bind: SocketAddr,
     pub qb_interval: Duration,
     pub jellyfin_interval: Duration,
+    pub subforge_interval: Duration,
     pub jellyfin_ws: bool,
     pub max_connections: usize,
     pub max_http_connections: usize,
@@ -26,6 +28,7 @@ pub struct Config {
     pub jellyfin_key: String,
     pub sonarr_key: String,
     pub radarr_key: String,
+    pub subforge_token: String,
 }
 
 fn value(name: &str, default: &str) -> String {
@@ -151,10 +154,15 @@ impl Config {
                 &value("RADARR_INTERNAL_URL", "http://radarr:7878"),
                 "RADARR_INTERNAL_URL",
             )?,
+            subforge: base(
+                &value("GLANCE_SUBFORGE_INTERNAL_URL", "http://subforge:8100"),
+                "GLANCE_SUBFORGE_INTERNAL_URL",
+            )?,
             allowed_hosts,
             bind: SocketAddr::new(host, port),
             qb_interval: seconds("GLANCE_LIVE_QBITTORRENT_INTERVAL", "2", 60.0)?,
             jellyfin_interval: seconds("GLANCE_LIVE_JELLYFIN_INTERVAL", "5", 60.0)?,
+            subforge_interval: seconds("GLANCE_LIVE_SUBFORGE_INTERVAL", "2", 60.0)?,
             jellyfin_ws,
             max_connections: integer("GLANCE_LIVE_MAX_CONNECTIONS", "64", 1000)?,
             max_http_connections: integer("GLANCE_LIVE_MAX_HTTP_CONNECTIONS", "128", 2000)?,
@@ -172,6 +180,7 @@ impl Config {
             jellyfin_key: value("JELLYFIN_API_KEY", ""),
             sonarr_key: value("SONARR_API_KEY", ""),
             radarr_key: value("RADARR_API_KEY", ""),
+            subforge_token: value("CONVERTER_WIDGET_TOKEN", ""),
         };
         if [
             &config.qb_username,
@@ -179,6 +188,7 @@ impl Config {
             &config.jellyfin_key,
             &config.sonarr_key,
             &config.radarr_key,
+            &config.subforge_token,
         ]
         .iter()
         .any(|v| v.len() > 4096 || v.chars().any(char::is_control))

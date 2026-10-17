@@ -43,3 +43,18 @@
 @media (prefers-reduced-motion: reduce) {
   .glance-live-torrent-progress > div, .media-live-jellyfin .jellyfin-progress > div { transition: none; }
 }
+.media-live-subforge .subforge-live-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; text-align: center; }
+.media-live-subforge .subforge-live-heading { margin-top: 18px; margin-bottom: 10px; }
+.media-live-subforge .subforge-live-jobs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.media-live-subforge .subforge-live-job { min-width: 0; border-top: 1px solid var(--color-separator); padding-top: 10px; overflow-wrap: anywhere; }
+.media-live-subforge .subforge-live-job-header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
+.media-live-subforge .subforge-live-job-header h4 { text-transform: capitalize; }
+.media-live-subforge .subforge-live-progress { height: 5px; margin: 10px 0; overflow: hidden; border-radius: 99px; background: var(--color-background); }
+.media-live-subforge .subforge-live-progress > div { height: 100%; background: var(--color-positive); }
+.media-live-subforge .subforge-live-timing { margin-top: 8px; }
+.media-live-subforge .subforge-live-languages { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.media-live-subforge [hidden] { display: none; }
+@media (max-width: 650px) {
+  .media-live-subforge .subforge-live-jobs { grid-template-columns: 1fr; }
+  .media-live-subforge .subforge-live-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

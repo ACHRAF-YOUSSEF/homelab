@@ -2,6 +2,7 @@ use crate::{
     Error,
     config::{Config, endpoint},
     model::{QbState, normalize_sessions},
+    subforge::normalize as normalize_subforge,
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -28,6 +29,7 @@ use tokio_tungstenite::{
 pub enum Topic {
     Jellyfin,
     Qbittorrent,
+    Subforge,
 }
 
 impl Topic {
@@ -35,12 +37,14 @@ impl Topic {
         match self {
             Self::Jellyfin => "jellyfin",
             Self::Qbittorrent => "qbittorrent",
+            Self::Subforge => "subforge",
         }
     }
     fn index(self) -> usize {
         match self {
             Self::Jellyfin => 0,
             Self::Qbittorrent => 1,
+            Self::Subforge => 2,
         }
     }
 }
@@ -84,7 +88,7 @@ pub struct Relay {
     pub config: Arc<Config>,
     pub http: Client,
     pub(crate) calendar_slots: Semaphore,
-    topics: [Channel; 2],
+    topics: [Channel; 3],
     slots: Arc<Semaphore>,
 }
 
@@ -172,7 +176,7 @@ pub(crate) fn bounded_json(data: &impl serde::Serialize, limit: usize) -> Result
 
 impl Relay {
     pub fn new(config: Config) -> Result<Arc<Self>, Error> {
-        let topics = [Topic::Jellyfin, Topic::Qbittorrent].map(|topic| {
+        let topics = [Topic::Jellyfin, Topic::Qbittorrent, Topic::Subforge].map(|topic| {
             let snapshot = Snapshot {
                 data: None,
                 updated: None,
@@ -212,6 +216,7 @@ impl Relay {
                 match topic {
                     Topic::Qbittorrent => relay.collect_qb().await,
                     Topic::Jellyfin => relay.collect_jellyfin().await,
+                    Topic::Subforge => relay.collect_subforge().await,
                 }
             }));
         }
@@ -260,6 +265,38 @@ impl Relay {
         let mut snapshot = channel.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         snapshot.failed = true;
         channel.tx.send_replace(snapshot.frame(topic));
+    }
+
+    async fn reconcile_subforge(&self) -> Result<(), Error> {
+        let response = self
+            .http
+            .get(endpoint(&self.config.subforge, "/api/widget"))
+            .bearer_auth(&self.config.subforge_token)
+            .send()
+            .await
+            .map_err(|_| Error::Upstream)?;
+        if response.status() != StatusCode::OK {
+            return Err(Error::Upstream);
+        }
+        let body = bounded_body(response, self.config.provider_bytes).await?;
+        self.publish(Topic::Subforge, normalize_subforge(&body)?, "rest")
+    }
+
+    async fn collect_subforge(&self) {
+        if self.config.subforge_token.is_empty() {
+            self.fail(Topic::Subforge);
+            return;
+        }
+        let delay = self
+            .config
+            .subforge_interval
+            .clamp(Duration::from_millis(500), Duration::from_secs(60));
+        loop {
+            if self.reconcile_subforge().await.is_err() {
+                self.fail(Topic::Subforge);
+            }
+            sleep(delay).await;
+        }
     }
 
     async fn qb_login(&self) -> Result<Option<HeaderValue>, Error> {

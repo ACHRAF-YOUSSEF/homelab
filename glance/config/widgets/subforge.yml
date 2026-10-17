@@ -49,6 +49,28 @@
         {{ if eq $liveness "stalled" }}<p class="subforge-detail color-primary size-h6 margin-top-10">No recent progress reported. Quiet OCR may still be working.</p>
         {{ else if eq $liveness "unresponsive" }}<p class="subforge-detail color-negative size-h6 margin-top-10">Coordinator heartbeat overdue. Check Activity in Subforge.</p>{{ end }}
       {{ end }}
+      {{ if gt (.JSON.Int "active_job_count") 1 }}
+        <div class="subforge-live-heading size-h6">OTHER ACTIVE JOBS</div>
+        <div class="subforge-live-jobs">
+          {{ $primaryID := .JSON.String "current_run.id" }}
+          {{ range .JSON.Array "active_jobs" }}
+            {{ if ne (.String "id") $primaryID }}
+              <article class="subforge-live-job">
+                <div class="subforge-live-job-header">
+                  <h4 class="color-highlight">{{ .String "kind" }} · {{ printf "%.8s" (.String "id") }}</h4>
+                  <span class="size-h6">{{ .String "liveness" }}{{ if eq (.String "status") "cancelling" }} · cancelling{{ end }}</span>
+                </div>
+                <p class="size-h6 color-subdue">{{ .String "phase" }} · {{ .Int "processed" }}/{{ .Int "total" }} files</p>
+                {{ if ne (.String "progress_percent") "" }}
+                  <div class="subforge-live-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ .Int "progress_percent" }}" aria-label="Job {{ .String "id" }} progress"><div style="width: {{ .Int "progress_percent" }}%"></div></div>
+                {{ end }}
+                <p class="subforge-live-timing size-h6">Elapsed {{ if ne (.String "elapsed_seconds") "" }}{{ template "subforge-duration" (.Int "elapsed_seconds") }}{{ else }}unavailable{{ end }} · {{ if and (eq (.String "liveness") "running") (eq (.String "status") "running") (ne (.String "eta_seconds") "") }}Approx. {{ template "subforge-duration" (.Int "eta_seconds") }} remaining{{ else }}ETA unavailable{{ end }}</p>
+                {{ if ne (.String "wait_reason") "" }}<p class="color-primary size-h6">{{ .String "wait_reason" }}</p>{{ end }}
+              </article>
+            {{ end }}
+          {{ end }}
+        </div>
+      {{ end }}
       <div class="margin-top-15">
         <div class="size-h6 color-subdue">LANGUAGES</div>
         <div class="subforge-languages">
@@ -59,7 +81,7 @@
           {{ else }}<span class="color-highlight">All languages</span>{{ end }}
         </div>
       </div>
-      <a class="block margin-top-15 color-primary" href="${SUBFORGE_PUBLIC_URL}">Open Subforge ↗</a>
+      <a data-subforge-link class="block margin-top-15 color-primary" href="${SUBFORGE_PUBLIC_URL}">Open Subforge ↗</a>
       <style>
         .media-live-subforge .subforge-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; text-align: center; }
         .media-live-subforge .subforge-stats > div { min-width: 0; }

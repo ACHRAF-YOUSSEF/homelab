@@ -8,7 +8,6 @@
     "media-live-jellyfin-library",
     "media-live-automation",
     "media-live-seerr",
-    "media-live-subforge",
   ];
   const intervalMs = 15_000;
   let timer;
