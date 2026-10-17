@@ -33,6 +33,15 @@ struct Item {
 struct Series {
     title: String,
     title_slug: String,
+    monitored: Option<bool>,
+    seasons: Option<List<Season, MAX_ITEMS>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Season {
+    season_number: u32,
+    monitored: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +55,21 @@ struct Episode {
     season_number: u32,
     episode_number: u32,
     has_file: Option<bool>,
+    monitored: Option<bool>,
+}
+
+impl Episode {
+    fn is_monitored(&self) -> bool {
+        // The monitored-only endpoint guarantees episode and series monitoring. Reject
+        // contrary flags defensively and check season flags, which its query omits.
+        self.monitored != Some(false)
+            && self.series.monitored != Some(false)
+            && !self.series.seasons.as_ref().is_some_and(|seasons| {
+                seasons.0.iter().any(|season| {
+                    season.season_number == self.season_number && season.monitored == Some(false)
+                })
+            })
+    }
 }
 
 #[derive(Deserialize)]
@@ -57,6 +81,7 @@ struct Movie {
     year: Option<u32>,
     has_file: Option<bool>,
     movie_file_id: Option<u64>,
+    monitored: Option<bool>,
 }
 
 impl Movie {
@@ -65,7 +90,8 @@ impl Movie {
         // A missing field alone is never evidence that a file is missing.
         let missing = self.has_file == Some(false)
             || (self.has_file.is_none() && self.movie_file_id == Some(0));
-        if !missing || self.movie_file_id.is_some_and(|id| id != 0) {
+        if self.monitored != Some(true) || !missing || self.movie_file_id.is_some_and(|id| id != 0)
+        {
             return Ok(None);
         }
         if self.year.is_some_and(|year| year > 9999) {
@@ -193,67 +219,61 @@ async fn provider<T: for<'de> Deserialize<'de>>(
 
 async fn episodes(relay: &Relay, items: &mut Vec<Item>) -> Result<(), Error> {
     let config = &relay.config;
-    let mut all_ids = HashSet::new();
-    let mut total_scanned = 0usize;
-    // Sonarr's two monitored filters partition episodes by episode AND series monitoring.
-    // Its missing endpoint includes specials and excludes episodes that have not finished airing.
-    for monitored in [true, false] {
-        let mut page_number = 1usize;
-        let mut expected_total = None;
-        let mut scanned = 0usize;
-        let mut page_ids = HashSet::new();
-        loop {
-            let page: Page = provider(
-                relay,
-                &config.sonarr,
-                &config.sonarr_key,
-                "/api/v3/wanted/missing",
-                &[
-                    ("includeSeries", "true".into()),
-                    ("monitored", monitored.to_string()),
-                    ("page", page_number.to_string()),
-                    ("pageSize", PAGE_SIZE.to_string()),
-                    ("sortKey", "episodes.airDateUtc".into()),
-                    ("sortDirection", "ascending".into()),
-                ],
-            )
-            .await?;
-            if page.page != page_number
-                || page.page_size != PAGE_SIZE
-                || page.total_records > MAX_ITEMS.saturating_sub(total_scanned - scanned)
-                || expected_total.is_some_and(|total| total != page.total_records)
-                || page.records.0.len() != PAGE_SIZE.min(page.total_records.saturating_sub(scanned))
-            {
+    let mut page_number = 1usize;
+    let mut expected_total = None;
+    let mut scanned = 0usize;
+    let mut page_ids = HashSet::new();
+    // Sonarr's monitored query includes specials and excludes episodes not finished airing.
+    loop {
+        let page: Page = provider(
+            relay,
+            &config.sonarr,
+            &config.sonarr_key,
+            "/api/v3/wanted/missing",
+            &[
+                ("includeSeries", "true".into()),
+                ("monitored", "true".into()),
+                ("page", page_number.to_string()),
+                ("pageSize", PAGE_SIZE.to_string()),
+                ("sortKey", "episodes.airDateUtc".into()),
+                ("sortDirection", "ascending".into()),
+            ],
+        )
+        .await?;
+        if page.page != page_number
+            || page.page_size != PAGE_SIZE
+            || page.total_records > MAX_ITEMS
+            || expected_total.is_some_and(|total| total != page.total_records)
+            || page.records.0.len() != PAGE_SIZE.min(page.total_records.saturating_sub(scanned))
+        {
+            return Err(Error::InvalidData);
+        }
+        expected_total = Some(page.total_records);
+        scanned += page.records.0.len();
+        for episode in page.records.0 {
+            // Repeated pages or unstable page boundaries could otherwise silently omit media.
+            if !page_ids.insert(episode.id) {
                 return Err(Error::InvalidData);
             }
-            expected_total = Some(page.total_records);
-            scanned += page.records.0.len();
-            total_scanned += page.records.0.len();
-            for episode in page.records.0 {
-                // Repeated pages or unstable page boundaries could otherwise silently omit media.
-                if !page_ids.insert(episode.id) {
-                    return Err(Error::InvalidData);
-                }
-                if episode.has_file == Some(true) || !all_ids.insert(episode.id) {
-                    continue;
-                }
-                items.push(Item {
-                    kind: "episode",
-                    id: episode.id,
-                    series_id: Some(episode.series_id),
-                    title: text(episode.series.title)?,
-                    subtitle: text(episode.title)?,
-                    slug: slug(episode.series.title_slug)?,
-                    season: Some(episode.season_number),
-                    episode: Some(episode.episode_number),
-                    year: None,
-                });
+            if episode.has_file == Some(true) || !episode.is_monitored() {
+                continue;
             }
-            if scanned == page.total_records {
-                break;
-            }
-            page_number += 1;
+            items.push(Item {
+                kind: "episode",
+                id: episode.id,
+                series_id: Some(episode.series_id),
+                title: text(episode.series.title)?,
+                subtitle: text(episode.title)?,
+                slug: slug(episode.series.title_slug)?,
+                season: Some(episode.season_number),
+                episode: Some(episode.episode_number),
+                year: None,
+            });
         }
+        if scanned == page.total_records {
+            break;
+        }
+        page_number += 1;
     }
     Ok(())
 }

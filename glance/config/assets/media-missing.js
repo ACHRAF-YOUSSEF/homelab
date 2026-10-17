@@ -58,7 +58,7 @@
     retry.hidden = true;
     retry.addEventListener("click", () => void load());
     const content = node("div", "media-missing-columns");
-    const note = node("p", "media-missing-note color-subdue", "Includes unmonitored items. Episodes appear after airing; movies include unreleased titles. Based on the latest Sonarr and Radarr scans.");
+    const note = node("p", "media-missing-note color-subdue", "Monitored items only. Episodes appear after airing; movies include unreleased titles. Based on the latest Sonarr and Radarr scans.");
     root.replaceChildren(status, retry, content, note);
     let timer, controller, revision = 0, signature = "", loaded = false;
 

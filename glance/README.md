@@ -157,7 +157,7 @@ The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling
 | [Jellyfin sessions](config/widgets/jellyfin-stats.yml) | Live relay uses Jellyfin `/socket` `SessionsStart`, plus `/Sessions` snapshots/reconciliation; shows active playback, users, devices, play method, pause state, and progress | `15s` initial cache; then event-driven, with `5s` REST reconciliation by default |
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
 | [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Same-origin `/live/calendar` gateway route backed by Sonarr and Radarr `/api/v3/calendar`; renders day, Monday-first week, month, or year views | Browser refresh every `30s` while visible |
-| [Missing from disk](config/widgets/media-missing.yml) | Same-origin `/live/missing`; Sonarr missing episodes and Radarr movies without files, including unmonitored items | Browser refresh every `30s` while visible; last successful inventory remains visible on refresh failure |
+| [Missing from disk](config/widgets/media-missing.yml) | Same-origin `/live/missing`; monitored Sonarr episodes and Radarr movies without files | Browser refresh every `30s` while visible; last successful inventory remains visible on refresh failure |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
 | [Subforge](config/widgets/subforge.yml) | JavaScript-rendered, same-origin SSE topic backed by Subforge's authenticated `/api/widget/events`; processed-file totals and up to 32 concurrent job summaries with progress, elapsed time, approximate ETA, liveness, and generic wait status | Native SSE while the Media page is visible; no browser REST fallback |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
@@ -353,13 +353,15 @@ blank, the endpoint returns `503`. The endpoint accepts same-origin requests
 only and does not accept query parameters.
 
 Sonarr inventory uses paginated `/api/v3/wanted/missing` requests with
-`includeSeries=true` and both `monitored=true` and `monitored=false`, so it
-includes unmonitored episodes and specials. It follows Sonarr's missing-episode
-semantics: episodes are included after airing, while future or undated episodes
-are excluded. Radarr inventory uses `/api/v3/movie` and includes titles without
-a movie file, including unmonitored and unreleased movies. “Missing” reflects
-the latest scan state reported by Sonarr or Radarr; the gateway does not probe
-the filesystem independently.
+`includeSeries=true` and `monitored=true`. The gateway also filters out entries
+that Sonarr explicitly marks as unmonitored at the episode, series, or season
+level. Monitored specials remain included. Sonarr's endpoint includes episodes
+after airing and excludes future or undated episodes. Radarr inventory uses
+`/api/v3/movie` and keeps only movies explicitly marked monitored that have no
+movie file; unmonitored or unknown-monitoring movies are excluded, while
+monitored unreleased movies remain included. “Missing” reflects the latest scan
+state reported by Sonarr or Radarr; the gateway does not probe the filesystem
+independently.
 
 The widget shows TV and movies in responsive columns. A show with multiple
 missing episodes starts collapsed by show and then by season; season `0` is

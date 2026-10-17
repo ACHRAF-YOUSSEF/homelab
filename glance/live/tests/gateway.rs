@@ -1242,14 +1242,14 @@ fn subforge_widget() -> Value {
 fn missing_episode(id: u64, season: u32, episode: u32) -> Value {
     json!({
         "id":id,"seriesId":20,"title":format!("Episode {id}"),
-        "series":{"title":"Example show","titleSlug":"example-show","path":"private-series-path"},
-        "seasonNumber":season,"episodeNumber":episode,"hasFile":false,
+        "series":{"title":"Example show","titleSlug":"example-show","path":"private-series-path","monitored":true,"seasons":[{"seasonNumber":season,"monitored":true}]},
+        "seasonNumber":season,"episodeNumber":episode,"hasFile":false,"monitored":true,
         "path":"private-episode-path","apiKey":"private-provider-key"
     })
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn missing_media_paginates_both_monitoring_classes_and_projects_only_public_fields() {
+async fn missing_media_paginates_monitored_items_and_respects_episode_series_and_season_flags() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
     let handler: Handler = Arc::new(move |request| {
@@ -1278,23 +1278,49 @@ async fn missing_media_paginates_both_monitoring_classes_and_projects_only_publi
                     assert_eq!(query.get("sortKey").unwrap(), "episodes.airDateUtc");
                     assert_eq!(query.get("sortDirection").unwrap(), "ascending");
                     let page: usize = query.get("page").unwrap().parse().unwrap();
-                    let monitored = query.get("monitored").unwrap() == "true";
-                    let records: Vec<_> = match (monitored, page) {
-                        (true, 1) => (1..=250)
+                    assert_eq!(query.get("monitored").unwrap(), "true");
+                    let records: Vec<_> = match page {
+                        1 => (1..=250)
                             .map(|id| missing_episode(id, 1, id as u32))
                             .collect(),
-                        (true, 2) => vec![missing_episode(251, 2, 1)],
-                        (false, 1) => {
+                        2 => {
                             let mut downloaded = missing_episode(501, 3, 1);
                             downloaded["hasFile"] = json!(true);
                             let mut special = missing_episode(500, 0, 1);
                             special.as_object_mut().unwrap().remove("hasFile");
-                            vec![missing_episode(251, 2, 1), special, downloaded]
+                            let mut unmonitored_episode = missing_episode(502, 1, 1);
+                            unmonitored_episode["monitored"] = json!(false);
+                            let mut unmonitored_series = missing_episode(503, 1, 1);
+                            unmonitored_series["series"]["monitored"] = json!(false);
+                            let mut unmonitored_season = missing_episode(504, 1, 1);
+                            unmonitored_season["series"]["seasons"][0]["monitored"] = json!(false);
+                            let mut unmonitored_special = missing_episode(505, 0, 1);
+                            unmonitored_special["series"]["seasons"][0]["monitored"] = json!(false);
+                            let mut legacy_episode = missing_episode(506, 1, 1);
+                            legacy_episode.as_object_mut().unwrap().remove("monitored");
+                            legacy_episode["series"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("monitored");
+                            legacy_episode["series"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("seasons");
+                            vec![
+                                missing_episode(251, 2, 1),
+                                special,
+                                downloaded,
+                                unmonitored_episode,
+                                unmonitored_series,
+                                unmonitored_season,
+                                unmonitored_special,
+                                legacy_episode,
+                            ]
                         }
                         _ => panic!("unexpected page"),
                     };
                     json_response(
-                        json!({"page":page,"pageSize":250,"totalRecords":if monitored {251} else {3},"records":records}),
+                        json!({"page":page,"pageSize":250,"totalRecords":258,"records":records}),
                     )
                 }
                 "/radarr/api/v3/movie" => {
@@ -1304,13 +1330,16 @@ async fn missing_media_paginates_both_monitoring_classes_and_projects_only_publi
                     );
                     assert!(request.uri().query().is_none());
                     json_response(json!([
-                        {"id":700,"title":"A future movie","titleSlug":"700","year":2099,"hasFile":false,"monitored":false,"inCinemas":"2099-01-01","path":"private-movie-path"},
-                        {"id":701,"title":"B current schema","titleSlug":"701","movieFileId":0},
-                        {"id":702,"title":"Downloaded","titleSlug":"702","hasFile":true},
-                        {"id":703,"title":"Unknown file status","titleSlug":"703"},
-                        {"id":704,"title":"Contradictory","titleSlug":"704","hasFile":false,"movieFileId":10},
-                        {"id":705,"title":"C nullable compatibility","titleSlug":"705","hasFile":null,"movieFileId":0},
-                        {"id":700,"title":"Duplicate movie","titleSlug":"700","hasFile":false}
+                        {"id":700,"title":"A future movie","titleSlug":"700","year":2099,"hasFile":false,"monitored":true,"inCinemas":"2099-01-01","path":"private-movie-path"},
+                        {"id":701,"title":"B current schema","titleSlug":"701","movieFileId":0,"monitored":true},
+                        {"id":702,"title":"Downloaded","titleSlug":"702","hasFile":true,"monitored":true},
+                        {"id":703,"title":"Unknown file status","titleSlug":"703","monitored":true},
+                        {"id":704,"title":"Contradictory","titleSlug":"704","hasFile":false,"movieFileId":10,"monitored":true},
+                        {"id":705,"title":"C nullable compatibility","titleSlug":"705","hasFile":null,"movieFileId":0,"monitored":true},
+                        {"id":706,"title":"Unmonitored","titleSlug":"706","hasFile":false,"monitored":false},
+                        {"id":707,"title":"Unknown monitoring","titleSlug":"707","hasFile":false},
+                        {"id":708,"title":"Null monitoring","titleSlug":"708","hasFile":false,"monitored":null},
+                        {"id":700,"title":"Duplicate movie","titleSlug":"700","hasFile":false,"monitored":true}
                     ]))
                 }
                 _ => panic!("unexpected upstream path"),
@@ -1341,15 +1370,21 @@ async fn missing_media_paginates_both_monitoring_classes_and_projects_only_publi
         json!({"sonarr":true,"radarr":true})
     );
     let items = projection["items"].as_array().unwrap();
-    assert_eq!(items.len(), 255);
+    assert_eq!(items.len(), 256);
     assert_eq!(
         items
             .iter()
             .filter(|item| item["kind"] == "episode")
             .count(),
-        252
+        253
     );
     assert_eq!(items.iter().filter(|item| item["id"] == 251).count(), 1);
+    assert!(!items.iter().any(|item| {
+        [501, 502, 503, 504, 505, 706, 707, 708]
+            .iter()
+            .any(|id| item["id"] == *id)
+    }));
+    assert!(items.iter().any(|item| item["id"] == 506));
     assert!(
         items
             .iter()
@@ -1370,7 +1405,7 @@ async fn missing_media_paginates_both_monitoring_classes_and_projects_only_publi
             .windows(2)
             .all(|pair| pair[0]["title"].as_str() <= pair[1]["title"].as_str())
     );
-    assert_eq!(seen.lock().unwrap().len(), 4);
+    assert_eq!(seen.lock().unwrap().len(), 3);
     fixture.close().await;
 }
 
@@ -1492,7 +1527,7 @@ async fn missing_media_reports_configured_providers_and_does_not_call_unconfigur
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            if sonarr { 2 } else { usize::from(radarr) }
+            usize::from(sonarr) + usize::from(radarr)
         );
         fixture.close().await;
     }
@@ -1589,8 +1624,8 @@ async fn missing_media_rejects_redirects_body_output_and_movie_list_limits_and_u
                     "oversize" => response(StatusCode::OK, Bytes::from(vec![b'x'; 2048])),
                     "provider-failed" => response(StatusCode::INTERNAL_SERVER_ERROR, "private-provider-error"),
                     "malformed" => response(StatusCode::OK, "private-provider-error"),
-                    "movie-limit" => json_response(json!((0..10001).map(|id| json!({"id":id,"title":"Movie","titleSlug":"123","hasFile":false})).collect::<Vec<_>>())),
-                    _ => json_response(json!([{"id":1,"title":"Movie","titleSlug":if mode == "slug" {"../private"} else {"123"},"hasFile":false}])),
+                    "movie-limit" => json_response(json!((0..10001).map(|id| json!({"id":id,"title":"Movie","titleSlug":"123","hasFile":false,"monitored":true})).collect::<Vec<_>>())),
+                    _ => json_response(json!([{"id":1,"title":"Movie","titleSlug":if mode == "slug" {"../private"} else {"123"},"hasFile":false,"monitored":true}])),
                 }
             })
         });
@@ -1682,11 +1717,10 @@ async fn missing_media_shares_the_calendar_concurrency_limit() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn missing_media_dedicated_byte_caps_support_realistic_libraries_and_remain_enforced() {
-    // Match a sizeable library: 1,217 monitored + 3,344 unmonitored missing episodes,
-    // and 318 movies with six missing. Large ignored metadata exercises provider byte caps.
-    let movies: Vec<_> = (1..=318).map(|id| json!({
+    // A synthetic monitored library with large ignored metadata exercises independent caps.
+    let movies: Vec<_> = (1..=320).map(|id| json!({
         "id":10000 + id,"title":format!("Fixture movie {id}"),"titleSlug":format!("movie-{id}"),
-        "year":2026,"movieFileId":if id <= 6 {0} else {id},
+        "year":2026,"movieFileId":if id <= 8 {0} else {id},"monitored":true,
         "overview":"x".repeat(6800),"path":"private-movie-path"
     })).collect();
     let movie_body = Bytes::from(serde_json::to_vec(&movies).unwrap());
@@ -1709,17 +1743,14 @@ async fn missing_media_dedicated_byte_caps_support_realistic_libraries_and_remai
                                 .into_owned()
                                 .collect();
                         let page: usize = query.get("page").unwrap().parse().unwrap();
-                        let monitored = query.get("monitored").unwrap() == "true";
-                        let (total, offset) = if monitored { (1217, 0) } else { (3344, 1217) };
+                        assert_eq!(query.get("monitored").unwrap(), "true");
+                        let total = 2000;
                         let start = (page - 1) * 250;
                         assert!(start < total);
                         let records: Vec<_> = (start..total.min(start + 250))
                             .map(|index| {
-                                let mut episode = missing_episode(
-                                    (offset + index + 1) as u64,
-                                    1,
-                                    (index + 1) as u32,
-                                );
+                                let mut episode =
+                                    missing_episode((index + 1) as u64, 1, (index + 1) as u32);
                                 episode["series"]["overview"] = json!("x".repeat(5500));
                                 episode
                             })
@@ -1761,7 +1792,7 @@ async fn missing_media_dedicated_byte_caps_support_realistic_libraries_and_remai
             assert!(output.len() > 256 * 1024);
             assert!(output.len() < 2 * 1024 * 1024);
             let projection: Value = serde_json::from_slice(&output).unwrap();
-            assert_eq!(projection["items"].as_array().unwrap().len(), 4567);
+            assert_eq!(projection["items"].as_array().unwrap().len(), 2008);
             assert!(!String::from_utf8_lossy(&output).contains("private-"));
         } else {
             assert_eq!(result.status(), StatusCode::BAD_GATEWAY, "{mode}");
@@ -1770,7 +1801,7 @@ async fn missing_media_dedicated_byte_caps_support_realistic_libraries_and_remai
                 "missing media providers unavailable or media limit exceeded"
             );
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 20, "{mode}");
+        assert_eq!(calls.load(Ordering::SeqCst), 9, "{mode}");
         assert_eq!(fixture.relay.config.provider_bytes, 2 * 1024 * 1024);
         assert_eq!(fixture.relay.config.snapshot_bytes, 256 * 1024);
         fixture.close().await;
