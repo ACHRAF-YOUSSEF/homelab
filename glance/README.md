@@ -144,7 +144,7 @@ The Glance dashboard and live stream have no user authentication. Keep host port
 
 The gateway proxies the upstream Glance application and emits sanitized JSON snapshots, keeping Jellyfin and optional qBittorrent credentials on the server. The `/live/events` route accepts only the `media` and `downloads` topics and applies same-origin checks; its request also probes the corresponding Glance page-content route with the browser cookie, preserving Glance's native authorization if enabled later. This probe does not add authentication to the current unauthenticated dashboard.
 
-`glance-live` uses one Tokio event-loop thread and at most two blocking DNS workers, with shared, on-demand collectors: a collector runs only while its topic has subscribers, and stops when the last browser disconnects. It has no GPU device access. Provider responses are limited to 2 MiB, normalized snapshots to 256 KiB, torrent lists to 2,000 entries, Jellyfin sessions to 256, active SSE clients to 64, accepted HTTP connections to 128, and SSE lifetime to 900 seconds by default. If an upstream payload exceeds its bound or fails, the topic is marked stale and its last valid snapshot is retained; the gateway does not synthesize replacement values. These defaults are configurable through `GLANCE_LIVE_*` variables described below.
+`glance-live` uses one Tokio event-loop thread and at most two blocking DNS workers, with shared, on-demand collectors: a collector runs only while its topic has subscribers, and stops when the last browser disconnects. It has no GPU device access. For live streams and the calendar, provider responses are limited to 2 MiB, normalized snapshots to 256 KiB, torrent lists to 2,000 entries, Jellyfin sessions to 256, active SSE clients to 64, accepted HTTP connections to 128, and SSE lifetime to 900 seconds by default. Missing-media inventory uses its own larger provider and snapshot bounds described below. If an upstream payload exceeds its bound or fails, the topic is marked stale and its last valid snapshot is retained; the gateway does not synthesize replacement values. These defaults are configurable through `GLANCE_LIVE_*` variables described below.
 
 The gateway runs as an unprivileged user, drops Linux capabilities, has a read-only filesystem, and is connected only to `homelab`; its Rust toolchain and runtime image are pinned. Glance itself remains upstream and continues on the internal `docker-monitoring` network for its read-only Docker API proxy; it does not mount the raw Docker socket. Keep API credentials and deployment-specific addresses in `.env`, and review [SECURITY.md](../SECURITY.md) before changing exposure or network access.
 
@@ -369,14 +369,18 @@ still exists. The browser refreshes every 30 seconds while the page is visible,
 keeps the last successful inventory after a refresh error, and exposes a
 **Retry** button. Returning to a visible tab triggers a fresh request.
 
-The gateway caps each Sonarr/Radarr inventory and the final inventory at 10,000
-records, each provider response at 2 MiB, and the normalized snapshot at
-256 KiB. A load has a 45-second overall timeout. Missing-inventory requests
-share two slots with calendar requests;
-when both are occupied, the endpoint returns `503`. An upstream, data, or size
-failure returns `502` and does not replace the previous browser-rendered
-inventory. These bounds use `GLANCE_LIVE_MAX_PROVIDER_BYTES` and
-`GLANCE_LIVE_MAX_SNAPSHOT_BYTES`, which also bound other live gateway payloads.
+Missing inventories can be larger than calendar and live-stream payloads, so
+they have separate configurable size bounds. The Sonarr and Radarr inputs and
+the final inventory are each limited to 10,000 records. By default,
+`GLANCE_LIVE_MISSING_MAX_PROVIDER_BYTES` allows 8 MiB per provider response
+(maximum 16 MiB), and `GLANCE_LIVE_MISSING_MAX_SNAPSHOT_BYTES` allows a 2 MiB
+normalized response (maximum 4 MiB). These settings do not change the general
+gateway bounds: `GLANCE_LIVE_MAX_PROVIDER_BYTES` remains 2 MiB by default and
+`GLANCE_LIVE_MAX_SNAPSHOT_BYTES` remains 256 KiB for the calendar and other
+live payloads. A load has a 45-second overall timeout. Missing-inventory
+requests share two slots with calendar requests; when both are occupied, the
+endpoint returns `503`. An upstream, data, or size failure returns `502` and
+does not replace the previous browser-rendered inventory.
 
 After changing gateway code or Sonarr/Radarr keys, rebuild and recreate
 `glance-live`; restart Glance to load updated page YAML and browser assets:
@@ -422,7 +426,7 @@ loaded, then reload the browser to pick up script changes:
 docker compose restart glance glance-live
 ```
 
-After changing `.env`, recreate the containers so they receive the new values. The gateway resource variables are `GLANCE_LIVE_MEMORY_LIMIT`, `GLANCE_LIVE_CPUS`, `GLANCE_LIVE_MAX_CONNECTIONS`, `GLANCE_LIVE_MAX_HTTP_CONNECTIONS`, `GLANCE_LIVE_SSE_MAX_SECONDS`, `GLANCE_LIVE_MAX_PROVIDER_BYTES`, `GLANCE_LIVE_MAX_SNAPSHOT_BYTES`, `GLANCE_LIVE_MAX_TORRENTS`, and `GLANCE_LIVE_MAX_SESSIONS`. Compose enforces the memory and CPU ceilings. The application validates connection, lifetime, payload, torrent, and session limits on startup and caps their accepted values. Recreate `glance-live` after changing any of them.
+After changing `.env`, recreate the containers so they receive the new values. The gateway resource variables are `GLANCE_LIVE_MEMORY_LIMIT`, `GLANCE_LIVE_CPUS`, `GLANCE_LIVE_MAX_CONNECTIONS`, `GLANCE_LIVE_MAX_HTTP_CONNECTIONS`, `GLANCE_LIVE_SSE_MAX_SECONDS`, `GLANCE_LIVE_MAX_PROVIDER_BYTES`, `GLANCE_LIVE_MAX_SNAPSHOT_BYTES`, `GLANCE_LIVE_MISSING_MAX_PROVIDER_BYTES`, `GLANCE_LIVE_MISSING_MAX_SNAPSHOT_BYTES`, `GLANCE_LIVE_MAX_TORRENTS`, and `GLANCE_LIVE_MAX_SESSIONS`. Compose enforces the memory and CPU ceilings. The application validates connection, lifetime, payload, torrent, and session limits on startup and caps their accepted values. Recreate `glance-live` after changing any of them.
 After changing cache code, rebuild and recreate only that service:
 
 ```shell

@@ -194,6 +194,8 @@ impl Fixture {
             sse_lifetime: Duration::from_secs(2),
             provider_bytes: 1024 * 1024,
             snapshot_bytes: 256 * 1024,
+            missing_provider_bytes: 8 * 1024 * 1024,
+            missing_snapshot_bytes: 2 * 1024 * 1024,
             max_torrents: 100,
             max_sessions: 100,
             qb_username: String::new(),
@@ -1594,13 +1596,13 @@ async fn missing_media_rejects_redirects_body_output_and_movie_list_limits_and_u
         });
         let fixture = Fixture::start(handler, |config| {
             config.sonarr_key.clear();
-            config.provider_bytes = if mode == "movie-limit" {
+            config.missing_provider_bytes = if mode == "movie-limit" {
                 1024 * 1024
             } else {
                 1024
             };
             if mode == "output" {
-                config.snapshot_bytes = 32;
+                config.missing_snapshot_bytes = 32;
             }
         })
         .await;
@@ -1676,6 +1678,103 @@ async fn missing_media_shares_the_calendar_concurrency_limit() {
         assert_eq!(task.await.unwrap().status(), StatusCode::OK);
     }
     fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_media_dedicated_byte_caps_support_realistic_libraries_and_remain_enforced() {
+    // Match a sizeable library: 1,217 monitored + 3,344 unmonitored missing episodes,
+    // and 318 movies with six missing. Large ignored metadata exercises provider byte caps.
+    let movies: Vec<_> = (1..=318).map(|id| json!({
+        "id":10000 + id,"title":format!("Fixture movie {id}"),"titleSlug":format!("movie-{id}"),
+        "year":2026,"movieFileId":if id <= 6 {0} else {id},
+        "overview":"x".repeat(6800),"path":"private-movie-path"
+    })).collect();
+    let movie_body = Bytes::from(serde_json::to_vec(&movies).unwrap());
+    assert!(movie_body.len() > 2 * 1024 * 1024);
+    assert!(movie_body.len() < 8 * 1024 * 1024);
+    for mode in ["default", "provider-cap", "snapshot-cap"] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let movie_body = movie_body.clone();
+        let handler: Handler = Arc::new(move |request| {
+            let calls = captured.clone();
+            let movie_body = movie_body.clone();
+            Box::pin(async move {
+                match request.uri().path() {
+                    "/api/pages/media/content/" => response(StatusCode::OK, "authorized"),
+                    "/sonarr/api/v3/wanted/missing" => {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let query: std::collections::HashMap<_, _> =
+                            url::form_urlencoded::parse(request.uri().query().unwrap().as_bytes())
+                                .into_owned()
+                                .collect();
+                        let page: usize = query.get("page").unwrap().parse().unwrap();
+                        let monitored = query.get("monitored").unwrap() == "true";
+                        let (total, offset) = if monitored { (1217, 0) } else { (3344, 1217) };
+                        let start = (page - 1) * 250;
+                        assert!(start < total);
+                        let records: Vec<_> = (start..total.min(start + 250))
+                            .map(|index| {
+                                let mut episode = missing_episode(
+                                    (offset + index + 1) as u64,
+                                    1,
+                                    (index + 1) as u32,
+                                );
+                                episode["series"]["overview"] = json!("x".repeat(5500));
+                                episode
+                            })
+                            .collect();
+                        json_response(
+                            json!({"page":page,"pageSize":250,"totalRecords":total,"records":records}),
+                        )
+                    }
+                    "/radarr/api/v3/movie" => {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        response(StatusCode::OK, movie_body)
+                    }
+                    _ => panic!("unexpected fixture path"),
+                }
+            })
+        });
+        let fixture = Fixture::start(handler, |config| {
+            // Existing SSE/calendar caps must remain independent of missing-media caps.
+            config.provider_bytes = 2 * 1024 * 1024;
+            config.snapshot_bytes = 256 * 1024;
+            if mode == "provider-cap" {
+                config.missing_provider_bytes = 2 * 1024 * 1024;
+            }
+            if mode == "snapshot-cap" {
+                config.missing_snapshot_bytes = 256 * 1024;
+            }
+        })
+        .await;
+        let result = fixture
+            .client
+            .get(fixture.url("/live/missing"))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap();
+        if mode == "default" {
+            assert_eq!(result.status(), StatusCode::OK);
+            let output = result.bytes().await.unwrap();
+            assert!(output.len() > 256 * 1024);
+            assert!(output.len() < 2 * 1024 * 1024);
+            let projection: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(projection["items"].as_array().unwrap().len(), 4567);
+            assert!(!String::from_utf8_lossy(&output).contains("private-"));
+        } else {
+            assert_eq!(result.status(), StatusCode::BAD_GATEWAY, "{mode}");
+            assert_eq!(
+                result.text().await.unwrap(),
+                "missing media providers unavailable or media limit exceeded"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 20, "{mode}");
+        assert_eq!(fixture.relay.config.provider_bytes, 2 * 1024 * 1024);
+        assert_eq!(fixture.relay.config.snapshot_bytes, 256 * 1024);
+        fixture.close().await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

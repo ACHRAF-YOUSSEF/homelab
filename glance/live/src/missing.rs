@@ -187,7 +187,7 @@ async fn provider<T: for<'de> Deserialize<'de>>(
     if response.status() != reqwest::StatusCode::OK {
         return Err(Error::Upstream);
     }
-    let body = bounded_body(response, relay.config.provider_bytes).await?;
+    let body = bounded_body(response, relay.config.missing_provider_bytes).await?;
     serde_json::from_slice(&body).map_err(|_| Error::InvalidData)
 }
 
@@ -305,7 +305,7 @@ pub(crate) async fn load(relay: &Relay) -> Result<Bytes, Error> {
                 radarr: !config.radarr_key.is_empty(),
             },
         },
-        config.snapshot_bytes,
+        config.missing_snapshot_bytes,
     )
 }
 
