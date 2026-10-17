@@ -107,11 +107,12 @@
     const bazarr=usesBazarr(),authority=state.inventoryAuthority||{},status=bazarr&&state.inventorySource!=='bazarr'?'stale':authority.status||'ready';
     setText($('#inventory-source'),bazarr?'Bazarr':'Filesystem');
     const blocked=bazarr&&!['ready','refresh_pending'].includes(status);
-    const banner=$('#inventory-authority');banner.classList.toggle('hidden',!bazarr||status==='ready');
+    const banner=$('#inventory-authority');banner.classList.remove('hidden');
+    banner.dataset.authorityState=bazarr?status:state.status?'ready':'loading';
     banner.classList.toggle('authority-error',blocked);
     const pendingCount=Array.isArray(authority.pending_srt_keys)?authority.pending_srt_keys.length:0;
     const pendingDetail=authority.verification_limited===true?' Some published outputs exceed the indexing verification limits.':pendingCount?` ${pendingCount.toLocaleString()} published SRT file${pendingCount===1?' is':'s are'} not yet confirmed by Bazarr.`:'';
-    setText(banner,bazarr?({ready:'',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:`Bazarr inventory synced. Published subtitle indexing is still unconfirmed.${pendingDetail} Conversion is available; existing SRT files are checked before converting.`,reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(status!=='ready'&&authority.reason?` ${authority.reason}`:'')+(authority.error?` ${authority.error}`:''):'');
+    setText(banner,bazarr?({ready:'Bazarr inventory is ready.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:`Bazarr inventory synced. Published subtitle indexing is still unconfirmed.${pendingDetail} Conversion is available; existing SRT files are checked before converting.`,reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(status!=='ready'&&authority.reason?` ${authority.reason}`:'')+(authority.error?` ${authority.error}`:''):state.status?'Filesystem inventory. Inspect media to update saved tracks and coverage.':'Checking library status…');
     $$('[data-action="inspect"]').forEach(button=>setText(button,bazarr?'Sync Bazarr inventory':'Inspect media'));
     const overviewNotice=$('#overview-inventory-notice');
     if(overviewNotice){overviewNotice.hidden=!bazarr||status==='ready';setText(overviewNotice,banner.textContent);}
@@ -132,12 +133,13 @@
     const count=key=>available[key]===false||!Number.isFinite(data[key])?'—':data[key].toLocaleString();
     setText($('#pipeline-inspected'),count('files_inspected'));setText($('#pipeline-ready'),count('generated_srt_count'));
     const inventoryStatus=$('#pipeline-status');
-    setText(inventoryStatus,state.inventoryUpdated?`${usesBazarr()?'Bazarr sync':'Inspected'} ${fmtDate(state.inventoryUpdated)}${state.inventoryTruncated?' · Partial snapshot':''}`:'No inventory yet');
+    const inventoryUpdated=state.status?.inventory?.updated??state.inventoryUpdated;
+    setText(inventoryStatus,inventoryUpdated?`${usesBazarr()?'Bazarr sync':'Inspected'} ${fmtDate(inventoryUpdated)}${state.status?.inventory?.truncated?' · Partial snapshot':''}`:'No inventory yet');
     if(inventoryStatus)inventoryStatus.title=usesBazarr()?'Bazarr profiles define the required languages. Open Library for verified SRT coverage.':'Inspect media to update the saved filesystem inventory.';
     setText($('#attention-pending'),count('pending_ocr_files'));setText($('#attention-failed'),count('failed_files'));setText($('#attention-unreachable'),count('unreachable_roots'));
-    for(const [key,value] of [['pending',data.pending_ocr_files],['failed',data.failed_files],['paths',data.unreachable_roots]]){const button=$(`[data-attention="${key}"]`);button.classList.toggle('has-issues',Number(value)>0);button.classList.toggle('is-clear',value===0);button.hidden=key==='paths'&&value===0;button.title=key==='paths'?'Review unavailable media folders':key==='failed'?'Review failures saved in conversion state':'Review files awaiting image subtitle recognition';}
+    for(const [key,value] of [['pending',data.pending_ocr_files],['failed',data.failed_files],['paths',data.unreachable_roots]]){const button=$(`[data-attention="${key}"]`);button.classList.toggle('has-issues',Number(value)>0);button.classList.toggle('is-clear',value===0);button.title=key==='paths'?'Review unavailable media folders':key==='failed'?'Review failures saved in conversion state':'Review files awaiting image subtitle recognition';}
     const idle=!running&&!queued,currentPanel=$('#current-work-title').closest('article'),idleStatus=$('#overview-work-status');
-    currentPanel.hidden=idle;currentPanel.classList.toggle('is-idle',idle);if(idleStatus){idleStatus.hidden=!idle;setText(idleStatus,'No jobs running');}
+    currentPanel.hidden=idle;currentPanel.classList.toggle('is-idle',idle);if(idleStatus)setText(idleStatus,idle?'No jobs running':running?`${active.length} job${active.length===1?'':'s'} running`:`${queued} queued job${queued===1?'':'s'}`);
     const progress=$('#pipeline-progress');progress.hidden=!running;
     if(running&&Number(running.total)>0){progress.value=jobPercent(running);progress.setAttribute('aria-label',`${running.processed||0} of ${running.total} files processed`);}else progress.removeAttribute('value');
     const content=$('#current-work-content');content.replaceChildren();
@@ -159,7 +161,7 @@
     const button=document.createElement('button');button.type='button';button.className='icon-button collapse-toggle';button.setAttribute('aria-controls',content.id);button.append(disclosureIcon());
     const sync=()=>{const collapsed=state.collapsedPanels.has(key);content.hidden=collapsed;card.classList.toggle('is-collapsed',collapsed);button.setAttribute('aria-expanded',String(!collapsed));button.setAttribute('aria-label',`${collapsed?'Expand':'Collapse'} ${title}`);button.title=`${collapsed?'Expand':'Collapse'} ${title}`;};
     button.addEventListener('click',()=>{if(state.collapsedPanels.has(key))state.collapsedPanels.delete(key);else state.collapsedPanels.add(key);sync();try{localStorage.setItem('subforge.collapsed-panels',JSON.stringify([...state.collapsedPanels]));}catch{}});
-    if(header.classList.contains('inventory-toolbar')){header.firstElementChild.classList.add('inventory-heading-title');const actions=document.createElement('div');actions.className='panel-heading-actions';actions.append(button);header.insertBefore(actions,$('.toolbar-filters',header));}
+    if(header.classList.contains('inventory-toolbar')){header.firstElementChild.classList.add('inventory-heading-title');const actions=$(':scope > .panel-heading-actions',header)||document.createElement('div');actions.className='panel-heading-actions';actions.append(button);if(!actions.parentElement)header.insertBefore(actions,$('.toolbar-filters',header));}
     else{const actions=document.createElement('div');actions.className='panel-heading-actions';while(header.children.length>1)actions.append(header.children[1]);actions.append(button);header.append(actions);}
     sync();
   };
@@ -425,9 +427,11 @@
   };
   const setConnection = good => { $('#connection-dot').classList.toggle('offline',!good); setText($('#connection-text'),good ? 'Service connected' : 'Service unavailable'); };
   const loadInventory = async summary => {
-    if(state.inventoryBusy)return;if(summary?.authority)state.inventoryAuthority=summary.authority;if(summary?.source)state.inventorySource=summary.source;renderInventoryAuthority();if(state.inventoryLoaded&&state.inventoryUpdated===summary?.updated&&state.inventoryRevision===summary?.state_revision)return;
+    if(summary?.authority)state.inventoryAuthority=summary.authority;if(summary?.source)state.inventorySource=summary.source;renderInventoryAuthority();
+    if(state.currentPage!=='library'||state.inventoryBusy)return;
+    if(state.inventoryLoaded&&state.inventoryUpdated===summary?.updated&&state.inventoryRevision===summary?.state_revision)return;
     state.inventoryBusy=true;
-    try {const data=await api('/api/inventory');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryRevision=data.state_revision;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;state.inventorySource=data.source||'filesystem';state.inventoryAuthority=data.authority||{status:'ready'};renderInventoryAuthority();renderInventory();renderPipeline();}
+    try {const data=await api('/api/library');state.inventory=Array.isArray(data.items)?data.items:[];state.inventoryUpdated=data.updated;state.inventoryRevision=data.state_revision;state.inventoryTruncated=!!data.truncated;state.inventoryLoaded=true;state.inventorySource=data.source||'filesystem';state.inventoryAuthority=data.authority||{status:'ready'};renderInventoryAuthority();renderInventory();renderPipeline();}
     catch(error){notify(`Could not load library inventory: ${error.message}`,'error');}
     finally{state.inventoryBusy=false;}
   };
@@ -438,6 +442,7 @@
     try {const view=JSON.parse(sessionStorage.getItem('subforge.inventory-view')||'{}');state.inventoryPage=Number.isInteger(view.page)&&view.page>0?Math.min(2000,view.page):1;state.inventoryPageSize=[25,50,100].includes(view.pageSize)?view.pageSize:'auto';$('#inventory-page-size').value=String(state.inventoryPageSize);$('#inventory-search').value=typeof view.search==='string'?view.search.slice(0,256):'';$('#inventory-filter').value=['all','needed','covered','unavailable','video','sidecar','issues','has_tracks','pending','failed','ready','metadata'].includes(view.filter)?view.filter:'all';state.inventoryRestoreRoot=typeof view.root==='string'?view.root.slice(0,64):'';}catch{}
   };
   const applyStatus = data => {
+    clearTimeout(state.bootstrapFallback);
     state.status=data;setConnection(true);renderRootSelectors(data.roots||[]);renderJobs();renderLogs(data.logs);renderPipeline();
     setText($('#last-updated'),`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
     void loadInventory(data.inventory);updateHookStates();updateIntegrationUsage();updateIntegrationDots();updateVersion(data.version,data.edition);
@@ -475,7 +480,7 @@
     const start=(state.inventoryPage-1)*pageSize, visibleRows=rows.slice(start,start+pageSize);
     setText($('#inventory-meta'),`${count.toLocaleString()} ${count===1?'match':'matches'} in ${state.inventory.length.toLocaleString()} ${usesBazarr()?'Bazarr media items':'inspected items'}`);
     const globalCount=filter==='failed'?state.status?.pipeline?.failed_files:filter==='pending'?state.status?.pipeline?.pending_ocr_files:null;
-    setText($('#inventory-scope-note'),[state.inventoryTruncated?'The server reports a bounded partial inventory.':'',Number.isFinite(globalCount)?`${count.toLocaleString()} ${count===1?'match':'matches'} in this snapshot; ${globalCount.toLocaleString()} ${filter==='failed'?'failed':'awaiting OCR'} files across saved conversion state.`:'',state.inventoryUpdated?`${usesBazarr()?'Last Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}.`:''].filter(Boolean).join(' '));
+    setText($('#inventory-scope-note'),[state.inventoryTruncated?'The server reports a bounded partial inventory.':'',Number.isFinite(globalCount)?`${count.toLocaleString()} ${count===1?'match':'matches'} in this snapshot; ${globalCount.toLocaleString()} ${filter==='failed'?'failed':'awaiting OCR'} files across saved conversion state.`:'',state.inventoryUpdated?`${usesBazarr()?'Last Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}.`:''].filter(Boolean).join(' ')||(state.inventoryLoaded?'No saved inventory. Inspect media to load tracks.':'Loading saved inventory…'));
     const range=count?`${(start+1).toLocaleString()}–${(start+visibleRows.length).toLocaleString()} of ${count.toLocaleString()} items`:'0 items';
     if ($('#inventory-range').textContent!==range) setText($('#inventory-range'),range);
     const pageSelect=$('#inventory-page');
@@ -930,7 +935,7 @@
     const administration=page==='settings'&&['tasks','status','media'].includes(section);$('#refresh-system').classList.toggle('hidden',!administration);$('#save-settings').classList.toggle('hidden',administration);
     if(administration&&state.csrf&&changed){if(section==='tasks')loadTasks();else if(section!=='media')loadSystem();}
     if(page==='overview'&&state.csrf&&changed){loadSystem();loadWorkers();}
-    if(page==='library')renderInventory();if(page==='activity')renderJobs();scheduleTableFit();
+    if(page==='library'){renderInventory();if(state.status)void loadInventory(state.status.inventory);}if(page==='activity')renderJobs();scheduleTableFit();
     syncSystemMonitor();
   };
   const restoreRoute = () => {
@@ -1022,11 +1027,17 @@
     bind();restoreRoute();
     try {
       const session=await api('/api/session');state.csrf=session.csrf_token||'';
-      await Promise.all([pollStatus(),loadSettings()]);
+      if(typeof EventSource!=='undefined'){
+        dashboardLive.start();
+        // A single bootstrap fallback keeps a capacity-limited stream from leaving the screen empty.
+        state.bootstrapFallback=setTimeout(()=>{if(!state.status&&!document.hidden)void pollStatus();},5000);
+        await loadSettings();
+      }else{
+        await Promise.all([pollStatus(),loadSettings()]);
+        if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers();
+      }
       if(state.currentPage==='settings'&&state.settingsSection==='media')await loadRootFolders();
       if(state.currentPage==='settings'&&state.settingsSection==='tasks')await loadTasks();
-      // Bootstrap snapshots also keep the dashboard usable in browsers without EventSource.
-      if(systemVisible())await loadSystem();if(workersVisible())await loadWorkers();
     } catch(error) {setConnection(false);notify(`Service initialization failed: ${error.message}`,'error');}
     dashboardLive.start();syncSystemMonitor();
     document.addEventListener('visibilitychange',()=>syncSystemMonitor());

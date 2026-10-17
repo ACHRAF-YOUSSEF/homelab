@@ -80,7 +80,7 @@ impl Server {
             .unwrap();
         write!(
             socket,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: {authorization}\r\n\r\n",
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: {authorization}\r\nAccept-Encoding: gzip\r\n\r\n",
             self.port
         )
         .unwrap();
@@ -94,11 +94,68 @@ impl Server {
             assert!(reader.read_line(&mut line).unwrap() > 0);
             bytes += line.len();
             assert!(bytes < 16 * 1024);
+            assert!(
+                !line.to_ascii_lowercase().starts_with("content-encoding:"),
+                "SSE must remain unbuffered"
+            );
             if line == "\r\n" {
                 break;
             }
         }
         (status, EventStream { reader })
+    }
+}
+
+#[test]
+fn gzip_negotiation_preserves_auth_content_length_and_source_bytes() {
+    fn get(server: &Server, path: &str, auth: Option<&str>, encoding: &str) -> (String, Vec<u8>) {
+        let mut socket = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let authorization = auth
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default();
+        write!(socket, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{authorization}Accept-Encoding: {encoding}\r\nConnection: close\r\n\r\n",server.port).unwrap();
+        let mut bytes = Vec::new();
+        socket.read_to_end(&mut bytes).unwrap();
+        let end = bytes
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8(bytes[..end].to_vec()).unwrap(),
+            bytes[end + 4..].to_vec(),
+        )
+    }
+    let server = Server::start();
+    let auth = server.auth_header();
+    let (head, body) = get(&server, "/static/app.min.js", Some(&auth), "gzip");
+    assert!(head.starts_with("HTTP/1.1 200"));
+    assert!(head.contains("Content-Encoding: gzip"));
+    assert!(head.contains("Vary: Accept-Encoding"));
+    assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(body.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, include_bytes!("../web/dist/app.min.js"));
+    let (head, identity) = get(&server, "/static/app.min.js", Some(&auth), "gzip;q=0,*;q=1");
+    assert!(!head.contains("Content-Encoding:"));
+    assert_eq!(identity, decoded);
+    let (denied, _) = get(&server, "/static/app.min.js", None, "gzip");
+    assert!(denied.starts_with("HTTP/1.1 401"));
+    assert!(!denied.contains("Content-Encoding:"));
+    let (small, _) = get(&server, "/api/session", Some(&auth), "gzip");
+    assert!(!small.contains("Content-Encoding:"));
+    for (path, encoding) in [
+        ("/api/session", "gzip,identity;q=0"),
+        ("/static/app.min.js", "gzip;q=0,identity;q=0"),
+        ("/static/app.min.js", "*;q=0"),
+    ] {
+        let (head, _) = get(&server, path, Some(&auth), encoding);
+        assert!(head.starts_with("HTTP/1.1 406 Not Acceptable"));
+        assert!(head.contains("Vary: Accept-Encoding"));
     }
 }
 
@@ -710,7 +767,13 @@ fn dashboard_auth_can_be_disabled_without_disabling_csrf_and_reenabled_on_restar
         ],
     );
     assert!(!server.data.join("ui-password").exists());
-    for path in ["/", "/api/status", "/api/inventory", "/api/settings"] {
+    for path in [
+        "/",
+        "/api/status",
+        "/api/inventory",
+        "/api/library",
+        "/api/settings",
+    ] {
         assert_eq!(server.request("GET", path, &[], None).unwrap().status, 200);
     }
     let session = server.request("GET", "/api/session", &[], None).unwrap();
@@ -1023,6 +1086,29 @@ fn inventory_api_is_separate_from_status_and_snapshot_survives_backend_restart()
         .expect("read inventory snapshot");
     assert_eq!(inventory.status, 200);
     assert_eq!(inventory.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        server
+            .request("GET", "/api/library", &[], None)
+            .unwrap()
+            .status,
+        401
+    );
+    let library = server
+        .request("GET", "/api/library", &[("Authorization", &auth)], None)
+        .unwrap();
+    assert_eq!(library.status, 200);
+    assert_eq!(
+        library.body["items"][0]["tracks"],
+        inventory.body["items"][0]["tracks"]
+    );
+    assert_eq!(
+        library.body["items"][0]["processing"],
+        inventory.body["items"][0]["processing"]
+    );
+    assert_eq!(
+        library.body["state_revision"],
+        inventory.body["state_revision"]
+    );
     let first_updated = inventory.body["updated"].as_f64().unwrap();
     assert_eq!(finished["inventory"]["count"], 1);
     assert!(finished["inventory"].get("items").is_none());

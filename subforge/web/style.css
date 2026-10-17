@@ -613,6 +613,7 @@ h2 { font-size: 17px; }
 .inventory-toolbar { gap: 16px; padding: 18px 20px; }
 .inventory-heading-title { flex: 1 1 auto; display: grid; gap: 4px; }
 .inventory-toolbar .panel-heading-actions { margin-left: auto; }
+.inventory-toolbar > .panel-heading-actions { min-width: 36px; min-height: 36px; }
 .toolbar-filters { flex-basis: 100%; justify-content: flex-start; }
 .search-box { padding: 0 12px; }
 .search-box input:not([type="checkbox"]):not([type="radio"]) { border: 0; background: transparent; padding: 0; min-height: 42px; }
@@ -880,7 +881,7 @@ h2 { font-size: 17px; }
 }
 
 .inventory-source { display: inline-flex; margin-left: 8px; padding: 3px 7px; border-radius: 5px; background: var(--surface-raised); color: var(--muted); font-size: 12px; font-weight: 500; }
-.inventory-authority { margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 13px; line-height: 1.6; }
+.inventory-authority { min-height: 51px; margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 13px; line-height: 1.6; }
 .inventory-limit-note#inventory-limit-note, #inventory-snapshot-note { display: none !important; }
 .inventory-authority.authority-error { border-color: #805665; color: #FFD0D9; background: #322431; }
 .coverage-existing { color: #91E9B4 !important; background: #15362C; border-color: #34644C; }
@@ -896,7 +897,7 @@ h2 { font-size: 17px; }
   .inventory-toolbar .toolbar-filters select { width: 100%; min-width: 0; flex: none; }
 }
 @media (max-width: 520px) {
-  .table-page .inventory-authority { max-height: 46px; overflow: hidden; padding: 6px 10px; font-size: 12px; line-height: 1.4; }
+  .table-page .inventory-authority { min-height: 46px; max-height: 46px; overflow: hidden; padding: 6px 10px; font-size: 12px; line-height: 1.4; }
   .inventory-pagination { align-items: center; flex-direction: row; flex-wrap: nowrap; justify-content: space-between; gap: 4px; min-height: 48px; padding: 6px 8px; }
   .inventory-page-info { flex: 0 1 auto; min-width: 0; width: auto; gap: 5px; font-size: 12px; }
   .inventory-page-info > span, .jobs-pagination > span { max-width: 52px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -913,6 +914,9 @@ h2 { font-size: 17px; }
 }
 
 /* Overview is a compact control center; secondary diagnostics stay folded away. */
+@media (max-height: 600px) and (max-width: 800px) {
+  .inventory-authority[data-authority-state="ready"] { display: none; }
+}
 #page-overview { padding-top: 20px; padding-bottom: 28px; }
 #page-overview .overview-heading { align-items: center; margin-bottom: 12px; }
 #page-overview .overview-heading h1 { margin-bottom: 3px; }

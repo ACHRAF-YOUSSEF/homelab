@@ -7,15 +7,15 @@
   <meta name="description" content="Subforge turns your media subtitles into SRT files, with language selection and library automation.">
   <title>Subforge · Subtitle automation</title>
   <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
-  <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/live.js" defer></script>
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/style.min.css">
+  <script src="/static/live.min.js" defer></script>
+  <script src="/static/app.min.js" defer></script>
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar" id="sidebar">
       <div class="sidebar-content">
-      <a class="brand" href="#overview" aria-label="Subforge home">
+      <a class="brand" href="#overview">
         <span class="brand-mark" aria-hidden="true"><img src="/static/icon.svg" width="40" height="40" alt=""></span>
         <span class="brand-copy"><strong>Sub<span class="brand-light">forge</span></strong><small>Subtitle workspace</small></span>
       </a>
@@ -61,7 +61,7 @@
               <div><strong id="pipeline-inspected">—</strong><span>Media items</span></div>
               <div><strong id="pipeline-ready">—</strong><span>Generated SRT files</span></div>
             </div>
-            <p id="overview-work-status" class="overview-work-status" role="status" hidden></p>
+            <p id="overview-work-status" class="overview-work-status" role="status">Connecting to the service…</p>
           </div>
           <div class="overview-attention" aria-label="Items needing attention">
             <button type="button" data-attention="failed"><strong id="attention-failed">—</strong><span>Failed</span></button>
@@ -128,9 +128,9 @@
 
       <section class="page table-page" id="page-library">
         <div class="page-heading"><div><h1>Library</h1><p class="lede">Review tracks and convert selected media into sidecar SRT files.</p></div><div class="heading-actions"><button class="button button-secondary" data-action="inspect">Inspect media</button><button class="button button-primary" data-action="scan">Convert subtitles</button></div></div>
-        <div id="inventory-authority" class="inventory-authority hidden" role="status"></div>
-        <article class="panel inventory-panel" data-collapse="library-inventory"><div class="inventory-toolbar"><div><h2>Subtitle inventory <span id="inventory-source" class="inventory-source">Saved snapshot</span></h2><p id="inventory-meta">Inspect a scan root to list its media and tracks.</p></div><div class="toolbar-filters"><label class="search-box inventory-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input id="inventory-search" type="search" placeholder="Search filenames or paths…" aria-label="Search library files" maxlength="256" autocomplete="off" spellcheck="false"></label><select id="inventory-root" class="input compact-input" aria-label="Filter by scan root"><option value="">All roots</option></select><select id="inventory-filter" class="input compact-input" aria-label="Filter by status or media type"><option value="all">All media</option><option value="needed">Needs SRT conversion</option><option value="covered">Already covered</option><option value="unavailable">No matching source</option><option value="video">Video files</option><option value="sidecar">Subtitle files</option><option value="issues">Needs attention</option><option value="has_tracks">Has tracks</option><option value="pending">Pending OCR</option><option value="failed">Failed</option><option value="ready">Ready</option><option value="metadata">Metadata</option></select></div></div>
-          <p id="inventory-scope-note" class="inventory-scope-note" role="status"></p><div class="table-wrap inventory-table-wrap"><table class="inventory-table"><thead><tr><th>Media file</th><th>Status</th><th>Subtitle tracks</th><th>SRT coverage and sources</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="inventory-body"><tr><td colspan="5" class="table-empty">Run an inspection to load your library.</td></tr></tbody></table></div>
+        <div id="inventory-authority" class="inventory-authority" role="status">Checking library status…</div>
+        <article class="panel inventory-panel" data-collapse="library-inventory"><div class="inventory-toolbar"><div class="inventory-heading-title"><h2>Subtitle inventory <span id="inventory-source" class="inventory-source">Saved snapshot</span></h2><p id="inventory-meta">Inspect a scan root to list its media and tracks.</p></div><div class="panel-heading-actions"></div><div class="toolbar-filters"><label class="search-box inventory-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input id="inventory-search" type="search" placeholder="Search filenames or paths…" aria-label="Search library files" maxlength="256" autocomplete="off" spellcheck="false"></label><select id="inventory-root" class="input compact-input" aria-label="Filter by scan root"><option value="">All roots</option></select><select id="inventory-filter" class="input compact-input" aria-label="Filter by status or media type"><option value="all">All media</option><option value="needed">Needs SRT conversion</option><option value="covered">Already covered</option><option value="unavailable">No matching source</option><option value="video">Video files</option><option value="sidecar">Subtitle files</option><option value="issues">Needs attention</option><option value="has_tracks">Has tracks</option><option value="pending">Pending OCR</option><option value="failed">Failed</option><option value="ready">Ready</option><option value="metadata">Metadata</option></select></div></div>
+          <p id="inventory-scope-note" class="inventory-scope-note" role="status">Loading saved inventory…</p><div class="table-wrap inventory-table-wrap"><table class="inventory-table"><thead><tr><th>Media file</th><th>Status</th><th>Subtitle tracks</th><th>SRT coverage and sources</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="inventory-body"><tr><td colspan="5" class="table-empty">Run an inspection to load your library.</td></tr></tbody></table></div>
           <div class="inventory-pagination"><div class="inventory-page-info"><span id="inventory-range" role="status" aria-live="polite">0 items</span><label class="inventory-page-size">Rows per page<select id="inventory-page-size" class="input compact-input"><option value="auto" selected>Auto</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label></div><nav class="inventory-page-nav" aria-label="Library pages"><button id="inventory-prev" class="button button-secondary" type="button" aria-label="Previous library page" aria-controls="inventory-body" disabled>Previous</button><select id="inventory-page" class="input compact-input" aria-label="Go to library page" aria-controls="inventory-body" disabled><option value="1">Page 1 of 1</option></select><button id="inventory-next" class="button button-secondary" type="button" aria-label="Next library page" aria-controls="inventory-body" disabled>Next</button></nav></div>
           <p id="inventory-limit-note" class="form-hint inventory-limit-note hidden">This inspection shows the first 2,000 files. Inspect a smaller scan root to see other files.</p>
           <p id="inventory-snapshot-note" class="form-hint inventory-limit-note" role="status"></p>

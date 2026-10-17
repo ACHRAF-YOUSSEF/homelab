@@ -14,10 +14,12 @@ async function main() {
   const output = process.env.SUBFORGE_UI_OUTPUT && path.resolve(process.env.SUBFORGE_UI_OUTPUT);
   if (output) await fs.mkdir(output, { recursive: true });
   const eventClients = new Set();
+  let rejectEvents = false;
   let publishSnapshot = () => {};
   const server = http.createServer(async (req, res) => {
     const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
     if (pathname === '/api/events' && req.method === 'GET') {
+      if(rejectEvents){res.writeHead(503);res.end();return;}
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       res.flushHeaders();
       eventClients.add(res);
@@ -25,11 +27,11 @@ async function main() {
       publishSnapshot(res);
       return;
     }
-    const asset = { '/': 'index.html', '/static/live.js': 'live.js', '/static/app.js': 'app.js', '/static/style.css': 'style.css', '/static/icon.svg': 'icon.svg' }[pathname];
+    const asset = { '/': 'index.html', '/static/live.js': 'live.js', '/static/app.js': 'app.js', '/static/style.css': 'style.css', '/static/icon.svg': 'icon.svg', '/static/app.min.js':'dist/app.min.js', '/static/live.min.js':'dist/live.min.js', '/static/style.min.css':'dist/style.min.css' }[pathname];
     if (!asset) { res.writeHead(404); res.end(); return; }
     const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' }[path.extname(asset)];
     res.writeHead(200, { 'Content-Type': mime });
-    res.end(await fs.readFile(asset === 'app.js' && appOverride ? appOverride : path.join(web, asset)));
+    res.end(await fs.readFile(['app.js','dist/app.min.js'].includes(asset) && appOverride ? appOverride : path.join(web, asset)));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser, metricsTimer, statusHeartbeatTimer;
@@ -132,7 +134,7 @@ async function main() {
       if(request.method()==='GET'&&endpoint==='/api/workers') { workerReads++; snapshotReads.workers++; }
       if(request.method()==='GET'&&endpoint==='/api/status')snapshotReads.status++;
       if(request.method()==='GET'&&endpoint==='/api/system')snapshotReads.system++;
-      if(endpoint==='/api/inventory'&&holdInventory){inventoryHeld=true;await new Promise(resolve=>{releaseInventory=resolve;});}
+      if(endpoint==='/api/library'&&holdInventory){inventoryHeld=true;await new Promise(resolve=>{releaseInventory=resolve;});}
       if(endpoint==='/api/system'&&holdSystem){systemHeld=true;await new Promise(resolve=>{releaseSystem=resolve;});}
       if(endpoint==='/api/workers'&&failWorkers){await route.fulfill({status:503,contentType:'application/json',body:'{"error":"Fixture unavailable"}'});return;}
       if (request.method() !== 'GET') {
@@ -142,7 +144,7 @@ async function main() {
       }
       if (endpoint === '/api/session') value = { csrf_token: 'disposable-ui-fixture' };
       else if (endpoint === '/api/status') value = statusData(false);
-      else if (endpoint === '/api/inventory') value = { items, updated: now, state_revision: revision, truncated: inventorySource !== 'bazarr', source: inventorySource, authority: inventoryAuthority };
+      else if (endpoint === '/api/library') value = { items, updated: now, state_revision: revision, truncated: inventorySource !== 'bazarr', source: inventorySource, authority: inventoryAuthority };
       else if (endpoint === '/api/settings') value = settings;
       else if (endpoint === '/api/workers') value = workerData();
       else if (endpoint === '/api/nodes') value = remote;
@@ -156,7 +158,7 @@ async function main() {
     await page.goto(`http://127.0.0.1:${server.address().port}/#/overview`);
     await page.getByText('Service connected', { exact: true }).waitFor();
     await page.locator('#pipeline-ready').getByText('11,326', { exact: true }).waitFor();
-    await page.waitForFunction(async () => await window.__workerReads() > 0);
+    await page.waitForFunction(async () => await window.__liveEventCount('workers') > 0);
     await page.locator('#pipeline-status').getByText(/Inspected/i).waitFor();
     // A pushed status snapshot updates counters without a click or blocking on inventory.
     const readsBeforePush = await page.evaluate(async () => await window.__snapshotReads());
@@ -167,9 +169,12 @@ async function main() {
     await page.locator('#attention-failed').getByText('511', {exact:true}).waitFor();
     await page.waitForFunction(async previous => await window.__liveEventCount('status') > previous, statusEventsBeforePush);
     assert.deepEqual(await page.evaluate(async () => await window.__snapshotReads()), readsBeforePush, 'SSE status updates do not trigger automatic status, system, or worker GETs');
+    assert(!inventoryHeld, 'Overview does not download the detailed library inventory');
+    await page.getByRole('button', { name: 'Library', exact: true }).click();
     await page.waitForFunction(async()=>await window.__inventoryHeld());
     assert(inventoryHeld, 'inventory request remains pending while fresh counters are rendered');
     holdInventory=false;releaseInventory();
+    await page.getByRole('button', { name: 'Overview', exact: true }).click();
     pipeline.generated_srt_count--;pipeline.failed_files++;revision++;
     await page.locator('#refresh-button').click();
     await page.locator('#pipeline-ready').getByText('11,326', {exact:true}).waitFor();
@@ -492,7 +497,7 @@ async function main() {
       path: '/media/movies/auto-fit/metadata-failure-row.mkv', error: metadataError,
       processing: { failed: true, last_error: metadataError }, metadata_pending: true,
     };
-    const tallRowReload = page.waitForResponse(response => new URL(response.url()).pathname === '/api/inventory' && response.request().method() === 'GET');
+    const tallRowReload = page.waitForResponse(response => new URL(response.url()).pathname === '/api/library' && response.request().method() === 'GET');
     revision++; pushStatus();
     await tallRowReload;
     await page.waitForFunction(() => /Fit \(\d+\)/.test(document.querySelector('#inventory-page-size option[value="auto"]').textContent));
@@ -601,7 +606,8 @@ async function main() {
     await page.locator('#inventory-filter').selectOption('covered');
     await page.waitForFunction(() => document.querySelectorAll('#inventory-body tr').length === 2);
     assert(await page.locator('[data-action="scan"]').first().isEnabled());
-    assert(await page.locator('#inventory-authority').isHidden(), 'healthy Bazarr inventory has no persistent banner');
+    assert.match(await page.locator('#inventory-authority').innerText(), /Bazarr inventory is ready/);
+    assert(!(await page.locator('#inventory-authority').getAttribute('class')).includes('authority-error'), 'healthy Bazarr inventory has no warning treatment');
     await page.getByRole('button', { name: 'Overview', exact: true }).click();
     inventoryAuthority = { status: 'refresh_pending' }; revision++;
     await page.locator('#refresh-button').click();
@@ -736,6 +742,16 @@ async function main() {
     await page.locator('#worker-pool-state').getByText('Sample stale',{exact:true}).waitFor({timeout:20000});
     failWorkers=false;
     await page.locator('#worker-pool-state').getByText('Ready',{exact:true}).waitFor({timeout:10000});
+    const readsBeforeFallback=snapshotReads.status;
+    rejectEvents=true;
+    await page.reload();
+    await page.waitForFunction(async previous=>(await window.__snapshotReads()).status===previous+1,readsBeforeFallback,{timeout:10000});
+    await page.locator('#pipeline-ready').getByText('11,326',{exact:true}).waitFor();
+    const receivedBeforeResume=await page.evaluate(async()=>await window.__liveEventCount('status'));
+    rejectEvents=false;
+    await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'));Object.defineProperty(document,'hidden',{configurable:true,value:false});document.dispatchEvent(new Event('visibilitychange'));});
+    await page.waitForFunction(async previous=>await window.__liveEventCount('status')>previous,receivedBeforeResume);
+    assert.equal(snapshotReads.status,readsBeforeFallback+1,'blocked SSE startup uses exactly one snapshot fallback, then returns to push updates');
     assert.deepEqual(errors, [], 'browser must have no uncaught errors');
     console.log('PASS Subforge fixed viewport/internal scrolling, visible collapsed toggle, native selects, desktop/mobile UI, language isolation, scope review, failure triage, workers, remote nodes, executor metadata, keyboard, Bazarr coverage/authority, and pending indexing confirmation regressions');
     await context.close();

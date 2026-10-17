@@ -357,6 +357,43 @@ fn coverage_counts(rows: &[Value]) -> Value {
     json!({"covered":total("covered"),"needs_conversion":total("needs_conversion"),"no_convertible_source":total("no_convertible_source"),"unknown":total("unknown")})
 }
 
+// The browser needs track choices and coverage, not Bazarr's duplicate source/index records.
+fn library_row(row: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+    for key in [
+        "name",
+        "path",
+        "root_id",
+        "type",
+        "tracks",
+        "error",
+        "metadata_pending",
+        "missing_srt",
+    ] {
+        if let Some(value) = row.get(key) {
+            result.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(coverage) = row.get("coverage") {
+        let mut summary = serde_json::Map::new();
+        for key in ["status", "reason", "existing_targets", "missing_targets"] {
+            if let Some(value) = coverage.get(key) {
+                summary.insert(key.into(), value.clone());
+            }
+        }
+        result.insert("coverage".into(), Value::Object(summary));
+    }
+    for key in ["wanted_targets", "existing_targets", "missing_targets"] {
+        if (key == "wanted_targets" && row["coverage"]["status"].as_str().is_none_or(str::is_empty)
+            || key != "wanted_targets" && row["coverage"][key].is_null())
+            && let Some(value) = row.get(key)
+        {
+            result.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(result)
+}
+
 fn bazarr_source_hints(
     row: &Value,
     mounts: &[PathBuf],
@@ -975,9 +1012,23 @@ impl App {
         self.enqueue(&json!({"kind":kind,"task_id":id,"retry":retry}), origin)
     }
     fn inventory(&self) -> Value {
+        self.inventory_view(false)
+    }
+
+    fn inventory_view(&self, compact: bool) -> Value {
         let runtime = lock(&self.runtime);
         let converter = lock(&self.converter);
-        let mut rows = runtime.inventory.clone();
+        let mut rows: Vec<Value> = runtime
+            .inventory
+            .iter()
+            .map(|row| {
+                if compact {
+                    library_row(row)
+                } else {
+                    row.clone()
+                }
+            })
+            .collect();
         for row in &mut rows {
             row["processing"] = converter.file_processing(row["path"].as_str().unwrap_or(""));
         }
@@ -3696,6 +3747,25 @@ fn guard(app: &App, request: &Request) -> Option<Reply> {
     None
 }
 fn handle(app: &App, request: &Request) -> Reply {
+    let mut reply = handle_uncompressed(app, request);
+    if request.method == "GET" && reply.status == 200 {
+        let encoding = request.headers.get("accept-encoding").map(String::as_str);
+        reply.extra.push(("Vary", "Accept-Encoding".into()));
+        if crate::compression::eligible(reply.content, reply.body.len())
+            && crate::compression::accepts_gzip(encoding)
+            && let Some(body) = crate::compression::gzip(&reply.body)
+        {
+            reply.body = body;
+            reply.extra.push(("Content-Encoding", "gzip".into()));
+        } else if !crate::compression::accepts_identity(encoding) {
+            reply = Reply::error(406, "No acceptable content encoding is available");
+            reply.extra.push(("Vary", "Accept-Encoding".into()));
+        }
+    }
+    reply
+}
+
+fn handle_uncompressed(app: &App, request: &Request) -> Reply {
     if let Some(reply) = guard(app, request) {
         return reply;
     }
@@ -3714,6 +3784,18 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/static/app.js" | "/app.js" => Reply::asset(
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/app.js"),
+            ),
+            "/static/app.min.js" => Reply::asset(
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/dist/app.min.js"),
+            ),
+            "/static/live.min.js" => Reply::asset(
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/dist/live.min.js"),
+            ),
+            "/static/style.min.css" => Reply::asset(
+                "text/css; charset=utf-8",
+                include_bytes!("../web/dist/style.min.css"),
             ),
             "/static/live.js" | "/live.js" => Reply::asset(
                 "text/javascript; charset=utf-8",
@@ -3738,6 +3820,7 @@ fn handle(app: &App, request: &Request) -> Reply {
             "/api/workers" => Reply::json(200, app.workers()),
             "/api/nodes" => Reply::json(200, lock(&app.remote).public()),
             "/api/inventory" => Reply::json(200, app.inventory()),
+            "/api/library" => Reply::json(200, app.inventory_view(true)),
             "/api/bazarr/inventory" => Reply::json(200, app.inventory()),
             "/api/widget" => Reply::json(200, app.widget()),
             "/api/settings" => Reply::json(200, app.settings()),
@@ -3898,6 +3981,7 @@ fn send(socket: &mut TcpStream, reply: Reply) -> std::io::Result<()> {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         503 => "Service Unavailable",
         _ => "Error",
     };
@@ -4155,6 +4239,35 @@ pub fn run(arguments: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_projection_keeps_track_choices_and_coverage_without_duplicate_provider_records() {
+        let row = json!({"name":"fixture.mkv","path":"/movies/fixture.mkv","root_id":"movies","type":"video",
+            "tracks":[{"id":3,"language":"fr","format":"ASS","forced":true,"hi":true}],
+            "coverage":{"status":"needs_conversion","reason":"Missing French SRT","existing_targets":[],"missing_targets":[{"language":"fr","forced":true,"hi":true}],"available_paths":["/movies/source.ass"]},
+            "wanted_targets":[{"language":"fr"}],"missing_targets":[{"language":"fr"}],
+            "source_hints":[{"provider_metadata":"unneeded"}],"subtitles":[{"provider_metadata":"unneeded"}]});
+        let projected = library_row(&row);
+        assert_eq!(projected["tracks"], row["tracks"]);
+        for key in ["status", "reason", "existing_targets", "missing_targets"] {
+            assert_eq!(projected["coverage"][key], row["coverage"][key]);
+        }
+        for key in [
+            "subtitles",
+            "source_hints",
+            "wanted_targets",
+            "missing_targets",
+        ] {
+            assert!(projected.get(key).is_none());
+        }
+        assert!(projected["coverage"].get("available_paths").is_none());
+        assert!(
+            row.get("subtitles").is_some(),
+            "projection must not mutate saved inventory"
+        );
+        let legacy = json!({"wanted_targets":[{"language":"fr"}],"missing_targets":[{"language":"fr"}],"existing_targets":[],"missing_srt":false});
+        assert_eq!(library_row(&legacy), legacy);
+    }
 
     #[test]
     fn dashboard_auth_configuration_preserves_password_across_opt_out() {

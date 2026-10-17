@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod compression;
 pub mod converter;
 pub mod edition;
 mod events;

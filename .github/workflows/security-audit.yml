@@ -410,6 +410,13 @@ jobs:
       - name: Run Subforge live widget regression tests
         run: node --test glance/test_subforge_live.cjs subforge/tests/live_frontend.cjs
 
+      - name: Verify and audit Subforge frontend build assets
+        working-directory: subforge/web
+        run: |
+          npm ci --ignore-scripts
+          npm run check
+          npm audit --audit-level=high
+
       - name: Run Subtitle Studio frontend regression tests
         run: node --test subtitle-studio/test_*.cjs
 
