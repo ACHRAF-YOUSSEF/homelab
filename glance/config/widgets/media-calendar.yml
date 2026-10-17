@@ -2,7 +2,14 @@
   title: Upcoming episodes & movies
   css-class: media-live-calendar
   source: |
-    <div data-media-calendar data-series-base="${HOMELAB_URL}:8989/series/" data-movie-base="${HOMELAB_URL}:7878/movie/">
-      <p class="color-subdue">Loading calendar…</p>
-      <noscript>Enable JavaScript to browse the Sonarr and Radarr calendar.</noscript>
+    <div class="widget media-live-calendar">
+      <div class="widget-header">
+        <h2 class="uppercase">Upcoming episodes &amp; movies</h2>
+      </div>
+      <div class="widget-content">
+        <div data-media-calendar data-series-base="${HOMELAB_URL}:8989/series/" data-movie-base="${HOMELAB_URL}:7878/movie/">
+          <p class="color-subdue">Loading calendar…</p>
+          <noscript>Enable JavaScript to browse the Sonarr and Radarr calendar.</noscript>
+        </div>
+      </div>
     </div>

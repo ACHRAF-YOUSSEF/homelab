@@ -246,7 +246,9 @@ Today, This week, This month, and This year controls. The year view shows all
 series on one browser-local day appear in a collapsed native disclosure; up to
 three remain listed individually. Navigation resets disclosures, while refresh
 preserves navigation and expansion state. Episode timestamps use the browser's
-local timezone; movie release dates remain date-only calendar days.
+local timezone; movie release dates remain date-only calendar days. The HTML
+shell includes Glance's standard widget header and frame to preserve the normal
+spacing from Subforge above and Automation below.
 
 The two service monitors
 have `30s` server caches. Neither stream nor browser refresh updates Media's
