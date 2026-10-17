@@ -3,6 +3,7 @@
 pub mod calendar;
 pub mod config;
 pub mod gateway;
+mod missing;
 pub mod model;
 pub mod relay;
 mod subforge;

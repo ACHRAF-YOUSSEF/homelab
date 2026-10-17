@@ -1,0 +1,15 @@
+- type: html
+  title: Missing from disk
+  css-class: media-live-missing
+  source: |
+    <div class="widget media-live-missing">
+      <div class="widget-header">
+        <h2 class="uppercase">Missing from disk</h2>
+      </div>
+      <div class="widget-content">
+        <div data-media-missing data-series-base="${HOMELAB_URL}:8989/series/" data-movie-base="${HOMELAB_URL}:7878/movie/">
+          <p class="color-subdue">Loading missing media…</p>
+          <noscript>Enable JavaScript to browse missing Sonarr episodes and Radarr movies.</noscript>
+        </div>
+      </div>
+    </div>

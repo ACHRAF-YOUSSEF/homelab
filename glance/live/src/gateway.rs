@@ -2,6 +2,7 @@ use crate::{
     Error,
     calendar::{self, Range},
     config::{Config, authority, endpoint},
+    missing,
     relay::{Relay, Topic, http_client},
 };
 use bytes::Bytes;
@@ -231,6 +232,56 @@ async fn calendar(request: Request<Incoming>, relay: Arc<Relay>, host: &str) -> 
     output
 }
 
+async fn missing(request: Request<Incoming>, relay: Arc<Relay>, host: &str) -> Response<Body> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    if !same_origin(request.headers(), host) {
+        return response(StatusCode::FORBIDDEN, "forbidden");
+    }
+    if request.uri().query().is_some_and(|query| !query.is_empty()) {
+        return response(StatusCode::BAD_REQUEST, "unsupported query");
+    }
+    let Ok(_permit) = relay.calendar_slots.try_acquire() else {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "media request limit reached",
+        );
+    };
+    let mut auth = relay
+        .http
+        .get(endpoint(&relay.config.glance, "/api/pages/media/content/"));
+    if let Some(cookie) = request.headers().get(header::COOKIE) {
+        auth = auth.header(header::COOKIE, cookie);
+    }
+    if !matches!(auth.send().await, Ok(response) if response.status() == StatusCode::OK) {
+        return response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    if relay.config.sonarr_key.is_empty() && relay.config.radarr_key.is_empty() {
+        return response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "missing media providers are not configured",
+        );
+    }
+    let Ok(Ok(bytes)) = tokio::time::timeout_at(deadline, missing::load(&relay)).await else {
+        return response(
+            StatusCode::BAD_GATEWAY,
+            "missing media providers unavailable or media limit exceeded",
+        );
+    };
+    let mut output = Response::new(
+        Full::new(bytes)
+            .map_err(|never: Infallible| match never {})
+            .boxed_unsync(),
+    );
+    output.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    output
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    output
+}
+
 async fn proxy(
     request: Request<Incoming>,
     relay: Arc<Relay>,
@@ -399,7 +450,8 @@ async fn handle(
         }
         ("GET", "/live/events") => events(request, relay, &host).await,
         ("GET", "/live/calendar") => calendar(request, relay, &host).await,
-        (_, "/live/calendar") => {
+        ("GET", "/live/missing") => missing(request, relay, &host).await,
+        (_, "/live/calendar" | "/live/missing") => {
             let mut denied = response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
             denied
                 .headers_mut()

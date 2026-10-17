@@ -1237,6 +1237,447 @@ fn subforge_widget() -> Value {
     ]})
 }
 
+fn missing_episode(id: u64, season: u32, episode: u32) -> Value {
+    json!({
+        "id":id,"seriesId":20,"title":format!("Episode {id}"),
+        "series":{"title":"Example show","titleSlug":"example-show","path":"private-series-path"},
+        "seasonNumber":season,"episodeNumber":episode,"hasFile":false,
+        "path":"private-episode-path","apiKey":"private-provider-key"
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_media_paginates_both_monitoring_classes_and_projects_only_public_fields() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let seen = captured.clone();
+        Box::pin(async move {
+            if request.uri().path() == "/api/pages/media/content/" {
+                assert_eq!(request.headers().get("cookie").unwrap(), "auth=valid");
+                assert!(request.headers().get("x-api-key").is_none());
+                return response(StatusCode::OK, "authorized");
+            }
+            assert!(request.headers().get("cookie").is_none());
+            assert_eq!(request.method(), "GET");
+            seen.lock().unwrap().push(request.uri().to_string());
+            match request.uri().path() {
+                "/sonarr/api/v3/wanted/missing" => {
+                    assert_eq!(
+                        request.headers().get("x-api-key").unwrap(),
+                        "fixture-sonarr-key"
+                    );
+                    let query: std::collections::HashMap<_, _> =
+                        url::form_urlencoded::parse(request.uri().query().unwrap().as_bytes())
+                            .into_owned()
+                            .collect();
+                    assert_eq!(query.get("includeSeries").unwrap(), "true");
+                    assert_eq!(query.get("pageSize").unwrap(), "250");
+                    assert_eq!(query.get("sortKey").unwrap(), "episodes.airDateUtc");
+                    assert_eq!(query.get("sortDirection").unwrap(), "ascending");
+                    let page: usize = query.get("page").unwrap().parse().unwrap();
+                    let monitored = query.get("monitored").unwrap() == "true";
+                    let records: Vec<_> = match (monitored, page) {
+                        (true, 1) => (1..=250)
+                            .map(|id| missing_episode(id, 1, id as u32))
+                            .collect(),
+                        (true, 2) => vec![missing_episode(251, 2, 1)],
+                        (false, 1) => {
+                            let mut downloaded = missing_episode(501, 3, 1);
+                            downloaded["hasFile"] = json!(true);
+                            let mut special = missing_episode(500, 0, 1);
+                            special.as_object_mut().unwrap().remove("hasFile");
+                            vec![missing_episode(251, 2, 1), special, downloaded]
+                        }
+                        _ => panic!("unexpected page"),
+                    };
+                    json_response(
+                        json!({"page":page,"pageSize":250,"totalRecords":if monitored {251} else {3},"records":records}),
+                    )
+                }
+                "/radarr/api/v3/movie" => {
+                    assert_eq!(
+                        request.headers().get("x-api-key").unwrap(),
+                        "fixture-radarr-key"
+                    );
+                    assert!(request.uri().query().is_none());
+                    json_response(json!([
+                        {"id":700,"title":"A future movie","titleSlug":"700","year":2099,"hasFile":false,"monitored":false,"inCinemas":"2099-01-01","path":"private-movie-path"},
+                        {"id":701,"title":"B current schema","titleSlug":"701","movieFileId":0},
+                        {"id":702,"title":"Downloaded","titleSlug":"702","hasFile":true},
+                        {"id":703,"title":"Unknown file status","titleSlug":"703"},
+                        {"id":704,"title":"Contradictory","titleSlug":"704","hasFile":false,"movieFileId":10},
+                        {"id":705,"title":"C nullable compatibility","titleSlug":"705","hasFile":null,"movieFileId":0},
+                        {"id":700,"title":"Duplicate movie","titleSlug":"700","hasFile":false}
+                    ]))
+                }
+                _ => panic!("unexpected upstream path"),
+            }
+        })
+    });
+    let fixture = Fixture::start(handler, |_| {}).await;
+    let result = fixture
+        .client
+        .get(fixture.url("/live/missing"))
+        .header("host", "localhost")
+        .header("cookie", "auth=valid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), StatusCode::OK);
+    assert_eq!(result.headers().get("cache-control").unwrap(), "no-store");
+    assert_eq!(
+        result.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = result.text().await.unwrap();
+    assert!(!body.contains("private-"));
+    assert!(!body.contains("fixture-"));
+    let projection: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        projection["providers"],
+        json!({"sonarr":true,"radarr":true})
+    );
+    let items = projection["items"].as_array().unwrap();
+    assert_eq!(items.len(), 255);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item["kind"] == "episode")
+            .count(),
+        252
+    );
+    assert_eq!(items.iter().filter(|item| item["id"] == 251).count(), 1);
+    assert!(
+        items
+            .iter()
+            .any(|item| item["id"] == 500 && item["season"] == 0)
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["id"] == 700 && item["year"] == 2099)
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item.as_object().unwrap().len() == 9)
+    );
+    assert!(
+        items
+            .windows(2)
+            .all(|pair| pair[0]["title"].as_str() <= pair[1]["title"].as_str())
+    );
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_media_rejects_queries_origins_methods_and_unauthorized_requests_before_providers()
+{
+    let providers = Arc::new(AtomicUsize::new(0));
+    let captured = providers.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let captured = captured.clone();
+        Box::pin(async move {
+            if request.uri().path() == "/api/pages/media/content/" {
+                return response(StatusCode::UNAUTHORIZED, "auth required");
+            }
+            captured.fetch_add(1, Ordering::SeqCst);
+            json_response(json!([]))
+        })
+    });
+    let fixture = Fixture::start(handler, |_| {}).await;
+    for (path, header, expected) in [
+        (
+            "/live/missing?url=http://elsewhere",
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/live/missing",
+            Some(("origin", "https://elsewhere.example")),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/live/missing",
+            Some(("sec-fetch-site", "same-site")),
+            StatusCode::FORBIDDEN,
+        ),
+        ("/live/missing", None, StatusCode::UNAUTHORIZED),
+    ] {
+        let mut request = fixture
+            .client
+            .get(fixture.url(path))
+            .header("host", "localhost");
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        assert_eq!(request.send().await.unwrap().status(), expected);
+    }
+    for method in [
+        reqwest::Method::POST,
+        reqwest::Method::HEAD,
+        reqwest::Method::DELETE,
+    ] {
+        let denied = fixture
+            .client
+            .request(method, fixture.url("/live/missing"))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(denied.headers().get("allow").unwrap(), "GET");
+    }
+    assert_eq!(providers.load(Ordering::SeqCst), 0);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_media_reports_configured_providers_and_does_not_call_unconfigured_ones() {
+    for (sonarr, radarr) in [(true, false), (false, true), (false, false)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let handler: Handler = Arc::new(move |request| {
+            let calls = captured.clone();
+            Box::pin(async move {
+                if request.uri().path() == "/api/pages/media/content/" {
+                    return response(StatusCode::OK, "authorized");
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                if request.uri().path() == "/sonarr/api/v3/wanted/missing" {
+                    assert!(sonarr);
+                    json_response(json!({"page":1,"pageSize":250,"totalRecords":0,"records":[]}))
+                } else {
+                    assert!(radarr);
+                    assert_eq!(request.uri().path(), "/radarr/api/v3/movie");
+                    json_response(json!([]))
+                }
+            })
+        });
+        let fixture = Fixture::start(handler, |config| {
+            if !sonarr {
+                config.sonarr_key.clear();
+            }
+            if !radarr {
+                config.radarr_key.clear();
+            }
+        })
+        .await;
+        let result = fixture
+            .client
+            .get(fixture.url("/live/missing"))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status(),
+            if sonarr || radarr {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        );
+        if sonarr || radarr {
+            let projection: Value = result.json().await.unwrap();
+            assert_eq!(
+                projection["providers"],
+                json!({"sonarr":sonarr,"radarr":radarr})
+            );
+            assert_eq!(projection["items"], json!([]));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if sonarr { 2 } else { usize::from(radarr) }
+        );
+        fixture.close().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_media_fails_closed_on_incomplete_unstable_or_excessive_pagination() {
+    for mode in [
+        "incomplete",
+        "page",
+        "page-size",
+        "total-limit",
+        "duplicate",
+        "changed-total",
+        "record-limit",
+    ] {
+        let handler: Handler = Arc::new(move |request| {
+            Box::pin(async move {
+                if request.uri().path() == "/api/pages/media/content/" {
+                    return response(StatusCode::OK, "authorized");
+                }
+                assert_eq!(request.uri().path(), "/sonarr/api/v3/wanted/missing");
+                let second = request.uri().query().unwrap().contains("page=2&");
+                let records: Vec<_> = match mode {
+                    "incomplete" => vec![],
+                    "duplicate" => vec![missing_episode(1, 1, 1), missing_episode(1, 1, 1)],
+                    "changed-total" if !second => (1..=250)
+                        .map(|id| missing_episode(id, 1, id as u32))
+                        .collect(),
+                    "record-limit" => (1..=251)
+                        .map(|id| missing_episode(id, 1, id as u32))
+                        .collect(),
+                    _ => vec![missing_episode(1, 1, 1)],
+                };
+                let total = match mode {
+                    "total-limit" => 10001,
+                    "duplicate" => 2,
+                    "changed-total" if !second => 251,
+                    "changed-total" => 252,
+                    "record-limit" => 251,
+                    _ => 1,
+                };
+                json_response(
+                    json!({"page":if mode == "page" || second {2} else {1},"pageSize":if mode == "page-size" {1} else {250},"totalRecords":total,"records":records}),
+                )
+            })
+        });
+        let fixture = Fixture::start(handler, |config| config.radarr_key.clear()).await;
+        let result = fixture
+            .client
+            .get(fixture.url("/live/missing"))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::BAD_GATEWAY, "{mode}");
+        assert_eq!(
+            result.text().await.unwrap(),
+            "missing media providers unavailable or media limit exceeded"
+        );
+        fixture.close().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_media_rejects_redirects_body_output_and_movie_list_limits_and_unsafe_links() {
+    for mode in [
+        "redirect",
+        "oversize",
+        "slug",
+        "output",
+        "movie-limit",
+        "provider-failed",
+        "malformed",
+    ] {
+        let leaks = Arc::new(AtomicUsize::new(0));
+        let captured = leaks.clone();
+        let handler: Handler = Arc::new(move |request| {
+            let leaks = captured.clone();
+            Box::pin(async move {
+                if request.uri().path() == "/api/pages/media/content/" {
+                    return response(StatusCode::OK, "authorized");
+                }
+                if request.uri().path() == "/leak" {
+                    leaks.fetch_add(1, Ordering::SeqCst);
+                    return json_response(json!([]));
+                }
+                match mode {
+                    "redirect" => {
+                        let mut result = response(StatusCode::FOUND, "private-provider-error");
+                        result.headers_mut().insert("location", HeaderValue::from_static("/leak"));
+                        result
+                    }
+                    "oversize" => response(StatusCode::OK, Bytes::from(vec![b'x'; 2048])),
+                    "provider-failed" => response(StatusCode::INTERNAL_SERVER_ERROR, "private-provider-error"),
+                    "malformed" => response(StatusCode::OK, "private-provider-error"),
+                    "movie-limit" => json_response(json!((0..10001).map(|id| json!({"id":id,"title":"Movie","titleSlug":"123","hasFile":false})).collect::<Vec<_>>())),
+                    _ => json_response(json!([{"id":1,"title":"Movie","titleSlug":if mode == "slug" {"../private"} else {"123"},"hasFile":false}])),
+                }
+            })
+        });
+        let fixture = Fixture::start(handler, |config| {
+            config.sonarr_key.clear();
+            config.provider_bytes = if mode == "movie-limit" {
+                1024 * 1024
+            } else {
+                1024
+            };
+            if mode == "output" {
+                config.snapshot_bytes = 32;
+            }
+        })
+        .await;
+        let result = fixture
+            .client
+            .get(fixture.url("/live/missing"))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::BAD_GATEWAY, "{mode}");
+        assert!(!result.text().await.unwrap().contains("private-"));
+        assert_eq!(leaks.load(Ordering::SeqCst), 0);
+        fixture.close().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_media_shares_the_calendar_concurrency_limit() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let captured_calls = calls.clone();
+    let captured_gate = gate.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let calls = captured_calls.clone();
+        let gate = captured_gate.clone();
+        Box::pin(async move {
+            if request.uri().path() == "/api/pages/media/content/" {
+                return response(StatusCode::OK, "authorized");
+            }
+            calls.fetch_add(1, Ordering::SeqCst);
+            gate.acquire().await.unwrap().forget();
+            json_response(json!([]))
+        })
+    });
+    let fixture = Fixture::start(handler, |config| config.sonarr_key.clear()).await;
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        let client = fixture.client.clone();
+        let url = fixture.url("/live/missing");
+        pending.push(tokio::spawn(async move {
+            client
+                .get(url)
+                .header("host", "localhost")
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    timeout(Duration::from_secs(2), async {
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for path in [
+        "/live/missing",
+        "/live/calendar?start=2026-10-20&end=2026-10-21",
+    ] {
+        let denied = fixture
+            .client
+            .get(fixture.url(path))
+            .header("host", "localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    gate.add_permits(2);
+    for task in pending {
+        assert_eq!(task.await.unwrap().status(), StatusCode::OK);
+    }
+    fixture.close().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn subforge_shared_collector_projects_multiple_jobs_and_stops_without_subscribers() {
     let calls = Arc::new(AtomicUsize::new(0));

@@ -48,6 +48,7 @@
 
         - $include: ../widgets/subforge.yml
         - $include: ../widgets/media-calendar.yml
+        - $include: ../widgets/media-missing.yml
 
         - type: monitor
           title: Automation

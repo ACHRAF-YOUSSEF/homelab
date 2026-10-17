@@ -23,6 +23,8 @@ networking. DNS, tunnel routes, and reverse-proxy hosts are configured separatel
 | [config/widgets/](config/widgets/) | Reusable custom API widgets for Jellyfin, Sonarr/Radarr, Seerr, qBittorrent, and Subforge |
 | [config/assets/media-calendar.js](config/assets/media-calendar.js) | Browser calendar controls, rendering, and same-origin calendar requests |
 | [config/assets/media-calendar.css](config/assets/media-calendar.css) | Responsive calendar layout and disclosure styling |
+| [config/assets/media-missing.js](config/assets/media-missing.js) | Same-origin missing-media inventory rendering, refresh, and disclosure state |
+| [config/assets/media-missing.css](config/assets/media-missing.css) | Responsive TV/movie columns and show/season disclosure styling |
 | [config/assets/subforge-live.js](config/assets/subforge-live.js) | Subforge live job-list rendering and bounded elapsed/ETA display |
 | [config/assets/media-live.js](config/assets/media-live.js) | Refreshes Media widgets outside the live Jellyfin session feed |
 | [config/assets/widget-live.js](config/assets/widget-live.js) | Connects visible Media and Downloads widgets to the same-origin SSE stream |
@@ -44,7 +46,7 @@ root `.env` file; edit YAML when changing the dashboard layout or widget behavio
 | Tab | Configured content |
 | --- | --- |
 | [Overview](config/pages/overview.yml) | SearxNG search with `!yt`, `!gh`, and `!r` shortcuts; clock; configured weather; calendar; Docker containers; core service status; quick links |
-| [Media](config/pages/media.yml) | Jellyfin sessions and library totals; interactive Sonarr/Radarr calendar; Seerr request counts; media and automation status including Subtitle Studio and Subforge; links and project releases |
+| [Media](config/pages/media.yml) | Jellyfin sessions and library totals; interactive Sonarr/Radarr calendar; missing Sonarr/Radarr media inventory; Seerr request counts; media and automation status including Subtitle Studio and Subforge; links and project releases |
 | [Downloads](config/pages/downloads.yml) | qBittorrent transfer and torrent statistics; download and processing service status; bookmarks; download stack releases |
 | [Network](config/pages/network.yml) | AdGuard Home, Nginx Proxy Manager, Uptime Kuma, and Portracker status; public-service links and checks; infrastructure releases; administration links |
 | [Tools](config/pages/tools.yml) | Tool status; AI, automation, document, and cloud links; latest Glance community widgets; developer links |
@@ -155,6 +157,7 @@ The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling
 | [Jellyfin sessions](config/widgets/jellyfin-stats.yml) | Live relay uses Jellyfin `/socket` `SessionsStart`, plus `/Sessions` snapshots/reconciliation; shows active playback, users, devices, play method, pause state, and progress | `15s` initial cache; then event-driven, with `5s` REST reconciliation by default |
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
 | [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Same-origin `/live/calendar` gateway route backed by Sonarr and Radarr `/api/v3/calendar`; renders day, Monday-first week, month, or year views | Browser refresh every `30s` while visible |
+| [Missing from disk](config/widgets/media-missing.yml) | Same-origin `/live/missing`; Sonarr missing episodes and Radarr movies without files, including unmonitored items | Browser refresh every `30s` while visible; last successful inventory remains visible on refresh failure |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
 | [Subforge](config/widgets/subforge.yml) | JavaScript-rendered, same-origin SSE topic backed by Subforge's authenticated `/api/widget/events`; processed-file totals and up to 32 concurrent job summaries with progress, elapsed time, approximate ETA, liveness, and generic wait status | Native SSE while the Media page is visible; no browser REST fallback |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
@@ -336,6 +339,62 @@ docker compose restart glance
 The calendar browser tests use local fixtures and do not contact Sonarr or
 Radarr. Run them from the repository root with `node --test
 glance/test_media_calendar.cjs` (PowerShell, Bash, or Zsh).
+
+### Missing from disk widget
+
+The Media page places **Missing from disk** immediately below the calendar.
+It requests `GET /live/missing` from the Glance same origin. The gateway checks
+the browser's media-page authorization through Glance, forwarding its session
+cookie for that check, then calls Arr APIs server-side; provider API keys never
+reach the browser. Configure the existing `SONARR_INTERNAL_URL`,
+`SONARR_API_KEY`, `RADARR_INTERNAL_URL`, and `RADARR_API_KEY` variables. A blank
+key marks that provider as not configured in the widget. If both keys are
+blank, the endpoint returns `503`. The endpoint accepts same-origin requests
+only and does not accept query parameters.
+
+Sonarr inventory uses paginated `/api/v3/wanted/missing` requests with
+`includeSeries=true` and both `monitored=true` and `monitored=false`, so it
+includes unmonitored episodes and specials. It follows Sonarr's missing-episode
+semantics: episodes are included after airing, while future or undated episodes
+are excluded. Radarr inventory uses `/api/v3/movie` and includes titles without
+a movie file, including unmonitored and unreleased movies. “Missing” reflects
+the latest scan state reported by Sonarr or Radarr; the gateway does not probe
+the filesystem independently.
+
+The widget shows TV and movies in responsive columns. A show with multiple
+missing episodes starts collapsed by show and then by season; season `0` is
+labelled **Specials**. A show with one missing episode is a flat entry. Refresh
+preserves open disclosures and restores keyboard focus when the focused entry
+still exists. The browser refreshes every 30 seconds while the page is visible,
+keeps the last successful inventory after a refresh error, and exposes a
+**Retry** button. Returning to a visible tab triggers a fresh request.
+
+The gateway caps each Sonarr/Radarr inventory and the final inventory at 10,000
+records, each provider response at 2 MiB, and the normalized snapshot at
+256 KiB. A load has a 45-second overall timeout. Missing-inventory requests
+share two slots with calendar requests;
+when both are occupied, the endpoint returns `503`. An upstream, data, or size
+failure returns `502` and does not replace the previous browser-rendered
+inventory. These bounds use `GLANCE_LIVE_MAX_PROVIDER_BYTES` and
+`GLANCE_LIVE_MAX_SNAPSHOT_BYTES`, which also bound other live gateway payloads.
+
+After changing gateway code or Sonarr/Radarr keys, rebuild and recreate
+`glance-live`; restart Glance to load updated page YAML and browser assets:
+
+```shell
+docker compose up -d --build --force-recreate glance-live
+docker compose restart glance
+```
+
+Run the missing-media browser regression checks from the repository root on
+Windows PowerShell, Bash, or Zsh:
+
+```shell
+node --test glance/test_media_missing.cjs
+```
+
+These use local fixtures and do not contact Sonarr, Radarr, or deploy the
+Compose stack.
 
 ## Maintenance
 
