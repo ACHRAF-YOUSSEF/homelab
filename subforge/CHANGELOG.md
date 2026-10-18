@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Resume interrupted Bazarr response reads on the existing connection within the original timeout budget; never replay a scan PATCH.
 - Enable scheduled media inventory refresh by default and migrate legacy task state once, while preserving later manual opt-outs.
 - Show Bazarr inventory age and restart-based staleness guidance, with an on-demand sync action.
 - Keep Library Fit at a 25-row minimum with a scrolling pane; add page selection and reviewed bulk conversion capped at 64 explicit media paths.

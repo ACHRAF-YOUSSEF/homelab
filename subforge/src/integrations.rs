@@ -3,6 +3,7 @@
 //! only emits the small set of methods and endpoints used by the app.
 
 mod bazarr;
+mod transport;
 
 use serde::Deserialize;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
@@ -14,6 +15,10 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
+};
+use ureq::unversioned::{
+    resolver::DefaultResolver,
+    transport::{Connector, DefaultConnector},
 };
 use ureq::{Agent, config::Config};
 use url::Url;
@@ -144,7 +149,11 @@ fn http_agent(timeout: Duration) -> Agent {
         .max_redirects(0)
         .proxy(None)
         .build();
-    Agent::new_with_config(config)
+    Agent::with_parts(
+        config,
+        DefaultConnector::default().chain(transport::ResumeReadsConnector),
+        DefaultResolver::default(),
+    )
 }
 
 fn safe_error(error: &ureq::Error) -> HttpFailure {
