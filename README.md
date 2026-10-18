@@ -72,7 +72,7 @@ Replace the example domain, LAN address, timezone, credentials, and media folder
 - **Network-wide ad/tracker blocking** - [AdGuard Home](https://adguard.com/en/adguard-home/overview.html) backed by a recursive [Unbound](https://unbound.docs.nlnetlabs.nl/) DNS resolver and DNS blocklists.
 - **Automated media pipeline** - Sonarr, Radarr, Bazarr, Prowlarr, qBittorrent, Tdarr, and Seerr for media requests.
 - **YouTube archiving** - [TubeArchivist](https://github.com/tubearchivist/tubearchivist) for self-hosted YouTube download, indexing, and management, backed by Elasticsearch and Redis.
-- **Local AI** - [Open WebUI](https://github.com/open-webui/open-webui) with NVIDIA GPU acceleration, connected to [LM Studio](https://lmstudio.ai/) for local LLM inference.
+- **Local AI** - [Open WebUI](https://github.com/open-webui/open-webui) connected to host-installed [LM Studio](https://lmstudio.ai/) for local LLM inference; configure inference acceleration in LM Studio.
 - **Self-hosted cloud** - [Nextcloud All-in-One](https://github.com/nextcloud/all-in-one) manages the Nextcloud deployment.
 - **Automation** - [n8n](https://github.com/n8n-io/n8n) for workflow automation.
 - **Local subtitles** - Subtitle Studio is a Rust web app that uses native whisper.cpp and FFmpeg, with optional translation and review through LM Studio.
@@ -125,7 +125,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 |---|---|---|---|---|
 | **Infrastructure** | Cloudflare Tunnel | `cloudflare/cloudflared` | - | Tunnel client for proxied Cloudflare routes |
 | **Infrastructure** | Cloudflare DDNS | `favonia/cloudflare-ddns` | - | Updates the configured DNS-only records |
-| **Infrastructure** | Nginx Proxy Manager | `jc21/nginx-proxy-manager` | 80, 81, 4443 | Reverse proxy and TLS; host 4443 maps to container 443 |
+| **Infrastructure** | Nginx Proxy Manager | `jc21/nginx-proxy-manager` | 80, 81, 443, 4443 | Reverse proxy and TLS; host 443 and alternate 4443 map to container 443 |
 | **Infrastructure** | [Glance](https://github.com/glanceapp/glance) | `glanceapp/glance` | Internal 8080 | Responsive dashboard with seven navigation pages; served through the live gateway |
 | **Infrastructure** | Glance live gateway | Local Rust build from `glance/live/` | 7575 (host, configurable bind) | Same-origin proxy, bounded SSE relay for qBittorrent, Jellyfin, and Subforge, plus Sonarr/Radarr calendar and missing-media inventory; Rust runtime and test tooling; 96 MiB, 0.50 CPU, 32-process ceilings; no GPU access |
 | **Infrastructure** | [Portracker](https://github.com/mostafa-wahied/portracker) | `mostafawahied/portracker` | 4999 | Docker container monitor |
@@ -146,7 +146,7 @@ The dashboard's host port `7575` belongs to `glance-live`; Glance itself stays o
 | **Media** | [TubeArchivist](https://github.com/tubearchivist/tubearchivist) | `bbilly1/tubearchivist` | 8000 | YouTube archiving and management |
 | **Media** | [MeTube](https://github.com/alexta69/metube) | `ghcr.io/alexta69/metube` | 8085 | YouTube downloader |
 | **Media** | archivist-es / archivist-redis | `bbilly1/tubearchivist-es` / `redis` | - | TubeArchivist backends |
-| **AI** | [Open WebUI](https://github.com/open-webui/open-webui) | `ghcr.io/open-webui/open-webui:cuda` | 3001 | Local LLM interface |
+| **AI** | [Open WebUI](https://github.com/open-webui/open-webui) | `ghcr.io/open-webui/open-webui:main` | 3001 | Local LLM interface; no GPU reservation |
 | **AI** | [SearxNG](https://github.com/searxng/searxng) | `searxng/searxng` | 8088 | Private metasearch engine |
 | **Cloud** | Nextcloud Docker proxy | Local build from `docker-proxy/aio/` | Unix socket only | Separate Docker API proxy for AIO lifecycle operations |
 | **Cloud** | [Nextcloud AIO](https://github.com/nextcloud/all-in-one) | `ghcr.io/nextcloud-releases/all-in-one` | 30917 (loopback) | Master interface; AIO provisions Apache separately on port 11000 |
@@ -196,14 +196,14 @@ Before you begin, ensure you have the following installed on your host machine:
 | Requirement | Configuration | Link |
 |---|---|---|
 | Docker Desktop / Docker Engine | Linux containers; use the runtime for your OS in the platform guide | [Install Docker](https://docs.docker.com/get-docker/) |
-| Docker Compose | Recent release supporting `include` and global overrides; the CPU override also uses `!reset` | [Include and overrides](https://docs.docker.com/compose/how-tos/multiple-compose-files/include/) |
+| Docker Compose | Recent release supporting `include` and global overrides | [Include and overrides](https://docs.docker.com/compose/how-tos/multiple-compose-files/include/) |
 | Git | Any | [Install Git](https://git-scm.com/downloads) |
 | NVIDIA GPU support in Docker | Optional; required only for Subtitle Studio's CUDA override and GPU-enabled services | [NVIDIA container guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
 | LM Studio | Host server on port 1234 for AI and subtitle translation/review | [lmstudio.ai](https://lmstudio.ai/) |
 | Jellyfin | Host server on port 8096 for playback and dashboard widgets | [Jellyfin downloads](https://jellyfin.org/downloads/server) |
 | Cloudflare account + domain | Needed for tunnel and DDNS services | [Cloudflare dashboard](https://dash.cloudflare.com/) |
 
-The base configuration reserves NVIDIA GPUs for Tdarr and Open WebUI. Subtitle Studio defaults to CPU; a separate Compose override enables its optional CUDA image. Platform instructions below describe required adaptations; they are not a claim that every image and service has been tested on every CPU architecture.
+The base configuration reserves an NVIDIA GPU for Tdarr. Open WebUI uses its standard `main` image without a GPU reservation. Subtitle Studio and Subforge default to CPU; separate Compose overrides enable their optional CUDA images. Platform instructions below describe required adaptations; they are not a claim that every image and service has been tested on every CPU architecture.
 
 ## Platform Guide
 
@@ -281,22 +281,16 @@ Inspect the rendered model locally to confirm host paths, retained config mounts
 
 ### Optional CUDA services
 
-For macOS, or Windows/Linux without NVIDIA, keep the default Subtitle Studio service on CPU. The optional CUDA Compose file enables its CUDA image on supported NVIDIA Docker hosts. The following example still shows how to disable GPU reservations for Open WebUI and profile Tdarr:
+For macOS, or Windows/Linux without NVIDIA, keep Subtitle Studio and Subforge on their default CPU images. Their optional CUDA Compose files enable NVIDIA support on compatible hosts. Open WebUI already has no GPU reservation. Add the following to your local override to exclude Tdarr from ordinary startup:
 
 ```yaml
 services:
   tdarr:
     profiles: [nvidia]
     # Retain the volumes from your path override here.
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    deploy:
-      resources:
-        reservations:
-          devices: !reset []
 ```
 
-The `main` image is the [standard Open WebUI image](https://docs.openwebui.com/getting-started/quick-start/). Clearing its inherited device reservations removes the container's NVIDIA requirement; LM Studio's own acceleration is configured separately on the host. Compose's [`!reset` merge tag](https://docs.docker.com/reference/compose-file/merge/#reset-value) clears inherited settings rather than appending to them.
+Tdarr then starts only when you enable the `nvidia` profile or explicitly target the service. LM Studio's own acceleration is configured separately on the host.
 
 Subforge uses its locally built CPU image in the regular stack and does not require NVIDIA; its CUDA edition requires the separate CUDA Compose override and an NVIDIA-enabled host. After adapting the paths and validating the override, a non-GPU AI/tools example is:
 
@@ -384,11 +378,19 @@ AdGuard Home ports:
 - HTTPS UI / DNS-over-HTTPS port mapping: `8443`
 - DNS-over-TLS / DNS-over-QUIC / DNSCrypt ports: `853`, `784`, `8853`, `5443`
 
-During setup, use `unbound:5053` as the upstream DNS server. Nginx Proxy Manager owns host ports `80` and `4443`, while AdGuard's HTTP and HTTPS container ports map to host `8180` and `8443`. The additional encrypted-DNS port mappings do not configure listeners or certificates automatically. AdGuard's state is stored in the ignored `./adguard/` directory.
+During setup, use `unbound:5053` as the upstream DNS server. Nginx Proxy Manager owns host ports `80`, `443`, and alternate HTTPS port `4443`, while AdGuard's HTTP and HTTPS container ports map to host `8180` and `8443`. The additional encrypted-DNS port mappings do not configure listeners or certificates automatically. AdGuard's state is stored in the ignored `./adguard/` directory.
 
 ### 4. Start the Stack
 
 The commands below work in PowerShell, Bash, and Zsh. They omit explicit file flags; if you created a local override, use the same `-f` flags as in the platform guide to make your file selection explicit. Recent Compose also discovers `compose.override.yaml` automatically. Full startup requires the original NVIDIA setup or a suitable override and all selected service dependencies.
+
+Before starting the full stack, build Subforge's local image; `docker compose up --build` cannot build it because the service has no Compose build definition. For the default CPU edition:
+
+```shell
+docker build --target final --tag homelab-subforge:0.4.4-cpu subforge
+```
+
+For its CUDA edition, follow the [Subforge build and override instructions](subforge/README.md#optional-nvidia-gpu-ocr) instead. Rebuild the selected local image after changing Subforge source; `docker compose pull` does not update it.
 
 ```sh
 # Validate after creating .env and preparing local configuration
@@ -417,7 +419,7 @@ To stop the entire stack:
 docker compose down
 ```
 
-To update all images and recreate containers:
+To pull registry images, rebuild services with Compose build definitions, and recreate containers (rebuild Subforge separately as above):
 
 ```shell
 docker compose pull
@@ -680,7 +682,7 @@ mount `DOCKER_SOCKET_SOURCE`; applications connect to a proxy endpoint.
 
 ## Port Reference
 
-These are host ports unless explicitly marked AIO-managed. Compose mappings without a host address publish on all interfaces; `30917` is bound to loopback, and dashboard ports `7575` and `8100` default to loopback through their `*_BIND_ADDRESS` settings. The read-only Docker proxy listens on container port `2375` only and has no published host port. Jellyfin's `8096` listener belongs to the separately installed host application.
+These are host ports unless explicitly marked AIO-managed. Compose mappings without a host address publish on all interfaces; `30917` is bound to loopback, and dashboard ports `7575`, `8099`, and `8100` default to loopback through their `*_BIND_ADDRESS` settings. The read-only Docker proxy listens on container port `2375` only and has no published host port. Jellyfin's `8096` listener belongs to the separately installed host application.
 
 | Port | Protocol | Service |
 |------|----------|---------|
@@ -707,7 +709,7 @@ These are host ports unless explicitly marked AIO-managed. Compose mappings with
 | 8085 | TCP | MeTube (container port 8081) |
 | 8088 | TCP | SearxNG |
 | 8096 | TCP | Separately installed Jellyfin on the host |
-| 8099 | TCP | Subtitle Studio |
+| 8099 | TCP | Subtitle Studio (loopback bind by default) |
 | 8100 | TCP | Subforge dashboard (container port 8100; loopback bind by default) |
 | 8180 | TCP | AdGuard Home Web UI |
 | 8265 | TCP | Tdarr Web UI |
@@ -764,13 +766,13 @@ The calendar uses Glance's standard widget spacing to separate it from Subforge 
 
 The `subforge` service (dashboard name **Subforge**) scans the four configured media mounts on persisted schedules; discovery defaults to every six hours and Media inventory is enabled by default. Legacy task state is migrated once to turn on inventory refresh; subsequent opt-outs persist. FFmpeg converts common text tracks, while TTML and SBV use Subtitle Edit even when image OCR is disabled. Image tracks use the native ocr-rs/MNN OCR helper only when `CONVERTER_ENABLE_OCR=true`; CUDA builds can use the CUDA backend. Explicit selected-file jobs share bounded CPU/GPU admission, while full scans and inventory maintenance run exclusively. Its dashboard at `http://localhost:8100` provides a scope review before text conversion, file inspection, per-track selection, job cancellation, and activity history; Library Fit shows at least 25 rows in a scrollable table, and row checkboxes support page selection and reviewed bulk conversion of up to 64 explicit paths. Basic Authentication defaults to enabled and `CONVERTER_AUTH_ENABLED=false` opts out. Settings has full-width Preferences, Media folders, Tasks, System, and Integrations sections with one sticky save/discard bar and navigation warnings for unsaved edits. Overview combines library totals with actionable counts, places Quick conversion beside local worker allocation, and shows Current work, elapsed time, and active file workers when busy; pipeline counters render from the status response without waiting for the detailed inventory request. Resource and worker readings refresh every three seconds on Overview or System. The shell fills the dynamic viewport, with the top bar staying visible as the workspace and sidebar scroll independently; the desktop navigation's expand/collapse chevron remains visible in either state. Native select menus retain keyboard behavior and share the dark control styling. Mobile uses a drawer and stacked file cards. Library and Activity use paginated tables with sticky headings and controls; Activity adapts row count to available table space. Activity defaults to subtitle jobs and opens full job details, including elapsed time, file progress, approximate ETA when available, liveness, errors, indexing status, retries, and executor history. A heartbeat gap or five minutes without progress is reported for diagnosis; these signals do not fail or cancel jobs automatically. New job activity identifies the assigned CPU, CPU OCR, or GPU OCR node and worker; retained job history shows up to 64 unique executor combinations, with older jobs left unchanged. Subforge writes sanitized newline-delimited JSON operation events to stdout and retains up to 200 for `/api/status` and the dashboard; a successful status response is HTTP 200. Events describe conversion phases, backend and track, file, job, worker, schedule, settings, and media-folder operations, rather than dashboard GET requests or heartbeat traffic. The component guide documents the local resource limits, optional remote workers, conversion behavior, and deployment requirements. Subforge provides locally built `0.4.4-cpu` and `0.4.4-cuda` images; Compose does not build or pull them. Set the host-side folders with the four `CONVERTER_*_DIR` variables; the container paths remain `/movies`, `/movies-C`, `/tv`, and `/tv-C`. The persistent data volume retains settings, worker allocation, preferences, jobs, scan state, and the generated password. The optional Glance status widget uses a dedicated private `CONVERTER_WIDGET_TOKEN`.
 
-Preferences supplies saved language defaults; Quick conversion can override them for manual jobs in the browser session, while Bazarr profiles still restrict eligible targets. **Tracked SRT outputs** counts historical publication receipts, including sources outside the current inventory; use Library for current coverage. Tasks supports intervals or weekday/time schedules with an explicit fixed UTC offset, meaningful maintenance results, and confirmed heavy runs. Backups in `/data/backups` can be downloaded or staged for restore while idle; restart applies the saved files and may restore dashboard credentials. Activity shows Started, Queue wait, readable media names, and the Operation log; it retains the latest 100 finished jobs plus active and queued work. See the [Subforge guide](subforge/README.md) for schedule, integration, and restore details.
+Preferences supplies saved language defaults; Quick conversion can override them for manual jobs in the browser session, while Bazarr profiles still restrict eligible targets. **Tracked SRT outputs** counts historical publication receipts, including sources outside the current inventory; use Library for current coverage. Tasks supports intervals or weekday/time schedules with an explicit fixed UTC offset, meaningful maintenance results, and confirmed heavy runs. Adjust the fixed offset manually when daylight-saving time changes. Backups in `/data/backups` can be downloaded or staged for restore while idle; restart applies the saved files and may restore dashboard credentials. Activity shows Started, Queue wait, readable media names, and the Operation log; it retains the latest 100 finished jobs plus active and queued work. See the [Subforge guide](subforge/README.md) for schedule, integration, and restore details.
 
 The top bar reports Live, Paused, Reconnecting, or Stale update state and the age since the browser received the last accepted update; hovering shows its absolute timestamp. The CPU-only or CUDA edition appears once in the header. The Settings → System page explains resource limits in plain language. Keyboard focus is visible, compact text remains at least 12 px, Library filenames wrap, SDH is explained, and integration status uses symbols with labels as well as color. The sidebar toggle uses **Hide sidebar** and **Show sidebar** wording to clarify that it stays on the current page; panel controls expand or collapse content. Media roots are grouped by volume where identity is available; the optional Compose-bound `CONVERTER_*_SOURCE` display hints reveal only an absolute Windows drive letter and do not expose host paths or grant access.
 
 Live badges share one receive-time clock, updated by the latest valid status, system, or worker message; stale resource status shows the separate last resource sample time. Generic volume groups are numbered **Storage volume 1**, **Storage volume 2**, and so on, while Windows drive labels such as **Movies (C:)** remain recognizable. Generic folder names stay plain, and changing configured CPU or memory limits requires recreating the Subforge container; restarting it alone keeps the current limits.
 
-Subforge can integrate with Sonarr, Radarr, Bazarr, and Jellyfin. For Bazarr, configure its URL and private API key in the ignored `.env`, then enable and test the integration under **Settings → Integrations → Bazarr**. Bazarr language profiles define wanted language, forced, and HI/SDH variants. Subforge checks matching non-empty, valid local SRT files before converting, and automatically skips untagged tracks. Failed or incomplete inventory syncs remain fail-closed. A successful fresh sync that is still waiting for Bazarr to index published SRTs shows a warning while conversion stays available and checks local SRT coverage; stale or unavailable inventory and definite reindex failures still block conversion. Published SRT paths are durably aggregated; scoped Bazarr `scan-disk` notifications run after queued and active jobs drain (up to 120 seconds per request within a 300-second batch), then inventory refreshes (90-second fetch allowance); lightweight requests remain 8 seconds. Interrupted response reads continue within the original request deadline; scan PATCH requests are never replayed. An uncertain scan is not retried, and incomplete output confirmation remains recorded across restart. **Check Bazarr indexing** is read-only. Whole-series scans can outlast a connection test; do not re-extract existing SRTs for indexing delays. Bazarr inventory is capped at 20,000 media items. Configure path mappings when services see different container paths; Windows, macOS, and Linux host paths still map to the container paths each service sees. Build the selected Subforge image locally before starting the service; Compose does not build or pull it. The [Subforge guide](subforge/README.md) documents Bazarr coverage, manual track override, bounded inventory behavior, job progress limits, worker limits, and platform paths.
+Subforge can integrate with Sonarr, Radarr, Bazarr, and Jellyfin. For Bazarr, configure its URL and private API key in the ignored `.env`, then enable and test the integration under **Settings → Integrations → Bazarr**. Bazarr language profiles define wanted language, forced, and HI/SDH variants. Subforge checks matching non-empty, valid local SRT files before converting, and automatically skips untagged tracks. Failed or incomplete inventory syncs remain fail-closed. The Library banner shows the last-sync age and offers **Sync now**; saved Bazarr inventory becomes stale on Subforge restart, with no time-based stale cutoff. A successful fresh sync that is still waiting for Bazarr to index published SRTs shows a warning while conversion stays available and checks local SRT coverage; stale or unavailable inventory and definite reindex failures still block conversion. Published SRT paths are durably aggregated; scoped Bazarr `scan-disk` notifications run after queued and active jobs drain (up to 120 seconds per request within a 300-second batch), then inventory refreshes (90-second fetch allowance); lightweight requests remain 8 seconds. Interrupted response reads continue within the original request deadline; scan PATCH requests are never replayed. An uncertain scan is not retried, and incomplete output confirmation remains recorded across restart. **Check Bazarr indexing** is read-only. Whole-series scans can outlast a connection test; do not re-extract existing SRTs for indexing delays. Bazarr inventory is capped at 20,000 media items. Configure path mappings when services see different container paths; Windows, macOS, and Linux host paths still map to the container paths each service sees. Build the selected Subforge image locally before starting the service; Compose does not build or pull it. The [Subforge guide](subforge/README.md) documents Bazarr coverage, manual track override, bounded inventory behavior, job progress limits, worker limits, and platform paths.
 
 For a read-only integration diagnostic, run `docker compose exec subforge subforge integration-check bazarr` (replace `bazarr` with `sonarr`, `radarr`, or `jellyfin`). It prints only a connection result and safe counts, never endpoint or credential values; see the [Subforge guide](subforge/README.md#safe-integration-diagnostic) for details.
 
@@ -852,7 +854,9 @@ The [security audit workflow](.github/workflows/security-audit.yml) runs on push
 | Repository privacy checks | Node.js built-in test fixtures and a checker for private deployment data, credentials, literal Glance endpoints, and Python or PowerShell source scripts. Ignored runtime data is excluded from the source-script policy. |
 | actionlint | GitHub Actions workflow syntax using the pinned actionlint release. |
 | Rust checks | Locked formatting, Clippy with warnings denied, tests, and RustSec dependency audits for Glance, Jellyfin counts cache, Subtitle Studio, and Subforge. |
+| Isolated runtime checks | Subtitle Studio CPU image health and SRT validation without a model; Jellyfin counts cache startup and Glance live gateway fixture checks, without external network access. |
 | Subtitle conversion integration | Pinned multi-stage container build and isolated text/OCR fixtures without network access or host media mounts. |
+| Frontend checks and npm audit | JavaScript syntax and frontend regression tests; Subforge's checked-in minified assets are verified against the build, and its npm dependencies are audited at high severity. |
 | pnpm audit | Subtitle Studio lockfile, including development dependencies, without installing project packages. |
 | Trivy | Filesystem dependency-manifest vulnerability and Dockerfile misconfiguration scan, including development dependencies. Compose misconfiguration and supplied-image OS vulnerabilities are outside this scan. |
 
