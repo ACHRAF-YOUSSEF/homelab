@@ -37,6 +37,8 @@
   
     - size: full
       widgets:
+        - $include: ../widgets/epic-free-games.yml
+
         - type: group
           widgets:
             - type: reddit

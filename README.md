@@ -182,7 +182,7 @@ Bind mounts beginning with `../` are relative to the included file in `compose/`
 
 ## Component Guides
 
-- [Glance dashboard](glance/README.md): seven pages, live qBittorrent/Jellyfin/Subforge widgets, LAN binding, API keys, and the Jellyfin counts helper.
+- [Glance dashboard](glance/README.md): seven pages, including the Epic Games free-promotions widget, live qBittorrent/Jellyfin/Subforge widgets, LAN binding, API keys, and the Jellyfin counts helper.
 - [Subtitle Studio](subtitle-studio/README.md): Rust setup, model management, resource limits, translation, and development checks.
 - [Subforge subtitle conversion](subforge/README.md): responsive dashboard with optional Basic Authentication, watcher setup, media-server integrations, configuration, language handling, limitations, and native use.
 - [Memory budget guide](docs/memory-budget.md): selected Compose ceilings, Nextcloud AIO child limits, monitoring, and manual adjustment guidance.
@@ -623,7 +623,7 @@ edits to deployment addresses in the dashboard YAML.
 | Docker API proxies | `DOCKER_SOCKET_SOURCE` selects the daemon-side socket mounted only by the proxies. `DOCKER_SOCKET_GID` selects the socket's numeric group as seen inside the unprivileged AIO proxy (Docker Desktop commonly reports `0`). `GLANCE_DOCKER_HOST` selects the monitoring proxy. `AIO_PROXY_SOCKET_PATH` identifies the daemon-side Nextcloud proxy socket used by AIO-managed child containers. See [Docker API access](#docker-api-access). |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values are reachable from containers, with no trailing slash. They control dashboard checks, APIs, and the library-count helper independently of browser links. |
 | Glance appearance | `GLANCE_APP_NAME`, `GLANCE_LOGO_TEXT`, and `GLANCE_WEATHER_LOCATION` replace example branding and weather. |
-| Public external bookmarks and search providers | `GLANCE_*_URL` values customize external links and search shortcuts. |
+| Public external bookmarks and search providers | `GLANCE_*_URL` values customize external links and search shortcuts. `GLANCE_EPIC_FREE_GAMES_API_URL` selects the public Epic Games promotions feed and its locale/country availability; it needs no API key. |
 | Glance public RSS feed sources | `GLANCE_*_FEED_URL` values customize RSS sources. |
 | Selected workload ceilings | `OPEN_WEBUI_MEMORY_LIMIT`, `SUBTITLE_STUDIO_MEMORY_LIMIT`, `SUBTITLE_STUDIO_CPUS`, `STIRLING_PDF_MEMORY_LIMIT`, `ARCHIVIST_ES_MEMORY_LIMIT`, and `CONVERTER_MEMORY_LIMIT` cap individual containers. Subtitle Studio also accepts the legacy `SUBTITLE_WORKER_MEMORY_LIMIT` and `SUBTITLE_WORKER_CPUS` names when the new settings are unset. These are not host RAM reservations; see the [memory budget guide](docs/memory-budget.md). |
 | Media paths | `EXAMPLE_MEDIA_ROOT` supports the portable override example. `SUBTITLE_MEDIA_DIR` and `SUBTITLE_LIBRARY_DIR` choose the worker's writable output and read-only source mounts. Use absolute paths for your OS. |

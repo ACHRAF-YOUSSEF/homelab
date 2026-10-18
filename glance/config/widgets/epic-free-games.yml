@@ -1,0 +1,46 @@
+- type: custom-api
+  title: Free on Epic Games
+  title-url: ${GLANCE_EPIC_GAMES_URL}/free-games
+  cache: 1h
+  url: ${GLANCE_EPIC_FREE_GAMES_API_URL}
+  template: |
+    {{ if eq .Response.StatusCode 200 }}
+      {{ $found := false }}
+      <div class="horizontal-cards-2" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 16px;">
+        {{ range .JSON.Array "data.Catalog.searchStore.elements" }}
+          {{ $hasPromo := gt (len (.Array "promotions.promotionalOffers")) 0 }}
+          {{ if and $hasPromo (eq (.String "price.totalPrice.discountPrice") "0") }}
+            {{ $gamePage := .String "productSlug" }}
+            {{ if gt (len (.Array "catalogNs.mappings")) 0 }}
+              {{ $gamePage = .String "catalogNs.mappings.0.pageSlug" }}
+            {{ end }}
+            {{ if gt (len (.Array "offerMappings")) 0 }}
+              {{ $gamePage = .String "offerMappings.0.pageSlug" }}
+            {{ end }}
+            {{ if ne $gamePage "" }}
+              {{ $found = true }}
+              {{ $title := .String "title" }}
+              {{ $image := "" }}
+              {{ range .Array "keyImages" }}
+                {{ if eq (.String "type") "OfferImageWide" }}{{ $image = .String "url" }}{{ end }}
+              {{ end }}
+              <a href="${GLANCE_EPIC_GAMES_URL}/en-US/p/{{ $gamePage }}" target="_blank" rel="noopener noreferrer" class="card">
+                {{ if ne $image "" }}
+                  <img src="{{ $image }}" alt="{{ $title }}" loading="lazy" style="width: 100%; aspect-ratio: 16 / 9; max-height: 240px; object-fit: cover; border-radius: var(--border-radius);">
+                {{ end }}
+                <div class="card-content" style="padding-top: 10px;">
+                  <span class="size-base color-primary">{{ $title }}</span><br>
+                  <span class="size-h5 color-subdue">
+                    {{ $end := .String "promotions.promotionalOffers.0.promotionalOffers.0.endDate" }}
+                    {{ if ge (len $end) 10 }}Free until {{ slice $end 0 10 }}{{ else }}Free this week{{ end }}
+                  </span>
+                </div>
+              </a>
+            {{ end }}
+          {{ end }}
+        {{ end }}
+      </div>
+      {{ if not $found }}<p class="color-subdue">No free Epic Games promotions are available for the configured region.</p>{{ end }}
+    {{ else }}
+      <p class="color-negative">Could not load Epic Games promotions. Check the feed URL and service availability.</p>
+    {{ end }}

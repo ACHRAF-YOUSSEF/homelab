@@ -50,7 +50,7 @@ root `.env` file; edit YAML when changing the dashboard layout or widget behavio
 | [Downloads](config/pages/downloads.yml) | qBittorrent transfer and torrent statistics; download and processing service status; bookmarks; download stack releases |
 | [Network](config/pages/network.yml) | AdGuard Home, Nginx Proxy Manager, Uptime Kuma, and Portracker status; public-service links and checks; infrastructure releases; administration links |
 | [Tools](config/pages/tools.yml) | Tool status; AI, automation, document, and cloud links; latest Glance community widgets; developer links |
-| [Gaming](config/pages/gaming.yml) | Twitch top games; store links; gaming Reddit feeds; YouTube videos; game deals |
+| [Gaming](config/pages/gaming.yml) | Twitch top games; store links; Epic Games free promotions; gaming Reddit feeds; YouTube videos; game deals |
 | [News](config/pages/news.yml) | Security and technology RSS; Hacker News; Lobsters; Reddit feeds; tech YouTube videos; project releases |
 
 Feed, video, weather, release, and community-widget content requires access to
@@ -87,7 +87,7 @@ if [ ! -f .env ]; then cp .env.example .env; fi
 | Docker API proxies | `GLANCE_DOCKER_HOST` for the internal read-only Docker proxy |
 | Internal service base URLs | `JELLYFIN_INTERNAL_URL`, the media API URLs, and `GLANCE_*_INTERNAL_URL` values for checks and the counts helper |
 | Glance appearance | `GLANCE_APP_NAME`, `GLANCE_LOGO_TEXT`, and `GLANCE_WEATHER_LOCATION` |
-| Public external bookmarks and search providers | `GLANCE_*_URL` values for external links and search shortcuts |
+| Public external bookmarks and search providers | `GLANCE_*_URL` values for external links and search shortcuts; `GLANCE_EPIC_FREE_GAMES_API_URL` selects the Epic Games promotions feed |
 | Glance public RSS feed sources | `GLANCE_*_FEED_URL` values for the news and AI feeds |
 
 `HOMELAB_URL` is a scheme and hostname or IP without a port or trailing slash;
@@ -158,9 +158,19 @@ The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling
 | [Jellyfin library](config/widgets/jellyfin-library.yml) | `GLANCE_JELLYFIN_COUNTS_INTERNAL_URL` plus `/counts`; movies, series, episodes, albums, songs, and collections | `15s` |
 | [Upcoming episodes & movies](config/widgets/media-calendar.yml) | Same-origin `/live/calendar` gateway route backed by Sonarr and Radarr `/api/v3/calendar`; renders day, Monday-first week, month, or year views | Browser refresh every `30s` while visible |
 | [Missing from disk](config/widgets/media-missing.yml) | Same-origin `/live/missing`; monitored Sonarr episodes and Radarr movies without files | Browser refresh every `30s` while visible; last successful inventory remains visible on refresh failure |
+| [Epic Games free promotions](config/widgets/epic-free-games.yml) | Epic Games Store public free-games promotions feed; artwork, titles, promotion end date, and store links | Glance cache `1h` |
 | [Seerr requests](config/widgets/seerr-requests.yml) | Seerr `/api/v1/request/count`; totals, movies, shows, pending, processing, and available requests | `15s` |
 | [Subforge](config/widgets/subforge.yml) | JavaScript-rendered, same-origin SSE topic backed by Subforge's authenticated `/api/widget/events`; processed-file totals and up to 32 concurrent job summaries with progress, elapsed time, approximate ETA, liveness, and generic wait status | Native SSE while the Media page is visible; no browser REST fallback |
 | [qBittorrent](config/widgets/qbittorrent-stats.yml) | Live relay `/api/v2/sync/maindata?rid=…`; transfer speed, seeding/downloading counts, and collapsible torrent list | `10s` initial cache; then incremental API polling every `2s` by default |
+
+The custom API widget shows current Epic Games Store promotions above the
+Gaming tab's Reddit feeds, with artwork, titles, promotion end dates, store
+links, and empty or error states; Glance caches it for one hour. It uses Epic's
+public feed without an API key, and `GLANCE_EPIC_FREE_GAMES_API_URL` defaults to
+the English-language United States region; change its `locale`, `country`, and
+`allowCountries` query values in the ignored root `.env` to choose another
+region. This widget is adapted from the
+[Glance community Epic free-games widget](https://github.com/glanceapp/community-widgets/blob/main/widgets/epic-free-widget/README.md).
 
 The Subforge widget is optional. The `subforge` service starts with
 the regular Compose stack after its selected local image has been built. Set a
