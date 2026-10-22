@@ -1,4 +1,9 @@
 .glance-live-status { margin-top: 1rem; }
+.media-refresh-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-top: 1rem; }
+.media-refresh-retry { cursor: pointer; text-decoration: underline; }
+.media-refresh-retry:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 3px; }
+.media-refresh-retry[hidden] { display: none; }
+.media-refresh-retry:disabled { opacity: .6; cursor: wait; }
 .glance-live-details { margin-top: 15px; }
 .glance-live-torrents { --list-gap: 15px; }
 .glance-live-torrent { gap: 10px; }

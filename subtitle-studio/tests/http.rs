@@ -113,6 +113,90 @@ impl Server {
 }
 
 #[test]
+fn archives_are_discoverable_downloadable_and_restorable_without_losing_subtitles() {
+    let server = Server::start();
+    let target = "/api/jobs/0123456789ab/archive";
+    assert_eq!(server.request("POST", target, "", "{}").0, 403);
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                target,
+                "Content-Type: application/json\r\nSec-Fetch-Site: cross-site\r\n",
+                "{}"
+            )
+            .0,
+        403
+    );
+    let (status, body) = server.request("POST", target, "Content-Type: application/json\r\n", "{}");
+    assert_eq!(status, 200);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["archived"], 1);
+    let (_, body) = server.request("GET", "/api/jobs?page=1&page_size=5", "", "");
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["total"], 0);
+    assert_eq!(snapshot["retention"]["saved"], 0);
+    assert_eq!(snapshot["retention"]["archived"], 1);
+    let (status, body) = server.request(
+        "GET",
+        "/api/jobs?status=archived&page=1&page_size=5",
+        "",
+        "",
+    );
+    assert_eq!(status, 200);
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["total"], 1);
+    assert_eq!(snapshot["jobs"][0]["can_restore"], true);
+    assert_eq!(snapshot["jobs"][0]["can_archive"], false);
+    assert_eq!(
+        snapshot["jobs"][0]["steps"]["extraction"]["can_retry"],
+        false
+    );
+    let (status, body) = server.request("GET", "/api/jobs/0123456789ab/files/vi", "", "");
+    assert_eq!(status, 200);
+    assert!(body.contains("Saved subtitle"));
+    let (status, body) = server.request("GET", "/api/jobs/0123456789ab/record", "", "");
+    assert_eq!(status, 200);
+    let record: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(record["id"], "0123456789ab");
+    assert!(record.get("path").is_none());
+    assert!(record["outputs"]["vi"].get("path").is_none());
+    assert!(record["step_task"].get("token").is_none());
+    assert!(!body.contains("/old/mount"));
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                "/api/jobs/0123456789ab/restore",
+                "Content-Type: application/json\r\n",
+                "{}"
+            )
+            .0,
+        200
+    );
+    let (_, body) = server.request("GET", "/api/jobs?page=1&page_size=5", "", "");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["total"], 1);
+    let (status, body) = server.request(
+        "POST",
+        "/api/jobs/archive-inactive",
+        "Content-Type: application/json\r\n",
+        "{}",
+    );
+    assert_eq!(status, 202);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["archived"], 1);
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                "/api/jobs/0123456789ab/archive",
+                "Content-Type: application/json\r\n",
+                "{}"
+            )
+            .0,
+        404
+    );
+}
+
+#[test]
 fn http_preserves_snapshots_recovers_interrupted_work_and_bounds_input() {
     let server = Server::start();
     let (status, body) = server.request("GET", "/api/jobs?page=1&page_size=5", "", "");

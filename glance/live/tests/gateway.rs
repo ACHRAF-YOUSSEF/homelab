@@ -750,6 +750,53 @@ async fn shared_collectors_publish_qb_deltas_and_jellyfin_rest_snapshots_then_st
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn malformed_jellyfin_success_retains_last_good_sessions_until_valid_empty_recovery() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream_calls = calls.clone();
+    let handler: Handler = Arc::new(move |_request| {
+        let call = upstream_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            json_response(match call {
+                0 => json!([{"Id":"playing","NowPlayingItem":{"Name":"Fixture"}}]),
+                1 => json!({"Items": []}),
+                2 => json!(null),
+                3 => json!("unavailable"),
+                _ => json!([]),
+            })
+        })
+    });
+    let fixture = Fixture::start(handler, |_| {}).await;
+    let mut subscription = fixture.relay.subscribe(Topic::Jellyfin).unwrap();
+    timeout(Duration::from_secs(2), subscription.rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let good = event_json(&subscription.rx.borrow_and_update());
+    assert_eq!(good["status"], "ok");
+    assert_eq!(good["data"]["sessions"][0]["id"], "playing");
+    for _ in 0..3 {
+        timeout(Duration::from_secs(2), subscription.rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = event_json(&subscription.rx.borrow_and_update());
+        assert_eq!(failed["status"], "stale");
+        assert_eq!(failed["data"], good["data"]);
+        assert_eq!(failed["updatedAt"], good["updatedAt"]);
+    }
+    timeout(Duration::from_secs(2), subscription.rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let recovered = event_json(&subscription.rx.borrow_and_update());
+    assert_eq!(recovered["status"], "ok");
+    assert_eq!(recovered["data"]["sessions"], json!([]));
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    drop(subscription);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn qb_upstream_failure_and_oversize_keep_the_last_good_snapshot_stale() {
     let calls = Arc::new(AtomicUsize::new(0));
     let upstream_calls = calls.clone();

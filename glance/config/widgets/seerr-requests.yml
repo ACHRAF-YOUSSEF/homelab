@@ -8,6 +8,7 @@
     X-Api-Key: ${SEERR_API_KEY}
   template: |
     {{ if eq .Response.StatusCode 200 }}
+      <span data-media-provider-state="ready" hidden></span>
       <div class="flex justify-between text-center">
         <div><div class="color-highlight size-h3">{{ .JSON.Int "total" }}</div><div class="size-h6">TOTAL</div></div>
         <div><div class="color-highlight size-h3">{{ .JSON.Int "movie" }}</div><div class="size-h6">MOVIES</div></div>
@@ -20,5 +21,6 @@
       </div>
       <a class="block margin-top-15 color-primary" href="${HOMELAB_URL}:5055/requests">Manage requests ↗</a>
     {{ else }}
+      <span data-media-provider-state="unavailable" hidden></span>
       <p class="color-negative">Could not load Seerr requests. Check the API key and service status.</p>
     {{ end }}

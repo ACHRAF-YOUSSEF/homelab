@@ -411,6 +411,9 @@ jobs:
       - name: Run missing media frontend regression tests
         run: node --test glance/test_media_missing.cjs
 
+      - name: Run widget refresh and transfer formatting regression tests
+        run: node --test glance/test_media_live.cjs glance/test_widget_live.cjs
+
       - name: Run Subforge live widget regression tests
         run: node --test glance/test_subforge_live.cjs subforge/tests/live_frontend.cjs
 

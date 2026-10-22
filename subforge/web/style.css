@@ -966,7 +966,7 @@ h2 { font-size: 17px; }
 
 /* Overview is a compact control center; secondary diagnostics stay folded away. */
 @media (max-height: 600px) and (max-width: 800px) {
-  .inventory-authority[data-authority-state="ready"] { display: none; }
+  .inventory-authority[data-authority-state="ready"]:has(#inventory-sync-now:not([data-continuation="true"])) { display: none; }
 }
 #page-overview { padding-top: 20px; padding-bottom: 28px; }
 #page-overview .overview-heading { align-items: center; margin-bottom: 12px; }

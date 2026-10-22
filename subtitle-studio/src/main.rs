@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{path::PathBuf, sync::Arc};
 use subtitle_studio::{App, config::Config, media, server, storage, subtitle};
 

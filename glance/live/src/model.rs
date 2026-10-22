@@ -166,9 +166,7 @@ impl QbState {
 }
 
 pub fn normalize_sessions(payload: &Value, max: usize) -> Result<Value, Error> {
-    let Some(items) = payload.as_array() else {
-        return Ok(json!({"sessions": []}));
-    };
+    let items = payload.as_array().ok_or(Error::InvalidData)?;
     if items.len() > max {
         return Err(Error::Limit);
     }
@@ -251,6 +249,29 @@ mod tests {
         assert_eq!(result["sessions"][0]["playMethod"], "Transcode");
         assert_eq!(result["sessions"][0]["playbackRate"], 1);
         assert!(normalize_sessions(&json!([{}, {}]), 1).is_err());
+    }
+
+    #[test]
+    fn sessions_require_an_array_but_allow_empty_and_idle_results() {
+        for payload in [
+            json!(null),
+            json!({}),
+            json!({"Items": []}),
+            json!("unavailable"),
+            json!(42),
+            json!(false),
+        ] {
+            assert!(matches!(
+                normalize_sessions(&payload, 10),
+                Err(Error::InvalidData)
+            ));
+        }
+        for payload in [json!([]), json!([{"Id": "idle"}])] {
+            assert_eq!(
+                normalize_sessions(&payload, 10).unwrap(),
+                json!({"sessions": []})
+            );
+        }
     }
 
     #[test]

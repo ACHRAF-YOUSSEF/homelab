@@ -372,6 +372,34 @@ fn handle(
             if parts.len() == 3 {
                 return json_response(stream, 200, &app.public_job(job));
             }
+            if parts.len() == 4 && parts[3] == "record" {
+                let mut record = app.public_job(job);
+                if let Some(object) = record.as_object_mut() {
+                    for field in ["path", "media_fingerprint", "generation_token"] {
+                        object.remove(field);
+                    }
+                }
+                for task in ["review_task", "step_task"] {
+                    if let Some(object) = record[task].as_object_mut() {
+                        object.remove("token");
+                    }
+                }
+                if let Some(outputs) = record["outputs"].as_object_mut() {
+                    for output in outputs.values_mut() {
+                        if let Some(object) = output.as_object_mut() {
+                            object.remove("path");
+                            object.remove("export_path");
+                        }
+                    }
+                }
+                return response(
+                    stream,
+                    200,
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&record).map_err(|_| "Could not encode saved job")?,
+                    Some(&format!("subtitle-job-{}.json", parts[2])),
+                );
+            }
             if parts.len() == 5
                 && parts[3] == "files"
                 && (2..=3).contains(&parts[4].len())
@@ -413,6 +441,8 @@ fn handle(
     }
     let result = if path == "/api/jobs" {
         app.create_job(&payload)?
+    } else if path == "/api/jobs/archive-inactive" {
+        app.archive_jobs(None)?
     } else if path == "/api/reviews/missing" {
         if payload.get("force").is_some_and(|v| v != false)
             || payload.get("languages").is_some_and(|v| !v.is_null())
@@ -452,6 +482,8 @@ fn handle(
             return json_response(stream, 404, &json!({"error":"Not found"}));
         }
         let job = match &parts[3..] {
+            ["archive"] => return json_response(stream, 200, &app.archive_jobs(Some(parts[2]))?),
+            ["restore"] => return json_response(stream, 200, &app.restore_job(parts[2])?),
             ["cancel"] => app.cancel(parts[2], None)?,
             ["review"] => app.queue_review(parts[2], &payload)?,
             ["steps", "cancel"] => app.cancel(

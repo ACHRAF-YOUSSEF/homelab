@@ -137,9 +137,15 @@
     const age=minutes===null?'Never synced':`Synced ${Math.floor(minutes/60)}h ${minutes%60}m ago`;
     $('#inventory-authority-copy').title=updated?`Last successful inventory sync: ${absoluteDate(updated)}`:'No successful inventory sync recorded';
     setText($('#inventory-authority-copy'),bazarr?({ready:'Bazarr inventory is ready.',stale:'Bazarr inventory is stale. Sync Bazarr before starting automatic conversion.',unavailable:'Bazarr inventory is unavailable. Sync Bazarr to retry; automatic conversion is blocked.',refresh_pending:`Bazarr inventory synced. Published subtitle indexing is still unconfirmed.${pendingDetail} Conversion is available; existing SRT files are checked before converting.`,reindex_failed:'Subtitles were published, but Bazarr could not reindex them. Check the Bazarr connection and sync again.'}[status]||'Bazarr inventory status is not available. Sync before converting.')+(status!=='ready'&&authority.reason?` ${authority.reason}`:'')+(authority.error?` ${authority.error}`:'')+` ${age}. Saved snapshots become stale when Subforge restarts; there is no age cutoff. A failed sync blocks conversion until a successful retry.`:state.status?'Filesystem inventory. Inspect media to update saved tracks and coverage.':'Checking library status…');
-    setText($('#inventory-sync-now'),bazarr?'Sync now':'Inspect now');
+    const continuation=!bazarr&&typeof authority.next_after==='string'&&authority.discovery_incomplete!==true;
+    $('#inventory-sync-now').dataset.continuation=String(continuation||!bazarr&&authority.discovery_incomplete===true||!bazarr&&Number(authority.batch)>1);
+    setText($('#inventory-sync-now'),bazarr?'Sync now':continuation?'Inspect next batch':'Inspect now');
+    if(!bazarr&&authority.discovery_incomplete===true)setText($('#inventory-authority-copy'),'Filesystem discovery was incomplete: a folder could not be read, the depth limit (64) or traversal limit (1,000,000 entries) was reached. Inspect a smaller root and retry.');
+    else if(!bazarr&&continuation)setText($('#inventory-authority-copy'),`Inspection batch ${Number(authority.batch)||1} is saved (up to 20,000 files). More files remain. Inspect next batch replaces the displayed snapshot; saved conversion state is retained. Newly added files before the cursor require a fresh inspection.`);
+    else if(!bazarr&&authority.scan_complete===true)setText($('#inventory-authority-copy'),`Inspection complete${Number(authority.batch)>1?` through batch ${Number(authority.batch)}; this page shows the final batch`:''}. Inspect media starts a fresh pass.`);
+    else if(!bazarr&&authority.scope==='paths')setText($('#inventory-authority-copy'),'Selected-file inspection saved. Inspect media to refresh the library inventory.');
     const syncing=jobList().some(job=>job.kind==='inspect'&&['queued','running'].includes(job.status));
-    $('#inventory-sync-now').disabled=syncing;$('#inventory-sync-now').title=syncing?'An inventory sync is already queued or running':'Refresh the complete inventory now';
+    $('#inventory-sync-now').disabled=syncing;$('#inventory-sync-now').title=syncing?'An inventory sync is already queued or running':continuation?'Inspect the next filesystem batch in path order':'Refresh the complete inventory now';
     $$('[data-action="inspect"]').forEach(button=>setText(button,bazarr?'Sync Bazarr inventory':'Inspect media'));
     const overviewNotice=$('#overview-inventory-notice');
     if(overviewNotice){overviewNotice.hidden=!bazarr||status==='ready';overviewNotice.replaceChildren();const copy=document.createElement('span');copy.textContent=$('#inventory-authority-copy').textContent;const sync=document.createElement('button');sync.type='button';sync.className='text-button';sync.textContent='Sync now';sync.disabled=syncing;sync.title=$('#inventory-sync-now').title;sync.addEventListener('click',syncInventoryNow);overviewNotice.append(copy,sync);}
@@ -515,8 +521,8 @@
     catch (error) { setConnection(false); if (!state.status) notify(`Could not load converter status: ${error.message}`,'error'); }
     finally { state.pollBusy=false; }
   };
-  const startJob = async ({kind,rootIds=[],paths=[],languages: selected=state.selectedLanguages,retry=false,trackIds,includeOcr,force=false}) => {
-    const payload={kind,root_ids:rootIds,paths,languages:selected,retry};if(trackIds!==undefined)payload.track_ids=trackIds;if(includeOcr!==undefined)payload.include_ocr=includeOcr;if(force)payload.force=true;
+  const startJob = async ({kind,rootIds=[],paths=[],languages: selected=state.selectedLanguages,retry=false,trackIds,includeOcr,force=false,continueInventory=false}) => {
+    const payload={kind,root_ids:rootIds,paths,languages:selected,retry};if(trackIds!==undefined)payload.track_ids=trackIds;if(includeOcr!==undefined)payload.include_ocr=includeOcr;if(force)payload.force=true;if(continueInventory)payload.continue_inventory=true;
     try { const result=await api('/api/jobs',{method:'POST',body:JSON.stringify(payload)}); notify(result.message || 'Job queued.'); await pollStatus(); return result; }
     catch (error) { notify(error.message,'error'); return null; }
   };
@@ -533,7 +539,8 @@
   };
   const syncInventoryNow = async () => {
     const button=$('#inventory-sync-now');button.disabled=true;
-    try{await startJob({kind:'inspect'});}finally{renderInventoryAuthority();}
+    const continuation=!usesBazarr()&&typeof state.inventoryAuthority?.next_after==='string'&&state.inventoryAuthority?.discovery_incomplete!==true;
+    try{await startJob({kind:'inspect',continueInventory:continuation,rootIds:continuation?state.inventoryAuthority.root_ids||[]:[]});}finally{renderInventoryAuthority();}
   };
   const renderInventory = () => {
     const body=$('#inventory-body');
@@ -562,7 +569,7 @@
     if (pageSelect.options.length!==pages) { pageSelect.replaceChildren();for(let page=1;page<=pages;page++)pageSelect.add(new Option(`Page ${page} of ${pages}`,String(page))); }
     pageSelect.value=String(state.inventoryPage);pageSelect.disabled=!count;
     $('#inventory-prev').disabled=state.inventoryPage===1;$('#inventory-next').disabled=state.inventoryPage===pages;
-    $('#inventory-limit-note').classList.toggle('hidden',!state.inventoryTruncated);setText($('#inventory-limit-note'),usesBazarr()?'Bazarr returned a bounded partial inventory. Resolve the reported limit before a complete conversion pass.':'This inspection shows the first 2,000 files. Inspect a smaller media folder to see other files.');
+    $('#inventory-limit-note').classList.toggle('hidden',!state.inventoryTruncated);setText($('#inventory-limit-note'),usesBazarr()?'Bazarr returned a bounded partial inventory. Resolve the reported limit before a complete conversion pass.':'This snapshot holds up to 20,000 files. Use Inspect next batch to continue, or inspect a smaller root if discovery was incomplete.');
     const refreshing=state.status?.running?.kind==='inspect'||(state.status?.queue||[]).some(job=>job.kind==='inspect');
     setText($('#inventory-snapshot-note'),state.inventoryUpdated?`${refreshing?'Refreshing… Showing the saved inventory. ':''}${usesBazarr()?'Bazarr sync':'Last inspection'}: ${fmtDate(state.inventoryUpdated)}${state.status?.inventory?.partial?' · Partial inventory':''}`:refreshing?'Building your first inventory…':'');
     const emptyMessage=state.inventory.length?'No files match your search or filters.':'No inventory yet. Choose Inspect library to read available subtitle tracks.';

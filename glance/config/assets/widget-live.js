@@ -1,5 +1,20 @@
 // Service credentials stay in the relay. This client receives display fields only.
 (() => {
+  const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const clamp = (value, max) => Math.max(0, Math.min(max, number(value)));
+  function speed(value, empty = false) {
+    value = Math.max(0, number(value));
+    if (empty && value < 1024) return "--";
+    return value < 1048576 ? `${(value / 1024).toFixed(0)} KiB/s` : `${(value / 1048576).toFixed(1)} MiB/s`;
+  }
+  function eta(value) {
+    value = number(value);
+    if (value >= 8640000) return "∞";
+    if (value <= 0) return "--";
+    if (value < 60) return "<1m";
+    return value >= 3600 ? `${Math.floor(value / 3600)}h ${Math.floor(value / 60) % 60}m` : `${Math.floor(value / 60)}m`;
+  }
+  if (typeof module === "object" && module.exports) { module.exports = { speed, eta }; return; }
   if (typeof pageData === "undefined" || !["media", "downloads"].includes(pageData.slug)) return;
   const topic = pageData.slug === "media" ? "jellyfin" : "qbittorrent";
   const widgetClass = topic === "jellyfin" ? "media-live-jellyfin" : "downloads-live-qbittorrent";
@@ -17,19 +32,6 @@
     node.className = classes;
     node.textContent = text;
     return node;
-  }
-  const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
-  const clamp = (value, max) => Math.max(0, Math.min(max, number(value)));
-  function speed(value, empty = false) {
-    value = Math.max(0, number(value));
-    if (empty && value < 1024) return "--";
-    return value < 1048576 ? `${(value / 1024).toFixed(0)} KiB/s` : `${(value / 1048576).toFixed(1)} MiB/s`;
-  }
-  function eta(value) {
-    value = number(value);
-    if (value >= 8640000) return "∞";
-    if (value <= 0) return "--";
-    return value >= 3600 ? `${Math.floor(value / 3600)}h ${Math.floor(value / 60) % 60}m` : `${Math.floor(value / 60)}m`;
   }
   function statistic(parent, label) {
     const block = element("div");

@@ -141,6 +141,13 @@
           <button type="button" data-job-filter="running" aria-pressed="false">Running</button>
           <button type="button" data-job-filter="queued" aria-pressed="false">Queued</button>
           <button type="button" data-job-filter="cancelled" aria-pressed="false">Cancelled</button>
+          <button type="button" data-job-filter="archived" aria-pressed="false">Archived</button>
+        </div>
+        <div class="shrink-0 border-b border-[#28333e] px-3 py-3">
+          <p id="jobs-retention" class="text-[11px] leading-[1.5] text-[#91a3af]">Loading history capacity…</p>
+          <p class="mt-2 text-[11px] leading-[1.5] text-[#8196a3]">Archiving frees saved history slots. Subtitle files and caches are kept. Restore archived jobs to run work again.</p>
+          <button id="archive-inactive-jobs" type="button" class="pagination-button mt-2">Archive inactive jobs</button>
+          <p id="archive-feedback" role="status" aria-live="polite" class="mt-2 text-[11px] leading-[1.5] text-[#adbfcb]" hidden></p>
         </div>
         <div id="jobs-content" tabindex="0" aria-label="Saved jobs and reviews" class="panel-scroll min-h-0 flex-1 overflow-y-auto">
         <details class="mx-[11px] mt-[11px] rounded-lg border border-[#304351] bg-[#121c25]">

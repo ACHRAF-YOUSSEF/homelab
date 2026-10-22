@@ -801,6 +801,25 @@ async function main() {
     assert.equal(await page.locator('#inventory-page-size').inputValue(), '25');
     await page.locator('#inventory-page-size').selectOption('auto');
     // Bazarr requirements take precedence over historical failures and wildcard tracks.
+    items = Array.from({length:2103},(_,index)=>({name:`Filesystem ${String(index).padStart(4,'0')}.ass`,path:`/media/movies/Filesystem ${String(index).padStart(4,'0')}.ass`,root_id:'movies',type:'sidecar',tracks:[]}));
+    inventoryAuthority={status:'ready',batch:1,next_after:items.at(-1).path,root_ids:['movies'],discovery_incomplete:false}; disabledIntegration='bazarr'; revision++;
+    pushStatus();
+    await page.locator('#inventory-filter').selectOption('all');
+    await page.locator('#inventory-search').fill('');
+    await page.locator('#inventory-meta').getByText(/2,103 matches/).waitFor();
+    await page.locator('#inventory-page-size').selectOption('100');
+    await page.locator('#inventory-page').selectOption('22');
+    assert.match(await page.locator('#inventory-body').innerText(),/Filesystem 2102/,'rows after the former 2,000-file boundary remain reachable');
+    assert.match(await page.locator('#inventory-authority-copy').innerText(),/More files remain.*replaces the displayed snapshot/);
+    await page.getByRole('button',{name:'Inspect next batch',exact:true}).click();
+    assert.equal(writes.at(-1).body.continue_inventory,true,'continuation requests the saved server cursor rather than sending a path');
+    assert.deepEqual(writes.at(-1).body.root_ids,['movies']);
+    assert.equal(writes.at(-1).body.inventory_after,undefined);
+    inventoryAuthority={status:'ready',batch:2,scan_complete:true,next_after:null,discovery_incomplete:false}; revision++;
+    pushStatus();
+    await page.locator('#inventory-authority-copy').getByText(/Inspection complete through batch 2/).waitFor();
+    await page.locator('#inventory-page-size').selectOption('auto');
+    disabledIntegration='';
     const target = (language, forced = false, hi = false) => ({ language, forced, hi });
     const wanted = [target('en'), target('fr'), target('ar')];
     const covered = {

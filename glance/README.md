@@ -144,13 +144,24 @@ The Glance dashboard and live stream have no user authentication. Keep host port
 
 The gateway proxies the upstream Glance application and emits sanitized JSON snapshots, keeping Jellyfin and optional qBittorrent credentials on the server. The `/live/events` route accepts only the `media` and `downloads` topics and applies same-origin checks; its request also probes the corresponding Glance page-content route with the browser cookie, preserving Glance's native authorization if enabled later. This probe does not add authentication to the current unauthenticated dashboard.
 
-`glance-live` uses one Tokio event-loop thread and at most two blocking DNS workers, with shared, on-demand collectors: a collector runs only while its topic has subscribers, and stops when the last browser disconnects. It has no GPU device access. For live streams and the calendar, provider responses are limited to 2 MiB, normalized snapshots to 256 KiB, torrent lists to 2,000 entries, Jellyfin sessions to 256, active SSE clients to 64, accepted HTTP connections to 128, and SSE lifetime to 900 seconds by default. Missing-media inventory uses its own larger provider and snapshot bounds described below. If an upstream payload exceeds its bound or fails, the topic is marked stale and its last valid snapshot is retained; the gateway does not synthesize replacement values. These defaults are configurable through `GLANCE_LIVE_*` variables described below.
+`glance-live` uses one Tokio event-loop thread and at most two blocking DNS workers, with shared, on-demand collectors: a collector runs only while its topic has subscribers, and stops when the last browser disconnects. It has no GPU device access. For live streams and the calendar, provider responses are limited to 2 MiB, normalized snapshots to 256 KiB, torrent lists to 2,000 entries, Jellyfin sessions to 256, active SSE clients to 64, accepted HTTP connections to 128, and SSE lifetime to 900 seconds by default. Missing-media inventory uses its own larger provider and snapshot bounds described below. Upstream failures, oversized payloads, and malformed Jellyfin session responses mark the topic stale and retain its last valid snapshot; malformed top-level responses are errors, while a valid empty session array means no active sessions. The gateway does not synthesize replacement values. These defaults are configurable through `GLANCE_LIVE_*` variables described below.
 
 The gateway runs as an unprivileged user, drops Linux capabilities, has a read-only filesystem, and is connected only to `homelab`; its Rust toolchain and runtime image are pinned. Glance itself remains upstream and continues on the internal `docker-monitoring` network for its read-only Docker API proxy; it does not mount the raw Docker socket. Keep API credentials and deployment-specific addresses in `.env`, and review [SECURITY.md](../SECURITY.md) before changing exposure or network access.
 
 The Compose gateway has a configurable 96 MiB memory ceiling, a 0.50 CPU ceiling, and a 32-process limit. The memory value is an upper bound, not an expected working set or a reservation. See the [isolated migration measurements](../docs/memory-budget.md#glance-live-migration-measurements) for observed usage and test limits.
 
 ## Custom widgets and refresh behavior
+
+The Media page's server-rendered service, library, automation, and Seerr widgets
+refresh every 15 seconds while the page is visible. Each widget reports refresh
+success or failure, keeps its last rendered data on failure, and offers **Retry**
+when its data is unavailable or stale. “Last checked” is the time this browser
+successfully received Glance-rendered widget content; provider-side cache age or
+measurement time may be different. Hiding the page pauses refreshes.
+
+The initial and live qBittorrent widgets display transfer rates in KiB/s below
+1 MiB/s and MiB/s at or above that threshold. Positive ETAs under one minute are
+shown as `<1m`.
 
 | Widget | Data source | Initial Glance cache / live refresh |
 | --- | --- | --- |

@@ -35,10 +35,19 @@ const MAX_TRACK_LABEL: usize = 32;
 // failures immediately. Successful fingerprint caches are independent.
 const ERROR_CACHE_REVISION: u64 = 3;
 const MAX_CANDIDATES: usize = 20_000;
+const MAX_DISCOVERY_ENTRIES: usize = 1_000_000;
 const MAX_TRACKED_OUTPUTS: usize = 20_000;
 const MAX_COVERAGE_ENTRIES: usize = 4096;
 const MAX_COVERAGE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_COVERAGE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A bounded, sorted filesystem page. Continuation uses the final canonical
+/// path, never an offset into the filesystem's unstable directory order.
+pub(crate) struct CandidatePage {
+    pub paths: Vec<PathBuf>,
+    pub has_more: bool,
+    pub incomplete: bool,
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -228,14 +237,30 @@ impl Converter {
     }
 
     pub fn candidates_with_stop(roots: &[PathBuf], stop: &AtomicBool) -> Vec<PathBuf> {
+        Self::candidate_page(roots, stop, None, MAX_CANDIDATES).paths
+    }
+
+    pub(crate) fn candidate_page(
+        roots: &[PathBuf],
+        stop: &AtomicBool,
+        after: Option<&Path>,
+        limit: usize,
+    ) -> CandidatePage {
+        let limit = limit.clamp(1, MAX_CANDIDATES);
         let mut found = BTreeSet::new();
-        for root in roots {
+        let mut incomplete = false;
+        let mut entries = 0_usize;
+        'roots: for root in roots {
             if root.is_symlink() || !root.is_dir() {
+                incomplete = true;
                 continue;
             }
             let canonical_root = match root.canonicalize() {
                 Ok(p) => normalize_canonical_local_path(p),
-                Err(_) => continue,
+                Err(_) => {
+                    incomplete = true;
+                    continue;
+                }
             };
             for entry in WalkDir::new(root)
                 .follow_links(false)
@@ -244,10 +269,21 @@ impl Converter {
                 .filter_entry(|entry| {
                     entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
                 })
-                .filter_map(Result::ok)
             {
-                if stop.load(Ordering::Relaxed) || found.len() >= MAX_CANDIDATES {
-                    return found.into_iter().collect();
+                if stop.load(Ordering::Relaxed) || entries >= MAX_DISCOVERY_ENTRIES {
+                    incomplete = true;
+                    break 'roots;
+                }
+                entries += 1;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        incomplete = true;
+                        continue;
+                    }
+                };
+                if entry.depth() == 64 && entry.file_type().is_dir() {
+                    incomplete = true;
                 }
                 if !entry.file_type().is_file() {
                     continue;
@@ -258,9 +294,19 @@ impl Converter {
                 }
                 let canonical = match path.canonicalize() {
                     Ok(p) => normalize_canonical_local_path(p),
-                    Err(_) => continue,
+                    Err(_) => {
+                        incomplete = true;
+                        continue;
+                    }
                 };
+                if canonical.to_str().is_none_or(|path| path.len() > 4096) {
+                    incomplete = true;
+                    continue;
+                }
                 if !canonical.starts_with(&canonical_root) {
+                    continue;
+                }
+                if after.is_some_and(|after| canonical.as_path() <= after) {
                     continue;
                 }
                 if extension(path).as_deref() == Some("idx") && path.with_extension("sub").is_file()
@@ -268,9 +314,22 @@ impl Converter {
                     continue;
                 }
                 found.insert(canonical);
+                // Keep only the smallest page plus one lookahead entry,
+                // irrespective of root and directory enumeration order.
+                if found.len() > limit + 1 {
+                    found.pop_last();
+                }
             }
         }
-        found.into_iter().collect()
+        let has_more = found.len() > limit;
+        if has_more {
+            found.pop_last();
+        }
+        CandidatePage {
+            paths: found.into_iter().collect(),
+            has_more,
+            incomplete,
+        }
     }
 
     pub fn safe_path(value: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
@@ -3713,6 +3772,56 @@ mod tests {
         fs::write(dir.path().join("lang.idx"), b"x").unwrap();
         fs::write(dir.path().join("lang.sub"), b"x").unwrap();
         assert_eq!(Converter::candidates(&[dir.path().to_path_buf()]).len(), 2);
+    }
+
+    #[test]
+    fn filesystem_pages_cover_more_than_two_thousand_files_without_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        fs::create_dir(&left).unwrap();
+        fs::create_dir(&right).unwrap();
+        for index in (0..2103).rev() {
+            fs::write(
+                if index % 2 == 0 { &left } else { &right }.join(format!("media-{index:04}.ass")),
+                b"fixture",
+            )
+            .unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        // Overlapping roots exercise deduplication as well as unstable root order.
+        let roots = vec![right, dir.path().to_path_buf(), left];
+        let first = Converter::candidate_page(&roots, &stop, None, 2000);
+        assert_eq!(first.paths.len(), 2000);
+        assert!(first.has_more);
+        assert!(!first.incomplete);
+        let second = Converter::candidate_page(
+            &roots,
+            &stop,
+            first.paths.last().map(PathBuf::as_path),
+            2000,
+        );
+        assert_eq!(second.paths.len(), 103);
+        assert!(!second.has_more);
+        assert!(!second.incomplete);
+        let all = first
+            .paths
+            .into_iter()
+            .chain(second.paths)
+            .collect::<Vec<_>>();
+        assert_eq!(all.len(), 2103);
+        assert!(all.windows(2).all(|pair| pair.first() < pair.get(1)));
+        let exact =
+            Converter::candidate_page(&roots, &stop, all.get(102).map(PathBuf::as_path), 2000);
+        assert_eq!(exact.paths.len(), 2000);
+        assert!(
+            !exact.has_more,
+            "an exact page is complete without a lookahead file"
+        );
+        let missing = Converter::candidate_page(&[dir.path().join("missing")], &stop, None, 2000);
+        assert!(missing.incomplete);
+        stop.store(true, Ordering::Relaxed);
+        assert!(Converter::candidate_page(&roots, &stop, None, 2000).incomplete);
     }
 
     #[test]

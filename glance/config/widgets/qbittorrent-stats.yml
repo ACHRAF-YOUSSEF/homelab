@@ -40,7 +40,11 @@
           {{ if eq $mode "upload" }}
           <div>
             {{ $ulSpeed := $transfer.JSON.Float "up_info_speed" }}
-            <div class="color-highlight size-h3">{{ printf "%.1f MB/s" (div $ulSpeed 1000000.0) }}</div>
+            {{ if lt $ulSpeed 1048576.0 }}
+              <div class="color-highlight size-h3">{{ printf "%.0f KiB/s" (div $ulSpeed 1024.0) }}</div>
+            {{ else }}
+              <div class="color-highlight size-h3">{{ printf "%.1f MiB/s" (div $ulSpeed 1048576.0) }}</div>
+            {{ end }}
             <div class="size-h6">UPLOADING</div>
           </div>
           {{ end }}
@@ -84,8 +88,9 @@
                     </div>
                     {{ $eta := $t.Int "eta" }}
                     <div class="size-sm color-paragraph">
-                      {{ if eq $eta 8640000 }}∞
-                      {{ else if gt $eta 3600 }}{{ printf "%dh %dm" (div $eta 3600) (mod (div $eta 60) 60) }}
+                      {{ if ge $eta 8640000 }}∞
+                      {{ else if ge $eta 3600 }}{{ printf "%dh %dm" (div $eta 3600) (mod (div $eta 60) 60) }}
+                      {{ else if and (gt $eta 0) (lt $eta 60) }}&lt;1m
                       {{ else if gt $eta 0 }}{{ printf "%dm" (div $eta 60) }}
                       {{ else }}--{{ end }}
                     </div>
@@ -100,7 +105,11 @@
       <div class="flex justify-between text-center">
         <div>
           {{ $dlSpeed := $transfer.JSON.Float "dl_info_speed" }}
-          <div class="color-highlight size-h3">{{ printf "%.1f MB/s" (div $dlSpeed 1000000.0) }}</div>
+          {{ if lt $dlSpeed 1048576.0 }}
+            <div class="color-highlight size-h3">{{ printf "%.0f KiB/s" (div $dlSpeed 1024.0) }}</div>
+          {{ else }}
+            <div class="color-highlight size-h3">{{ printf "%.1f MiB/s" (div $dlSpeed 1048576.0) }}</div>
+          {{ end }}
           <div class="size-h6">DOWNLOADING</div>
         </div>
         <div>

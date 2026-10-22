@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+
+pub mod archive;
 pub mod config;
 pub mod llm;
 pub mod media;
@@ -25,6 +28,7 @@ pub struct Work {
 
 pub(crate) struct State {
     jobs: Vec<Value>,
+    archived: Vec<Value>,
     queue: VecDeque<Work>,
     revision: u64,
 }
@@ -143,10 +147,12 @@ impl App {
                 }
             }
         }
+        let archived = archive::load(&config, &jobs)?;
         let app = Self {
             config,
             state: Mutex::new(State {
                 jobs,
+                archived,
                 queue: VecDeque::new(),
                 revision: 0,
             }),
@@ -173,11 +179,11 @@ impl App {
     }
 
     pub fn job(&self, id: &str) -> Result<Value, String> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        state
             .jobs
             .iter()
+            .chain(state.archived.iter())
             .find(|j| j["id"] == id)
             .cloned()
             .ok_or_else(|| "Job not found".into())
@@ -577,10 +583,13 @@ impl App {
 
     pub fn public_job(&self, mut job: Value) -> Value {
         let is_busy = busy(&job);
+        let archived = job["archived_at"].is_string();
+        job["can_archive"] = json!(!archived && !is_busy);
+        job["can_restore"] = json!(archived);
         // Snapshot enrichment uses file existence only. Read/parse/align subtitle
         // contents when accepting work, never once per SSE client and revision.
         let has_source = self.source_hint(&job);
-        let review_languages = if !active(&job["status"]) {
+        let review_languages = if !archived && !active(&job["status"]) {
             job["outputs"]
                 .as_object()
                 .into_iter()
@@ -632,7 +641,8 @@ impl App {
                     true
                 };
                 step["can_retry"] = json!(
-                    !is_busy
+                    !archived
+                        && !is_busy
                         && source_ok
                         && matches!(
                             step["status"].as_str(),
@@ -651,14 +661,19 @@ impl App {
     pub fn snapshot(&self, view: Option<&View>) -> Value {
         let items = {
             let state = self.state.lock().unwrap();
-            let mut items: Vec<&Value> = state
-                .jobs
+            let source = if view.is_some_and(|v| v.status == "archived") {
+                &state.archived
+            } else {
+                &state.jobs
+            };
+            let mut items: Vec<&Value> = source
                 .iter()
                 .filter(|j| view.is_none_or(|v| matches_filter(j, &v.status)))
                 .collect();
             items.sort_by(|a, b| text(b, "created_at", "").cmp(text(a, "created_at", "")));
             let total = items.len();
-            let total_all = state.jobs.len();
+            let total_all = source.len();
+            let retention = json!({"saved":state.jobs.len(),"saved_limit":self.config.max_jobs,"archived":state.archived.len(),"archive_limit":archive::MAX_ARCHIVED_JOBS,"json_bytes_limit":self.config.max_json_bytes});
             if let Some(v) = view {
                 let count = total.div_ceil(v.page_size).max(1);
                 let page = v.page.min(count);
@@ -668,14 +683,22 @@ impl App {
                     .take(v.page_size)
                     .cloned()
                     .collect::<Vec<_>>();
-                (selected, Some((page, v.page_size, total, total_all, count)))
+                (
+                    selected,
+                    Some((page, v.page_size, total, total_all, count)),
+                    retention,
+                )
             } else {
-                (items.into_iter().take(100).cloned().collect(), None)
+                (
+                    items.into_iter().take(100).cloned().collect(),
+                    None,
+                    retention,
+                )
             }
         };
         let jobs: Vec<Value> = items.0.into_iter().map(|j| self.public_job(j)).collect();
         if let Some((page, size, total, total_all, count)) = items.1 {
-            json!({"jobs":jobs,"page":page,"page_size":size,"total":total,"total_all":total_all,"page_count":count})
+            json!({"jobs":jobs,"page":page,"page_size":size,"total":total,"total_all":total_all,"page_count":count,"retention":items.2})
         } else {
             json!(jobs)
         }
@@ -860,7 +883,7 @@ impl View {
         let status = get("status", "all")?;
         if !matches!(
             status.as_str(),
-            "all" | "completed" | "failed" | "running" | "queued" | "cancelled"
+            "all" | "completed" | "failed" | "running" | "queued" | "cancelled" | "archived"
         ) {
             return Err("Unsupported job status filter".into());
         }
@@ -872,6 +895,9 @@ impl View {
     }
 }
 fn matches_filter(job: &Value, status: &str) -> bool {
+    if status == "archived" {
+        return job["archived_at"].is_string();
+    }
     let states = [
         &job["status"],
         &job["review_task"]["status"],

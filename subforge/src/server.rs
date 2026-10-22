@@ -786,6 +786,19 @@ impl App {
             runtime.inventory_truncated = saved["truncated"].as_bool().unwrap_or(false);
             runtime.inventory_partial = saved["partial"].as_bool().unwrap_or(false);
             runtime.inventory_authority = json!({"status":if runtime.inventory_source == "bazarr" {"stale"} else {"ready"},"error":saved["authority"]["error"],"previous_status":saved["authority"]["status"],"pending_srt_keys":index_keys(&saved["authority"]["pending_srt_keys"]),"verification_limited":saved["authority"]["verification_limited"]==true});
+            if runtime.inventory_source == "filesystem" {
+                for key in [
+                    "next_after",
+                    "root_paths",
+                    "root_ids",
+                    "batch",
+                    "scan_complete",
+                    "scope",
+                    "discovery_incomplete",
+                ] {
+                    runtime.inventory_authority[key] = saved["authority"][key].clone();
+                }
+            }
         }
         // Inventory is stored once, independently of rotating job history.
         runtime.cached_roots = runtime
@@ -1970,6 +1983,29 @@ impl App {
                 Converter::safe_path(value, &roots).map(|path| path.to_string_lossy().into_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if data
+            .get("continue_inventory")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("Invalid inventory continuation option".into());
+        }
+        let continuation = data["continue_inventory"] == true;
+        if continuation
+            && (kind != "inspect"
+                || origin != "manual"
+                || !paths.is_empty()
+                || runtime.inventory_source != "filesystem"
+                || runtime.inventory_authority["root_paths"] != json!(roots)
+                || runtime.inventory_authority["discovery_incomplete"] == true
+                || !runtime.inventory_authority["next_after"]
+                    .as_str()
+                    .is_some_and(|path| path.len() <= 4096 && Path::new(path).is_absolute()))
+        {
+            return Err(
+                "No complete discovery page is available to continue; inspect the library again"
+                    .into(),
+            );
+        }
         if kind == "extract" && paths.is_empty() {
             return Err("Choose a file to extract".into());
         }
@@ -2035,6 +2071,11 @@ impl App {
                 && data["include_ocr"].as_bool().unwrap_or(true));
         let job = json!({"id":token(8),"task_id":task_id,"workload":if kind=="ocr" {"ocr"}else if include_ocr {"all"}else{"text"},"include_ocr":include_ocr,"kind":kind,"status":"queued","created":now(),"started":null,"finished":null,"current":null,"summary":{},"error":null,"results":[],"languages":languages,"root_ids":roots.iter().map(|root|root_info(root,&self.mounts)["id"].clone()).collect::<Vec<_>>(),"root_paths":roots,"paths":paths,"retry":data["retry"].as_bool().unwrap_or(false),"origin":origin,"provider":provider,"processed":0,"total":0});
         let mut job = job;
+        if continuation {
+            job["inventory_after"] = runtime.inventory_authority["next_after"].clone();
+            job["inventory_batch"] =
+                json!(count(&runtime.inventory_authority["batch"]).saturating_add(1));
+        }
         job["force"] = json!(force);
         if let Some(track_ids) = track_ids {
             job["track_ids"] = json!(track_ids);
@@ -3067,12 +3108,36 @@ impl App {
         if integrations.bazarr_enabled() && job["force"] != true {
             return self.execute_bazarr(job, integrations);
         }
+        let _inventory_writer = (job["kind"] == "inspect" || job["task_id"] == "discovery")
+            .then(|| self.wait_inventory_sync())
+            .transpose()?;
+        if job["inventory_after"].is_string()
+            && lock(&self.runtime).inventory_authority["next_after"] != job["inventory_after"]
+        {
+            return Err("The inventory page changed before continuation started; continue the current page instead".into());
+        }
         let roots = strings(&job["root_paths"])
             .iter()
             .map(|path| validate_root(Path::new(path), &self.mounts, false))
             .collect::<Result<Vec<_>, _>>()?;
         self.job_phase("discovering");
-        let paths = if job["kind"] == "ocr" {
+        let discovery = ((job["kind"] == "inspect" || job["task_id"] == "discovery")
+            && strings(&job["paths"]).is_empty())
+        .then(|| {
+            Converter::candidate_page(
+                &roots,
+                &self.cancellation(),
+                job["inventory_after"].as_str().map(Path::new),
+                INVENTORY_LIMIT,
+            )
+        });
+        let directory_discovery = discovery.is_some();
+        let (discovery_more, discovery_incomplete) = discovery
+            .as_ref()
+            .map_or((false, false), |page| (page.has_more, page.incomplete));
+        let paths = if let Some(page) = discovery {
+            page.paths
+        } else if job["kind"] == "ocr" {
             lock(&self.converter).ocr_candidates(&roots, job["retry"].as_bool().unwrap_or(false))
         } else if strings(&job["paths"]).is_empty() {
             Converter::candidates_with_stop(&roots, &self.cancellation())
@@ -3167,11 +3232,14 @@ impl App {
                         running["summary"]["inspection_failed"] = json!(failed);
                         running["summary"]["metadata_pending"] = json!(metadata_pending);
                     }
-                    running["truncated"] = json!(paths.len() > INVENTORY_LIMIT);
+                    running["truncated"] = json!(
+                        discovery_more || discovery_incomplete || paths.len() > INVENTORY_LIMIT
+                    );
                 }
             }
             let cancelled = self.cancellation().load(Ordering::Relaxed);
-            let partial = cancelled || metadata_pending > 0;
+            let partial =
+                cancelled || metadata_pending > 0 || discovery_more || discovery_incomplete;
             let keep_previous = cancelled && !lock(&self.runtime).inventory.is_empty();
             if !keep_previous {
                 let processing_changed =
@@ -3180,10 +3248,19 @@ impl App {
                     self.refresh_pipeline();
                 }
                 let updated = now();
-                let truncated = paths.len() > INVENTORY_LIMIT;
-                write_private(
+                let truncated =
+                    discovery_more || discovery_incomplete || paths.len() > INVENTORY_LIMIT;
+                let authority = json!({"status":"ready","error":null,
+                    "next_after":if discovery_more && !discovery_incomplete && !cancelled { paths.last().map(|path|path.to_string_lossy().into_owned()) } else { None },
+                    "root_paths":roots,"root_ids":job["root_ids"],"batch":job["inventory_batch"].as_u64().unwrap_or(1),
+                    "scan_complete":directory_discovery && !cancelled && !discovery_more && !discovery_incomplete,"scope":if directory_discovery {"roots"} else {"paths"},"discovery_incomplete":discovery_incomplete});
+                // Publish the cursor only after its matching page is durable.
+                // Readers continue using the previous snapshot during disk IO.
+                let _persist_writer = lock(&self.inventory_persist);
+                crate::util::write_private_limited(
                     &self.data.join("inventory.json"),
-                    &json!({"items":results,"updated":updated,"truncated":truncated,"partial":partial}),
+                    &json!({"items":results,"updated":updated,"truncated":truncated,"partial":partial,"source":"filesystem","authority":authority}),
+                    JSON_LIMIT as u64,
                 )?;
                 let mut runtime = lock(&self.runtime);
                 runtime.inventory = results;
@@ -3191,9 +3268,7 @@ impl App {
                 runtime.inventory_truncated = truncated;
                 runtime.inventory_partial = partial;
                 runtime.inventory_source = "filesystem".into();
-                runtime.inventory_authority = json!({"status":"ready","error":null});
-                drop(runtime);
-                self.persist_inventory()?;
+                runtime.inventory_authority = authority;
             }
         }
         lock(&self.converter).persist_metadata()?;
@@ -6223,6 +6298,100 @@ mod tests {
             app.status()["pipeline"]["failed_files"]
         );
     }
+
+    #[test]
+    fn filesystem_continuation_survives_restart_and_is_bound_to_the_saved_roots() {
+        let (_temporary, app, paths, _gate) = gated_workers_fixture();
+        let roots = app.mounts.clone();
+        let root_ids = roots
+            .iter()
+            .map(|root| root_info(root, &roots)["id"].clone())
+            .collect::<Vec<_>>();
+        {
+            let mut runtime = lock(&app.runtime);
+            runtime.running = None;
+            runtime.inventory_source = "filesystem".into();
+            runtime.inventory_authority = json!({"status":"ready","next_after":paths.first(),"root_paths":roots,"root_ids":root_ids,"batch":1,"scan_complete":false,"discovery_incomplete":false});
+        }
+        app.persist_inventory().unwrap();
+        let data = app.data.clone();
+        drop(app);
+        let app = App::new(
+            roots.clone(),
+            data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        lock(&app.resources).set_fixture(crate::resources::Snapshot::fixture(
+            4.0,
+            Some(1536 * 1024 * 1024),
+        ));
+        assert_eq!(app.inventory()["authority"]["batch"], 1);
+        assert!(
+            app.enqueue(
+                &json!({"kind":"extract","continue_inventory":true,"paths":[paths[1]]}),
+                "manual"
+            )
+            .is_err()
+        );
+        assert!(
+            app.enqueue(
+                &json!({"kind":"inspect","continue_inventory":"yes"}),
+                "manual"
+            )
+            .is_err()
+        );
+        let other = roots.first().unwrap().join("different-root");
+        fs::create_dir(&other).unwrap();
+        lock(&app.runtime).roots = vec![other];
+        assert!(
+            app.enqueue(
+                &json!({"kind":"inspect","continue_inventory":true}),
+                "manual"
+            )
+            .is_err(),
+            "continuation cannot reuse a cursor for a changed root selection"
+        );
+        lock(&app.runtime).roots = roots.clone();
+        let job = app
+            .enqueue(
+                &json!({"kind":"inspect","continue_inventory":true}),
+                "manual",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(job["inventory_after"], json!(paths.first()));
+        lock(&app.runtime).running = Some(job.clone());
+        let mut integrations = Integrations::new(data.join("settings.json")).unwrap();
+        app.execute(&job, &mut integrations).unwrap();
+        let inventory = app.inventory();
+        assert_eq!(inventory["items"].as_array().unwrap().len(), 2);
+        assert_eq!(inventory["items"][0]["path"], json!(paths[1]));
+        assert_eq!(inventory["items"][1]["path"], json!(paths[2]));
+        assert_eq!(inventory["authority"]["batch"], 2);
+        assert_eq!(inventory["authority"]["scan_complete"], true);
+        assert!(inventory["authority"]["next_after"].is_null());
+        assert_eq!(inventory["truncated"], false);
+        assert!(
+            app.enqueue(
+                &json!({"kind":"inspect","continue_inventory":true}),
+                "manual"
+            )
+            .is_err()
+        );
+        assert!(
+            app.execute(&job, &mut integrations).is_err(),
+            "a stale queued continuation cannot overwrite a newer page"
+        );
+        // Inspection never modifies existing sidecar outputs.
+        for path in paths {
+            assert_eq!(
+                fs::read(path.with_extension("srt")).unwrap(),
+                b"existing output must survive"
+            );
+        }
+    }
     #[test]
     fn stored_inventory_is_bounded_and_stays_inside_mounts() {
         let temporary = tempfile::tempdir().expect("fixture");
@@ -6240,6 +6409,82 @@ mod tests {
             crate::metadata::MAX_TRACKS
         );
         assert!(rows[0]["tracks"][0]["language"].as_str().unwrap().len() <= 35);
+    }
+
+    #[test]
+    fn filesystem_page_write_failure_keeps_previous_snapshot_and_cursor() {
+        let (_temporary, app, paths, _gate) = gated_workers_fixture();
+        {
+            let mut runtime = lock(&app.runtime);
+            runtime.inventory = vec![json!({"path":paths.first(),"tracks":[],"type":"sidecar"})];
+            runtime.inventory_updated = 42.0;
+            runtime.inventory_authority = json!({"status":"ready","next_after":paths.first(),"root_paths":app.mounts,"batch":1});
+        }
+        app.persist_inventory().unwrap();
+        let old = app.inventory();
+        let destination = app.data.join("inventory.json");
+        let preserved = app.data.join("inventory-preserved.json");
+        fs::rename(&destination, &preserved).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let job = json!({"kind":"inspect","root_paths":app.mounts,"languages":["*"],"paths":[paths[1]],"inventory_after":paths.first(),"inventory_batch":2});
+        lock(&app.runtime).running = Some(job.clone());
+        let mut integrations = Integrations::new(app.data.join("settings.json")).unwrap();
+        assert!(app.execute(&job, &mut integrations).is_err());
+        assert_eq!(app.inventory()["items"], old["items"]);
+        assert_eq!(app.inventory()["authority"], old["authority"]);
+        assert_eq!(app.inventory()["updated"], 42.0);
+        fs::remove_dir(&destination).unwrap();
+        fs::rename(preserved, destination).unwrap();
+        let restarted = App::new(
+            app.mounts.clone(),
+            app.data.clone(),
+            Duration::from_secs(21600),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.inventory()["authority"]["next_after"],
+            old["authority"]["next_after"]
+        );
+    }
+
+    #[test]
+    fn filesystem_inspection_waits_for_the_shared_bazarr_inventory_writer() {
+        let (_temporary, app, paths, _gate) = gated_workers_fixture();
+        let job =
+            json!({"kind":"inspect","root_paths":app.mounts,"languages":["*"],"paths":[paths[1]]});
+        lock(&app.runtime).running = Some(job.clone());
+        let bazarr_writer = lock(&app.inventory_sync);
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::sync_channel(1);
+            let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+            let app = &app;
+            scope.spawn(move || {
+                let mut integrations = Integrations::new(app.data.join("settings.json")).unwrap();
+                started_tx.send(()).unwrap();
+                finished_tx
+                    .send(app.execute(&job, &mut integrations))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(
+                finished_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(app.inventory()["items"].as_array().unwrap().is_empty());
+            drop(bazarr_writer);
+            finished_rx
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            assert_eq!(app.inventory()["items"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                app.inventory()["authority"]["scan_complete"],
+                false,
+                "inspecting one explicit file cannot claim a complete directory pass"
+            );
+            assert_eq!(app.inventory()["authority"]["scope"], "paths");
+        });
     }
 
     #[test]

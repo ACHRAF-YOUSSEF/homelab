@@ -548,7 +548,7 @@ async function controlJob(job, step, action) {
   state.pendingStepActions.add(key);
   state.jobActionFeedback.delete(job.id);
   renderJobs();
-  const route = step ? `steps/${action}` : 'cancel';
+  const route = step ? `steps/${action}` : action;
   try {
     await api(`/api/jobs/${encodeURIComponent(job.id)}/${route}`, {
       method: 'POST',
@@ -556,16 +556,41 @@ async function controlJob(job, step, action) {
       body: JSON.stringify(step ? { step } : {}),
     });
     const label = step ? job.steps[step].label || step : 'job';
+    const retentionAction = ['archive', 'restore'].includes(action);
+    if (retentionAction) archiveFeedback(action === 'archive' ? 'Job archived. Subtitle files and caches are kept.' : 'Job restored to saved history.');
     state.jobActionFeedback.set(job.id, {
-      message: action === 'cancel' ? `Cancellation requested for ${label}. Completed results are kept.` : `Retry queued for ${label}.`,
+      message: retentionAction ? (action === 'archive' ? 'Job archived.' : 'Job restored.') : action === 'cancel' ? `Cancellation requested for ${label}. Completed results are kept.` : `Retry queued for ${label}.`,
       error: false,
     });
     await loadJobs();
   } catch (error) {
+    if (['archive', 'restore'].includes(action)) archiveFeedback(error.message, true);
     state.jobActionFeedback.set(job.id, { message: error.message, error: true });
   } finally {
     state.pendingStepActions.delete(key);
     renderJobs();
+  }
+}
+
+function archiveFeedback(message, error = false) {
+  const feedback = $('archive-feedback');
+  feedback.hidden = false;
+  feedback.textContent = message;
+  feedback.setAttribute('role', error ? 'alert' : 'status');
+}
+
+async function archiveInactiveJobs() {
+  const button = $('archive-inactive-jobs');
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const result = await api('/api/jobs/archive-inactive', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    archiveFeedback(`${result.archived} ${result.archived === 1 ? 'job archived' : 'jobs archived'}. Subtitle files and caches are kept.`);
+    await loadJobs();
+  } catch (error) {
+    archiveFeedback(error.message, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -580,6 +605,13 @@ function renderJobControls(card, job) {
     const cancel = controlButton(job, cancelling ? 'Cancelling…' : 'Cancel job', null, 'cancel');
     cancel.disabled ||= cancelling;
     actions.append(cancel);
+    card.append(actions);
+  } else if (job.can_archive || job.can_restore) {
+    const actions = element('div', 'mt-3 flex flex-wrap gap-[6px]');
+    actions.append(controlButton(job, job.can_restore ? 'Restore job' : 'Archive job', null, job.can_restore ? 'restore' : 'archive'));
+    const record = element('a', 'pagination-button', 'Download job record');
+    record.href = `/api/jobs/${encodeURIComponent(job.id)}/record`;
+    actions.append(record);
     card.append(actions);
   }
   if (Object.values(job.steps || {}).some(step => step.status === 'cancelling')) {
@@ -749,6 +781,7 @@ function renderReviewActivity(card, job) {
 }
 
 function renderReviewActions(card, job) {
+  if (job.archived_at) return;
   if (['queued', 'running', 'cancelling'].includes(job.status)) return;
   const available = job.review_available;
   const languages = Array.isArray(available?.languages) ? available.languages : [];
@@ -974,6 +1007,11 @@ function jobsViewQuery() {
 }
 
 function renderJobsPagination() {
+  const retention = $('jobs-retention');
+  if (retention && state.retention) {
+    const data = state.retention;
+    retention.textContent = `Saved history: ${data.saved}/${data.saved_limit} jobs · Archive: ${data.archived}/${data.archive_limit} jobs · Each history file is limited to ${Math.floor(data.json_bytes_limit / 1048576)} MiB.`;
+  }
   $('jobs-page-size').value = String(state.jobPageSize);
   $('jobs-prev').disabled = state.jobsLoading || state.jobPage <= 1;
   $('jobs-next').disabled = state.jobsLoading || state.jobPage >= state.jobPageCount;
@@ -1031,6 +1069,7 @@ function applyJobsSnapshot(snapshot) {
   validateJobsSnapshot(snapshot);
   const clamped = snapshot.page !== state.jobPage || snapshot.page_size !== state.jobPageSize;
   state.jobs = snapshot.jobs;
+  state.retention = snapshot.retention;
   state.jobPage = snapshot.page;
   state.jobPageSize = snapshot.page_size;
   state.jobTotal = snapshot.total;
@@ -1147,6 +1186,7 @@ function stopJobsUpdates() {
 $('refresh-library').onclick = () => refreshButton('refresh-library', () => loadFolder(state.folder));
 $('refresh-jobs').onclick = () => refreshButton('refresh-jobs', loadJobs);
 $('review-missing-jobs').onclick = reviewMissingJobs;
+$('archive-inactive-jobs').onclick = archiveInactiveJobs;
 $('review-enabled').onchange = updateReviewSelection;
 for (const id of ['translation-thinking', 'review-thinking', 'jobs-review-thinking']) {
   $(id).onchange = () => {
