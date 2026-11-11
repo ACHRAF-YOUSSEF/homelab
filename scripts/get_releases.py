@@ -26,9 +26,6 @@ def get_releases():
     
     SONARR_KEY = keys.get("SONARR_API_KEY") or os.getenv("SONARR_API_KEY")
     RADARR_KEY = keys.get("RADARR_API_KEY") or os.getenv("RADARR_API_KEY")
-    
-    if not SONARR_KEY or not RADARR_KEY:
-        return f"Error: Keys not found."
 
     sonarr_base = "http://localhost:8989"
     radarr_base = "http://localhost:7878"
