@@ -1,63 +1,37 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# weather_bot.sh - Bash version of weather_bot.py
+# Fetches current weather from wttr.in for a given location
 
-# Weather Bot - Shell script version using wttr.in
-# Retrieves weather data from wttr.in API and formats output
-
+# Default location (can be overridden via command line argument)
 LOCATION="${1:-Hammam Sousse, Tunisia}"
 
-# Fetch weather data from wttr.in and parse with Python inline
-RESULT=$(python3 << 'PYTHON_EOF'
-import subprocess
-import json
-import sys
+# Simplify the location for the URL (replace spaces with +)
+CLEAN_LOC=$(echo "$LOCATION" | tr ' ' '+')
 
-location = "${1:-Hammam Sousse, Tunisia}".replace(' ', '+') if len(sys.argv) > 1 else "Hammam+Sousse,Tunisia"
-url = f"https://wttr.in/{location}?format=j1"
+# Build URL
+URL="wttr.in/${CLEAN_LOC}?format=j1"
 
-try:
-    # Use curl via Python subprocess to fetch data
-    result = subprocess.run(
-        ["curl", "-sS", "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", url],
-        capture_output=True, text=True
-    )
-    
-    response = result.stdout
-    
-    if not response.strip():
-        print("N/A|Unknown|N/A")
-        sys.exit(0)
-    
-    try:
-        data = json.loads(response)
-        temp = str(data.get('current_condition', [{}])[0].get('temp_C', 'N/A'))
-        desc = str(data.get('current_condition', [{}])[0].get('weatherDesc', [{}])[0].get('value', 'Unknown')).strip()
-        humidity = str(data.get('current_condition', [{}])[0].get('humidity', 'N/A'))
-        print(f"{temp}|{desc}|{humidity}")
-    except (json.JSONDecodeError, KeyError, IndexError):
-        # Fall back to text parsing if JSON fails
-        temp = "N/A"
-        desc = "Unknown"
-        humidity = "N/A"
-except Exception as e:
-    print(f"N/A|Error:{str(e)[:20]}|N/A")
+# Fetch weather data using curl
+WEATHER_DATA=$(curl -s --max-time 10 "${URL}" || true)
 
-PYTHON_EOF
-)
-
-# Parse the result from Python
-TEMP=$(echo "$RESULT" | cut -d'|' -f1)
-WEATHER_DESC=$(echo "$RESULT" | cut -d'|' -f2)
-HUMIDITY=$(echo "$RESULT" | cut -d'|' -f3)
-
-# Handle error case
-if [ "$TEMP" == "N/A" ] && [ "$WEATHER_DESC" == "Unknown" ]; then
-    echo "Error: Could not parse weather data from response."
+# Check if we got a valid response
+if [[ $(echo "$WEATHER_DATA" | grep -q '"current_condition"' && echo 1) == 0 ]]; then
+    echo "Error fetching weather: Failed to connect or no data received"
     exit 1
 fi
 
-# Format the output
-if [ -n "$TEMP" ] && [ -n "$WEATHER_DESC" ] && [ "$TEMP" != "N/A" ]; then
-    echo "The current weather in $LOCATION is ${WEATHER_DESC} with a temperature of ${TEMP}°C and ${HUMIDITY}% humidity."
-else
-    echo "Error: Could not parse weather data from response. Got: TEMP=$TEMP DESC=$WEATHER_DESC HUMIDITY=$HUMIDITY"
+# Parse JSON using jq
+TEMP=$(echo "$WEATHER_DATA" | jq -r '.current_condition[0].temp_C' 2>/dev/null || echo "N/A")
+DESCRIPTION=$(echo "$WEATHER_DATA" | jq -r '.current_condition[0].weatherDesc[0].value' 2>/dev/null || echo "N/A")
+HUMIDITY=$(echo "$WEATHER_DATA" | jq -r '.current_condition[0].humidity' 2>/dev/null || echo "N/A")
+
+# Handle N/A cases
+if [[ "$TEMP" == "null" || -z "$TEMP" ]]; then
+    TEMP="N/A"
 fi
+if [[ "$HUMIDITY" == "null" || -z "$HUMIDITY" ]]; then
+    HUMIDITY="N/A"
+fi
+
+# Format and output the weather information
+echo "The current weather in ${LOCATION} is ${DESCRIPTION} with a temperature of ${TEMP}°C and ${HUMIDITY}% humidity."
