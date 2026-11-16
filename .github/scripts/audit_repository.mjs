@@ -58,7 +58,8 @@ function auditSource(path, text) {
       findings.push(finding(path, lineNumber, 'source-private-user-path'));
     }
     for (const match of line.matchAll(ASSIGNMENT)) {
-      if (!CREDENTIAL_NAME.test(match.groups.name.replaceAll('-', '_'))) continue;
+      if (PRIVATE_KEY.test(line)
+        || !CREDENTIAL_NAME.test(match.groups.name.replaceAll('-', '_'))) continue;
       const raw = line.slice(match.index + match[0].length).trim();
       const literal = raw.startsWith('"') || raw.startsWith("'")
         ? literalValue(raw)
