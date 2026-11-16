@@ -43,6 +43,35 @@ function validAddresses(line) {
     .map(match => match[0]).filter(address => isIP(address)));
 }
 
+function auditSource(path, text) {
+  const findings = [];
+  for (const [index, line] of text.split(/\r\n|\n|\r/).entries()) {
+    const lineNumber = index + 1;
+    if (validAddresses(line).some(address => {
+      if (isIP(address) !== 4) return false;
+      const [first, second] = address.split('.').map(Number);
+      return first === 10 || (first === 172 && second >= 16 && second <= 31)
+        || (first === 192 && second === 168);
+    })) findings.push(finding(path, lineNumber, 'source-private-ip'));
+    if (PRIVATE_KEY.test(line)) findings.push(finding(path, lineNumber, 'source-private-key'));
+    if (/\b[A-Za-z]:\\Users\\[^\r\n"']+/i.test(line)) {
+      findings.push(finding(path, lineNumber, 'source-private-user-path'));
+    }
+    for (const match of line.matchAll(ASSIGNMENT)) {
+      if (!CREDENTIAL_NAME.test(match.groups.name.replaceAll('-', '_'))) continue;
+      const raw = line.slice(match.index + match[0].length).trim();
+      const literal = raw.startsWith('"') || raw.startsWith("'")
+        ? literalValue(raw)
+        : /^[A-Za-z0-9._~+/=-]+(?:\s+#.*)?$/.test(raw) ? literalValue(raw) : '';
+      if (literal && !placeholder(literal)) {
+        findings.push(finding(path, lineNumber, 'source-credential-assignment'));
+        break;
+      }
+    }
+  }
+  return findings;
+}
+
 export function auditMarkdown(path, text) {
   const findings = [];
   for (const [index, line] of text.split(/\r\n|\n|\r/).entries()) {
@@ -147,7 +176,7 @@ export function auditRepository(root) {
     }
     // Check file names without opening private runtime files, including .env.
     if (!existsSync(path)) continue;
-    if (/\.(?:py[wi23]?|ipynb)$/i.test(name)) findings.push(finding(name, 0, 'repository-python-source'));
+    if (/\.(?:py[wi23]?|ipynb)$/i.test(name)) findings.push(...auditSource(name, readText(path)));
     if (/\.ps1$/i.test(name)) findings.push(finding(name, 0, 'repository-powershell-script'));
     if (/\.md$/i.test(name)) findings.push(...auditMarkdown(name, readText(path)));
   }
