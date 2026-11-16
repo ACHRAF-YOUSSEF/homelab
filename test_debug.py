@@ -1,7 +1,6 @@
 import requests, os
 
 env_paths = [
-    r"C:\Users\achraf youssef\Documents\my-projects\homelab\.env",
     os.path.join(os.getcwd(), ".env"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
 ]
