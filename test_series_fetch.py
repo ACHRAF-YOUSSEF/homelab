@@ -2,7 +2,6 @@ import requests, os
 
 # Load env file
 env_paths = [
-    r"C:\Users\achraf youssef\Documents\my-projects\homelab\.env",
     os.path.join(os.getcwd(), ".env"),
 ]
 keys = {}
