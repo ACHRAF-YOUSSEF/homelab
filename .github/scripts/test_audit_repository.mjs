@@ -155,7 +155,7 @@ test('Python source is allowed but sensitive literals are rejected; ignored runt
     'API_KEY = "fixture-sensitive-value"',
     'SERVER = "192.168.1.25"',
     'PRIVATE_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----"',
-    String.raw\`CONFIG = r"C:\Users\private-user\Documents\config"\`,
+    String.raw`CONFIG = r"C:\Users\private-user\Documents\config"`,
   ].join('\n'));
   write('helper.pyw', 'print("safe")\n');
   write('types.pyi', 'class Example: ...\n');
