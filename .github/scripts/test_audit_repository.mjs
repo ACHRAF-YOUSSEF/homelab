@@ -148,18 +148,27 @@ test('CLI failure exit code and output never display matched values', t => {
   assert.ok(!(result.stdout + result.stderr).includes('fixture-sensitive-value'));
 });
 
-test('source policy rejects Python, notebooks, and PowerShell but preserves ignored runtime data', t => {
+test('Python source is allowed but sensitive literals are rejected; ignored runtime data stays ignored', t => {
   const { root, write } = repositoryFixture(t);
   write('.gitignore', '.env\nruntime/\n');
-  for (const name of ['helper.py', 'helper.pyw', 'types.pyi', 'analysis.ipynb', 'helper.ps1', 'runtime/plugin.py']) {
-    write(name, '');
-  }
+  write('helper.py', [
+    'API_KEY = "fixture-sensitive-value"',
+    'SERVER = "192.168.1.25"',
+    'PRIVATE_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----"',
+    'CONFIG = r"C:\\Users\\private-user\\Documents\\config"',
+  ].join('\n'));
+  write('helper.pyw', 'print("safe")\n');
+  write('types.pyi', 'class Example: ...\n');
+  write('analysis.ipynb', '{"cells": []}\n');
+  write('runtime/plugin.py', 'API_KEY = "ignored-runtime-value"\n');
   const findings = auditRepository(root);
-  assert.equal(findings.filter(item => item.rule === 'repository-python-source').length, 4);
-  assert.equal(findings.filter(item => item.rule === 'repository-powershell-script').length, 1);
+  assert.deepEqual(new Set(findings.map(item => item.rule)), new Set([
+    'source-credential-assignment', 'source-private-ip',
+    'source-private-key', 'source-private-user-path',
+  ]));
+  assert.equal(findings.length, 4);
   assert.ok(!findings.some(item => item.path.startsWith('runtime/')));
 });
-
 test('invalid encoding fails closed without showing content', t => {
   const { root, write } = repositoryFixture(t);
   write('README.md', Buffer.from([0xff, 0xfe]));
