@@ -108,7 +108,7 @@ name = "visualize_det"
 path = "examples/visualize_det.rs"
 
 [dependencies.env_logger]
-version = "0.10"
+version = "0.11"
 
 [dependencies.fast_image_resize]
 version = "5"
