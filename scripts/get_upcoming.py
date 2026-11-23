@@ -81,7 +81,7 @@ def get_upcoming():
     sunday = monday + timedelta(days=6)
     start_date = (monday - timedelta(days=2)).strftime('%Y-%m-%d')
     end_date = (sunday + timedelta(days=2)).strftime('%Y-%m-%d')
-    target_start = (monday - timedelta(days=1)).strftime('%Y-%m-%d')
+    target_start = monday.strftime('%Y-%m-%d')
     target_end = (sunday + timedelta(days=1)).strftime('%Y-%m-%d')
     
     # Fetch releases (Sonarr with includeSeries=true to get series title directly)
